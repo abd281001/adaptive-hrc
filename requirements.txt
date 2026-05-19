@@ -1,0 +1,12 @@
+# Minimal runtime and test environment for the adaptive HRC benchmark.
+#
+# Keep this environment separate from the Overcooked/TALENTS stack. The old
+# project .venv mixed TensorFlow, Torch/CUDA, Ray, Overcooked, Jupyter, and a
+# NumPy wheel linked against OpenBLAS 0.3.23.dev, which made native failures
+# difficult to isolate.
+numpy==2.4.4
+scipy==1.17.1
+matplotlib==3.10.8
+pillow==12.2.0
+ipykernel==7.2.0
+pytest>=8.0

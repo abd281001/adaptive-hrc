@@ -1,0 +1,11 @@
+.codex
+
+prompts/
+venv/
+talents-zsc/
+eval_results/
+
+src/evaluations.py
+
+src/__pycache__
+tests/__pycache__
