@@ -1,6 +1,7 @@
 import unittest
 
 from src.adaptive_agent import AdaptiveHRCAgent, MODE_ONLINE
+from src.memory import _aligned_next_index
 from src.representations import observations_from_actions
 from src.environment import gen
 from src.models import Config, top_k
@@ -81,6 +82,98 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         self.assertIn(obs.action_vector, ag.action_vector_to_token)
         self.assertFalse(row.correct)
 
+    def test_aligned_next_index_advances_past_entire_prefix(self):
+        ordering = ("a1", "a2", "a3", "a4")
+        self.assertEqual(_aligned_next_index(("a1", "a2"), ordering), 2)
+        self.assertEqual(_aligned_next_index(("a1", "a3"), ordering), 3)
+
+    def test_action_gate_uses_calibrated_margin_entropy_score(self):
+        ag = AdaptiveHRCAgent(Config(
+            verbose=False,
+            posterior_action_confidence_threshold=0.35,
+            posterior_action_gate_temperature=1.0,
+            posterior_action_gate_margin_weight=0.20,
+            posterior_action_gate_entropy_weight=0.20,
+            posterior_action_margin_threshold=0.10,
+            posterior_action_margin_min_confidence=0.10,
+            posterior_action_entropy_threshold=0.70,
+        ))
+
+        allowed, score, reason = ag._action_gate_allows(confidence=0.20, entropy=0.20, margin=0.20)
+        self.assertTrue(allowed)
+        self.assertGreaterEqual(score, 0.35)
+        self.assertEqual(reason, "margin_entropy_gate")
+
+        allowed, score, reason = ag._action_gate_allows(confidence=0.20, entropy=0.95, margin=0.0)
+        self.assertFalse(allowed)
+        self.assertLess(score, 0.35)
+        self.assertIn(reason, {"low_action_confidence", "low_action_gate_score"})
+
+    def test_predict_gates_final_ensemble_when_posterior_is_unavailable(self):
+        ag = AdaptiveHRCAgent(Config(
+            verbose=False,
+            posterior_action_confidence_threshold=0.20,
+            ensemble_fallback_assist_threshold=0.35,
+        ))
+        ag.irl.predict = lambda state: {"a": 0.90, "b": 0.10}
+        ag.markov.predict = lambda state, prefix: {"a": 0.90, "b": 0.10}
+        ag.graph.predict = lambda state, prefix: {"a": 0.90, "b": 0.10}
+
+        dist = ag.predict_next_tokens([])
+        gate = ag.assist_gate_stats()
+
+        self.assertEqual(top_k(dist, 1)[0], "a")
+        self.assertTrue(gate["assist_used"])
+        self.assertEqual(gate["assist_source"], "ensemble_posterior_empty")
+        self.assertIsNotNone(gate["final_action_confidence"])
+
+    def test_predict_initializes_posterior_from_active_memory_at_episode_start(self):
+        ag = AdaptiveHRCAgent(Config(verbose=False))
+        a = ag._token_for_vector((1, 0))
+        b = ag._token_for_vector((0, 1))
+        ag._register_if_live("R1", [a, b], step=1)
+        ag.irl.predict = lambda state: {a: 0.50, b: 0.50}
+        ag.markov.predict = lambda state, prefix: {a: 0.50, b: 0.50}
+        ag.graph.predict = lambda state, prefix: {a: 0.50, b: 0.50}
+        ag.posterior.reset()
+
+        ag.predict_next_tokens([])
+
+        self.assertTrue(ag.posterior.joint())
+
+    def test_dynamic_blend_trusts_agreement_more_than_conflicting_ensemble(self):
+        ag = AdaptiveHRCAgent(Config(
+            verbose=False,
+            posterior_assist_strength=0.70,
+            posterior_assist_strength_min=0.15,
+            posterior_assist_strength_max=0.90,
+            posterior_assist_agreement_bonus=0.15,
+            posterior_assist_disagreement_penalty=0.45,
+        ))
+        agree = ag._posterior_blend_strength({"a": 0.80, "b": 0.20}, {"a": 0.70, "b": 0.30}, 0.80, 0.72, 0.60, 0.70, 0.88, 0.40)
+        disagree = ag._posterior_blend_strength({"b": 0.55, "a": 0.45}, {"a": 0.90, "b": 0.10}, 0.55, 0.99, 0.10, 0.90, 0.47, 0.80)
+
+        self.assertGreater(agree, disagree)
+        self.assertGreaterEqual(agree, 0.80)
+        self.assertLess(disagree, 0.70)
+
+    def test_preference_lock_boosts_locked_variant_frontier(self):
+        ag = AdaptiveHRCAgent(Config(verbose=False, locked_variant_action_boost=0.70))
+        a = ag._token_for_vector((1, 0))
+        b = ag._token_for_vector((0, 1))
+        c = ag._token_for_vector((1, 1))
+        ag._register_if_live("R1", [a, b, c], step=1)
+        locked = ag._register_if_live("R1", [a, c, b], step=2)
+        ag.locked_variant_key = ("R1", locked.pref_hash)
+        ag.locked_pref_id = ag.variant_pref_ids.get(ag.locked_variant_key)
+        pid = ag.locked_pref_id or ag.last_pref_id or "P1"
+        ag.posterior._joint = {("R1", pid): 1.0}
+
+        dist, _confidence, _entropy, _margin = ag._action_marginal_distribution([a])
+
+        self.assertGreater(dist.get(c, 0.0), dist.get(b, 0.0))
+        self.assertEqual(top_k(dist, 1)[0], c)
+
     def test_retrain_rebuilds_predictors_from_active_set_only(self):
         ag = AdaptiveHRCAgent(
             Config(
@@ -135,7 +228,7 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         original_base = ag_base._tokens_from_action_labels(RECIPE_TOMATO_ONION_SOUP)
         prefix_base = target_base[:1]
         ag_base.posterior.update(prefix_base, ag_base._roles_for_tokens(prefix_base), ag_base.recipe_prototypes, ag_base.preference_prototypes, ag_base._memory_state_for_recipe)
-        dist_base, _, _ = ag_base._action_marginal_distribution(prefix_base)
+        dist_base, _, _, _ = ag_base._action_marginal_distribution(prefix_base)
 
         ag_transfer = AdaptiveHRCAgent(cfg)
         self._obs(ag_transfer, RECIPE_TOMATO_ONION_SOUP)
@@ -144,7 +237,7 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         original_transfer = ag_transfer._tokens_from_action_labels(RECIPE_TOMATO_ONION_SOUP)
         prefix_transfer = target_transfer[:1]
         ag_transfer.posterior.update(prefix_transfer, ag_transfer._roles_for_tokens(prefix_transfer), ag_transfer.recipe_prototypes, ag_transfer.preference_prototypes, ag_transfer._memory_state_for_recipe)
-        dist_transfer, _, _ = ag_transfer._action_marginal_distribution(prefix_transfer)
+        dist_transfer, _, _, _ = ag_transfer._action_marginal_distribution(prefix_transfer)
 
         self.assertGreater(dist_transfer.get(target_transfer[1], 0.0), dist_base.get(target_base[1], 0.0))
         self.assertGreater(dist_transfer.get(target_transfer[1], 0.0), dist_transfer.get(original_transfer[1], 0.0))
@@ -422,8 +515,8 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         """A single-step argmax flip must NOT change inferred_recipe.
         Without hysteresis, prefix-collision scenarios thrash the committed
         identity; the gate requires k=2 consecutive agreements + log-margin."""
-        from src.adaptive_agent import SWITCH_AGREEMENT_K
         ag = AdaptiveHRCAgent(Config(verbose=False))
+        switch_agreement = int(getattr(ag.cfg, "posterior_switch_agreement", 2))
         ag.inferred_recipe = "A"
         self._patch_posterior(ag, {("B", "P1"): 0.9, ("A", "P1"): 0.1})
         ag._refresh_recipe_inference([])
@@ -433,7 +526,7 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         self.assertEqual(ag._pending_count, 1)
         # Second consecutive agreement: now switch.
         ag._refresh_recipe_inference([])
-        if SWITCH_AGREEMENT_K <= 2:
+        if switch_agreement <= 2:
             self.assertEqual(ag.inferred_recipe, "B", "after K consecutive agreements identity should switch")
 
     def test_identity_hysteresis_resets_on_revert(self):

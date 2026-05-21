@@ -10,7 +10,7 @@ import random
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .environment import (_FEAT, CONTAINERS, COOKABLES, CUTTABLES, GRATABLE, INGREDIENTS, ITEMS, LOCATIONS, SEASONINGS, StateTracker)
@@ -146,7 +146,22 @@ class Config:
     # Preference-conditioned next-action gate.
     posterior_action_confidence_threshold: float = 0.20
     posterior_action_topk:          int     = 16
-    posterior_assist_strength:      float   = 1.0
+    posterior_assist_strength:      float   = 0.70
+    posterior_assist_strength_min:  float   = 0.15
+    posterior_assist_strength_max:  float   = 0.90
+    posterior_assist_agreement_bonus: float = 0.15
+    posterior_assist_disagreement_penalty: float = 0.45
+    ensemble_fallback_assist_threshold: float = 0.35
+    locked_variant_action_boost: float = 0.70
+    # The action gate operates on a calibrated score, not just raw max action
+    # probability. Temperature < 1 compensates for posterior-marginal dilution;
+    # margin and entropy terms reward decisive action marginals.
+    posterior_action_gate_temperature: float = 0.85
+    posterior_action_gate_margin_weight: float = 0.15
+    posterior_action_gate_entropy_weight: float = 0.10
+    posterior_action_margin_threshold: float = 0.06
+    posterior_action_margin_min_confidence: float = 0.10
+    posterior_action_entropy_threshold: float = 0.85
     online_new_recipe_min_prefix:   int     = 3
     online_new_recipe_partial_threshold: float = 0.30
     # Ablation switches. Each disables one component of the preference-conditioned pathway so the experiment matrix can attribute gains to specific components. All default to False (full system).
@@ -343,7 +358,17 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
     When `ewc_theta_star` and `ewc_fisher` are provided, an in-loop Fisher-weighted quadratic penalty `(ewc_lambda/2) * Σ_i F_i (θ_i - θ*_i)^2` is added to the ascent gradient at every iteration (Kirkpatrick et al.). The `maxent_l2` term is kept as a separate isotropic prior."""
     n_states, n_features = feature_matrix.shape
     n_actions = len(action_to_idx)
-    if n_states == 0 or n_features == 0 or n_actions == 0:                  return np.zeros(n_features, dtype=np.float32), np.zeros(n_states), np.zeros(n_states), {}, {}
+    if n_states == 0 or n_features == 0 or n_actions == 0:
+        stats = {
+            "model_family": "maxent_irl",
+            "estimated_flops": 0.0,
+            "n_states": float(n_states),
+            "n_features": float(n_features),
+            "n_actions": float(n_actions),
+            "iterations_run": 0.0,
+            "warm_start": 1.0 if init_weights is not None else 0.0,
+        }
+        return np.zeros(n_features, dtype=np.float32), np.zeros(n_states), np.zeros(n_states), {}, {}, stats
 
     weights = np.ones(len(demonstrations), dtype=np.float32) if demo_weights is None else np.asarray(demo_weights, dtype=np.float32)
     w_sum = float(weights.sum())
@@ -411,14 +436,20 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
     best_weights    = reward_weights.copy()
     momentum        = np.zeros(n_features, dtype=np.float32)
     momentum_beta   = 0.9
+    iterations_run = 0
+    total_vi_sweeps = 0
+    mc_rollouts_run = 0
+    mc_steps = 0
     
 
     for iteration in range(n_iterations):
+        iterations_run = iteration + 1
         lr = learning_rate * (0.97 ** (no_improve // 20))
         rewards = feat_aug @ reward_weights
 
         # Soft Bellman VI.
         for _ in range(50):
+            total_vi_sweeps += 1
             new_values = rewards.copy()
             for (s_idx, a_idx) in state_action_pairs:
                 ns = transition_model.get((s_idx, a_idx))
@@ -444,10 +475,12 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
         # Expected discounted features via weighted MC rollouts.
         expected_fc = np.zeros(n_features, dtype=np.float32)
         for _ in range(mc_count):
+            mc_rollouts_run += 1
             demo_idx = _sample_categorical(demo_probs, rng=cfg.prng)
             s_idx = demo_starts[demo_idx]
             traj_feat = np.zeros(n_features, dtype=np.float32)
             for t in range(cfg.maxent_mc_horizon):
+                mc_steps += 1
                 if s_idx < n_states:                            traj_feat += (gamma ** t) * feature_matrix[s_idx]
                 if s_idx not in policy_table:                   break
                 a_list, probs = policy_table[s_idx]
@@ -482,7 +515,9 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
     best_rewards = feat_aug @ best_weights
     best_values = best_rewards.copy()
     best_q: Dict[Tuple[int, int], float] = {}
+    final_vi_sweeps = 0
     for _ in range(50):
+        final_vi_sweeps += 1
         new_vals = best_rewards.copy()
         for (s_idx, a_idx) in state_action_pairs:
             ns = transition_model.get((s_idx, a_idx))
@@ -498,7 +533,30 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
 
     clean_s_to_actions = {s: [a for a in a_list if a != deviate_a] for s, a_list in s_to_actions.items()}
     best_q_clean = {(s, a): v for (s, a), v in best_q.items() if a != deviate_a}
-    return best_weights, best_rewards[:n_states], best_values[:n_states], best_q_clean, clean_s_to_actions
+    fit_stats = {
+        "model_family": "maxent_irl",
+        "n_demonstrations": float(len(demonstrations)),
+        "n_demo_state_visits": float(sum(len(traj) for traj in demonstrations)),
+        "n_states": float(n_states),
+        "n_states_augmented": float(n_states_aug),
+        "n_features": float(n_features),
+        "n_actions": float(n_actions),
+        "n_state_action_pairs": float(len(state_action_pairs)),
+        "n_policy_states": float(len(s_to_actions)),
+        "n_policy_state_actions": float(sum(len(v) for v in s_to_actions.values())),
+        "n_transition_edges": float(len(transition_model)),
+        "iterations_requested": float(n_iterations),
+        "iterations_run": float(iterations_run),
+        "vi_sweeps": float(total_vi_sweeps),
+        "final_vi_sweeps": float(final_vi_sweeps),
+        "mc_rollouts_requested_per_iteration": float(mc_count),
+        "mc_rollouts_run": float(mc_rollouts_run),
+        "mc_steps": float(mc_steps),
+        "warm_start": 1.0 if init_weights is not None else 0.0,
+        "ewc_enabled": 1.0 if ewc_theta_star is not None and ewc_fisher is not None else 0.0,
+    }
+    fit_stats["estimated_flops"] = _maxent_fit_flop_estimate(fit_stats)
+    return best_weights, best_rewards[:n_states], best_values[:n_states], best_q_clean, clean_s_to_actions, fit_stats
 
 
 def predict_action_2(state: State, reward_weights: np.ndarray, feature_matrix: np.ndarray, state_to_idx: Dict[State, int], action_to_idx: Dict[str, int], idx_to_action: Dict[int, str], transition_model: Dict[Tuple[int, int], int], col_min: Optional[np.ndarray] = None, 
@@ -557,6 +615,30 @@ def _apply_delta(state: State, delta: Tuple[Tuple[int, ...], Tuple[int, ...]]) -
     return tuple(s.astype(int).tolist())
 
 
+def _maxent_fit_flop_estimate(stats: Dict[str, Any]) -> float:
+    """Estimate scalar floating-point work from actual MaxEnt fit loop counts."""
+    n_features = float(stats.get("n_features", 0.0))
+    n_states_aug = float(stats.get("n_states_augmented", 0.0))
+    n_state_actions = float(stats.get("n_state_action_pairs", 0.0))
+    n_policy_edges = float(stats.get("n_policy_state_actions", 0.0))
+    n_demo_visits = float(stats.get("n_demo_state_visits", 0.0))
+    iterations = float(stats.get("iterations_run", 0.0))
+    vi_sweeps = float(stats.get("vi_sweeps", 0.0) + stats.get("final_vi_sweeps", 0.0))
+    mc_steps = float(stats.get("mc_steps", 0.0))
+    ewc_enabled = bool(stats.get("ewc_enabled", 0.0))
+
+    empirical_feature_work = 2.0 * n_demo_visits * n_features
+    reward_dot_work = 2.0 * n_states_aug * n_features * max(1.0, iterations + 1.0)
+    # Bellman and policy work is mostly scalar arithmetic plus exp/log calls.
+    # Count it separately from feature-vector work so the estimate is not
+    # multiplied by nonexistent dense action-feature products.
+    vi_scalar_work = vi_sweeps * ((4.0 * n_state_actions) + (8.0 * n_policy_edges))
+    policy_scalar_work = iterations * 8.0 * n_policy_edges
+    rollout_feature_work = 2.0 * mc_steps * n_features
+    gradient_work = iterations * (8.0 * n_features + (4.0 * n_features if ewc_enabled else 0.0))
+    return float(empirical_feature_work + reward_dot_work + vi_scalar_work + policy_scalar_work + rollout_feature_work + gradient_work)
+
+
 class MaxEntIRL2:
     """State-feature MaxEnt IRL with warm-started retrains."""
 
@@ -575,6 +657,23 @@ class MaxEntIRL2:
         self.values: Optional[np.ndarray] = None
         self.q_table: Dict[Tuple[int, int], float] = {}
         self.s_to_actions: Dict[int, List[int]] = {}
+        self.last_fit_stats: Dict[str, Any] = {}
+
+    def reset(self) -> None:
+        self.theta = None
+        self.feature_matrix = None
+        self.normalizer = WelfordFeatureNormalizer()
+        self.col_min = None
+        self.col_max = None
+        self.state_to_idx = {}
+        self.idx_to_state = {}
+        self.action_to_idx = {}
+        self.idx_to_action = {}
+        self.transition_model = {}
+        self.values = None
+        self.q_table = {}
+        self.s_to_actions = {}
+        self.last_fit_stats = {"model_family": "maxent_irl", "estimated_flops": 0.0}
 
     def _expanded_state_actions(self, demonstrations: Sequence[Trajectory]) -> Dict[Tuple[State, str], State]:
         """Cached valid-action approximation from observed action effects."""
@@ -612,7 +711,7 @@ class MaxEntIRL2:
         self.normalizer = WelfordFeatureNormalizer()
         fm, col_min, col_max = create_feature_matrix_2_0(self.idx_to_state, normalizer=self.normalizer, update_normalizer=True)
         init = self.theta if self.theta is not None and self.theta.shape[0] == fm.shape[1] else None
-        weights, _, values, q_table, s_to_actions = max_ent_irl_2(demonstrations, fm, self.state_to_idx, self.action_to_idx, cfg=self.cfg, init_weights=init, demo_weights=demo_weights, ewc_theta_star=ewc_theta_star, ewc_fisher=ewc_fisher, extra_transitions=extra_transitions)
+        weights, _, values, q_table, s_to_actions, fit_stats = max_ent_irl_2(demonstrations, fm, self.state_to_idx, self.action_to_idx, cfg=self.cfg, init_weights=init, demo_weights=demo_weights, ewc_theta_star=ewc_theta_star, ewc_fisher=ewc_fisher, extra_transitions=extra_transitions)
         # Deterministic transition table.
         transition: Dict[Tuple[int, int], int] = {}
         for traj in demonstrations:
@@ -631,6 +730,10 @@ class MaxEntIRL2:
         self.values = values.astype(np.float32)
         self.q_table = q_table
         self.s_to_actions = s_to_actions
+        fit_stats = dict(fit_stats)
+        fit_stats["model_family"] = "maxent_irl"
+        fit_stats["n_transitions"] = float(sum(max(0, len(traj) - 1) for traj in demonstrations))
+        self.last_fit_stats = fit_stats
 
     def predict(self, state: State) -> Dict[str, float]:
         if self.theta is None or self.feature_matrix is None: return {}

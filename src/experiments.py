@@ -14,6 +14,7 @@ import math
 import multiprocessing as mp
 import os
 import random
+import re
 import socket
 import sys
 import time
@@ -74,6 +75,7 @@ APPENDIX_BASELINES: Tuple[str, ...] = (
 )
 FACTOR_BASELINES: Tuple[str, ...] = (
     "full",
+    "experience_replay_bc",
     "irl_ngram_graph_only",
     "no_preference_prototype",
     "no_recipe_prototype",
@@ -83,6 +85,7 @@ FACTOR_BASELINES: Tuple[str, ...] = (
     "latest_only",
     "bigram",
     "oracle_preference_label",
+    "oracle_recipe_and_preference_label",
 )
 
 _BASELINE_COLORS: Dict[str, str] = {
@@ -117,12 +120,14 @@ _BASELINE_DISPLAY_NAMES: Dict[str, str] = {
     "full": "Full",
     "adaptive": "Adaptive decay",
     "fixed_decay": "Fixed decay",
-    "no_decay": "NoDecay (unbounded memory)",
+    "no_decay": "Unbounded memory",
     "latest_only": "Latest only",
     "experience_replay_bc": "Experience replay BC",
     "bigram": "Bigram",
     "frequency_conditioned_bigram": "Weighted bigram",
     "oracle_ceiling": "Oracle ceiling",
+    "oracle_preference_label": "Oracle preference",
+    "oracle_recipe_and_preference_label": "Oracle recipe+preference",
 }
 
 _BASELINE_GROUPS: Dict[str, str] = {
@@ -136,14 +141,17 @@ _BASELINE_GROUPS: Dict[str, str] = {
     "bigram": "Weak baselines / ablations",
     "frequency_conditioned_bigram": "Weak baselines / ablations",
     "latest_only": "Weak baselines / ablations",
-    "no_decay": "Weak baselines / ablations",
+    "no_decay": "Memory ablations",
     "no_preference_prototype": "Weak baselines / ablations",
     "no_recipe_prototype": "Weak baselines / ablations",
     "oracle_ceiling": "Oracle",
+    "oracle_preference_label": "Oracle",
+    "oracle_recipe_and_preference_label": "Oracle",
 }
 
 _BASELINE_GROUP_ORDER: Tuple[str, ...] = (
     "Proposed variants",
+    "Memory ablations",
     "CL baselines",
     "Weak baselines / ablations",
     "Oracle",
@@ -238,7 +246,23 @@ LEGACY_EXPERIMENTS: Tuple[str, ...] = (
 ALL_EXPERIMENTS: Tuple[str, ...] = MAIN_EXPERIMENTS + APPENDIX_EXPERIMENTS
 FOUR_CELL_KEYS: Tuple[str, ...] = ("seen_seen", "seen_unseen", "unseen_seen", "unseen_unseen")
 DEPLOYMENT_REPORT_CELLS: Tuple[str, ...] = ("seen_seen", "seen_unseen")
+TRANSFER_CELL_KEYS: Tuple[str, ...] = (
+    "direct_retrieval",
+    "seen_recipe_preference_seen_elsewhere",
+    "seen_recipe_new_preference",
+    "unseen_recipe_seen_preference",
+    "unseen_unseen",
+)
+PRIMARY_EVENT_TYPES: Tuple[str, ...] = (
+    "routine_reuse",
+    "preference_shift",
+    "gradual_shift",
+    "gradual_shift_followup",
+    "cross_transfer_probe",
+    "rare_reentry",
+)
 ASSIST_WRONG_PENALTY: float = 1.0
+ASSIST_HIDDEN_CORRECT_PENALTY: float = 0.25
 
 SCENARIO_NARRATIVES: Dict[str, Dict[str, str]] = {
     "deployment_stream": {
@@ -300,6 +324,45 @@ SCENARIO_NARRATIVES: Dict[str, Dict[str, str]] = {
     "compute_tradeoff": {
         "claim": "Improved assistance should be justified against runtime and refit cost.",
         "pressure": "Shared continual stream with wall-time and fit-count accounting.",
+    },
+    "zipf_usage_sweep": {
+        "claim": "A deployed kitchen assistant should remain useful when demand concentrates on house favorites without losing rare customized workflows.",
+        "pressure": "Balanced prep-book onboarding followed by branched rush-hour Zipf streams; utility is demand-weighted while fairness evaluates the whole menu, including unsampled tail workflows.",
+    },
+}
+
+DEPLOYMENT_EVENT_NARRATIVES: Dict[str, Dict[str, str]] = {
+    "routine_reuse": {
+        "claim": "Previously demonstrated recipe-preference pairs should remain directly reusable.",
+        "pressure": "Assist episodes reuse the current user/recipe pair without a preference change.",
+    },
+    "preference_shift": {
+        "claim": "A known recipe may be reused with a different preference ordering.",
+        "pressure": "Assist episodes keep the recipe fixed while changing the preference label.",
+    },
+    "gradual_shift": {
+        "claim": "Preference drift is gradual in realistic use; the system should track it step by step.",
+        "pressure": "Blended preference episodes at alpha=0.30, followed by a full target-preference episode.",
+    },
+    "gradual_shift_followup": {
+        "claim": "After a gradual drift signal, the system should recover on the fully shifted preference.",
+        "pressure": "The episode immediately after a blended demonstration uses the full target preference.",
+    },
+    "user_switch": {
+        "claim": "Persistent user identity should modulate expected preferences across blocks.",
+        "pressure": "Blocked user returns test retention after other users intervene.",
+    },
+    "cross_transfer_probe": {
+        "claim": "Known preferences should transfer to recipes where that preference has not been shown.",
+        "pressure": "Probe pairs require both a seen recipe and a globally seen preference in a new combination.",
+    },
+    "rare_reentry": {
+        "claim": "Stale or likely-pruned tasks should be recoverable after long absence.",
+        "pressure": "Probe pairs are sampled from older stream history beyond the decay horizon.",
+    },
+    "new_recipe_observe": {
+        "claim": "The stream should continue acquiring genuinely new recipes during deployment.",
+        "pressure": "Observation events introduce recipes outside the initial Phase-A recipe set.",
     },
 }
 
@@ -417,6 +480,14 @@ class DeploymentStreamConfig:
     transfer_warmup_events: int = 30
     forgetting_checkpoint_interval: int = 10
     coverage_curve_thresholds: Tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+    calibrate_full_action_gate: bool = True
+    calibration_baselines: Tuple[str, ...] = ()
+    calibration_thresholds: Tuple[float, ...] = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80, 0.95, 1.01)
+    calibration_min_conditional_top1: float = 0.55
+    calibration_max_wrong_assist_rate: float = 0.45
+    calibration_wrong_assist_penalty: float = ASSIST_WRONG_PENALTY
+    calibration_hidden_correct_penalty: float = ASSIST_HIDDEN_CORRECT_PENALTY
+    calibration_n_probe_pairs: int = 24
 
 
 @dataclass(frozen=True)
@@ -448,6 +519,7 @@ class DisambiguationAuditConfig:
     action_gate_thresholds: Tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
     validation_fraction: float = 0.30
     drop_fractions: Tuple[float, ...] = (0.10, 0.15, 0.20, 0.25)
+    prefix_fractions: Tuple[float, ...] = (0.10, 0.25, 0.50, 0.75, 1.00)
 
 
 @dataclass(frozen=True)
@@ -495,8 +567,10 @@ class SparsePoolConfig:
 @dataclass(frozen=True)
 class ZipfUsageConfig:
     n_recipes: int = 12
+    n_preferences: int = 4
     n_events: int = 120
     alphas: Tuple[float, ...] = (0.0, 0.5, 1.0, 1.5, 2.0, 2.5)
+    phase_a_cycles: int = 1
 
 
 @dataclass(frozen=True)
@@ -623,7 +697,19 @@ class LiveStepRecord:
     posterior_max_prob: Optional[float] = None
     posterior_n_hypotheses: Optional[int] = None
     assist_used: bool = False
+    raw_action_confidence: Optional[float] = None
+    action_gate_score: Optional[float] = None
+    action_margin: Optional[float] = None
+    action_gate_threshold: Optional[float] = None
     action_marginal_entropy: Optional[float] = None
+    assist_source: Optional[str] = None
+    final_action_confidence: Optional[float] = None
+    final_action_margin: Optional[float] = None
+    final_action_entropy: Optional[float] = None
+    conditioned_action_confidence: Optional[float] = None
+    ensemble_action_confidence: Optional[float] = None
+    policy_agreement: Optional[bool] = None
+    blend_strength: Optional[float] = None
     prediction_wall_s: Optional[float] = None
 
 
@@ -968,9 +1054,10 @@ def binary_decision_metrics(scores: Sequence[float], labels: Sequence[int], n_bi
 def behavioral_steps_to_lock(steps: Sequence[LiveStepRecord], window: int = 3, threshold: float = 0.75) -> int:
     """Baseline-agnostic lock time based on sustained behavioral accuracy."""
     n = len(steps)
-    if n <= 0:
-        return -1
     width = max(1, int(window))
+    min_episode_steps = max(width, 5)
+    if n < min_episode_steps:
+        return -1
     for k in range(n):
         stable = True
         for j in range(k, n):
@@ -1011,6 +1098,16 @@ def live_episode_metrics(record: LiveEpisodeRecord, *, true_rid: Optional[str] =
             "useful_assistance_rate": 0.0,
             "confidence_ece": 0.0,
             "confidence_brier": 0.0,
+            "correct_prediction_assist_recall": 0.0,
+            "wrong_prediction_assist_rate": 0.0,
+            "hidden_correct_rate": 0.0,
+            "abstention_error_rate": 0.0,
+            "abstention_recall": 0.0,
+            "mean_final_action_confidence": 0.0,
+            "mean_conditioned_action_confidence": 0.0,
+            "mean_ensemble_action_confidence": 0.0,
+            "policy_agreement_rate": 0.0,
+            "mean_blend_strength": 0.0,
             "mean_prediction_wall_s": 0.0,
             "p95_prediction_wall_s": 0.0,
         }
@@ -1018,8 +1115,20 @@ def live_episode_metrics(record: LiveEpisodeRecord, *, true_rid: Optional[str] =
     post_steps = record.steps[fm + 1:] if fm >= 0 else record.steps
     assist_steps = [s for s in record.steps if s.assist_used]
     closed_steps = [s for s in record.steps if not s.assist_used]
+    correct_steps = [s for s in record.steps if s.correct_top1]
     wrong_steps = [s for s in record.steps if not s.correct_top1]
+    assist_correct_steps = [s for s in assist_steps if s.correct_top1]
+    assist_wrong_steps = [s for s in assist_steps if not s.correct_top1]
+    closed_correct_steps = [s for s in closed_steps if s.correct_top1]
     confidences = [float(s.posterior_confidence) for s in record.steps if s.posterior_confidence is not None]
+    raw_confidences = [float(s.raw_action_confidence) for s in record.steps if s.raw_action_confidence is not None]
+    gate_scores = [float(s.action_gate_score) for s in record.steps if s.action_gate_score is not None]
+    margins = [float(s.action_margin) for s in record.steps if s.action_margin is not None]
+    final_confidences = [float(s.final_action_confidence) for s in record.steps if s.final_action_confidence is not None]
+    conditioned_confidences = [float(s.conditioned_action_confidence) for s in record.steps if s.conditioned_action_confidence is not None]
+    ensemble_confidences = [float(s.ensemble_action_confidence) for s in record.steps if s.ensemble_action_confidence is not None]
+    agreement_flags = [1.0 if bool(s.policy_agreement) else 0.0 for s in record.steps if s.policy_agreement is not None]
+    blend_strengths = [float(s.blend_strength) for s in record.steps if s.blend_strength is not None]
     entropies = [float(s.posterior_entropy) for s in record.steps if s.posterior_entropy is not None]
     action_entropies = [float(s.action_marginal_entropy) for s in record.steps if s.action_marginal_entropy is not None]
     n_hypotheses = [int(s.posterior_n_hypotheses) for s in record.steps if s.posterior_n_hypotheses is not None]
@@ -1057,15 +1166,26 @@ def live_episode_metrics(record: LiveEpisodeRecord, *, true_rid: Optional[str] =
         "coverage": len(assist_steps) / n,
         "conditional_top1": _mean([1.0 if s.correct_top1 else 0.0 for s in assist_steps]),
         "useful_assistance_rate": (len(assist_steps) / n) * _mean([1.0 if s.correct_top1 else 0.0 for s in assist_steps]),
-        "assist_correct_rate": len([s for s in assist_steps if s.correct_top1]) / n,
-        "assist_wrong_rate": len([s for s in assist_steps if not s.correct_top1]) / n,
+        "assist_correct_rate": len(assist_correct_steps) / n,
+        "assist_wrong_rate": len(assist_wrong_steps) / n,
         "net_assistance_value": (
-            len([s for s in assist_steps if s.correct_top1])
-            - ASSIST_WRONG_PENALTY * len([s for s in assist_steps if not s.correct_top1])
+            len(assist_correct_steps)
+            - ASSIST_WRONG_PENALTY * len(assist_wrong_steps)
         ) / n,
+        "correct_prediction_assist_recall": len(assist_correct_steps) / max(1, len(correct_steps)),
+        "wrong_prediction_assist_rate": len(assist_wrong_steps) / max(1, len(wrong_steps)),
+        "hidden_correct_rate": len(closed_correct_steps) / n,
         "abstention_error_rate": _mean([1.0 if not s.correct_top1 else 0.0 for s in closed_steps]),
         "abstention_recall": len([s for s in closed_steps if not s.correct_top1]) / max(1, len(wrong_steps)),
         "mean_action_confidence": _mean(confidences),
+        "mean_raw_action_confidence": _mean(raw_confidences),
+        "mean_action_gate_score": _mean(gate_scores),
+        "mean_action_margin": _mean(margins),
+        "mean_final_action_confidence": _mean(final_confidences),
+        "mean_conditioned_action_confidence": _mean(conditioned_confidences),
+        "mean_ensemble_action_confidence": _mean(ensemble_confidences),
+        "policy_agreement_rate": _mean(agreement_flags),
+        "mean_blend_strength": _mean(blend_strengths),
         "mean_posterior_entropy": _mean(entropies),
         "mean_action_marginal_entropy": _mean(action_entropies),
         "posterior_degenerate_rate": _mean([1.0 if h <= 1 else 0.0 for h in n_hypotheses]),
@@ -1234,35 +1354,7 @@ def per_recipe_accuracy_matrix(records_by_label: Dict[str, Dict[str, float]], pa
 
 
 def live_step_trace(step_rows: Sequence[Dict[str, Any]]) -> List[Dict[str, float]]:
-    episodes: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = defaultdict(list)
-    for i, row in enumerate(step_rows):
-        key = (
-            row.get("baseline"),
-            row.get("event_idx"),
-            row.get("pair"),
-            row.get("condition"),
-            row.get("repeat"),
-            row.get("arm"),
-            row.get("gap"),
-        )
-        if key[1] is None:
-            key = (row.get("baseline"), row.get("pair"), row.get("condition"), i)
-        episodes[key].append(row)
-    if episodes:
-        lengths = [len(rows) for rows in episodes.values()]
-        target_len = min(20, max(lengths))
-        eligible = [rows for rows in episodes.values() if len(rows) >= target_len]
-        if not eligible:
-            target_len = min(lengths)
-            eligible = [rows for rows in episodes.values() if len(rows) >= target_len]
-        rows_for_trace = [
-            row
-            for rows in eligible
-            for row in rows
-            if int(row.get("step", 0)) < target_len
-        ]
-    else:
-        rows_for_trace = list(step_rows)
+    rows_for_trace = list(step_rows)
     by_step: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for row in rows_for_trace:
         by_step[int(row.get("step", 0))].append(row)
@@ -1278,6 +1370,787 @@ def live_step_trace(step_rows: Sequence[Dict[str, Any]]) -> List[Dict[str, float
             "n_steps": float(len(rows)),
         })
     return out
+
+
+def calibration_curve_from_steps(step_rows: Sequence[Dict[str, Any]], n_bins: int = 10) -> List[Dict[str, float]]:
+    rows = [
+        (float(r.get("action_confidence")), 1.0 if r.get("correct_top1") else 0.0)
+        for r in step_rows
+        if r.get("action_confidence") is not None
+    ]
+    if not rows:
+        return []
+    scores = np.asarray([r[0] for r in rows], dtype=float)
+    labels = np.asarray([r[1] for r in rows], dtype=float)
+    if scores.min() < 0.0 or scores.max() > 1.0:
+        scores = (scores - float(scores.min())) / max(float(scores.max() - scores.min()), 1e-9)
+    edges = np.linspace(0.0, 1.0, max(1, int(n_bins)) + 1)
+    curve: List[Dict[str, float]] = []
+    for idx in range(len(edges) - 1):
+        lo, hi = float(edges[idx]), float(edges[idx + 1])
+        mask = ((scores >= lo) & (scores <= hi)) if idx == len(edges) - 2 else ((scores >= lo) & (scores < hi))
+        count = int(mask.sum())
+        if count <= 0:
+            continue
+        curve.append({
+            "bin": float(idx),
+            "confidence": float(scores[mask].mean()),
+            "accuracy": float(labels[mask].mean()),
+            "n_steps": float(count),
+        })
+    return curve
+
+
+def latency_cdf_from_steps(step_rows: Sequence[Dict[str, Any]], max_points: int = 101) -> List[Dict[str, float]]:
+    vals = sorted(float(r.get("prediction_wall_s")) for r in step_rows if r.get("prediction_wall_s") is not None)
+    if not vals:
+        return []
+    qs = np.linspace(0.0, 1.0, max(2, int(max_points)))
+    arr = np.asarray(vals, dtype=float)
+    return [{"latency_s": float(np.quantile(arr, q)), "cdf": float(q)} for q in qs]
+
+
+def assist_gate_reason_summary(step_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    counts = Counter(str(r.get("assist_reason", "unknown")) for r in step_rows)
+    sources = Counter(str(r.get("assist_source", "unknown")) for r in step_rows)
+    total = max(1, sum(counts.values()))
+    source_total = max(1, sum(sources.values()))
+    return {
+        "counts": {k: int(v) for k, v in sorted(counts.items())},
+        "rates": {k: float(v / total) for k, v in sorted(counts.items())},
+        "source_counts": {k: int(v) for k, v in sorted(sources.items())},
+        "source_rates": {k: float(v / source_total) for k, v in sorted(sources.items())},
+    }
+
+
+def _safe_read_json(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _humanize_identifier(value: str) -> str:
+    stem = Path(str(value)).stem
+    stem = re.sub(r"^(aggregate_)?", "", stem)
+    stem = re.sub(r"^[FS][0-9]+[a-z]?_", "", stem)
+    return stem.replace("_", " ").strip()
+
+
+def _short_metric_value(value: Any) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    if abs(v) >= 1000.0:
+        return f"{v:.3g}"
+    if abs(v) >= 10.0:
+        return f"{v:.2f}"
+    return f"{v:.3f}"
+
+
+def _figure_kind(data: Mapping[str, Any], filename: str) -> str:
+    name = filename.lower()
+    if "heatmap" in name or "matrix" in name or "matrix" in data:
+        return "heatmap"
+    if "cdf" in name or "curve" in name:
+        return "line chart"
+    if "series" in data or "curves" in data:
+        return "line chart"
+    if "groups" in data:
+        return "grouped bar chart"
+    if "values" in data:
+        return "bar chart"
+    return "figure"
+
+
+def _infer_axes(filename: str, data: Mapping[str, Any]) -> Tuple[str, str]:
+    x = str(data.get("xlabel") or data.get("x_label") or "")
+    y = str(data.get("ylabel") or data.get("y_label") or "")
+    text = f"{filename} {data.get('title', '')}".lower()
+    if "latency_cdf" in text:
+        x = "prediction latency (milliseconds)"
+        y = "cumulative fraction of predictions"
+    if not x:
+        if "forgetting_curve" in text:
+            x = "number of Phase-B events after initial demonstrations"
+        elif "four_cell" in text:
+            x = "seen/unseen recipe-preference condition and baseline"
+        elif "event_type" in text:
+            x = "deployment event type and baseline"
+        elif "memory_state" in text:
+            x = "ground-truth memory state and event type"
+        elif "assist_gate" in text:
+            x = "gate diagnostic category and baseline"
+        elif "heatmap" in filename.lower() and data.get("x_labels"):
+            x = "columns: " + ", ".join(str(v) for v in data.get("x_labels", [])[:8])
+        elif "per_step" in filename.lower() or "adaptation" in filename.lower():
+            x = "within-episode step"
+        elif "gap" in filename.lower() or "reentry" in filename.lower() or "decay" in filename.lower():
+            x = "gap since last use"
+        elif "threshold" in filename.lower() or "coverage_accuracy" in filename.lower():
+            x = "decision threshold"
+        elif "zipf" in filename.lower():
+            x = "Zipf reuse skew alpha"
+        elif "hamming" in filename.lower():
+            x = "preference-composition distance"
+        elif "demo_count" in filename.lower() or "sample_efficiency" in filename.lower():
+            x = "number of demonstrations"
+        else:
+            x = "system variant or experimental condition"
+    if not y:
+        title = str(data.get("title") or filename).lower()
+        if "four_cell" in text or "forgetting_curve" in text or "per_step_adaptation" in text or "event_type" in text or "memory_state" in text:
+            y = "top-1 accuracy"
+        elif "top-1" in title or "top1" in filename.lower():
+            y = "top-1 accuracy"
+        elif "assist_gate" in text:
+            y = "rate"
+        elif "coverage" in title or "coverage" in filename.lower():
+            y = "assistance coverage"
+        elif "latency" in title or "wall" in title or "fit time" in title:
+            y = "seconds"
+        elif "flop" in title or "flop" in filename.lower():
+            y = "estimated FLOPs"
+        elif "memory" in title or "variant" in title:
+            y = "variant count"
+        elif "rate" in title or "rate" in filename.lower():
+            y = "rate"
+        else:
+            y = "measured outcome"
+    return x, y
+
+
+def _good_direction(filename: str, title: str, y_label: str) -> str:
+    text = f"{filename} {title} {y_label}".lower()
+    if "hrc_assistance_utility" in text or "gate utility" in text or "rate / utility" in text:
+        return "Higher utility is better; coverage and conditional top-1 should rise without increasing wrong-assist rate or hiding many correct predictions."
+    if "latency_cdf" in text or "latency cdf" in text:
+        return "Better curves rise earlier and sit higher at small millisecond thresholds; that means more predictions finish fast enough for interactive assistance."
+    if "net assistance" in text:
+        return "Higher is better: positive values mean useful correct assists outweigh wrong assists."
+    if any(k in text for k in ("latency", "wall time", "fit time", "flop", "steps", "error", "wrong", "duplicate", "entropy")):
+        return "Lower is better, assuming accuracy and coverage are not sacrificed."
+    if any(k in text for k in ("active memory", "active variants", "latest-key", "latest keys", "pruned memory", "pruned variants")):
+        return "Memory is a tradeoff: lower footprint is cheaper, but too low can mean the system is not retaining enough recoverable workflow history."
+    if "coverage" in text:
+        return "Higher coverage is only good when conditional top-1 and net assistance remain high."
+    if any(k in text for k in ("top-1", "top1", "accuracy", "macro-f1", "useful", "net assistance", "retention", "recovery", "purity", "transfer")):
+        return "Higher is better."
+    if "global rate" in text:
+        return "Context dependent: higher decay rate forgets faster; lower decay rate keeps variants longer."
+    return "Interpret relative to the comparison baseline and the companion accuracy/memory plots."
+
+
+def _kitchen_analogy(filename: str, title: str, experiment: str) -> str:
+    text = f"{filename} {title} {experiment}".lower()
+    if "top-1" in text or "top1" in text:
+        return "This is whether the assistant names the exact next kitchen action, such as chop tomato versus retrieve bowl, before the cook does it."
+    if "forgetting" in text:
+        return "This checks whether the assistant still remembers the original recipes after many later orders and preference changes."
+    if "latency_cdf" in text or "prediction latency cdf" in text:
+        return "This is how often the assistant can whisper the next prep step within a few milliseconds, before the cook has already moved on."
+    if any(k in text for k in ("flop", "fit", "wall", "latency")):
+        return "Think of this as the cost of updating the kitchen's prep notebook between customers before the next order arrives."
+    if any(k in text for k in ("memory", "active", "pruned", "latest")):
+        return "This is the stack of recipe cards kept on the counter versus cards archived away after they have not been used."
+    if any(k in text for k in ("reentry", "gap", "decay")):
+        return "This is a customer asking for an old dish again after many intervening meals; the system should recover without relearning from scratch."
+    if any(k in text for k in ("transfer", "four_cell", "seen_unseen", "unseen_seen")):
+        return "This asks whether a learned kitchen habit, such as prep-first or clean-as-you-go, transfers from one recipe to another."
+    if any(k in text for k in ("gate", "coverage", "reliability", "confidence")):
+        return "This is the sous-chef deciding when to speak up with the next action versus staying quiet to avoid giving bad help."
+    if any(k in text for k in ("adaptation", "shift", "per_step")):
+        return "This follows how quickly the assistant adjusts when the cook changes the order of familiar actions in the middle of a recipe."
+    if any(k in text for k in ("disambiguation", "threshold", "confusion", "boundary", "prefix")):
+        return "This is the system watching a partial chopping/prep sequence and deciding whether it is a known dish, a new style, or a new recipe."
+    if any(k in text for k in ("materiality", "duplicate", "kendall", "axis")):
+        return "This checks whether a named workflow preference actually changes the kitchen order rather than producing the same recipe trace."
+    if "zipf" in text:
+        return "This mimics a kitchen where a few house favorites are ordered often while many dishes are rare."
+    return "Read it as a controlled kitchen-workflow comparison: each point or bar is one way the assistant handles recipe and preference demonstrations."
+
+
+GUIDE_EVENT_TYPE_ORDER: Tuple[str, ...] = (
+    "phase_a_observe",
+    "diagonal_train",
+    "initial_recipe_observation",
+    "prep_book_onboarding",
+    "single_shot_observe",
+    "routine_reuse",
+    "rush_hour_repeat_order",
+    "single_shot_first_reuse",
+    "preference_shift",
+    "known_recipe_new_preference",
+    "gradual_shift",
+    "gradual_shift_followup",
+    "user_switch",
+    "cross_transfer_probe",
+    "offdiagonal_transfer",
+    "regular_menu_rotation",
+    "novel_recipe_assist_attempt",
+    "rare_reentry",
+    "rare_custom_order_reentry",
+    "new_recipe_observe",
+)
+
+EVENT_TYPE_EXPLANATIONS: Dict[str, str] = {
+    "phase_a_observe": "initial demonstrations before deployment; these seed the recipe/preference library rather than testing assistance.",
+    "diagonal_train": "training demonstrations where each recipe is paired with one assigned preference; this creates the diagonal training set for transfer tests.",
+    "initial_recipe_observation": "a first observation pass over recipes before the assistant is evaluated.",
+    "prep_book_onboarding": "a balanced pre-service demonstration pass over recipe/preference workflows before the rush-hour demand stream begins.",
+    "single_shot_observe": "one demonstration of a recipe/preference pair before asking whether one exposure is enough.",
+    "routine_reuse": "an assist episode for a recipe/preference pair that has already been demonstrated; this tests direct recall.",
+    "rush_hour_repeat_order": "a high-frequency house-favorite workflow repeatedly requested during the simulated service window.",
+    "single_shot_first_reuse": "the first assist attempt immediately after a single demonstration; this tests one-shot reuse.",
+    "preference_shift": "a known recipe is requested with a different preference ordering; this tests whether the assistant adapts to a changed human style.",
+    "known_recipe_new_preference": "the recipe is familiar but the requested preference has not been seen on that recipe before.",
+    "gradual_shift": "an intermediate or blended preference episode; this tests whether the system tracks drift before the preference fully changes.",
+    "gradual_shift_followup": "the episode after a gradual-shift signal, now using the fully shifted preference; this tests whether adaptation carried over.",
+    "user_switch": "the active user context changes; this tests whether user-specific preferences are retained across blocks.",
+    "cross_transfer_probe": "a seen preference is applied to a recipe where that exact pairing was not demonstrated; this tests cross-recipe transfer.",
+    "offdiagonal_transfer": "a held-out recipe/preference combination after diagonal training; this tests whether preference structure transfers rather than memorizing pairs.",
+    "regular_menu_rotation": "a mid-frequency workflow that appears during ordinary menu rotation, neither a house favorite nor a rare custom order.",
+    "novel_recipe_assist_attempt": "an assist attempt on a recipe the system has not directly observed; this is a hard generalization case.",
+    "rare_reentry": "an older recipe/preference pair returns after a long gap; this tests recovery from stale or pruned memory.",
+    "rare_custom_order_reentry": "a low-frequency customized workflow returns during the Zipf branch; fairness should still count it even if finite sampling barely shows it.",
+    "new_recipe_observe": "a deployment-time observation event for a new recipe; this expands the library instead of measuring assistance.",
+}
+
+TRANSFER_CELL_EXPLANATIONS: Dict[str, str] = {
+    "direct_retrieval": "the exact recipe/preference pair was previously observed, so the assistant can retrieve a known workflow.",
+    "seen_recipe_preference_seen_elsewhere": "the recipe is known and the preference is known from another recipe, but this exact pairing is new.",
+    "seen_recipe_new_preference": "the recipe is known but the preference has not been seen before.",
+    "unseen_recipe_seen_preference": "the recipe is new but the preference style has appeared elsewhere.",
+    "unseen_unseen": "neither the recipe nor the preference style has been seen before.",
+}
+
+FOUR_CELL_EXPLANATIONS: Dict[str, str] = {
+    "seen_seen": "both the recipe and the preference style have been seen before, although not necessarily together.",
+    "seen_unseen": "the recipe has been seen before but the preference style is new.",
+    "unseen_seen": "the recipe is new but the preference style has been seen elsewhere.",
+    "unseen_unseen": "both recipe and preference style are new to the system.",
+}
+
+MEMORY_STATE_EXPLANATIONS: Dict[str, str] = {
+    "no_memory": "the system has no retained variant for the requested workflow.",
+    "active_memory": "the requested variant is still active in the bounded memory set.",
+    "pruned_memory": "the requested variant was previously learned but has decayed into the pruned/archive set.",
+    "same_recipe_new_preference": "the recipe is known, but the current preference variant for that recipe is new.",
+}
+
+BASELINE_EXPLANATIONS: Dict[str, str] = {
+    "full": "the proposed system with bounded memory, adaptive decay, replay weighting, and latest-preference protection.",
+    "adaptive": "adaptive decay without latest-preference protection.",
+    "fixed_decay": "bounded memory with a fixed decay rate rather than reuse-adaptive decay.",
+    "no_decay": "unbounded memory; learned variants are retained instead of decayed out.",
+    "latest_only": "only the most recent preference variant per recipe is retained.",
+    "experience_replay_bc": "a behavior-cloning continual-learning baseline trained with replay.",
+    "ewc": "a continual-learning baseline using elastic weight consolidation.",
+    "online_ewc": "an online EWC variant that updates the consolidation anchor over time.",
+    "l2_anchor": "a quadratic anchor baseline that penalizes drift from the previous fit.",
+    "no_replay": "only the newest committed demonstration survives before retraining.",
+    "bigram": "a weak next-action baseline using local transition statistics.",
+    "frequency_conditioned_bigram": "a bigram baseline conditioned by observed action frequency.",
+    "oracle_ceiling": "an upper-bound baseline with privileged recipe/preference information.",
+}
+
+
+def _ordered_known_labels(labels: Iterable[str], preferred: Sequence[str]) -> List[str]:
+    seen = {str(label) for label in labels if str(label)}
+    ordered: List[str] = []
+    for label in preferred:
+        if label in seen and label not in ordered:
+            ordered.append(label)
+    ordered.extend(sorted(seen.difference(ordered)))
+    return ordered
+
+
+def _event_type_description(event_type: str) -> str:
+    event_type = str(event_type)
+    if event_type in EVENT_TYPE_EXPLANATIONS:
+        return EVENT_TYPE_EXPLANATIONS[event_type]
+    narrative = DEPLOYMENT_EVENT_NARRATIVES.get(event_type)
+    if narrative:
+        parts = [str(narrative.get("claim", "")).strip(), str(narrative.get("pressure", "")).strip()]
+        return " ".join(p for p in parts if p)
+    return f"`{_humanize_identifier(event_type)}` workflow category recorded by the experiment harness."
+
+
+def _prior_state_description(label: str) -> str:
+    label = str(label)
+    if label in TRANSFER_CELL_EXPLANATIONS:
+        return TRANSFER_CELL_EXPLANATIONS[label]
+    if label in FOUR_CELL_EXPLANATIONS:
+        return FOUR_CELL_EXPLANATIONS[label]
+    if label in MEMORY_STATE_EXPLANATIONS:
+        return MEMORY_STATE_EXPLANATIONS[label]
+    return f"`{_humanize_identifier(label)}` prior exposure state recorded by the harness."
+
+
+def _event_type_glossary_lines(event_types: Iterable[str]) -> List[str]:
+    labels = _ordered_known_labels(event_types, GUIDE_EVENT_TYPE_ORDER)
+    if not labels:
+        return []
+    lines = [
+        "",
+        "### Event Type Glossary",
+        "These labels describe the kitchen situation being evaluated, not just plotting categories.",
+    ]
+    for label in labels:
+        lines.append(f"- `{label}`: {_event_type_description(label)}")
+    return lines
+
+
+def _prior_state_glossary_lines(prior_states: Iterable[str]) -> List[str]:
+    labels = _ordered_known_labels(
+        prior_states,
+        tuple(TRANSFER_CELL_KEYS) + tuple(FOUR_CELL_KEYS) + tuple(MEMORY_STATE_LABELS),
+    )
+    if not labels:
+        return []
+    lines = [
+        "",
+        "### Prior State Glossary",
+        "The prior state column describes what the system had seen before that episode begins.",
+    ]
+    for label in labels:
+        lines.append(f"- `{label}`: {_prior_state_description(label)}")
+    return lines
+
+
+def _scenario_event_type_counts(result: Mapping[str, Any]) -> Dict[str, int]:
+    scenario = result.get("scenario", {}) or {}
+    counts = scenario.get("event_type_counts")
+    if isinstance(counts, Mapping):
+        return {str(k): int(v) for k, v in counts.items()}
+    counter: Counter[str] = Counter()
+    for event in scenario.get("events", []) or []:
+        if isinstance(event, Mapping):
+            event_type = event.get("event_type", event.get("requested_event_type", event.get("condition")))
+            if event_type:
+                counter[str(event_type)] += 1
+    return dict(counter)
+
+
+def _scenario_prior_state_counts(result: Mapping[str, Any]) -> Dict[str, int]:
+    scenario = result.get("scenario", {}) or {}
+    counter: Counter[str] = Counter()
+    for event in scenario.get("events", []) or []:
+        if not isinstance(event, Mapping):
+            continue
+        state = event.get("transfer_cell_before") or event.get("four_cell_before") or event.get("memory_state")
+        if state:
+            counter[str(state)] += 1
+    return dict(counter)
+
+
+def _aggregate_seed_results(folder: Path) -> List[Dict[str, Any]]:
+    seed_results: List[Dict[str, Any]] = []
+    for result_path in sorted(folder.parent.glob("seed_*/result.json")):
+        data = _safe_read_json(result_path)
+        if data:
+            seed_results.append(data)
+    return seed_results
+
+
+def _guide_context_for_folder(folder: Path, result: Mapping[str, Any], aggregate: Mapping[str, Any]) -> Dict[str, Any]:
+    seed_results: List[Mapping[str, Any]]
+    if result:
+        seed_results = [result]
+    elif aggregate:
+        seed_results = _aggregate_seed_results(folder)
+    else:
+        seed_results = []
+    event_counts: Counter[str] = Counter()
+    prior_counts: Counter[str] = Counter()
+    for seed_result in seed_results:
+        event_counts.update(_scenario_event_type_counts(seed_result))
+        prior_counts.update(_scenario_prior_state_counts(seed_result))
+    return {
+        "event_type_counts": dict(event_counts),
+        "prior_state_counts": dict(prior_counts),
+    }
+
+
+def _figure_label_tokens(data: Mapping[str, Any]) -> List[str]:
+    labels: List[str] = []
+    for key in ("groups", "x_labels", "y_labels"):
+        values = data.get(key)
+        if isinstance(values, (list, tuple)):
+            labels.extend(str(v) for v in values)
+    for key in ("values", "series", "curves"):
+        values = data.get(key)
+        if isinstance(values, Mapping):
+            labels.extend(str(v) for v in values.keys())
+    baseline_groups = data.get("baseline_groups")
+    if isinstance(baseline_groups, Mapping):
+        for group_values in baseline_groups.values():
+            if isinstance(group_values, (list, tuple)):
+                labels.extend(str(v) for v in group_values)
+    return labels
+
+
+def _figure_event_type_labels(filename: str, data: Mapping[str, Any], context: Mapping[str, Any]) -> List[str]:
+    title = str(data.get("title", ""))
+    text = f"{filename} {title}".lower()
+    tokens = set(_figure_label_tokens(data))
+    known = tuple(GUIDE_EVENT_TYPE_ORDER) + tuple(k for k in DEPLOYMENT_EVENT_NARRATIVES if k not in GUIDE_EVENT_TYPE_ORDER)
+    labels = [label for label in known if label in tokens or label in text]
+    if not labels and any(k in text for k in ("event_type", "per_event_type", "event_memory_state")):
+        counts = context.get("event_type_counts", {})
+        if isinstance(counts, Mapping):
+            labels = [str(k) for k in counts.keys()]
+            if any(k in text for k in ("live_top1", "memory_state", "assist")):
+                labels = [label for label in labels if label not in {"phase_a_observe", "new_recipe_observe", "diagonal_train", "single_shot_observe", "initial_recipe_observation"}]
+    return _ordered_known_labels(labels, GUIDE_EVENT_TYPE_ORDER)
+
+
+def _figure_transfer_cell_labels(filename: str, data: Mapping[str, Any]) -> List[str]:
+    title = str(data.get("title", ""))
+    text = f"{filename} {title}".lower()
+    tokens = set(_figure_label_tokens(data))
+    labels = [label for label in TRANSFER_CELL_KEYS if label in tokens or label in text]
+    if labels or "transfer_cell" in text or "direct retrieval" in text or "cross-recipe transfer" in text:
+        return _ordered_known_labels(labels or TRANSFER_CELL_KEYS, TRANSFER_CELL_KEYS)
+    return []
+
+
+def _figure_four_cell_labels(filename: str, data: Mapping[str, Any]) -> List[str]:
+    title = str(data.get("title", ""))
+    text = f"{filename} {title}".lower()
+    tokens = set(_figure_label_tokens(data))
+    labels = [label for label in FOUR_CELL_KEYS if label in tokens or label in text]
+    if labels or "four_cell" in text or "seen/unseen" in text:
+        return _ordered_known_labels(labels or FOUR_CELL_KEYS, FOUR_CELL_KEYS)
+    return []
+
+
+def _figure_memory_state_labels(filename: str, data: Mapping[str, Any], context: Mapping[str, Any]) -> List[str]:
+    title = str(data.get("title", ""))
+    text = f"{filename} {title}".lower()
+    tokens = set(_figure_label_tokens(data))
+    labels = [label for label in MEMORY_STATE_LABELS if label in tokens or label in text]
+    if not labels and "memory_state" in text:
+        counts = context.get("prior_state_counts", {})
+        if isinstance(counts, Mapping):
+            labels = [str(k) for k in counts.keys() if str(k) in MEMORY_STATE_LABELS]
+    if labels or "memory_state" in text:
+        return _ordered_known_labels(labels or MEMORY_STATE_LABELS, MEMORY_STATE_LABELS)
+    return []
+
+
+def _figure_baseline_labels(data: Mapping[str, Any]) -> List[str]:
+    labels = []
+    for label in _figure_label_tokens(data):
+        if label in BASELINE_EXPLANATIONS or label in PAPER_BASELINES or label in APPENDIX_BASELINES or label in FACTOR_BASELINES:
+            labels.append(label)
+    return _ordered_baseline_names(labels)
+
+
+def _dependent_variable_detail_lines(filename: str, title: str, y_label: str) -> List[str]:
+    text = f"{filename} {title} {y_label}".lower()
+    details: List[str] = []
+    if "hrc_assistance_utility" in text or "gate utility" in text or "rate / utility" in text:
+        details.append("HRC assistance utility is correct-assist rate minus wrong-assist cost and a smaller penalty for correct predictions that were hidden by abstention.")
+    if "latency_cdf" in text or "latency cdf" in text:
+        details.append("The CDF is the fraction of prediction calls completed at or below each latency on the x-axis; a value of 0.9 at 10 ms means 90% of predictions were that fast or faster.")
+    if "conditional" in text and ("top-1" in text or "top1" in text):
+        details.append("Conditional top-1 accuracy is computed only on steps where the assistant chose to provide help; it asks whether spoken assistance is correct when it happens.")
+    elif "live" in text and ("top-1" in text or "top1" in text):
+        details.append("Live top-1 accuracy is the fraction of online steps where the assistant's single first-choice next action exactly matches the cook's next action before that action is revealed.")
+    elif "top-1" in text or "top1" in text:
+        details.append("Top-1 accuracy is the fraction of action steps where the model's single highest-ranked next-action prediction exactly matches the actual next kitchen action.")
+    if "topk" in text or "top-k" in text:
+        details.append("Top-k accuracy gives credit when the correct next action appears anywhere in the assistant's short ranked list, not necessarily as the first choice.")
+    if "coverage" in text:
+        details.append("Assistance coverage is the fraction of steps where the assistant speaks up instead of abstaining; high coverage is useful only if those assists are usually correct.")
+    if "useful_assistance" in text or "useful assistance" in text:
+        details.append("Useful assistance rate is the fraction of all steps that receive a correct assist, so it combines coverage with correctness.")
+    if "net_assistance" in text or "correct assists - wrong assists" in text or "net assistance" in text:
+        details.append("Net assistance value counts correct assists positively and wrong assists negatively, approximating whether help would actually reduce user burden.")
+    if ("latency" in text or "wall time" in text or "seconds" in text) and "latency_cdf" not in text and "latency cdf" not in text:
+        details.append("Seconds measure wall-clock cost for prediction or retraining; in deployment this is the delay the user or between-session update pipeline would feel.")
+    if "last_estimated_flops" in text:
+        details.append("Latest retrain FLOPs estimate the compute used by the most recent executed retrain, which matches the between-session update cost instead of cumulative experiment compute.")
+    elif "flop" in text:
+        details.append("FLOPs estimate training compute. For current headline plots, prefer latest retrain FLOPs over cumulative FLOPs when skipped retrains exist.")
+    if "active variants" in text or "active_memory" in text or "active memory" in text:
+        details.append("Active variants are recipe/preference workflows still retained for direct use by the bounded-memory system.")
+    if "pruned variants" in text or "pruned_memory" in text or "pruned memory" in text:
+        details.append("Pruned variants are workflows that were learned earlier but moved out of active memory; they should remain recoverable for rare reentry.")
+    if not details and y_label.lower() in {"rate", "measured outcome"}:
+        details.append("This outcome is a diagnostic rate or score; interpret it alongside the companion accuracy, coverage, memory, and compute plots rather than in isolation.")
+    return details
+
+
+def _independent_variable_detail_lines(
+    filename: str,
+    data: Mapping[str, Any],
+    x_label: str,
+    context: Mapping[str, Any],
+) -> List[str]:
+    title = str(data.get("title") or _humanize_identifier(filename))
+    text = f"{filename} {title} {x_label}".lower()
+    details: List[str] = []
+    if "gate_calibration_selection" in text:
+        details.append("This threshold sweep is the held-out calibration set actually used to choose the deployed action gate; the selected marker should be interpreted against wrong-assist and hidden-correct penalties, not coverage alone.")
+    if "posthoc_coverage_accuracy" in text:
+        details.append("This threshold sweep is a post-hoc diagnostic after deployment, not the data used to choose the threshold; it checks whether the selected policy generalizes to the later stream.")
+    if "latency_cdf" in text or "latency cdf" in text:
+        details.append("Prediction latency is the elapsed time for one online next-action query. The plot is zoomed to 0-20 ms because sub-20 ms predictions are effectively instantaneous for kitchen assistance, while a 500 ms axis hides meaningful differences in this run.")
+    event_labels = _figure_event_type_labels(filename, data, context)
+    if event_labels:
+        details.append("Deployment event type is the kind of kitchen situation being tested, such as direct reuse, preference drift, user switching, transfer, or rare reentry.")
+        for label in event_labels[:10]:
+            details.append(f"`{label}` means {_event_type_description(label)}")
+    four_labels = _figure_four_cell_labels(filename, data)
+    if four_labels:
+        details.append("The four-cell condition crosses whether the recipe has been seen before with whether the preference style has been seen before.")
+        for label in four_labels:
+            details.append(f"`{label}` means {FOUR_CELL_EXPLANATIONS.get(label, _prior_state_description(label))}")
+    transfer_labels = _figure_transfer_cell_labels(filename, data)
+    if transfer_labels:
+        details.append("Transfer cell is the prior exposure status before the episode starts; it separates direct retrieval from transfer to new recipe/preference pairings.")
+        for label in transfer_labels:
+            details.append(f"`{label}` means {TRANSFER_CELL_EXPLANATIONS.get(label, _prior_state_description(label))}")
+    memory_labels = _figure_memory_state_labels(filename, data, context)
+    if memory_labels:
+        details.append("Memory state is the ground-truth retention status of the requested workflow at the start of the episode.")
+        for label in memory_labels:
+            details.append(f"`{label}` means {MEMORY_STATE_EXPLANATIONS.get(label, _prior_state_description(label))}")
+    baseline_labels = _figure_baseline_labels(data)
+    if "baseline" in x_label.lower() or baseline_labels:
+        details.append("Baseline means the algorithmic system variant being compared; for example `full` is the proposed bounded-memory system, `no_decay` keeps all learned variants, and `latest_only` keeps only the newest variant per recipe.")
+        if 0 < len(baseline_labels) <= 6:
+            for label in baseline_labels:
+                details.append(f"`{label}` means {BASELINE_EXPLANATIONS.get(label, _baseline_label(label))}")
+    if "within-episode step" in x_label.lower() or "per_step" in text or "adaptation" in text:
+        details.append("Within-episode step is the action position inside a single recipe execution; earlier recovery means the assistant adapts before many wrong kitchen suggestions are made.")
+    if "phase-b events" in x_label.lower() or "forgetting_curve" in text:
+        details.append("Phase-B events are deployment episodes after the initial demonstrations; moving right means more intervening kitchen sessions have occurred since the original training examples.")
+    if "threshold" in x_label.lower() or "coverage_accuracy" in text:
+        details.append("The decision threshold controls how confident the assistant must be before speaking; raising it usually reduces coverage and can improve correctness when it does speak.")
+    if "zipf" in x_label.lower() or "zipf" in text:
+        details.append("Zipf reuse skew controls how concentrated the workload is: low values use recipes more evenly, high values make a few recipes dominate while others become rare.")
+    if "gap" in x_label.lower() or "reentry" in text or "decay" in text:
+        details.append("Gap measures how many intervening sessions occur before an old workflow returns; larger gaps are harder because memory decay has had more time to act.")
+    if not details and "system variant or experimental condition" in x_label.lower():
+        details.append("Each bar or curve is one controlled system setting, so differences should be read as changes caused by the compared algorithm or scenario condition.")
+    return details
+
+
+def _figure_summary_lines(
+    filename: str,
+    data: Mapping[str, Any],
+    experiment: str,
+    context: Optional[Mapping[str, Any]] = None,
+) -> List[str]:
+    title = str(data.get("title") or _humanize_identifier(filename))
+    kind = _figure_kind(data, filename)
+    x_label, y_label = _infer_axes(filename, data)
+    context = context or {}
+    lines = [
+        f"### `{filename}`",
+        f"- **What it is:** {kind}: {title}.",
+        f"- **Kitchen analogy:** {_kitchen_analogy(filename, title, experiment)}",
+        f"- **Independent variable:** {x_label}.",
+    ]
+    for detail in _independent_variable_detail_lines(filename, data, x_label, context):
+        lines.append(f"- **Independent variable detail:** {detail}")
+    lines.append(f"- **Dependent variable:** {y_label}.")
+    for detail in _dependent_variable_detail_lines(filename, title, y_label):
+        lines.append(f"- **Dependent variable detail:** {detail}")
+    lines.extend([
+        f"- **Good vs bad:** {_good_direction(filename, title, y_label)}",
+    ])
+    if "estimated_flops" in filename and "last_estimated_flops" not in filename:
+        lines.append("- **Reporting note:** this is the legacy cumulative fit-FLOP plot. The current headline compute plot is `*_last_estimated_flops.png`, which reflects the latest executed retrain between sessions.")
+    if isinstance(data.get("values"), Mapping):
+        values = dict(data.get("values") or {})
+        if values:
+            best_key = max(values, key=lambda k: float(values[k]))
+            lines.append(f"- **Largest value in this file:** `{best_key}` = {_short_metric_value(values[best_key])}.")
+    elif isinstance(data.get("series"), Mapping):
+        lines.append(f"- **Series shown:** {', '.join(str(k) for k in list(data.get('series', {}).keys())[:12])}.")
+    elif isinstance(data.get("groups"), (list, tuple)):
+        lines.append(f"- **Groups shown:** {', '.join(str(k) for k in list(data.get('groups', []))[:12])}.")
+    elif isinstance(data.get("x_labels"), (list, tuple)) and isinstance(data.get("y_labels"), (list, tuple)):
+        lines.append(f"- **Rows/columns:** rows = {', '.join(str(k) for k in list(data.get('y_labels', []))[:8])}; columns = {', '.join(str(k) for k in list(data.get('x_labels', []))[:8])}.")
+    lines.append("")
+    return lines
+
+
+def _event_brief(row: Mapping[str, Any]) -> str:
+    idx = row.get("event_idx", row.get("phase_b_idx", ""))
+    mode = row.get("mode", row.get("condition", ""))
+    event_type = row.get("event_type", row.get("requested_event_type", row.get("condition", "")))
+    recipe = row.get("recipe") or str(row.get("pair", "")).split("/")[0]
+    pref = row.get("preference") or (str(row.get("pair", "")).split("/")[-1] if row.get("pair") else "")
+    user = row.get("user_id", "")
+    phase = row.get("phase", "")
+    memory = row.get("transfer_cell_before", row.get("four_cell_before", ""))
+    return f"| {idx} | {mode} | {phase} | {event_type} | {user} | {recipe} | {pref} | {memory} |"
+
+
+def _scenario_lines_for_seed(result: Mapping[str, Any]) -> List[str]:
+    meta = result.get("metadata", {}) or {}
+    scenario = result.get("scenario", {}) or {}
+    narrative = scenario.get("narrative", {}) or {}
+    events = list(scenario.get("events", []) or [])
+    event_type_counts = _scenario_event_type_counts(result)
+    prior_state_counts = _scenario_prior_state_counts(result)
+    lines = [
+        "## Scenario / Workflow",
+        f"- **Experiment:** `{meta.get('experiment', 'unknown')}`.",
+        f"- **Seed:** `{meta.get('seed', 'unknown')}`.",
+    ]
+    if narrative.get("claim"):
+        lines.append(f"- **Scientific claim:** {narrative.get('claim')}")
+    if narrative.get("pressure"):
+        lines.append(f"- **Scenario pressure:** {narrative.get('pressure')}")
+    if scenario.get("mode_counts"):
+        lines.append(f"- **Mode counts:** {dict(scenario.get('mode_counts') or {})}.")
+    if event_type_counts:
+        lines.append(f"- **Event type counts:** {dict(event_type_counts)}.")
+    if scenario.get("selected_recipes"):
+        lines.append(f"- **Selected recipes:** {', '.join(str(x) for x in scenario.get('selected_recipes', [])[:20])}.")
+    if scenario.get("selected_preferences"):
+        lines.append(f"- **Selected preferences:** {', '.join(str(x) for x in scenario.get('selected_preferences', [])[:20])}.")
+    phase_a = [e for e in events if str(e.get("phase")) == "phase_a"]
+    if phase_a:
+        shown = [f"{e.get('recipe') or str(e.get('pair', '')).split('/')[0]}/{e.get('preference') or str(e.get('pair', '')).split('/')[-1]}" for e in phase_a[:30]]
+        lines.append(f"- **Initial demonstrations in order:** {', '.join(shown)}.")
+    lines.extend(_event_type_glossary_lines(event_type_counts.keys()))
+    lines.extend(_prior_state_glossary_lines(prior_state_counts.keys()))
+    if events:
+        lines.extend([
+            "",
+            "### Event Flow",
+            "This table is the exact seed-level workflow order recorded by the harness.",
+            "",
+            "| idx | mode | phase | event type | user | recipe | preference | prior state |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ])
+        max_events = 180
+        for row in events[:max_events]:
+            lines.append(_event_brief(row))
+        if len(events) > max_events:
+            lines.append(f"| ... | ... | ... | ... | ... | ... | ... | truncated after {max_events} of {len(events)} events |")
+    lines.append("")
+    return lines
+
+
+def _scenario_lines_for_aggregate(folder: Path, aggregate: Mapping[str, Any]) -> List[str]:
+    seed_results = _aggregate_seed_results(folder)
+    lines = [
+        "## Scenario / Workflow",
+        f"- **Experiment aggregate:** `{folder.parent.name}`.",
+        f"- **Seeds summarized:** {len(seed_results)}.",
+    ]
+    if seed_results:
+        experiment = str(seed_results[0].get("metadata", {}).get("experiment", folder.parent.name))
+        narrative = (seed_results[0].get("scenario", {}) or {}).get("narrative", {}) or SCENARIO_NARRATIVES.get(experiment, {})
+        if narrative.get("claim"):
+            lines.append(f"- **Scientific claim:** {narrative.get('claim')}")
+        if narrative.get("pressure"):
+            lines.append(f"- **Scenario pressure:** {narrative.get('pressure')}")
+        count_rows = []
+        aggregate_event_counts: Counter[str] = Counter()
+        aggregate_prior_counts: Counter[str] = Counter()
+        for seed_result in seed_results:
+            scenario = seed_result.get("scenario", {}) or {}
+            meta = seed_result.get("metadata", {}) or {}
+            event_type_counts = _scenario_event_type_counts(seed_result)
+            aggregate_event_counts.update(event_type_counts)
+            aggregate_prior_counts.update(_scenario_prior_state_counts(seed_result))
+            count_rows.append({
+                "seed": meta.get("seed"),
+                "events": scenario.get("n_events", 0),
+                "event_types": event_type_counts,
+            })
+        lines.append(f"- **Aggregate status:** {dict(aggregate.get('status', {}) or {})}.")
+        lines.extend(["", "### Seed Event Counts", "", "| seed | events | event type counts |", "| --- | ---: | --- |"])
+        for row in count_rows:
+            lines.append(f"| {row['seed']} | {row['events']} | {row['event_types']} |")
+        lines.extend(_event_type_glossary_lines(aggregate_event_counts.keys()))
+        lines.extend(_prior_state_glossary_lines(aggregate_prior_counts.keys()))
+        lines.extend(["", "### Seed Initial Demonstration Orders"])
+        for seed_result in seed_results:
+            meta = seed_result.get("metadata", {}) or {}
+            events = list((seed_result.get("scenario", {}) or {}).get("events", []) or [])
+            phase_a = [e for e in events if str(e.get("phase")) == "phase_a"]
+            shown = [f"{e.get('recipe') or str(e.get('pair', '')).split('/')[0]}/{e.get('preference') or str(e.get('pair', '')).split('/')[-1]}" for e in phase_a[:20]]
+            lines.append(f"- Seed `{meta.get('seed')}`: {', '.join(shown) if shown else 'no ordered demonstrations recorded'}.")
+    else:
+        lines.append("- No seed-level result files were found beside this aggregate folder.")
+    lines.append("")
+    return lines
+
+
+def _figure_data_map_for_folder(folder: Path, result: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    figures = result.get("figures", {}) if isinstance(result, Mapping) else {}
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(figures, Mapping):
+        for name, row in figures.items():
+            if isinstance(row, Mapping):
+                data = row.get("data", {}) if isinstance(row.get("data", {}), Mapping) else {}
+                out[str(name)] = dict(data)
+    return out
+
+
+def _artifact_guide_text(folder: Path) -> Optional[str]:
+    pngs = sorted(folder.glob("*.png"))
+    result_path = folder / "result.json"
+    aggregate_path = folder / "aggregate.json"
+    if not pngs and not result_path.exists() and not aggregate_path.exists():
+        return None
+    result = _safe_read_json(result_path) if result_path.exists() else {}
+    aggregate = _safe_read_json(aggregate_path) if aggregate_path.exists() else {}
+    experiment = str((result.get("metadata", {}) or {}).get("experiment") or (aggregate.get("metadata", {}) or {}).get("experiment") or folder.parent.name)
+    context = _guide_context_for_folder(folder, result, aggregate)
+    lines = [
+        "# Artifact Guide",
+        "",
+        "This file is generated from stored result artifacts. It is meant to make the plots auditable without rerunning the experiment or opening the notebook.",
+        "",
+    ]
+    if result:
+        lines.extend(_scenario_lines_for_seed(result))
+    elif aggregate:
+        lines.extend(_scenario_lines_for_aggregate(folder, aggregate))
+    else:
+        lines.extend(["## Scenario / Workflow", "- No structured result JSON was found in this folder.", ""])
+    if pngs:
+        lines.extend(["## Figure Guide", ""])
+        figure_data = _figure_data_map_for_folder(folder, result)
+        for png in pngs:
+            data = figure_data.get(png.name, {})
+            if not data and aggregate:
+                data = {"title": _humanize_identifier(png.name)}
+            lines.extend(_figure_summary_lines(png.name, data, experiment, context))
+    else:
+        lines.extend(["## Figure Guide", "- No PNG figures were found in this folder.", ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def generate_artifact_guides(run_dir: str | Path) -> Dict[str, Any]:
+    """Write per-seed and per-aggregate markdown guides for stored artifacts."""
+    root = Path(run_dir)
+    written: List[str] = []
+    for folder in sorted([p for p in root.rglob("*") if p.is_dir()] + [root]):
+        if folder.name == "__pycache__":
+            continue
+        text = _artifact_guide_text(folder)
+        if text is None:
+            continue
+        guide_path = folder / "artifact_guide.md"
+        guide_path.write_text(text, encoding="utf-8")
+        try:
+            written.append(str(guide_path.relative_to(root)))
+        except ValueError:
+            written.append(str(guide_path))
+    return {"n_guides": len(written), "guides": written}
 
 
 def _flatten_numeric(prefix: str, obj: Any, out: Optional[Dict[str, float]] = None) -> Dict[str, float]:
@@ -1393,6 +2266,7 @@ def _plot_lines(
     ylabel: str,
     vlines: Optional[Sequence[Tuple[float, str]]] = None,
     hlines: Optional[Sequence[Tuple[float, str]]] = None,
+    xlim: Optional[Tuple[float, float]] = None,
 ) -> None:
     if not series:
         return
@@ -1413,11 +2287,15 @@ def _plot_lines(
     for y, label in hlines or ():
         ax.axhline(float(y), color="#374151", linestyle=":", linewidth=1.0, alpha=0.85)
         ax.text(0.99, float(y), str(label), transform=ax.get_yaxis_transform(), va="bottom", ha="right", fontsize=7, color="#374151")
+    if xlim is not None:
+        ax.set_xlim(float(xlim[0]), float(xlim[1]))
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
     fig_data = {"series": series, "title": title, "xlabel": xlabel, "ylabel": ylabel, "vlines": list(vlines or ()), "hlines": list(hlines or ())}
+    if xlim is not None:
+        fig_data["xlim"] = [float(xlim[0]), float(xlim[1])]
     if _ACTIVE_RESULT is not None:
         _ACTIVE_RESULT.capture_figure(path, fig_data)
 
@@ -1459,6 +2337,35 @@ def _plot_lines_ci(
     plt.close(fig)
     if _ACTIVE_RESULT is not None:
         _ACTIVE_RESULT.capture_figure(path, {"series": series, "title": title, "xlabel": xlabel, "ylabel": ylabel, "vlines": list(vlines or ()), "hlines": list(hlines or ())})
+
+
+def _plot_reliability(
+    path: Path,
+    title: str,
+    curves: Mapping[str, Sequence[Mapping[str, float]]],
+) -> None:
+    curves = {str(k): list(v) for k, v in curves.items() if v}
+    if not curves:
+        return
+    path = _flat_artifact_path(path)
+    _ensure(path.parent)
+    fig, ax = plt.subplots(figsize=(5.2, 4.2), dpi=140)
+    ax.plot([0.0, 1.0], [0.0, 1.0], color="#374151", linestyle=":", linewidth=1.0, label="ideal")
+    for label, rows in curves.items():
+        xs = [float(r.get("confidence", 0.0)) for r in rows]
+        ys = [float(r.get("accuracy", 0.0)) for r in rows]
+        ax.plot(xs, ys, marker="o", lw=1.4, label=_baseline_label(label), color=_baseline_color(label))
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("predicted confidence")
+    ax.set_ylabel("empirical accuracy")
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    if _ACTIVE_RESULT is not None:
+        _ACTIVE_RESULT.capture_figure(path, {"curves": _jsonable(curves), "title": title})
 
 
 def _plot_heatmap(path: Path, title: str, matrix: Sequence[Sequence[float]], x_labels: Sequence[str], y_labels: Sequence[str], cmap: str = "Blues") -> None:
@@ -1669,11 +2576,20 @@ def _curve_series(curve: Mapping[str, Mapping[str, Any]], metric: str) -> Tuple[
     return [p[0] for p in points], [p[1] for p in points]
 
 
+def _curve_line_map(curve: Mapping[str, Mapping[str, Any]], metrics: Sequence[str]) -> Dict[str, Tuple[List[float], List[float]]]:
+    out: Dict[str, Tuple[List[float], List[float]]] = {}
+    for metric in metrics:
+        xs, ys = _curve_series(curve, metric)
+        if xs:
+            out[metric] = (xs, ys)
+    return out
+
+
 def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: Mapping[str, Any]) -> None:
     """Regenerate the F-series seed figures from stored metrics only."""
     out = Path(seed_dir)
     if experiment in {"deployment_stream", "cl_regularizer_comparison"}:
-        _remove_stale_pngs(out, ("F1_main_results_*.png", "F2_four_cell_heatmap.png"))
+        _remove_stale_pngs(out, ("F1_main_results_*.png", "F2_four_cell_heatmap.png", "F5_coverage_accuracy.png"))
         per_baseline = dict(metrics.get("per_baseline", {}) or {})
         _plot_bar(out / "figures/F1a_live_top1.png", "F1a deployment stream live top-1", _label_to_metric_rows(per_baseline, "live_top1"), ylabel="top-1")
         _plot_bar(out / "figures/F1b_assistance_coverage.png", "F1b assistance coverage", _label_to_metric_rows(per_baseline, "assistance_coverage"), ylabel="coverage")
@@ -1682,6 +2598,42 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
         _plot_bar(out / "figures/F1e_useful_assistance_secondary.png", "F1e useful assistance (coverage x conditional top-1)", _label_to_metric_rows(per_baseline, "useful_assistance_rate"), ylabel="rate")
         _plot_bar(out / "figures/F1f_recovery_latency.png", "F1f recovery latency after first mismatch", _label_to_metric_rows(per_baseline, "adaptation_latency_steps"), ylabel="steps")
         _plot_bar(out / "figures/F1g_p95_prediction_latency.png", "F1g p95 prediction latency", _label_to_metric_rows(per_baseline, "p95_prediction_wall_s"), ylabel="seconds")
+        gate_diag_baselines = [b for b in ("full", "no_decay", "experience_replay_bc", "bigram", "latest_only") if b in per_baseline]
+        if gate_diag_baselines:
+            _plot_grouped_bar(
+                out / "figures/S1_assist_gate_diagnostics.png",
+                "S1 assist gate diagnostics",
+                ("correct_prediction_assist_recall", "wrong_prediction_assist_rate", "hidden_correct_rate"),
+                {
+                    b: [
+                        float(per_baseline[b].get("correct_prediction_assist_recall", 0.0)),
+                        float(per_baseline[b].get("wrong_prediction_assist_rate", 0.0)),
+                        float(per_baseline[b].get("hidden_correct_rate", 0.0)),
+                    ]
+                    for b in gate_diag_baselines
+                },
+                ylabel="rate",
+            )
+        event_groups = [event for event in PRIMARY_EVENT_TYPES if any(event in (row.get("per_event_type", {}) or {}) for row in per_baseline.values())]
+        event_baselines = [b for b in ("full", "latest_only", "experience_replay_bc", "bigram") if b in per_baseline]
+        if event_groups and event_baselines:
+            _plot_grouped_bar(
+                out / "figures/F1h_event_type_live_top1.png",
+                "F1h live top-1 by deployment event type",
+                event_groups,
+                {
+                    b: [per_baseline[b].get("per_event_type", {}).get(event, {}).get("live_top1", 0.0) for event in event_groups]
+                    for b in event_baselines
+                },
+                ylabel="top-1",
+            )
+        retention_values = {
+            b: _mean([float(v.get("return_minus_first_live_top1", 0.0)) for v in (row.get("per_user_return_retention", {}) or {}).values()])
+            for b, row in per_baseline.items()
+            if row.get("per_user_return_retention")
+        }
+        if retention_values:
+            _plot_bar(out / "figures/S1_user_return_retention_delta.png", "S1 return-user retention delta", retention_values, ylabel="return - first live top-1")
         heatmap_baselines = [b for b in ("full", "no_preference_prototype", "no_recipe_prototype", "latest_only", "experience_replay_bc", "bigram", "oracle_ceiling") if b in per_baseline]
         grouped_bar_baselines = _ordered_baseline_names(per_baseline)
         if heatmap_baselines:
@@ -1705,6 +2657,13 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
                 forgetting_series[name] = ([r["phase_b_count"] for r in ft], [r["mean_phase_a_top1"] for r in ft])
         if forgetting_series:
             _plot_lines(out / "figures/F3_forgetting_curve.png", "F3 retained Phase-A accuracy", forgetting_series, "Phase-B events", "frozen top-1")
+        identity_forgetting_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
+        for name in ("full", "no_decay", "latest_only", "fixed_decay"):
+            ft = [r for r in metrics.get("derived_views", {}).get("forgetting_curve", []) if r.get("baseline") == name and "mean_phase_a_identity_reference_top1" in r]
+            if ft:
+                identity_forgetting_series[name] = ([r["phase_b_count"] for r in ft], [r["mean_phase_a_identity_reference_top1"] for r in ft])
+        if identity_forgetting_series:
+            _plot_lines(out / "figures/F3_identity_reference_forgetting_curve.png", "F3 identity-reference retained accuracy", identity_forgetting_series, "Phase-B events", "frozen top-1")
         trace_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
         trace_baselines = [b for b in ("full", "experience_replay_bc", "bigram", "latest_only") if b in per_baseline]
         for baseline in trace_baselines:
@@ -1714,21 +2673,107 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
                 trace_series[baseline] = ([r["step"] for r in trace], [r["top1"] for r in trace])
         if trace_series:
             _plot_lines(out / "figures/F4_per_step_adaptation.png", "F4 adaptation within session", trace_series, "step", "top-1")
+        for event_type in ("preference_shift", "cross_transfer_probe", "gradual_shift_followup"):
+            event_trace_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
+            for baseline in trace_baselines:
+                trace = (per_baseline[baseline].get("live_step_trace_by_event_type", {}) or {}).get(event_type, [])
+                if trace:
+                    event_trace_series[baseline] = ([r["step"] for r in trace], [r["top1"] for r in trace])
+            if event_trace_series:
+                _plot_lines(out / f"figures/F4_{event_type}_per_step_adaptation.png", f"F4 {event_type} adaptation", event_trace_series, "step", "top-1")
+        full_calibration = (per_baseline.get("full", {}) or {}).get("action_gate_calibration", {}) or {}
+        calibration_curve = full_calibration.get("curve", {}) or {}
+        if calibration_curve:
+            selected = float((full_calibration.get("selection", {}) or {}).get("selected_threshold", metrics.get("selected_action_confidence_threshold", DEFAULT_CONFIG.posterior_action_confidence_threshold)))
+            default_thr = float(full_calibration.get("default_threshold", DEFAULT_CONFIG.posterior_action_confidence_threshold))
+            _plot_lines(
+                out / "figures/F5a_gate_calibration_selection.png",
+                "F5a action-gate calibration selection",
+                _curve_line_map(calibration_curve, ("coverage", "conditional_top1", "wrong_prediction_assist_rate", "hrc_assistance_utility")),
+                "threshold",
+                "rate / utility",
+                vlines=((default_thr, "default"), (selected, "selected")),
+                hlines=((0.0, "zero utility"),),
+            )
         curve = (metrics.get("derived_views", {}).get("coverage_accuracy_curve", {}) or {}).get("full", {})
         if curve:
-            xs_cov, ys_cov = _curve_series(curve, "coverage")
-            xs_acc, ys_acc = _curve_series(curve, "conditional_top1")
-            selected = float(metrics.get("selected_action_confidence_threshold", DEFAULT_CONFIG.posterior_action_confidence_threshold))
             _plot_lines(
-                out / "figures/F5_coverage_accuracy.png",
-                "F5 coverage vs accuracy",
-                {"coverage": (xs_cov, ys_cov), "conditional_top1": (xs_acc, ys_acc)},
+                out / "figures/F5b_posthoc_coverage_accuracy.png",
+                "F5b post-hoc coverage/accuracy diagnostic",
+                _curve_line_map(curve, ("coverage", "conditional_top1", "wrong_prediction_assist_rate", "hrc_assistance_utility")),
                 "threshold",
-                "rate",
-                vlines=((selected, "selected"),),
+                "rate / utility",
+                hlines=((0.0, "zero utility"),),
+            )
+        gate_calibrations = {
+            b: row.get("action_gate_calibration", {}) or {}
+            for b, row in per_baseline.items()
+            if (row.get("action_gate_calibration", {}) or {}).get("curve")
+        }
+        if gate_calibrations:
+            _plot_bar(
+                out / "figures/S1_selected_action_gate_threshold.png",
+                "S1 selected action-gate threshold",
+                {b: float((cal.get("selection", {}) or {}).get("selected_threshold", cal.get("default_threshold", DEFAULT_CONFIG.posterior_action_confidence_threshold))) for b, cal in gate_calibrations.items()},
+                ylabel="threshold",
+            )
+            _plot_grouped_bar(
+                out / "figures/S1_fixed_vs_calibrated_gate_utility.png",
+                "S1 fixed vs calibrated gate utility",
+                ("fixed_default", "calibrated"),
+                {
+                    b: [
+                        float((cal.get("fixed_default_row", {}) or {}).get("hrc_assistance_utility", 0.0)),
+                        float((cal.get("calibrated_row", {}) or (cal.get("selection", {}) or {}).get("selected_row", {}) or {}).get("hrc_assistance_utility", 0.0)),
+                    ]
+                    for b, cal in gate_calibrations.items()
+                },
+                ylabel="HRC assistance utility",
             )
         _plot_bar(out / "figures/S1_memory_active_variants.png", "S1 active memory footprint", {b: float(row.get("memory", {}).get("active_variants", 0.0)) for b, row in per_baseline.items()}, ylabel="active variants")
         _plot_bar(out / "figures/S1_compute_wall_time.png", "S1 wall time by baseline", {b: float(row.get("compute", {}).get("wall_s", 0.0)) for b, row in per_baseline.items()}, ylabel="seconds")
+        transfer_groups = [cell for cell in TRANSFER_CELL_KEYS if any(cell in (row.get("per_transfer_cell", {}) or {}) for row in per_baseline.values())]
+        if transfer_groups and event_baselines:
+            _plot_grouped_bar(
+                out / "figures/S1_transfer_cell_live_top1.png",
+                "S1 direct retrieval vs cross-recipe transfer",
+                transfer_groups,
+                {
+                    b: [per_baseline[b].get("per_transfer_cell", {}).get(cell, {}).get("live_top1", 0.0) for cell in transfer_groups]
+                    for b in event_baselines
+                },
+                ylabel="top-1",
+            )
+        full_cross = (per_baseline.get("full", {}) or {}).get("per_event_type_memory_state_gt", {}) or {}
+        if full_cross:
+            events = sorted(full_cross)
+            states = sorted({state for row in full_cross.values() for state in row})
+            matrix = [[float(full_cross.get(event, {}).get(state, {}).get("live_top1", 0.0)) for state in states] for event in events]
+            _plot_heatmap(out / "figures/S1_event_memory_state_live_top1.png", "S1 full-model live top-1 by event and memory state", matrix, states, events)
+        reliability_baselines = [b for b in ("full", "experience_replay_bc", "latest_only", "bigram") if b in per_baseline]
+        _plot_reliability(
+            out / "figures/S1_reliability_diagram.png",
+            "S1 reliability diagram",
+            {b: per_baseline[b].get("calibration_curve", []) for b in reliability_baselines},
+        )
+        latency_series = {
+            b: (
+                [1000.0 * r["latency_s"] for r in per_baseline[b].get("latency_cdf", [])],
+                [r["cdf"] for r in per_baseline[b].get("latency_cdf", [])],
+            )
+            for b in reliability_baselines
+            if per_baseline[b].get("latency_cdf")
+        }
+        if latency_series:
+            _plot_lines(
+                out / "figures/S1_prediction_latency_cdf.png",
+                "S1 prediction latency CDF",
+                latency_series,
+                "milliseconds",
+                "CDF",
+                vlines=((5.0, "5ms"), (10.0, "10ms"), (20.0, "20ms")),
+                xlim=(0.0, 20.0),
+            )
     elif experiment in {"cross_recipe_transfer", "posterior_ablation_matrix"}:
         recipes = list(metrics.get("recipes", []) or [])
         prefs = list(metrics.get("preferences", []) or [])
@@ -1770,8 +2815,17 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
         per_baseline = dict(metrics.get("per_baseline", {}) or {})
         _plot_bar(out / "figures/S2_offdiag_live_top1_by_baseline.png", "S2 off-diagonal live top-1", _label_to_metric_rows(per_baseline, "live_top1"), ylabel="top-1")
         _plot_bar(out / "figures/S2_primary_seen_seen_transfer_top1.png", "S2 primary seen-seen transfer top-1", _label_to_metric_rows(per_baseline, "primary_transfer_live_top1"), ylabel="top-1")
+        _plot_bar(out / "figures/S2_preference_gate_accuracy.png", "S2 preference gate accuracy", _label_to_metric_rows(per_baseline, "preference_gate_accuracy"), ylabel="rate")
         _plot_bar(out / "figures/S2_preference_cluster_purity.png", "S2 preference cluster purity", _label_to_metric_rows(per_baseline, "preference_cluster_purity"), ylabel="purity")
         _plot_bar(out / "figures/S2_offdiag_conditional_top1_by_baseline.png", "S2 off-diagonal conditional top-1", _label_to_metric_rows(per_baseline, "conditional_top1"), ylabel="conditional top-1")
+        axis_labels = sorted({axis for row in per_baseline.values() for axis in (row.get("axis_holdout", {}) or {})})
+        axis_baselines = _ordered_baseline_names([b for b, row in per_baseline.items() if row.get("axis_holdout")])
+        if axis_labels and axis_baselines:
+            matrix = [
+                [float(per_baseline[b].get("axis_holdout", {}).get(axis, {}).get("live_top1", 0.0)) for axis in axis_labels]
+                for b in axis_baselines
+            ]
+            _plot_heatmap(out / "figures/S2_axis_holdout_heatmap.png", "S2 axis-holdout live top-1", matrix, axis_labels, axis_baselines)
         cycle_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
         for baseline, row in per_baseline.items():
             curve = row.get("diagonal_cycle_curve", {}) or {}
@@ -1780,12 +2834,18 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
                 cycle_series[baseline] = (xs, [curve[str(x)].get("frozen_diagonal_top1", 0.0) for x in xs])
         if cycle_series:
             _plot_lines(out / "figures/S2_single_shot_sufficiency_curve.png", "S2 single-shot sufficiency curve", cycle_series, "diagonal cycles", "frozen diagonal top-1")
-        comp = (metrics.get("per_baseline", {}).get("full", {}) or {}).get("novel_composition", {})
-        if comp:
-            xs = sorted(int(k) for k in comp)
-            _plot_lines(out / "figures/F7_composition_curve.png", "F7 novel composition by hamming distance", {"full": (xs, [comp[str(x)].get("live_top1", 0.0) for x in xs])}, "hamming distance", "live top-1")
+        comp_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
+        for baseline in ("full", "latest_only", "experience_replay_bc", "bigram", "no_preference_prototype", "no_state_graph"):
+            comp = (metrics.get("per_baseline", {}).get(baseline, {}) or {}).get("novel_composition", {})
+            if comp:
+                xs = sorted(int(k) for k in comp)
+                comp_series[baseline] = (xs, [comp[str(x)].get("live_top1", 0.0) for x in xs])
+        if comp_series:
+            _plot_lines(out / "figures/F7_composition_curve.png", "F7 novel composition by hamming distance", comp_series, "hamming distance", "live top-1")
     elif experiment == "decay_reentry":
         f8_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
+        f8_useful_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
+        f8_coverage_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
         f8_active_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
         f9_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
         crossing_vlines: List[Tuple[float, str]] = []
@@ -1798,6 +2858,8 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
                 xs = [int(g) for g in gap_keys]
                 if xs:
                     f8_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)]["live_top1"] for g in xs])
+                    f8_useful_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)].get("useful_assistance_rate", 0.0) for g in xs])
+                    f8_coverage_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)].get("assistance_coverage", 0.0) for g in xs])
                     f8_active_series[f"{baseline}_{arm_name}_active_before"] = (xs, [per_gap[str(g)].get("active_before_rate", 0.0) for g in xs])
                     if baseline in ("full", "adaptive"):
                         f9_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)]["global_rate_after"] for g in xs])
@@ -1808,16 +2870,47 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
                             crossing_vlines.append((float(below[0]), f"{arm_name} active<=0.5"))
         if f8_series:
             _plot_lines(out / "figures/F8_decay_reentry_curve.png", "F8 decay reentry by gap", f8_series, "gap", "live top-1", vlines=crossing_vlines, hlines=((0.5, "0.5"),))
+        if f8_useful_series:
+            _plot_lines(out / "figures/F8_useful_reentry_curve.png", "F8 user-visible reentry value by gap", f8_useful_series, "gap", "useful assistance rate", vlines=crossing_vlines, hlines=((0.5, "0.5"),))
+        if f8_coverage_series:
+            _plot_lines(out / "figures/F8_reentry_coverage_curve.png", "F8 reentry assistance coverage by gap", f8_coverage_series, "gap", "coverage", vlines=crossing_vlines)
+        post_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
+        for baseline, row in (metrics.get("per_baseline", {}) or {}).items():
+            if baseline not in ("full", "adaptive", "fixed_decay", "no_decay", "experience_replay_bc", "bigram"):
+                continue
+            for arm_name, arm_row in (row.get("arms", {}) or {}).items():
+                per_gap = arm_row.get("per_gap", {}) or {}
+                gap_keys = sorted(per_gap, key=lambda g: int(g))
+                xs = [int(g) for g in gap_keys]
+                if xs:
+                    post_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)].get("post_reentry_top1", 0.0) for g in xs])
+        if post_series:
+            _plot_lines(out / "figures/F8_post_reentry_recovery_curve.png", "F8 post-reentry recovery by gap", post_series, "gap", "post-reentry frozen top-1", hlines=((0.5, "0.5"),))
+        full_recovery = {}
+        for arm_name in ("neutral", "distractor"):
+            per_gap = ((metrics.get("per_baseline", {}).get("full", {}) or {}).get("arms", {}).get(arm_name, {}) or {}).get("per_gap", {}) or {}
+            if per_gap:
+                xs = sorted(int(g) for g in per_gap)
+                full_recovery[f"live_{arm_name}"] = (xs, [per_gap[str(g)].get("live_top1", 0.0) for g in xs])
+                full_recovery[f"post_{arm_name}"] = (xs, [per_gap[str(g)].get("post_reentry_top1", 0.0) for g in xs])
+        if full_recovery:
+            _plot_lines(out / "figures/F8_full_live_vs_post_reentry.png", "F8 full live vs post-reentry recovery", full_recovery, "gap", "top-1", hlines=((0.5, "0.5"),))
         if f8_active_series:
             _plot_lines(out / "figures/F8_active_before_curve.png", "F8 active-before by gap", f8_active_series, "gap", "active-before rate", vlines=crossing_vlines, hlines=((0.5, "pruning midpoint"),))
         if f9_series:
             _plot_lines(out / "figures/F9_decay_rate_adaptation.png", "F9 decay rate adaptation", f9_series, "gap", "global rate", hlines=((1.0 / max(1, int(DEFAULT_CONFIG.decay_horizon_init)), "initial horizon rate"),))
         for arm_name in ("neutral", "distractor"):
             arm_live = {k.replace(f"_{arm_name}", ""): v for k, v in f8_series.items() if k.endswith(f"_{arm_name}")}
+            arm_useful = {k.replace(f"_{arm_name}", ""): v for k, v in f8_useful_series.items() if k.endswith(f"_{arm_name}")}
+            arm_coverage = {k.replace(f"_{arm_name}", ""): v for k, v in f8_coverage_series.items() if k.endswith(f"_{arm_name}")}
             arm_active = {k.replace(f"_{arm_name}_active_before", ""): v for k, v in f8_active_series.items() if k.endswith(f"_{arm_name}_active_before")}
             arm_rate = {k.replace(f"_{arm_name}", ""): v for k, v in f9_series.items() if k.endswith(f"_{arm_name}")}
             if arm_live:
                 _plot_lines(out / f"figures/F8_{arm_name}_decay_reentry_curve.png", f"F8 {arm_name} decay reentry by gap", arm_live, "gap", "live top-1", hlines=((0.5, "0.5"),))
+            if arm_useful:
+                _plot_lines(out / f"figures/F8_{arm_name}_useful_reentry_curve.png", f"F8 {arm_name} user-visible reentry by gap", arm_useful, "gap", "useful assistance rate", hlines=((0.5, "0.5"),))
+            if arm_coverage:
+                _plot_lines(out / f"figures/F8_{arm_name}_reentry_coverage_curve.png", f"F8 {arm_name} reentry coverage by gap", arm_coverage, "gap", "coverage")
             if arm_active:
                 _plot_lines(out / f"figures/F8_{arm_name}_active_before_curve.png", f"F8 {arm_name} active-before by gap", arm_active, "gap", "active-before rate", hlines=((0.5, "pruning midpoint"),))
             if arm_rate:
@@ -1829,6 +2922,8 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
             _plot_lines(out / "figures/F10_disambiguation_macro_f1.png", "F10 disambiguation macro-F1", {"macro_f1": (xs, [per_threshold[str(t)]["macro_f1"] for t in xs])}, "jaccard threshold", "macro-F1", vlines=((0.95, "production"),))
             gate_f1 = [per_threshold[str(t)].get("gate_decision", {}).get("macro_f1", 0.0) for t in xs]
             _plot_lines(out / "figures/F10_gate_decision_macro_f1.png", "F10 gate decision macro-F1", {"gate_macro_f1": (xs, gate_f1)}, "jaccard threshold", "macro-F1", vlines=((0.95, "production"),))
+            recipe_gate_acc = [per_threshold[str(t)].get("recipe_holdout_gate_decision", {}).get("accuracy", 0.0) for t in xs]
+            _plot_lines(out / "figures/F10_recipe_holdout_gate_accuracy.png", "F10 recipe-heldout gate accuracy", {"recipe_holdout_gate_accuracy": (xs, recipe_gate_acc)}, "jaccard threshold", "accuracy", vlines=((0.95, "production"),))
             best = str(metrics.get("best_threshold") or xs[0])
             rows = per_threshold.get(best, {}).get("rows", [])
             labels = MEMORY_STATE_LABELS
@@ -1843,7 +2938,11 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
         boundary = metrics.get("boundary_degradation", {}) or {}
         if boundary:
             xs = sorted(float(k) for k in boundary)
-            _plot_lines(out / "figures/S4_boundary_degradation.png", "S4 online-prefix boundary degradation", {"macro_f1": (xs, [boundary[str(x)]["macro_f1"] for x in xs]), "accuracy": (xs, [boundary[str(x)]["accuracy"] for x in xs])}, "drop fraction", "score")
+            _plot_lines(out / "figures/S4_boundary_degradation.png", "S4 missing-observation degradation", {"macro_f1": (xs, [boundary[str(x)]["macro_f1"] for x in xs]), "accuracy": (xs, [boundary[str(x)]["accuracy"] for x in xs])}, "drop fraction", "score")
+        prefix = metrics.get("prefix_robustness", {}) or {}
+        if prefix:
+            xs = sorted(float(k) for k in prefix)
+            _plot_lines(out / "figures/S4_prefix_robustness.png", "S4 growing-prefix robustness", {"macro_f1": (xs, [prefix[str(x)]["macro_f1"] for x in xs]), "accuracy": (xs, [prefix[str(x)]["accuracy"] for x in xs])}, "prefix fraction", "score")
         axis_deg = metrics.get("preference_axis_degradation", {}) or {}
         if axis_deg:
             xs = sorted(int(k) for k in axis_deg)
@@ -1931,6 +3030,7 @@ def _aggregate_curve_by_threshold(
 
 def _render_deployment_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
     aggregate_dir = _ensure(exp_dir / "aggregate")
+    _remove_stale_pngs(aggregate_dir, (f"{prefix}_F5_coverage_accuracy.png",))
     for metric, ylabel, title in (
         ("live_top1", "top-1", "F1a aggregate live top-1"),
         ("assistance_coverage", "coverage", "F1b aggregate assistance coverage"),
@@ -1942,6 +3042,61 @@ def _render_deployment_aggregate_figures(exp_dir: Path, seed_results: Sequence[D
     ):
         means, ci = _aggregate_baseline_metric(seed_results, (metric,))
         _plot_bar_ci(aggregate_dir / f"{prefix}_{metric}.png", title, means, ci, ylabel=ylabel)
+    gate_diag_baselines = [b for b in ("full", "no_decay", "experience_replay_bc", "bigram", "latest_only") if b in _baseline_names_from_seed_results(seed_results)]
+    if gate_diag_baselines:
+        gate_metrics = ("correct_prediction_assist_recall", "wrong_prediction_assist_rate", "hidden_correct_rate")
+        _plot_grouped_bar(
+            aggregate_dir / f"{prefix}_S1_assist_gate_diagnostics.png",
+            "S1 aggregate assist gate diagnostics",
+            gate_metrics,
+            {
+                b: [
+                    _mean([
+                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, metric), 0.0))
+                        for result in _completed_seed_results(seed_results)
+                    ])
+                    for metric in gate_metrics
+                ]
+                for b in gate_diag_baselines
+            },
+            ylabel="rate",
+        )
+    event_groups = [
+        event for event in PRIMARY_EVENT_TYPES
+        if any(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_event_type", event)) for result in _completed_seed_results(seed_results))
+    ]
+    event_baselines = [b for b in ("full", "latest_only", "experience_replay_bc", "bigram") if b in _baseline_names_from_seed_results(seed_results)]
+    if event_groups and event_baselines:
+        _plot_grouped_bar(
+            aggregate_dir / f"{prefix}_F1h_event_type_live_top1.png",
+            "F1h aggregate live top-1 by event type",
+            event_groups,
+            {
+                b: [
+                    _mean([
+                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "per_event_type", event, "live_top1"), 0.0))
+                        for result in _completed_seed_results(seed_results)
+                    ])
+                    for event in event_groups
+                ]
+                for b in event_baselines
+            },
+            ylabel="top-1",
+        )
+    retention_values: Dict[str, float] = {}
+    retention_ci: Dict[str, float] = {}
+    for baseline in _baseline_names_from_seed_results(seed_results):
+        vals: List[float] = []
+        for result in _completed_seed_results(seed_results):
+            ret = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "per_user_return_retention"), {}) or {}
+            per_seed = [float(v.get("return_minus_first_live_top1", 0.0)) for v in ret.values() if isinstance(v, Mapping)]
+            if per_seed:
+                vals.append(_mean(per_seed))
+        if vals:
+            retention_values[baseline] = _mean(vals)
+            retention_ci[baseline] = _stderr95(vals)
+    if retention_values:
+        _plot_bar_ci(aggregate_dir / f"{prefix}_S1_user_return_retention_delta.png", "S1 aggregate return-user retention delta", retention_values, retention_ci, ylabel="return - first live top-1")
     for metric, ylabel, title in (
         ("active_variants", "active variants", "Aggregate active memory footprint"),
         ("pruned_variants", "pruned variants", "Aggregate pruned memory footprint"),
@@ -1956,7 +3111,7 @@ def _render_deployment_aggregate_figures(exp_dir: Path, seed_results: Sequence[D
         ("mean_retrain_fit_wall_s", "seconds", "Aggregate mean retrain fit time"),
         ("p95_retrain_fit_wall_s", "seconds", "Aggregate p95 retrain fit time"),
         ("total_retrain_fit_wall_s", "seconds", "Aggregate total retrain fit time"),
-        ("estimated_flops", "estimated FLOPs", "Aggregate estimated training FLOPs"),
+        ("last_estimated_flops", "latest retrain estimated FLOPs", "Aggregate latest executed retrain FLOPs"),
     ):
         means, ci = _aggregate_baseline_metric(seed_results, ("compute", metric))
         _plot_bar_ci(aggregate_dir / f"{prefix}_compute_{metric}.png", title, means, ci, ylabel=ylabel)
@@ -2020,6 +3175,16 @@ def _render_deployment_aggregate_figures(exp_dir: Path, seed_results: Sequence[D
     if "full" in f3:
         keep = {k: v for k, v in f3.items() if k in ("full", "no_decay", "latest_only", "fixed_decay")}
         _plot_lines_ci(aggregate_dir / f"{prefix}_F3_forgetting_curve.png", "F3 aggregate retained Phase-A accuracy", keep, "Phase-B events", "frozen top-1")
+    f3_identity = _line_aggregate_from_traces(
+        seed_results,
+        ("derived_views", "forgetting_curve"),
+        "phase_b_count",
+        "mean_phase_a_identity_reference_top1",
+        label_filter=lambda row: str(row.get("baseline", "unknown")),
+    )
+    if "full" in f3_identity:
+        keep = {k: v for k, v in f3_identity.items() if k in ("full", "no_decay", "latest_only", "fixed_decay")}
+        _plot_lines_ci(aggregate_dir / f"{prefix}_F3_identity_reference_forgetting_curve.png", "F3 aggregate identity-reference retained accuracy", keep, "Phase-B events", "frozen top-1")
     trace_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
     for baseline in ("full", "experience_replay_bc", "bigram", "latest_only"):
         by_step: Dict[float, List[float]] = defaultdict(list)
@@ -2031,23 +3196,183 @@ def _render_deployment_aggregate_figures(exp_dir: Path, seed_results: Sequence[D
             xs = sorted(by_step)
             trace_series[baseline] = (xs, [_mean(by_step[x]) for x in xs], [_stderr95(by_step[x]) for x in xs])
     _plot_lines_ci(aggregate_dir / f"{prefix}_F4_per_step_adaptation.png", "F4 aggregate adaptation within session", trace_series, "step", "top-1")
-    cov = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "coverage")
-    acc = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "conditional_top1")
-    if cov[0] and acc[0]:
+    for event_type in ("preference_shift", "cross_transfer_probe", "gradual_shift_followup"):
+        event_trace_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
+        for baseline in ("full", "experience_replay_bc", "bigram", "latest_only"):
+            by_step: Dict[float, List[float]] = defaultdict(list)
+            for result in _completed_seed_results(seed_results):
+                trace = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "live_step_trace_by_event_type", event_type), []) or []
+                for row in trace:
+                    by_step[float(row["step"])].append(float(row["top1"]))
+            if by_step:
+                xs = sorted(by_step)
+                event_trace_series[baseline] = (xs, [_mean(by_step[x]) for x in xs], [_stderr95(by_step[x]) for x in xs])
+        if event_trace_series:
+            _plot_lines_ci(aggregate_dir / f"{prefix}_F4_{event_type}_per_step_adaptation.png", f"F4 aggregate {event_type} adaptation", event_trace_series, "step", "top-1")
+    cal_path = ("per_baseline", "full", "action_gate_calibration", "curve")
+    cal_cov = _aggregate_curve_by_threshold(seed_results, cal_path, "coverage")
+    cal_acc = _aggregate_curve_by_threshold(seed_results, cal_path, "conditional_top1")
+    cal_wrong = _aggregate_curve_by_threshold(seed_results, cal_path, "wrong_prediction_assist_rate")
+    cal_utility = _aggregate_curve_by_threshold(seed_results, cal_path, "hrc_assistance_utility")
+    if cal_cov[0] and cal_acc[0]:
         selected_vals = [
-            float(_nested_get(result.get("metrics", {}) or {}, ("selected_action_confidence_threshold",), DEFAULT_CONFIG.posterior_action_confidence_threshold))
+            float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "action_gate_calibration", "selection", "selected_threshold"), DEFAULT_CONFIG.posterior_action_confidence_threshold))
+            for result in _completed_seed_results(seed_results)
+        ]
+        default_vals = [
+            float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "action_gate_calibration", "default_threshold"), DEFAULT_CONFIG.posterior_action_confidence_threshold))
             for result in _completed_seed_results(seed_results)
         ]
         selected = _mean(selected_vals) if selected_vals else float(DEFAULT_CONFIG.posterior_action_confidence_threshold)
+        default_thr = _mean(default_vals) if default_vals else float(DEFAULT_CONFIG.posterior_action_confidence_threshold)
         _plot_lines_ci(
-            aggregate_dir / f"{prefix}_F5_coverage_accuracy.png",
-            "F5 aggregate coverage vs accuracy",
-            {"coverage": cov, "conditional_top1": acc},
+            aggregate_dir / f"{prefix}_F5a_gate_calibration_selection.png",
+            "F5a aggregate action-gate calibration selection",
+            {"coverage": cal_cov, "conditional_top1": cal_acc, "wrong_prediction_assist_rate": cal_wrong, "hrc_assistance_utility": cal_utility},
             "threshold",
-            "rate",
-            vlines=((selected, "selected"),),
+            "rate / utility",
+            vlines=((default_thr, "default"), (selected, "mean selected")),
+            hlines=((0.0, "zero utility"),),
         )
-    for group_name, path in (("per_user", ("per_user",)), ("per_event_type", ("per_event_type",))):
+    cov = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "coverage")
+    acc = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "conditional_top1")
+    wrong = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "wrong_prediction_assist_rate")
+    utility = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "hrc_assistance_utility")
+    if cov[0] and acc[0]:
+        _plot_lines_ci(
+            aggregate_dir / f"{prefix}_F5b_posthoc_coverage_accuracy.png",
+            "F5b aggregate post-hoc coverage/accuracy diagnostic",
+            {"coverage": cov, "conditional_top1": acc, "wrong_prediction_assist_rate": wrong, "hrc_assistance_utility": utility},
+            "threshold",
+            "rate / utility",
+            hlines=((0.0, "zero utility"),),
+        )
+    gate_baselines = [
+        b for b in _baseline_names_from_seed_results(seed_results)
+        if any(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "curve"), {}) for result in _completed_seed_results(seed_results))
+    ]
+    if gate_baselines:
+        threshold_vals = {
+            b: _mean([
+                float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "selection", "selected_threshold"), DEFAULT_CONFIG.posterior_action_confidence_threshold))
+                for result in _completed_seed_results(seed_results)
+            ])
+            for b in gate_baselines
+        }
+        _plot_bar_ci(
+            aggregate_dir / f"{prefix}_S1_selected_action_gate_threshold.png",
+            "S1 aggregate selected action-gate threshold",
+            threshold_vals,
+            {
+                b: _stderr95([
+                    float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "selection", "selected_threshold"), DEFAULT_CONFIG.posterior_action_confidence_threshold))
+                    for result in _completed_seed_results(seed_results)
+                ])
+                for b in gate_baselines
+            },
+            ylabel="threshold",
+        )
+        _plot_grouped_bar(
+            aggregate_dir / f"{prefix}_S1_fixed_vs_calibrated_gate_utility.png",
+            "S1 aggregate fixed vs calibrated gate utility",
+            ("fixed_default", "calibrated"),
+            {
+                b: [
+                    _mean([
+                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "fixed_default_row", "hrc_assistance_utility"), 0.0))
+                        for result in _completed_seed_results(seed_results)
+                    ]),
+                    _mean([
+                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "selection", "selected_row", "hrc_assistance_utility"), 0.0))
+                        for result in _completed_seed_results(seed_results)
+                    ]),
+                ]
+                for b in gate_baselines
+            },
+            ylabel="HRC assistance utility",
+        )
+    transfer_groups = [
+        cell for cell in TRANSFER_CELL_KEYS
+        if any(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_transfer_cell", cell)) for result in _completed_seed_results(seed_results))
+    ]
+    if transfer_groups and event_baselines:
+        _plot_grouped_bar(
+            aggregate_dir / f"{prefix}_S1_transfer_cell_live_top1.png",
+            "S1 aggregate direct retrieval vs cross-recipe transfer",
+            transfer_groups,
+            {
+                b: [
+                    _mean([
+                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "per_transfer_cell", cell, "live_top1"), 0.0))
+                        for result in _completed_seed_results(seed_results)
+                    ])
+                    for cell in transfer_groups
+                ]
+                for b in event_baselines
+            },
+            ylabel="top-1",
+        )
+    full_cross_events = sorted({
+        event
+        for result in _completed_seed_results(seed_results)
+        for event in (_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_event_type_memory_state_gt"), {}) or {})
+    })
+    full_cross_states = sorted({
+        state
+        for result in _completed_seed_results(seed_results)
+        for event_row in (_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_event_type_memory_state_gt"), {}) or {}).values()
+        for state in (event_row or {})
+    })
+    if full_cross_events and full_cross_states:
+        matrix = []
+        for event in full_cross_events:
+            matrix.append([
+                _mean([
+                    float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_event_type_memory_state_gt", event, state, "live_top1"), 0.0))
+                    for result in _completed_seed_results(seed_results)
+                ])
+                for state in full_cross_states
+            ])
+        _plot_heatmap(aggregate_dir / f"{prefix}_S1_event_memory_state_live_top1.png", "S1 aggregate full-model live top-1 by event and memory state", matrix, full_cross_states, full_cross_events)
+    reliability_curves: Dict[str, List[Dict[str, float]]] = {}
+    for baseline in event_baselines:
+        by_bin: Dict[float, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+        for result in _completed_seed_results(seed_results):
+            for row in _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "calibration_curve"), []) or []:
+                b = float(row.get("bin", len(by_bin)))
+                by_bin[b]["confidence"].append(float(row.get("confidence", 0.0)))
+                by_bin[b]["accuracy"].append(float(row.get("accuracy", 0.0)))
+                by_bin[b]["n_steps"].append(float(row.get("n_steps", 0.0)))
+        reliability_curves[baseline] = [
+            {"bin": b, "confidence": _mean(vals["confidence"]), "accuracy": _mean(vals["accuracy"]), "n_steps": _mean(vals["n_steps"])}
+            for b, vals in sorted(by_bin.items())
+        ]
+    _plot_reliability(aggregate_dir / f"{prefix}_S1_reliability_diagram.png", "S1 aggregate reliability diagram", reliability_curves)
+    latency_series: Dict[str, Tuple[List[float], List[float]]] = {}
+    for baseline in event_baselines:
+        by_q: Dict[float, List[float]] = defaultdict(list)
+        for result in _completed_seed_results(seed_results):
+            rows = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "latency_cdf"), []) or []
+            for idx, row in enumerate(rows):
+                by_q[float(row.get("cdf", idx / max(1, len(rows))))].append(float(row.get("latency_s", 0.0)))
+        if by_q:
+            xs = sorted(by_q)
+            latency_series[baseline] = ([1000.0 * _mean(by_q[x]) for x in xs], xs)
+    if latency_series:
+        _plot_lines(
+            aggregate_dir / f"{prefix}_S1_prediction_latency_cdf.png",
+            "S1 aggregate prediction latency CDF",
+            latency_series,
+            "milliseconds",
+            "CDF",
+            vlines=((5.0, "5ms"), (10.0, "10ms"), (20.0, "20ms")),
+            xlim=(0.0, 20.0),
+        )
+    for group_name, path in (
+        ("per_user", ("per_user",)),
+        ("per_event_type", ("per_event_type",)),
+        ("per_memory_state_gt", ("per_memory_state_gt",)),
+    ):
         labels = sorted({label for result in _completed_seed_results(seed_results) for label in (_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", *path), {}) or {})})
         values: Dict[str, float] = {}
         ci: Dict[str, float] = {}
@@ -2068,7 +3393,7 @@ def _render_transfer_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dic
         ("zero_shot_preference_live_top1", "top-1", "S2 aggregate zero-shot preference top-1"),
         ("assistance_coverage", "coverage", "S2 aggregate off-diagonal assistance coverage"),
         ("conditional_top1", "conditional top-1", "S2 aggregate off-diagonal conditional top-1"),
-        ("preference_transfer_rate", "rate", "S2 aggregate preference transfer rate"),
+        ("preference_gate_accuracy", "rate", "S2 aggregate preference gate accuracy"),
         ("preference_cluster_purity", "purity", "S2 aggregate preference cluster purity"),
         ("confidence_ece", "ECE", "S2 aggregate confidence ECE"),
         ("confidence_brier", "Brier", "S2 aggregate confidence Brier"),
@@ -2076,7 +3401,7 @@ def _render_transfer_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dic
         means, ci = _aggregate_baseline_metric(seed_results, (metric,))
         _plot_bar_ci(aggregate_dir / f"{prefix}_{metric}.png", title, means, ci, ylabel=ylabel)
     comp_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-    for baseline in ("full", "latest_only", "bigram", "no_preference_prototype", "no_state_graph"):
+    for baseline in ("full", "latest_only", "experience_replay_bc", "bigram", "no_preference_prototype", "no_state_graph"):
         by_h: Dict[float, List[float]] = defaultdict(list)
         for result in _completed_seed_results(seed_results):
             comp = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "novel_composition"), {}) or {}
@@ -2086,6 +3411,25 @@ def _render_transfer_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dic
             xs = sorted(by_h)
             comp_series[baseline] = (xs, [_mean(by_h[x]) for x in xs], [_stderr95(by_h[x]) for x in xs])
     _plot_lines_ci(aggregate_dir / f"{prefix}_F7_composition_curve_by_baseline.png", "F7 aggregate composition by baseline", comp_series, "hamming distance", "live top-1")
+    axis_labels = sorted({
+        axis
+        for result in _completed_seed_results(seed_results)
+        for baseline_row in (_nested_get(result.get("metrics", {}) or {}, ("per_baseline",), {}) or {}).values()
+        for axis in (baseline_row.get("axis_holdout", {}) or {})
+    })
+    axis_baselines = [b for b in _baseline_names_from_seed_results(seed_results) if any(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "axis_holdout")) for result in _completed_seed_results(seed_results))]
+    if axis_labels and axis_baselines:
+        matrix = [
+            [
+                _mean([
+                    float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "axis_holdout", axis, "live_top1"), 0.0))
+                    for result in _completed_seed_results(seed_results)
+                ])
+                for axis in axis_labels
+            ]
+            for baseline in axis_baselines
+        ]
+        _plot_heatmap(aggregate_dir / f"{prefix}_S2_axis_holdout_heatmap.png", "S2 aggregate axis-holdout live top-1", matrix, axis_labels, axis_baselines)
     cycle_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
     for baseline in _baseline_names_from_seed_results(seed_results):
         by_cycle: Dict[float, List[float]] = defaultdict(list)
@@ -2105,20 +3449,29 @@ def _render_decay_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[s
         ("live_top1", "top-1", "S3 aggregate reentry live top-1"),
         ("active_before_rate", "rate", "S3 aggregate active-before rate"),
         ("post_reentry_top1", "top-1", "S3 aggregate post-reentry top-1"),
+        ("assistance_coverage", "coverage", "S3 aggregate reentry assistance coverage"),
+        ("useful_assistance_rate", "rate", "S3 aggregate user-visible reentry value"),
+        ("net_assistance_value", "correct assists - wrong assists", "S3 aggregate net reentry assistance value"),
     ):
         means, ci = _aggregate_baseline_metric(seed_results, (metric,))
         _plot_bar_ci(aggregate_dir / f"{prefix}_{metric}.png", title, means, ci, ylabel=ylabel)
     for arm in ("neutral", "distractor"):
         series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
+        useful_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
+        coverage_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
         active_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
         crossing_vlines: List[Tuple[float, str]] = []
         for baseline in ("full", "adaptive", "fixed_decay", "no_decay", "experience_replay_bc", "bigram"):
             by_gap: Dict[float, List[float]] = defaultdict(list)
+            by_useful: Dict[float, List[float]] = defaultdict(list)
+            by_coverage: Dict[float, List[float]] = defaultdict(list)
             by_active: Dict[float, List[float]] = defaultdict(list)
             for result in _completed_seed_results(seed_results):
                 per_gap = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "arms", arm, "per_gap"), {}) or {}
                 for gap, row in per_gap.items():
                     by_gap[float(gap)].append(float(row.get("live_top1", 0.0)))
+                    by_useful[float(gap)].append(float(row.get("useful_assistance_rate", 0.0)))
+                    by_coverage[float(gap)].append(float(row.get("assistance_coverage", 0.0)))
                     by_active[float(gap)].append(float(row.get("active_before_rate", 0.0)))
             if by_gap:
                 xs = sorted(by_gap)
@@ -2128,11 +3481,30 @@ def _render_decay_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[s
                     below = [x for x, y in zip(xs, active_vals) if y <= 0.5]
                     if below:
                         crossing_vlines.append((float(below[0]), "active<=0.5"))
+            if by_useful:
+                xs = sorted(by_useful)
+                useful_series[baseline] = (xs, [_mean(by_useful[x]) for x in xs], [_stderr95(by_useful[x]) for x in xs])
+            if by_coverage:
+                xs = sorted(by_coverage)
+                coverage_series[baseline] = (xs, [_mean(by_coverage[x]) for x in xs], [_stderr95(by_coverage[x]) for x in xs])
             if by_active:
                 xs = sorted(by_active)
                 active_series[baseline] = (xs, [_mean(by_active[x]) for x in xs], [_stderr95(by_active[x]) for x in xs])
         _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_live_top1_by_gap.png", f"F8 aggregate {arm} reentry by gap", series, "gap", "live top-1", vlines=crossing_vlines, hlines=((0.5, "0.5"),))
+        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_useful_reentry_by_gap.png", f"F8 aggregate {arm} user-visible reentry by gap", useful_series, "gap", "useful assistance rate", vlines=crossing_vlines, hlines=((0.5, "0.5"),))
+        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_reentry_coverage_by_gap.png", f"F8 aggregate {arm} reentry coverage by gap", coverage_series, "gap", "coverage", vlines=crossing_vlines)
         _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_active_before_by_gap.png", f"F8 aggregate {arm} active-before by gap", active_series, "gap", "active-before rate", vlines=crossing_vlines, hlines=((0.5, "pruning midpoint"),))
+        post_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
+        for baseline in ("full", "adaptive", "fixed_decay", "no_decay", "experience_replay_bc", "bigram"):
+            by_gap: Dict[float, List[float]] = defaultdict(list)
+            for result in _completed_seed_results(seed_results):
+                per_gap = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "arms", arm, "per_gap"), {}) or {}
+                for gap, row in per_gap.items():
+                    by_gap[float(gap)].append(float(row.get("post_reentry_top1", 0.0)))
+            if by_gap:
+                xs = sorted(by_gap)
+                post_series[baseline] = (xs, [_mean(by_gap[x]) for x in xs], [_stderr95(by_gap[x]) for x in xs])
+        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_post_reentry_by_gap.png", f"F8 aggregate {arm} post-reentry recovery by gap", post_series, "gap", "post-reentry frozen top-1", hlines=((0.5, "0.5"),))
     rate_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
     for baseline in ("full", "adaptive"):
         for arm in ("neutral", "distractor"):
@@ -2149,6 +3521,19 @@ def _render_decay_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[s
         arm_series = {label.replace(f"_{arm}", ""): vals for label, vals in rate_series.items() if label.endswith(f"_{arm}")}
         if arm_series:
             _plot_lines_ci(aggregate_dir / f"{prefix}_F9_{arm}_decay_rate_adaptation.png", f"F9 aggregate {arm} decay rate adaptation", arm_series, "gap", "global rate", hlines=((1.0 / max(1, int(DEFAULT_CONFIG.decay_horizon_init)), "initial horizon rate"),))
+    full_recovery: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
+    for arm in ("neutral", "distractor"):
+        for metric, label in (("live_top1", f"live_{arm}"), ("post_reentry_top1", f"post_{arm}")):
+            by_gap: Dict[float, List[float]] = defaultdict(list)
+            for result in _completed_seed_results(seed_results):
+                per_gap = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "arms", arm, "per_gap"), {}) or {}
+                for gap, row in per_gap.items():
+                    by_gap[float(gap)].append(float(row.get(metric, 0.0)))
+            if by_gap:
+                xs = sorted(by_gap)
+                full_recovery[label] = (xs, [_mean(by_gap[x]) for x in xs], [_stderr95(by_gap[x]) for x in xs])
+    if full_recovery:
+        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_full_live_vs_post_reentry.png", "F8 aggregate full live vs post-reentry recovery", full_recovery, "gap", "top-1", hlines=((0.5, "0.5"),))
 
 
 def _render_disambiguation_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
@@ -2170,6 +3555,14 @@ def _render_disambiguation_aggregate_figures(exp_dir: Path, seed_results: Sequen
     if gate_by_thr:
         xs = sorted(gate_by_thr)
         _plot_lines_ci(aggregate_dir / f"{prefix}_F10_gate_decision_macro_f1_by_threshold.png", "F10 aggregate gate decision macro-F1 by threshold", {"gate_macro_f1": (xs, [_mean(gate_by_thr[x]) for x in xs], [_stderr95(gate_by_thr[x]) for x in xs])}, "threshold", "macro-F1", vlines=((0.95, "production"),))
+    recipe_gate_by_thr: Dict[float, List[float]] = defaultdict(list)
+    for result in _completed_seed_results(seed_results):
+        per_threshold = _nested_get(result.get("metrics", {}) or {}, ("per_threshold",), {}) or {}
+        for thr, row in per_threshold.items():
+            recipe_gate_by_thr[float(thr)].append(float((row.get("recipe_holdout_gate_decision") or {}).get("accuracy", 0.0)))
+    if recipe_gate_by_thr:
+        xs = sorted(recipe_gate_by_thr)
+        _plot_lines_ci(aggregate_dir / f"{prefix}_F10_recipe_holdout_gate_accuracy_by_threshold.png", "F10 aggregate recipe-heldout gate accuracy by threshold", {"recipe_holdout_gate_accuracy": (xs, [_mean(recipe_gate_by_thr[x]) for x in xs], [_stderr95(recipe_gate_by_thr[x]) for x in xs])}, "threshold", "accuracy", vlines=((0.95, "production"),))
     cov = _aggregate_curve_by_threshold(seed_results, ("action_gate_curve",), "coverage")
     acc = _aggregate_curve_by_threshold(seed_results, ("action_gate_curve",), "conditional_top1")
     if cov[0] and acc[0]:
@@ -2183,6 +3576,15 @@ def _render_disambiguation_aggregate_figures(exp_dir: Path, seed_results: Sequen
         if by_drop:
             xs = sorted(by_drop)
             _plot_lines_ci(aggregate_dir / f"{prefix}_S4_boundary_{metric}.png", f"S4 aggregate boundary degradation {metric}", {metric: (xs, [_mean(by_drop[x]) for x in xs], [_stderr95(by_drop[x]) for x in xs])}, "drop fraction", metric)
+    for metric in ("macro_f1", "accuracy"):
+        by_prefix: Dict[float, List[float]] = defaultdict(list)
+        for result in _completed_seed_results(seed_results):
+            prefix_rows = _nested_get(result.get("metrics", {}) or {}, ("prefix_robustness",), {}) or {}
+            for frac, row in prefix_rows.items():
+                by_prefix[float(frac)].append(float(row.get(metric, 0.0)))
+        if by_prefix:
+            xs = sorted(by_prefix)
+            _plot_lines_ci(aggregate_dir / f"{prefix}_S4_prefix_{metric}.png", f"S4 aggregate growing-prefix {metric}", {metric: (xs, [_mean(by_prefix[x]) for x in xs], [_stderr95(by_prefix[x]) for x in xs])}, "prefix fraction", metric)
     labels = MEMORY_STATE_LABELS
     counts = np.zeros((len(labels), len(labels)), dtype=float)
     for result in _completed_seed_results(seed_results):
@@ -2200,10 +3602,13 @@ def _render_materiality_aggregate_figures(exp_dir: Path, seed_results: Sequence[
     aggregate_dir = _ensure(exp_dir / "aggregate")
     by_recipe_eff: Dict[str, List[float]] = defaultdict(list)
     by_recipe_dup: Dict[str, List[float]] = defaultdict(list)
+    by_recipe_pairwise: Dict[str, List[float]] = defaultdict(list)
     for result in _completed_seed_results(seed_results):
         for row in result.get("metrics", {}).get("summary", []) or []:
             by_recipe_eff[str(row.get("recipe"))].append(float(row.get("effective_preference_count", 0.0)))
             by_recipe_dup[str(row.get("recipe"))].append(float(row.get("duplicate_count", 0.0)))
+            if "min_pairwise_kendall_per_recipe" in row:
+                by_recipe_pairwise[str(row.get("recipe"))].append(float(row.get("min_pairwise_kendall_per_recipe", 0.0)))
     _plot_bar_ci(
         aggregate_dir / f"{prefix}_materiality_effective_preferences.png",
         "Materiality preflight effective preferences per recipe",
@@ -2218,6 +3623,14 @@ def _render_materiality_aggregate_figures(exp_dir: Path, seed_results: Sequence[
         {k: _stderr95(v) for k, v in sorted(by_recipe_dup.items())},
         ylabel="count",
     )
+    if by_recipe_pairwise:
+        _plot_bar_ci(
+            aggregate_dir / f"{prefix}_materiality_min_pairwise_kendall.png",
+            "Materiality preflight min pairwise Kendall per recipe",
+            {k: _mean(v) for k, v in sorted(by_recipe_pairwise.items())},
+            {k: _stderr95(v) for k, v in sorted(by_recipe_pairwise.items())},
+            ylabel="distance",
+        )
 
 
 def _render_demo_count_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
@@ -2575,7 +3988,19 @@ def _posterior_stats(agent: AdaptiveHRCAgent) -> Dict[str, Any]:
             "assist_used": bool(gate.get("assist_used", False)),
             "assist_reason": gate.get("reason"),
             "action_confidence": gate.get("action_confidence"),
+            "raw_action_confidence": gate.get("raw_action_confidence"),
+            "action_gate_score": gate.get("action_gate_score"),
+            "action_margin": gate.get("action_margin"),
+            "action_gate_threshold": gate.get("action_gate_threshold"),
             "action_entropy": gate.get("action_entropy"),
+            "assist_source": gate.get("assist_source"),
+            "final_action_confidence": gate.get("final_action_confidence"),
+            "final_action_margin": gate.get("final_action_margin"),
+            "final_action_entropy": gate.get("final_action_entropy"),
+            "conditioned_action_confidence": gate.get("conditioned_action_confidence"),
+            "ensemble_action_confidence": gate.get("ensemble_action_confidence"),
+            "policy_agreement": gate.get("policy_agreement"),
+            "blend_strength": gate.get("blend_strength"),
         }
     probs = [float(p) for p in joint.values()]
     raw_h = -sum(p * math.log(max(p, 1e-12)) for p in probs)
@@ -2590,7 +4015,19 @@ def _posterior_stats(agent: AdaptiveHRCAgent) -> Dict[str, Any]:
         "assist_used": bool(gate.get("assist_used", False)),
         "assist_reason": gate.get("reason"),
         "action_confidence": gate.get("action_confidence"),
+        "raw_action_confidence": gate.get("raw_action_confidence"),
+        "action_gate_score": gate.get("action_gate_score"),
+        "action_margin": gate.get("action_margin"),
+        "action_gate_threshold": gate.get("action_gate_threshold"),
         "action_entropy": gate.get("action_entropy"),
+        "assist_source": gate.get("assist_source"),
+        "final_action_confidence": gate.get("final_action_confidence"),
+        "final_action_margin": gate.get("final_action_margin"),
+        "final_action_entropy": gate.get("final_action_entropy"),
+        "conditioned_action_confidence": gate.get("conditioned_action_confidence"),
+        "ensemble_action_confidence": gate.get("ensemble_action_confidence"),
+        "policy_agreement": gate.get("policy_agreement"),
+        "blend_strength": gate.get("blend_strength"),
     }
 
 
@@ -2647,6 +4084,7 @@ def assist_episode(
             "recipe": pair.recipe_name,
             "preference": pair.preference_name,
             "memory_state": memory_state,
+            "memory_state_gt": memory_state,
             "actual": actual,
             "actual_action": pair.actions[idx],
             "predicted": ranked[0] if ranked else None,
@@ -2657,6 +4095,8 @@ def assist_episode(
             "prediction_wall_s": float(prediction_wall_s),
             **post,
         }
+        if event_tag:
+            row.update(event_tag)
         if run_config.log_full_distributions:
             row["distribution"] = {k: float(v) for k, v in sorted(dist.items(), key=lambda kv: -kv[1])}
         steps.append(row)
@@ -2676,7 +4116,19 @@ def assist_episode(
             posterior_max_prob=post.get("posterior_max_prob"),
             posterior_n_hypotheses=post.get("posterior_n_hypotheses"),
             assist_used=bool(post.get("assist_used", False)),
+            raw_action_confidence=post.get("raw_action_confidence"),
+            action_gate_score=post.get("action_gate_score"),
+            action_margin=post.get("action_margin"),
+            action_gate_threshold=post.get("action_gate_threshold"),
             action_marginal_entropy=post.get("action_entropy"),
+            assist_source=post.get("assist_source"),
+            final_action_confidence=post.get("final_action_confidence"),
+            final_action_margin=post.get("final_action_margin"),
+            final_action_entropy=post.get("final_action_entropy"),
+            conditioned_action_confidence=post.get("conditioned_action_confidence"),
+            ensemble_action_confidence=post.get("ensemble_action_confidence"),
+            policy_agreement=post.get("policy_agreement"),
+            blend_strength=post.get("blend_strength"),
             prediction_wall_s=float(prediction_wall_s),
         ))
         agent.observe_observation(obs, ground_truth_recipe=rid)
@@ -2689,6 +4141,16 @@ def assist_episode(
         agent.current_prefix = []
         agent.inferred_recipe = None
         agent.inferred_pref = None
+        if hasattr(agent, "_needs_observation"):
+            agent._needs_observation = False
+        if hasattr(agent, "_pending_argmax"):
+            agent._pending_argmax = None
+        if hasattr(agent, "_pending_count"):
+            agent._pending_count = 0
+        if hasattr(agent, "locked_variant_key"):
+            agent.locked_variant_key = None
+        if hasattr(agent, "locked_pref_id"):
+            agent.locked_pref_id = None
         agent.posterior.reset()
     n = max(1, len(actual_tokens))
     assist_steps = [s for s in steps if s.get("assist_used")]
@@ -2696,6 +4158,9 @@ def assist_episode(
     post_div = [s for s in steps[first_mismatch + 1:]] if first_mismatch >= 0 else steps
     recipe_hits = [s for s in steps if rid is not None and s.get("posterior_recipe") == rid]
     confidence_vals = [float(s["action_confidence"]) for s in steps if s.get("action_confidence") is not None]
+    raw_confidence_vals = [float(s["raw_action_confidence"]) for s in steps if s.get("raw_action_confidence") is not None]
+    gate_score_vals = [float(s["action_gate_score"]) for s in steps if s.get("action_gate_score") is not None]
+    margin_vals = [float(s["action_margin"]) for s in steps if s.get("action_margin") is not None]
     entropy_vals = [float(s["posterior_entropy"]) for s in steps if s.get("posterior_entropy") is not None]
     degenerate = [s for s in steps if int(s.get("posterior_n_hypotheses") or 0) <= 1]
     live_record = LiveEpisodeRecord(
@@ -2718,6 +4183,7 @@ def assist_episode(
         "preference": pair.preference_name,
         "mode": "assist",
         "memory_state": memory_state,
+        "memory_state_gt": memory_state,
         "n_steps": len(actual_tokens),
         "live_top1": hits1 / n,
         "live_topk": hits3 / n,
@@ -2730,6 +4196,9 @@ def assist_episode(
         "abstention_error_rate": len(closed_wrong) / max(1, n - len(assist_steps)),
         "posterior_correct_recipe": len(recipe_hits) / n if rid is not None else 0.0,
         "mean_action_confidence": _mean(confidence_vals),
+        "mean_raw_action_confidence": _mean(raw_confidence_vals),
+        "mean_action_gate_score": _mean(gate_score_vals),
+        "mean_action_margin": _mean(margin_vals),
         "mean_posterior_entropy": _mean(entropy_vals),
         "posterior_degenerate_rate": len(degenerate) / n,
         "classification_kind": getattr(cls, "kind", None),
@@ -2772,16 +4241,175 @@ def coverage_vs_accuracy_curve(
             row, _steps = assist_episode(agent, pair, dict(name_to_rid or {}), run_config=run_config, commit=False, event_tag={"threshold": threshold})
             rows.append(row)
         agg = _aggregate_episode_metrics(rows)
+        wrong_all_steps = max(0.0, float(agg.get("assistance_coverage", 0.0)) - float(agg.get("useful_assistance_rate", 0.0)))
         out[str(threshold)] = {
             "live_top1": float(agg.get("live_top1", 0.0)),
             "live_topk": float(agg.get("live_topk", 0.0)),
             "coverage": float(agg.get("assistance_coverage", 0.0)),
             "conditional_top1": float(agg.get("conditional_top1", 0.0)),
             "useful_assistance_rate": float(agg.get("useful_assistance_rate", 0.0)),
+            "wrong_assistance_rate": float(wrong_all_steps),
+            "net_assistance_value": float(agg.get("net_assistance_value", 0.0)),
+            "correct_prediction_assist_recall": float(agg.get("correct_prediction_assist_recall", 0.0)),
+            "wrong_prediction_assist_rate": float(agg.get("wrong_prediction_assist_rate", 0.0)),
+            "hidden_correct_rate": float(agg.get("hidden_correct_rate", 0.0)),
             "n": float(agg.get("n_steps", 0.0)),
         }
     agent.restore_from(snap)
     agent.cfg = original_cfg
+    return out
+
+
+def hrc_assistance_utility(
+    row: Mapping[str, float],
+    *,
+    wrong_assist_penalty: float = ASSIST_WRONG_PENALTY,
+    hidden_correct_penalty: float = ASSIST_HIDDEN_CORRECT_PENALTY,
+) -> float:
+    """Reviewer-facing assistance utility: correct assists minus harmful and missed assists."""
+    useful = float(row.get("useful_assistance_rate", 0.0))
+    wrong_all_steps = float(row.get("wrong_assistance_rate", max(0.0, float(row.get("coverage", 0.0)) - useful)))
+    hidden_correct = float(row.get("hidden_correct_rate", 0.0))
+    return float(useful - float(wrong_assist_penalty) * wrong_all_steps - float(hidden_correct_penalty) * hidden_correct)
+
+
+def _annotate_gate_curve_utility(
+    curve: Mapping[str, Mapping[str, float]],
+    *,
+    wrong_assist_penalty: float = ASSIST_WRONG_PENALTY,
+    hidden_correct_penalty: float = ASSIST_HIDDEN_CORRECT_PENALTY,
+) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for key, row in curve.items():
+        numeric = {str(k): float(v) for k, v in (row or {}).items() if isinstance(v, (int, float))}
+        numeric["hrc_assistance_utility"] = hrc_assistance_utility(
+            numeric,
+            wrong_assist_penalty=wrong_assist_penalty,
+            hidden_correct_penalty=hidden_correct_penalty,
+        )
+        out[str(key)] = numeric
+    return out
+
+
+def select_action_gate_threshold(
+    curve: Mapping[str, Mapping[str, float]],
+    *,
+    min_conditional_top1: float = 0.55,
+    max_wrong_assist_rate: float = 0.45,
+    wrong_assist_penalty: float = ASSIST_WRONG_PENALTY,
+    hidden_correct_penalty: float = ASSIST_HIDDEN_CORRECT_PENALTY,
+) -> Tuple[float, Dict[str, Any]]:
+    rows: List[Tuple[float, Dict[str, float]]] = []
+    for key, row in curve.items():
+        try:
+            threshold = float(key)
+        except Exception:
+            continue
+        if not isinstance(row, Mapping):
+            continue
+        numeric = {str(k): float(v) for k, v in row.items() if isinstance(v, (int, float))}
+        numeric["hrc_assistance_utility"] = hrc_assistance_utility(
+            numeric,
+            wrong_assist_penalty=wrong_assist_penalty,
+            hidden_correct_penalty=hidden_correct_penalty,
+        )
+        rows.append((threshold, numeric))
+    if not rows:
+        default = float(DEFAULT_CONFIG.posterior_action_confidence_threshold)
+        return default, {"selected_threshold": default, "selection_reason": "empty_curve"}
+    eligible = [
+        (thr, row)
+        for thr, row in rows
+        if float(row.get("coverage", 0.0)) > 0.0
+        and float(row.get("conditional_top1", 0.0)) >= float(min_conditional_top1)
+        and float(row.get("wrong_prediction_assist_rate", 0.0)) <= float(max_wrong_assist_rate)
+    ]
+    pool = eligible or rows
+    reason = "max_hrc_assistance_utility_under_constraints" if eligible else "max_hrc_assistance_utility_unconstrained"
+    best_thr, best_row = max(
+        pool,
+        key=lambda item: (
+            float(item[1].get("hrc_assistance_utility", 0.0)),
+            float(item[1].get("useful_assistance_rate", 0.0)),
+            float(item[1].get("coverage", 0.0)),
+            -float(item[1].get("wrong_prediction_assist_rate", 0.0)),
+        ),
+    )
+    return float(best_thr), {
+        "selected_threshold": float(best_thr),
+        "selected_row": dict(best_row),
+        "selection_reason": reason,
+        "min_conditional_top1": float(min_conditional_top1),
+        "max_wrong_assist_rate": float(max_wrong_assist_rate),
+        "wrong_assist_penalty": float(wrong_assist_penalty),
+        "hidden_correct_penalty": float(hidden_correct_penalty),
+        "n_thresholds": len(rows),
+        "n_eligible_thresholds": len(eligible),
+    }
+
+
+def deployment_gate_calibration_pairs(
+    seed: int,
+    phase_a_pairs: Sequence[RecipePrefPair],
+    cfg_obj: DeploymentStreamConfig,
+) -> List[RecipePrefPair]:
+    """Offline deployment-style calibration probes drawn from known recipes.
+
+    This is separate from the Phase-B test stream. It mixes direct reuse,
+    same-recipe preference shifts, and cross-recipe seen-preference probes so
+    the operating threshold is tuned for the deployment distribution instead of
+    the pessimistic identity-only S4 calibration.
+    """
+    max_pairs = max(1, int(cfg_obj.calibration_n_probe_pairs))
+    rng = _rng(seed, 8607)
+    library = gen.recipe_library()
+    phase_by_recipe = {p.recipe_name: p for p in phase_a_pairs}
+    seen_prefs = sorted({p.preference_name for p in phase_a_pairs})
+    candidates: List[RecipePrefPair] = []
+
+    def add_pair(recipe: str, preference: str) -> None:
+        if recipe not in library:
+            return
+        try:
+            candidates.append(materialize_pair(recipe, preference, library[recipe]))
+        except Exception:
+            return
+
+    for pair in phase_a_pairs:
+        candidates.append(pair)
+    for pair in phase_a_pairs:
+        prefs = [p for p in PREFERENCE_NAMES if p != pair.preference_name]
+        rng.shuffle(prefs)
+        for pref in prefs[:3]:
+            add_pair(pair.recipe_name, pref)
+    for recipe, base_pair in phase_by_recipe.items():
+        prefs = [p for p in seen_prefs if p != base_pair.preference_name]
+        rng.shuffle(prefs)
+        for pref in prefs[:2]:
+            add_pair(recipe, pref)
+
+    unique = list({p.label: p for p in candidates}.values())
+    rng.shuffle(unique)
+    return unique[: min(max_pairs, len(unique))]
+
+
+def _calibratable_action_gate_baselines(baselines: Sequence[str], cfg_obj: DeploymentStreamConfig) -> Tuple[str, ...]:
+    if not bool(getattr(cfg_obj, "calibrate_full_action_gate", True)):
+        return ()
+    explicit = tuple(str(b) for b in getattr(cfg_obj, "calibration_baselines", ()) if b)
+    candidates = explicit or tuple(str(b) for b in baselines)
+    non_deployable = {"oracle_ceiling", "oracle_preference_label", "oracle_recipe_and_preference_label"}
+    return tuple(dict.fromkeys(b for b in candidates if b in baselines and b not in non_deployable))
+
+
+def _gate_curve_row_at_threshold(curve: Mapping[str, Mapping[str, float]], threshold: float) -> Dict[str, float]:
+    if not curve:
+        return {}
+    target = float(threshold)
+    best_key = min(curve.keys(), key=lambda key: abs(float(key) - target))
+    row = curve.get(best_key, {}) or {}
+    out = {str(k): float(v) for k, v in row.items() if isinstance(v, (int, float))}
+    out["threshold"] = float(best_key)
     return out
 
 
@@ -2846,6 +4474,25 @@ def _four_cell(seen_recipe: bool, seen_preference: bool) -> str:
     return "unseen_unseen"
 
 
+def _transfer_cell(
+    *,
+    seen_recipe: bool,
+    seen_pair: bool,
+    seen_preference_global: bool,
+    seen_preference_same_recipe: bool,
+    seen_preference_other_recipe: bool,
+) -> str:
+    if seen_pair or (seen_recipe and seen_preference_same_recipe):
+        return "direct_retrieval"
+    if seen_recipe and seen_preference_other_recipe:
+        return "seen_recipe_preference_seen_elsewhere"
+    if seen_recipe and not seen_preference_global:
+        return "seen_recipe_new_preference"
+    if (not seen_recipe) and seen_preference_global:
+        return "unseen_recipe_seen_preference"
+    return "unseen_unseen"
+
+
 def _aggregate_episode_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, float]:
     if not rows:
         return {
@@ -2867,17 +4514,32 @@ def _aggregate_episode_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, floa
         "live_top1", "live_topk", "post_divergence_top1", "assistance_coverage",
         "coverage", "conditional_top1", "useful_assistance_rate",
         "assist_correct_rate", "assist_wrong_rate", "net_assistance_value",
+        "correct_prediction_assist_recall", "wrong_prediction_assist_rate",
+        "hidden_correct_rate", "abstention_error_rate", "abstention_recall",
         "posterior_correct_recipe", "recipe_vocab_top1",
-        "preference_consistent_top1", "recipe_vocab_conditional_top1",
-        "mean_action_confidence",
+        "recipe_vocab_conditional_top1",
+        "mean_action_confidence", "mean_raw_action_confidence",
+        "mean_action_gate_score", "mean_action_margin",
         "mean_posterior_entropy", "mean_action_marginal_entropy",
-        "posterior_degenerate_rate", "cross_entropy", "steps_to_lock",
-        "behavioral_steps_to_lock", "posterior_steps_to_lock",
+        "posterior_degenerate_rate", "cross_entropy",
+        "posterior_steps_to_lock",
         "adaptation_latency_steps", "confidence_ece", "confidence_brier",
         "pooled_ece", "pooled_brier", "p95_prediction_wall_s",
         "mean_prediction_wall_s",
     ):
         out[key] = sum(float(r.get(key, 0.0)) * w for r, w in zip(rows, weights)) / total
+    lock_rows = [r for r in rows if int(r.get("n_steps", 0)) >= 5]
+    lock_weights = [max(1, int(r.get("n_steps", 1))) for r in lock_rows]
+    lock_total = max(1, sum(lock_weights))
+    out["n_episodes_behavioral_lock_eligible"] = float(len(lock_rows))
+    out["lock_success_rate"] = _mean([1.0 if float(r.get("behavioral_steps_to_lock", -1.0)) >= 0.0 else 0.0 for r in lock_rows]) if lock_rows else 0.0
+    successful_lock_rows = [r for r in lock_rows if float(r.get("behavioral_steps_to_lock", -1.0)) >= 0.0]
+    out["mean_steps_to_lock_conditional"] = _mean([float(r.get("behavioral_steps_to_lock", 0.0)) for r in successful_lock_rows]) if successful_lock_rows else -1.0
+    for key in ("steps_to_lock", "behavioral_steps_to_lock"):
+        out[key] = (
+            sum(float(r.get(key, -1.0)) * w for r, w in zip(lock_rows, lock_weights)) / lock_total
+            if lock_rows else -1.0
+        )
     for bucket, predicate in (
         ("early", lambda fm: 0 <= fm < 5),
         ("middle", lambda fm: 5 <= fm <= 15),
@@ -2925,6 +4587,7 @@ def _support_counts(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     seen_recipes: set = set()
     seen_preferences: set = set()
     cells = Counter()
+    transfer_cells = Counter()
     modes = Counter()
     conditions = Counter()
     for event in events:
@@ -2932,6 +4595,9 @@ def _support_counts(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         seen_recipe = bool(recipe and recipe in seen_recipes)
         seen_preference = bool(preference and preference in seen_preferences)
         cells[_four_cell(seen_recipe, seen_preference)] += 1
+        transfer_cell = str(event.get("transfer_cell_before", ""))
+        if transfer_cell:
+            transfer_cells[transfer_cell] += 1
         mode = str(event.get("mode", "unknown"))
         modes[mode] += 1
         conditions[str(event.get("condition", event.get("event_type", "unknown")))] += 1
@@ -2941,6 +4607,7 @@ def _support_counts(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             seen_preferences.add(preference)
     return {
         "four_cell": {k: int(cells.get(k, 0)) for k in FOUR_CELL_KEYS},
+        "transfer_cell": {k: int(transfer_cells.get(k, 0)) for k in TRANSFER_CELL_KEYS},
         "modes": dict(modes),
         "conditions": dict(conditions),
     }
@@ -3020,9 +4687,13 @@ def _comparison_summary(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "live_top1", "live_topk", "post_divergence_top1", "assistance_coverage",
         "conditional_top1", "useful_assistance_rate", "frozen_top1",
         "post_adapt_top1", "safe_fail_rate", "preference_transfer_rate",
+        "preference_gate_accuracy",
         "known_shift_live_top1", "novel_recipe_live_top1",
         "primary_transfer_live_top1", "adaptation_latency_steps",
         "p95_prediction_wall_s", "behavioral_steps_to_lock",
+        "lock_success_rate", "mean_steps_to_lock_conditional",
+        "correct_prediction_assist_recall", "wrong_prediction_assist_rate",
+        "hidden_correct_rate",
         "pooled_ece", "preference_cluster_purity",
     )
     for baseline, row in per_baseline.items():
@@ -3080,6 +4751,7 @@ def _run_baseline_stream(
         **_aggregate_episode_metrics([r for r in episode_rows if r.get("mode") == "assist"]),
         "compute": compute_snapshot(agent, wall_s),
         "memory": memory_snapshot(agent),
+        "assist_gate": assist_gate_reason_summary(step_rows),
     }
     return metrics, episode_rows, step_rows, memory_rows
 
@@ -3545,6 +5217,7 @@ def _advance_gap(agent: AdaptiveHRCAgent, gap: int, distractors: Sequence[Recipe
     else:
         for i in range(max(0, int(gap))):
             observe_episode(agent, distractors[i % len(distractors)], name_to_rid)
+            agent.decay._recompute_effective(agent.session_counter)
 
 
 def run_adaptive_decay_reentry(seed: int, out: Path, run_config: RunConfig, cfg_obj: AdaptiveDecayReentryConfig) -> Dict[str, Any]:
@@ -4034,45 +5707,177 @@ def run_sparse_first_exposure_pool_sweep(seed: int, out: Path, run_config: RunCo
 
 
 def run_zipf_usage_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: ZipfUsageConfig) -> Dict[str, Any]:
-    builders = select_recipe_builders(seed, cfg_obj.n_recipes)
-    base_pairs = [materialize_pair(r, "identity", fn) for r, fn in builders]
+    builders = select_recipe_builders(seed, min(cfg_obj.n_recipes, 4) if run_config.quick else cfg_obj.n_recipes)
+    prefs = select_preference_names(max(1, int(cfg_obj.n_preferences)))
+    by_recipe: Dict[str, List[RecipePrefPair]] = {}
+    for recipe_name, fn in builders:
+        seen_orders: set = set()
+        rows: List[RecipePrefPair] = []
+        for pref in prefs:
+            try:
+                pair = materialize_pair(recipe_name, pref, fn)
+            except Exception:
+                continue
+            if pair.actions in seen_orders:
+                continue
+            seen_orders.add(pair.actions)
+            rows.append(pair)
+        if rows:
+            by_recipe[recipe_name] = rows
+    ranked_pairs: List[RecipePrefPair] = []
+    max_rows = max((len(v) for v in by_recipe.values()), default=0)
+    for pref_idx in range(max_rows):
+        for recipe_name, _fn in builders:
+            rows = by_recipe.get(recipe_name, [])
+            if pref_idx < len(rows):
+                ranked_pairs.append(rows[pref_idx])
+    if not ranked_pairs:
+        raise RuntimeError("zipf_usage_sweep requires at least one materialized recipe/preference workflow")
+    n_events = min(int(cfg_obj.n_events), 24) if run_config.quick else int(cfg_obj.n_events)
+    phase_a_pairs: List[RecipePrefPair] = []
+    for _cycle in range(max(1, int(cfg_obj.phase_a_cycles))):
+        phase_a_pairs.extend(ranked_pairs)
+    recipes = [r for r, _ in builders]
+    _record_common_artifacts(out, seed, cfg_obj, recipes, prefs)
+    phase_a_events = [
+        ScenarioEvent(
+            pair=pair,
+            mode="observe",
+            phase="phase_a_onboarding",
+            user_id="kitchen_staff",
+            tags={
+                "event_idx": idx,
+                "event_type": "prep_book_onboarding",
+                "workflow_rank": ranked_pairs.index(pair),
+                "scenario_note": "balanced onboarding demonstration before rush-hour skew",
+            },
+        )
+        for idx, pair in enumerate(phase_a_pairs)
+    ]
     per_alpha: Dict[str, Any] = {}
+    all_episode_rows: List[Dict[str, Any]] = []
+    all_step_rows: List[Dict[str, Any]] = []
+    all_memory_rows: List[Dict[str, Any]] = []
+    scenario_rows: List[Dict[str, Any]] = [_scenario_event_row(e) for e in phase_a_events]
+    phase_a_snapshots: Dict[str, Any] = {}
+    phase_a_name_to_rid: Dict[str, Dict[str, str]] = {}
+    phase_a_wall_s: Dict[str, float] = {}
+    for baseline in run_config.baselines:
+        agent = make_agent(baseline, base_config(seed, run_config))
+        name_to_rid: Dict[str, str] = {}
+        t_phase = time.perf_counter()
+        for pair in phase_a_pairs:
+            observe_episode(agent, pair, name_to_rid)
+        phase_a_wall_s[baseline] = float(time.perf_counter() - t_phase)
+        phase_a_snapshots[baseline] = agent.snapshot()
+        phase_a_name_to_rid[baseline] = dict(name_to_rid)
     for alpha in cfg_obj.alphas:
-        probs = _zipf_probs(len(base_pairs), float(alpha))
+        probs = _zipf_probs(len(ranked_pairs), float(alpha))
         rng = _rng(seed, int(alpha * 1000) + 707)
-        events: List[Tuple[str, RecipePrefPair, Dict[str, Any]]] = [("observe", p, {"phase": "phase_a"}) for p in base_pairs]
         counts = Counter()
-        for i in range(max(1, int(cfg_obj.n_events))):
-            idx = int(rng.choice(len(base_pairs), p=probs))
-            counts[base_pairs[idx].label] += 1
-            events.append(("assist", base_pairs[idx], {"phase": "phase_b", "event_idx": i, "zipf_alpha": alpha, "rank": idx}))
+        alpha_events: List[ScenarioEvent] = []
+        head_cut = max(1, len(ranked_pairs) // 4)
+        tail_start = max(0, len(ranked_pairs) - head_cut)
+        for i in range(max(1, n_events)):
+            idx = int(rng.choice(len(ranked_pairs), p=probs))
+            pair = ranked_pairs[idx]
+            counts[pair.label] += 1
+            if idx < head_cut:
+                event_type = "rush_hour_repeat_order"
+            elif idx >= tail_start:
+                event_type = "rare_custom_order_reentry"
+            else:
+                event_type = "regular_menu_rotation"
+            alpha_events.append(ScenarioEvent(
+                pair=pair,
+                mode="assist",
+                phase="zipf_phase_b",
+                user_id="service_window",
+                tags={
+                    "event_idx": i,
+                    "event_type": event_type,
+                    "zipf_alpha": float(alpha),
+                    "workflow_rank": idx,
+                    "intended_probability": float(probs[idx]),
+                    "head_tail_bin": "head" if idx < head_cut else ("tail" if idx >= tail_start else "middle"),
+                },
+            ))
+        scenario_rows.extend(_scenario_event_row(e) for e in alpha_events)
         alpha_row: Dict[str, Any] = {}
         total = max(1, sum(counts.values()))
-        head_labels = {p.label for p in base_pairs[: max(1, len(base_pairs) // 4)]}
-        tail_labels = {p.label for p in base_pairs[-max(1, len(base_pairs) // 4):]}
+        head_labels = {p.label for p in ranked_pairs[:head_cut]}
+        tail_labels = {p.label for p in ranked_pairs[tail_start:]}
+        prob_by_label = {p.label: float(probs[idx]) for idx, p in enumerate(ranked_pairs)}
         for baseline in run_config.baselines:
-            row, episode_rows, step_rows, memory_rows = _run_baseline_stream(baseline, base_config(seed, run_config), events, run_config)
-            # Use stream rows for utility/fairness, avoiding an extra replay-heavy pass.
+            agent = make_agent(baseline, base_config(seed, run_config))
+            agent.restore_from(phase_a_snapshots[baseline])
+            name_to_rid = dict(phase_a_name_to_rid[baseline])
+            episode_rows: List[Dict[str, Any]] = []
+            step_rows: List[Dict[str, Any]] = []
+            memory_rows: List[Dict[str, Any]] = []
+            t0 = time.perf_counter()
+            for event_idx, event in enumerate(alpha_events):
+                tags = {"phase": event.phase, "user_id": event.user_id, **dict(event.tags)}
+                row, steps = assist_episode(agent, event.pair, name_to_rid, run_config=run_config, event_tag=tags)
+                row.update(tags)
+                episode_rows.append(row)
+                step_rows.extend({"event_idx": event_idx, "baseline": baseline, **s} for s in steps)
+                memory_rows.append({"event_idx": event_idx, "baseline": baseline, "zipf_alpha": float(alpha), **memory_snapshot(agent)})
+            phase_b_wall = float(time.perf_counter() - t0)
             assist_rows = [r for r in episode_rows if r.get("mode") == "assist"]
-            by_label = defaultdict(list)
+            by_label: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
             for r in assist_rows:
                 by_label[r["pair"]].append(r)
-            label_acc = {lbl: _aggregate_episode_metrics(rows)["live_top1"] for lbl, rows in by_label.items()}
-            utility = sum(label_acc.get(lbl, 0.0) * (cnt / total) for lbl, cnt in counts.items())
-            fairness = _mean(list(label_acc.values()))
-            row.update({
+            label_live_acc = {lbl: _aggregate_episode_metrics(rows)["live_top1"] for lbl, rows in by_label.items()}
+            posthoc = frozen_eval(agent, ranked_pairs, name_to_rid)
+            label_acc = {lbl: float(row.get("top1", 0.0)) for lbl, row in posthoc.items()}
+            utility = sum(label_acc.get(lbl, 0.0) * prob_by_label.get(lbl, 0.0) for lbl in label_acc)
+            realized_utility = sum(label_acc.get(lbl, 0.0) * (cnt / total) for lbl, cnt in counts.items())
+            fairness = _mean([label_acc.get(p.label, 0.0) for p in ranked_pairs])
+            live_row = _aggregate_episode_metrics(assist_rows)
+            row = {
+                **live_row,
+                "compute": compute_snapshot(agent, phase_a_wall_s.get(baseline, 0.0) + phase_b_wall),
+                "memory": memory_snapshot(agent),
                 "utility_top1": utility,
+                "realized_utility_top1": realized_utility,
                 "fairness_top1": fairness,
                 "head_top1": _mean([label_acc.get(lbl, 0.0) for lbl in head_labels]),
                 "tail_top1": _mean([label_acc.get(lbl, 0.0) for lbl in tail_labels]),
                 "head_tail_gap": _mean([label_acc.get(lbl, 0.0) for lbl in head_labels]) - _mean([label_acc.get(lbl, 0.0) for lbl in tail_labels]),
+                "live_utility_top1": sum(label_live_acc.get(lbl, 0.0) * (cnt / total) for lbl, cnt in counts.items()),
+                "live_fairness_top1_observed": _mean(list(label_live_acc.values())),
                 "frequency_hist": dict(counts),
-            })
+                "head_realised_n": int(sum(counts.get(lbl, 0) for lbl in head_labels)),
+                "tail_realised_n": int(sum(counts.get(lbl, 0) for lbl in tail_labels)),
+                "n_eval_pairs": len(ranked_pairs),
+                "n_unique_phase_b_pairs": len(counts),
+                "phase_a_wall_s": phase_a_wall_s.get(baseline, 0.0),
+                "phase_b_wall_s": phase_b_wall,
+            }
             alpha_row[baseline] = row
-            _append_jsonl(out / "episode_steps.jsonl", step_rows)
-            _append_jsonl(out / "memory_trace.jsonl", memory_rows)
+            all_episode_rows.extend({"baseline": baseline, **r} for r in episode_rows)
+            all_step_rows.extend(step_rows)
+            all_memory_rows.extend(memory_rows)
         per_alpha[str(alpha)] = alpha_row
-    metrics = {"seed": seed, "per_alpha": per_alpha}
+    _append_jsonl(out / "scenario_events.jsonl", scenario_rows)
+    _append_jsonl(out / "episode_metrics.jsonl", all_episode_rows)
+    _append_jsonl(out / "episode_steps.jsonl", all_step_rows)
+    _append_jsonl(out / "memory_trace.jsonl", all_memory_rows)
+    metrics = {
+        "seed": seed,
+        "n_recipes": len(recipes),
+        "n_preferences": len(prefs),
+        "n_workflows": len(ranked_pairs),
+        "scenario": {
+            "description": "Balanced prep-book onboarding followed by branched rush-hour Zipf demand over recipe/preference workflows.",
+            "phase_a_cycles": max(1, int(cfg_obj.phase_a_cycles)),
+            "phase_b_events_per_alpha": max(1, n_events),
+            "head_definition": "top quartile of intended Zipf workflow ranks",
+            "tail_definition": "bottom quartile of intended Zipf workflow ranks, including workflows not sampled in a finite branch",
+        },
+        "per_alpha": per_alpha,
+    }
     _write_json(out / "metrics.json", metrics)
     baselines = sorted({baseline for row in per_alpha.values() for baseline in row})
     for metric, ylabel in (
@@ -4131,7 +5936,7 @@ def run_baseline_anchor_sweep(seed: int, out: Path, run_config: RunConfig, cfg_o
 
 
 def run_continual_learning_regularizer_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: ComputeTradeoffConfig) -> Dict[str, Any]:
-    cl_run = replace(run_config, baselines=("bc", "l2_anchor", "ewc", "online_ewc", "experience_replay_bc", "full"))
+    cl_run = replace(run_config, baselines=("bc", "l2_anchor", "ewc", "online_ewc", "experience_replay_bc", "no_decay", "full"))
     stream_cfg = DeploymentStreamConfig(n_recipes=cfg_obj.n_recipes, n_phase_b_events=cfg_obj.n_events)
     return run_deployment_stream(seed, out, cl_run, stream_cfg)
 
@@ -4417,22 +6222,39 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
     seen_recipes: set = set()
     seen_preferences: set = set()
     seen_pairs: set = set()
+    seen_preferences_by_recipe: Dict[str, set] = defaultdict(set)
     last_by_recipe: Dict[str, RecipePrefPair] = {}
     last_by_user_recipe: Dict[Tuple[str, str], RecipePrefPair] = {}
     for idx, pair in enumerate(phase_a_pairs):
         seen_preference_before = pair.preference_name in seen_preferences
+        seen_preference_same_recipe_before = pair.preference_name in seen_preferences_by_recipe.get(pair.recipe_name, set())
+        seen_preference_other_recipe_before = any(
+            pair.preference_name in vals
+            for recipe, vals in seen_preferences_by_recipe.items()
+            if recipe != pair.recipe_name
+        )
         events.append(ScenarioEvent(pair, "observe", "phase_a", "U1", {
             "event_idx": idx,
             "event_type": "phase_a_observe",
             "phase_a_preference": pair.preference_name,
             "four_cell_before": "unseen_unseen",
+            "transfer_cell_before": _transfer_cell(
+                seen_recipe=False,
+                seen_pair=False,
+                seen_preference_global=seen_preference_before,
+                seen_preference_same_recipe=seen_preference_same_recipe_before,
+                seen_preference_other_recipe=seen_preference_other_recipe_before,
+            ),
             "seen_recipe_before": False,
             "seen_preference_before": seen_preference_before,
+            "seen_preference_same_recipe_before": seen_preference_same_recipe_before,
+            "seen_preference_other_recipe_before": seen_preference_other_recipe_before,
             "seen_pair_before": False,
         }))
         seen_recipes.add(pair.recipe_name)
         seen_preferences.add(pair.preference_name)
         seen_pairs.add(pair.label)
+        seen_preferences_by_recipe[pair.recipe_name].add(pair.preference_name)
         last_by_recipe[pair.recipe_name] = pair
         last_by_user_recipe[("U1", pair.recipe_name)] = pair
     event_mix = dict(cfg_obj.event_mix)
@@ -4451,6 +6273,13 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
             candidates = by_recipe.get(recipe_name) or [materialize_pair(recipe_name, "identity", fn)]
             pref = users.get(current_user, "identity")
             pair = next((p for p in candidates if p.preference_name == pref), candidates[0])
+            seen_preference_before = pair.preference_name in seen_preferences
+            seen_preference_same_recipe_before = pair.preference_name in seen_preferences_by_recipe.get(pair.recipe_name, set())
+            seen_preference_other_recipe_before = any(
+                pair.preference_name in vals
+                for recipe, vals in seen_preferences_by_recipe.items()
+                if recipe != pair.recipe_name
+            )
             events.append(ScenarioEvent(pair, "observe", "phase_b_observe", current_user, {
                 "event_idx": len(events),
                 "phase_b_idx": i,
@@ -4460,13 +6289,23 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
                 "user_block": user_block,
                 "is_return_user_block": is_return_block,
                 "seen_recipe_before": False,
-                "seen_preference_before": pair.preference_name in seen_preferences,
+                "seen_preference_before": seen_preference_before,
+                "seen_preference_same_recipe_before": seen_preference_same_recipe_before,
+                "seen_preference_other_recipe_before": seen_preference_other_recipe_before,
                 "seen_pair_before": False,
-                "four_cell_before": _four_cell(False, pair.preference_name in seen_preferences),
+                "four_cell_before": _four_cell(False, seen_preference_before),
+                "transfer_cell_before": _transfer_cell(
+                    seen_recipe=False,
+                    seen_pair=False,
+                    seen_preference_global=seen_preference_before,
+                    seen_preference_same_recipe=seen_preference_same_recipe_before,
+                    seen_preference_other_recipe=seen_preference_other_recipe_before,
+                ),
             }))
             seen_recipes.add(pair.recipe_name)
             seen_preferences.add(pair.preference_name)
             seen_pairs.add(pair.label)
+            seen_preferences_by_recipe[pair.recipe_name].add(pair.preference_name)
             last_by_recipe[pair.recipe_name] = pair
             last_by_user_recipe[(current_user, pair.recipe_name)] = pair
             history.append(pair)
@@ -4475,6 +6314,13 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
             pair, recipe_idx, requested_event_type = pending_gradual_followups.pop(0)
             seen_recipe_before = pair.recipe_name in seen_recipes
             seen_preference_before = pair.preference_name in seen_preferences
+            seen_pair_before = pair.label in seen_pairs
+            seen_preference_same_recipe_before = pair.preference_name in seen_preferences_by_recipe.get(pair.recipe_name, set())
+            seen_preference_other_recipe_before = any(
+                pair.preference_name in vals
+                for recipe, vals in seen_preferences_by_recipe.items()
+                if recipe != pair.recipe_name
+            )
             events.append(ScenarioEvent(pair, "assist", "phase_b", current_user, {
                 "event_idx": len(events),
                 "phase_b_idx": i,
@@ -4489,13 +6335,23 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
                 "eventual_preference": pair.preference_name,
                 "seen_recipe_before": seen_recipe_before,
                 "seen_preference_before": seen_preference_before,
-                "seen_pair_before": pair.label in seen_pairs,
+                "seen_preference_same_recipe_before": seen_preference_same_recipe_before,
+                "seen_preference_other_recipe_before": seen_preference_other_recipe_before,
+                "seen_pair_before": seen_pair_before,
                 "four_cell_before": _four_cell(seen_recipe_before, seen_preference_before),
+                "transfer_cell_before": _transfer_cell(
+                    seen_recipe=seen_recipe_before,
+                    seen_pair=seen_pair_before,
+                    seen_preference_global=seen_preference_before,
+                    seen_preference_same_recipe=seen_preference_same_recipe_before,
+                    seen_preference_other_recipe=seen_preference_other_recipe_before,
+                ),
                 "followup_for": "gradual_shift",
             }))
             seen_recipes.add(pair.recipe_name)
             seen_preferences.add(pair.preference_name)
             seen_pairs.add(pair.label)
+            seen_preferences_by_recipe[pair.recipe_name].add(pair.preference_name)
             last_by_recipe[pair.recipe_name] = pair
             last_by_user_recipe[(current_user, pair.recipe_name)] = pair
             history.append(pair)
@@ -4553,6 +6409,13 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
             pair = base
         seen_recipe_before = pair.recipe_name in seen_recipes
         seen_preference_before = pair.preference_name in seen_preferences
+        seen_pair_before = pair.label in seen_pairs
+        seen_preference_same_recipe_before = pair.preference_name in seen_preferences_by_recipe.get(pair.recipe_name, set())
+        seen_preference_other_recipe_before = any(
+            pair.preference_name in vals
+            for recipe, vals in seen_preferences_by_recipe.items()
+            if recipe != pair.recipe_name
+        )
         events.append(ScenarioEvent(pair, "assist", "phase_b", current_user, {
             "event_idx": len(events),
             "phase_b_idx": i,
@@ -4567,12 +6430,22 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
             "eventual_preference": target_after_event.preference_name if target_after_event is not None else pair.preference_name,
             "seen_recipe_before": seen_recipe_before,
             "seen_preference_before": seen_preference_before,
-            "seen_pair_before": pair.label in seen_pairs,
+            "seen_preference_same_recipe_before": seen_preference_same_recipe_before,
+            "seen_preference_other_recipe_before": seen_preference_other_recipe_before,
+            "seen_pair_before": seen_pair_before,
             "four_cell_before": _four_cell(seen_recipe_before, seen_preference_before),
+            "transfer_cell_before": _transfer_cell(
+                seen_recipe=seen_recipe_before,
+                seen_pair=seen_pair_before,
+                seen_preference_global=seen_preference_before,
+                seen_preference_same_recipe=seen_preference_same_recipe_before,
+                seen_preference_other_recipe=seen_preference_other_recipe_before,
+            ),
         }))
         seen_recipes.add(pair.recipe_name)
         seen_preferences.add(pair.preference_name)
         seen_pairs.add(pair.label)
+        seen_preferences_by_recipe[pair.recipe_name].add(pair.preference_name)
         last_pair = target_after_event or pair
         last_by_recipe[pair.recipe_name] = last_pair
         last_by_user_recipe[(current_user, pair.recipe_name)] = last_pair
@@ -4593,12 +6466,28 @@ def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
     interval = max(1, int(cfg_obj.forgetting_checkpoint_interval))
     phase_b_pairs = [e.pair for e in events if e.mode == "assist"]
     eval_pool = list({event.pair.label: event.pair for event in events}.values())
+    library = gen.recipe_library()
+    phase_a_identity_pairs = [
+        materialize_pair(pair.recipe_name, "identity", library[pair.recipe_name])
+        for pair in phase_a_pairs
+        if pair.recipe_name in library
+    ]
+    gate_calibration_pairs = deployment_gate_calibration_pairs(seed, phase_a_pairs, cfg_obj)
+    if run_config.quick:
+        gate_calibration_pairs = gate_calibration_pairs[: max(1, min(8, len(gate_calibration_pairs)))]
+    gate_calibration_baselines = set(_calibratable_action_gate_baselines(run_config.baselines, cfg_obj))
+    calibration_thresholds = tuple(float(t) for t in cfg_obj.calibration_thresholds)
+    if run_config.quick and len(calibration_thresholds) > 6:
+        calibration_thresholds = (0.0, 0.25, 0.50, 0.75, 1.01)
     for baseline in run_config.baselines:
-        agent = make_agent(baseline, base_config(seed, run_config))
+        cfg = base_config(seed, run_config)
+        default_action_threshold = float(cfg.posterior_action_confidence_threshold)
+        agent = make_agent(baseline, cfg)
         name_to_rid: Dict[str, str] = {}
         simulator_observed_labels: set = set()
         simulator_observed_recipes: set = set()
         phase_a_eval_at_start: Optional[Dict[str, Dict[str, float]]] = None
+        gate_calibration: Dict[str, Any] = {}
         episode_rows: List[Dict[str, Any]] = []
         step_rows: List[Dict[str, Any]] = []
         memory_rows: List[Dict[str, Any]] = []
@@ -4608,6 +6497,32 @@ def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
             tags = {"phase": event.phase, "user_id": event.user_id, **dict(event.tags)}
             if phase_a_eval_at_start is None and event.phase != "phase_a":
                 phase_a_eval_at_start = frozen_eval(agent, eval_pool, name_to_rid)
+                if baseline in gate_calibration_baselines and gate_calibration_pairs:
+                    calibration_curve = _annotate_gate_curve_utility(
+                        coverage_vs_accuracy_curve(agent, gate_calibration_pairs, name_to_rid, run_config, calibration_thresholds),
+                        wrong_assist_penalty=cfg_obj.calibration_wrong_assist_penalty,
+                        hidden_correct_penalty=cfg_obj.calibration_hidden_correct_penalty,
+                    )
+                    selected_threshold, selection = select_action_gate_threshold(
+                        calibration_curve,
+                        min_conditional_top1=cfg_obj.calibration_min_conditional_top1,
+                        max_wrong_assist_rate=cfg_obj.calibration_max_wrong_assist_rate,
+                        wrong_assist_penalty=cfg_obj.calibration_wrong_assist_penalty,
+                        hidden_correct_penalty=cfg_obj.calibration_hidden_correct_penalty,
+                    )
+                    agent.cfg = replace(agent.cfg, posterior_action_confidence_threshold=float(selected_threshold))
+                    fixed_row = _gate_curve_row_at_threshold(calibration_curve, default_action_threshold)
+                    selected_row = dict(selection.get("selected_row", {}) or {})
+                    gate_calibration = {
+                        "curve": calibration_curve,
+                        "selection": selection,
+                        "default_threshold": default_action_threshold,
+                        "fixed_default_row": fixed_row,
+                        "calibrated_row": selected_row,
+                        "calibrated": True,
+                        "n_probe_pairs": len(gate_calibration_pairs),
+                        "probe_pair_labels": [p.label for p in gate_calibration_pairs],
+                    }
             if event.mode == "observe":
                 row = observe_episode(agent, event.pair, name_to_rid)
                 row.update(tags)
@@ -4630,11 +6545,14 @@ def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
                 phase_b_count += 1
                 if phase_b_count % interval == 0:
                     evals = frozen_eval(agent, phase_a_pairs, name_to_rid)
+                    identity_evals = frozen_eval(agent, phase_a_identity_pairs, name_to_rid) if phase_a_identity_pairs else {}
                     forgetting_rows.append({
                         "baseline": baseline,
                         "phase_b_count": phase_b_count,
                         "mean_phase_a_top1": _mean([v.get("top1", 0.0) for v in evals.values()]),
                         "mean_phase_a_top3": _mean([v.get("top3", 0.0) for v in evals.values()]),
+                        "mean_phase_a_identity_reference_top1": _mean([v.get("top1", 0.0) for v in identity_evals.values()]),
+                        "mean_phase_a_identity_reference_top3": _mean([v.get("top3", 0.0) for v in identity_evals.values()]),
                     })
             memory_rows.append({"event_idx": idx, "baseline": baseline, **memory_snapshot(agent)})
         wall_s = time.perf_counter() - t0
@@ -4673,6 +6591,29 @@ def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
                 }
         metrics["per_user_return_retention"] = user_block_retention
         metrics["per_event_type"] = {k: _aggregate_episode_metrics([r for r in assist_rows if r.get("event_type") == k]) for k in sorted({str(r.get("event_type")) for r in assist_rows})}
+        metrics["per_event_type_support"] = {k: float(v.get("n_episodes", 0.0)) for k, v in metrics["per_event_type"].items()}
+        metrics["per_memory_state_gt"] = {
+            k: _aggregate_episode_metrics([
+                r for r in assist_rows
+                if str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) == k
+            ])
+            for k in sorted({str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) for r in assist_rows})
+        }
+        metrics["per_event_type_memory_state_gt"] = {
+            event_type: {
+                state: _aggregate_episode_metrics([
+                    r for r in assist_rows
+                    if str(r.get("event_type")) == event_type
+                    and str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) == state
+                ])
+                for state in sorted({str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) for r in assist_rows if str(r.get("event_type")) == event_type})
+            }
+            for event_type in sorted({str(r.get("event_type")) for r in assist_rows})
+        }
+        metrics["per_transfer_cell"] = {
+            cell: _aggregate_episode_metrics([r for r in assist_rows if r.get("transfer_cell_before") == cell])
+            for cell in TRANSFER_CELL_KEYS
+        }
         metrics["four_cell"] = {cell: _aggregate_episode_metrics([r for r in assist_rows if r.get("four_cell_before") == cell]) for cell in FOUR_CELL_KEYS}
         for cell, vals in metrics["four_cell"].items():
             for metric_name, metric_val in vals.items():
@@ -4680,15 +6621,28 @@ def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
                     metrics[f"{metric_name}_{cell}"] = float(metric_val)
         metrics["memory_efficiency"] = float(metrics.get("useful_assistance_rate", 0.0)) / max(1.0, math.log1p(float(metrics["memory"].get("active_variants", 0.0))))
         metrics["live_step_trace"] = live_step_trace(step_rows)
+        metrics["live_step_trace_by_event_type"] = {
+            event_type: live_step_trace([s for s in step_rows if str(s.get("event_type")) == event_type])
+            for event_type in PRIMARY_EVENT_TYPES
+        }
         prediction_walls = [float(s.get("prediction_wall_s")) for s in step_rows if s.get("prediction_wall_s") is not None]
         metrics["mean_prediction_wall_s"] = _mean(prediction_walls)
         metrics["p95_prediction_wall_s"] = _p95(prediction_walls)
+        metrics["calibration_curve"] = calibration_curve_from_steps(step_rows)
+        metrics["latency_cdf"] = latency_cdf_from_steps(step_rows)
+        metrics["assist_gate"] = assist_gate_reason_summary(step_rows)
+        metrics["action_gate_calibration"] = gate_calibration
+        metrics["selected_action_confidence_threshold"] = float(agent.cfg.posterior_action_confidence_threshold)
         metrics["bwt"] = bwt_fwt["bwt"]
         metrics["fwt"] = bwt_fwt["fwt"]
         metrics["bwt_fwt_detail"] = bwt_fwt
-        if baseline == "full" and phase_b_pairs:
+        if baseline in gate_calibration_baselines and phase_b_pairs:
             probe_pairs = list({p.label: p for p in phase_b_pairs}.values())[: max(1, min(20, len(phase_b_pairs)))]
-            coverage_curves[baseline] = coverage_vs_accuracy_curve(agent, probe_pairs, name_to_rid, run_config, cfg_obj.coverage_curve_thresholds)
+            coverage_curves[baseline] = _annotate_gate_curve_utility(
+                coverage_vs_accuracy_curve(agent, probe_pairs, name_to_rid, run_config, cfg_obj.coverage_curve_thresholds),
+                wrong_assist_penalty=cfg_obj.calibration_wrong_assist_penalty,
+                hidden_correct_penalty=cfg_obj.calibration_hidden_correct_penalty,
+            )
             metrics["coverage_accuracy_curve"] = coverage_curves[baseline]
         per_baseline[baseline] = metrics
         all_episode_rows.extend({"baseline": baseline, **r} for r in episode_rows)
@@ -4704,14 +6658,21 @@ def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
         "n_users": len(users),
         "n_events": len(events),
         "n_phase_b_events": sum(1 for e in events if e.mode == "assist"),
-        "selected_action_confidence_threshold": float(base_config(seed, run_config).posterior_action_confidence_threshold),
+        "selected_action_confidence_threshold": float((per_baseline.get("full", {}) or {}).get("selected_action_confidence_threshold", base_config(seed, run_config).posterior_action_confidence_threshold)),
+        "selected_action_confidence_thresholds": {b: row.get("selected_action_confidence_threshold", base_config(seed, run_config).posterior_action_confidence_threshold) for b, row in per_baseline.items()},
         "per_baseline": per_baseline,
         "derived_views": {
             "memory_efficiency": {b: row.get("memory_efficiency", 0.0) for b, row in per_baseline.items()},
             "compute_tradeoff": {b: row.get("compute", {}) for b, row in per_baseline.items()},
             "forgetting_curve": forgetting_rows,
             "per_user_accuracy": {b: row.get("per_user", {}) for b, row in per_baseline.items()},
+            "per_memory_state_gt": {b: row.get("per_memory_state_gt", {}) for b, row in per_baseline.items()},
+            "per_transfer_cell": {b: row.get("per_transfer_cell", {}) for b, row in per_baseline.items()},
+            "per_event_type_memory_state_gt": {b: row.get("per_event_type_memory_state_gt", {}) for b, row in per_baseline.items()},
             "coverage_accuracy_curve": coverage_curves,
+            "action_gate_calibration": {b: row.get("action_gate_calibration", {}) for b, row in per_baseline.items()},
+            "assist_gate": {b: row.get("assist_gate", {}) for b, row in per_baseline.items()},
+            "event_type_narratives": DEPLOYMENT_EVENT_NARRATIVES,
         },
     }
     _write_json(out / "metrics.json", metrics)
@@ -4926,6 +6887,7 @@ def run_cross_recipe_transfer_suite(seed: int, out: Path, run_config: RunConfig,
             **_aggregate_episode_metrics(off_rows),
             "frozen_diagonal_top1": _mean([v.get("top1", 0.0) for v in frozen_diag.values()]),
             "frozen_offdiagonal_top1": _mean([v.get("top1", 0.0) for v in frozen_off.values()]),
+            "preference_gate_accuracy": _mean([1.0 if r.get("preference_transfer_correct") else 0.0 for r in off_rows]),
             "preference_transfer_rate": _mean([1.0 if r.get("preference_transfer_correct") else 0.0 for r in off_rows]),
             "per_four_cell": per_four_cell,
             **{f"live_top1_{cell}": float(per_four_cell[cell].get("live_top1", 0.0)) for cell in FOUR_CELL_KEYS},
@@ -4985,6 +6947,7 @@ def run_decay_reentry_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj
     all_steps: List[Dict[str, Any]] = []
     for baseline in cfg_obj.baselines:
         arm_rows: Dict[str, Dict[str, Any]] = {}
+        baseline_episode_rows: List[Dict[str, Any]] = []
         t0 = time.perf_counter()
         last_agent_for_snapshot: Optional[AdaptiveHRCAgent] = None
         for arm_name, neutral in arms:
@@ -5022,6 +6985,7 @@ def run_decay_reentry_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj
                         "pruned_variants_end": len(agent.decay.pruned),
                     })
                     gap_rows[f"{target_idx}:{gap}"] = row
+                    baseline_episode_rows.append(row)
                     all_rows.append(row)
                     all_steps.extend({"baseline": baseline, "arm": arm_name, **s} for s in steps)
                     last_agent_for_snapshot = agent
@@ -5044,7 +7008,9 @@ def run_decay_reentry_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj
                 "post_reentry_top1": _mean([r["post_reentry_top1"] for r in gap_rows.values()]),
                 "global_rate_after": _mean([r["global_rate_after"] for r in gap_rows.values()]),
             }
+        baseline_episode_agg = _aggregate_episode_metrics(baseline_episode_rows)
         per_baseline[baseline] = {
+            **baseline_episode_agg,
             "arms": arm_rows,
             "live_top1": _mean([r["live_top1"] for r in arm_rows.values()]),
             "active_before_rate": _mean([r["active_before_rate"] for r in arm_rows.values()]),
@@ -5062,6 +7028,15 @@ def run_decay_reentry_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj
         "per_baseline": per_baseline,
         "derived_views": {"decay_rate_trace": {b: r.get("arms", {}) for b, r in per_baseline.items()}},
     }
+    no_decay_neutral = _nested_get(metrics, ("per_baseline", "no_decay", "arms", "neutral", "per_gap"), {}) or {}
+    if no_decay_neutral:
+        min_active = min(float(row.get("active_before_rate", 0.0)) for row in no_decay_neutral.values())
+        metrics["no_decay_neutral_sanity"] = {
+            "min_active_before_rate": min_active,
+            "passes": bool(min_active >= 0.99),
+        }
+        if min_active < 0.99 and _ACTIVE_RESULT is not None:
+            _ACTIVE_RESULT.warnings.append("no_decay_neutral_active_before_below_one")
     _write_json(out / "metrics.json", metrics)
     _render_seed_publication_figures(out, "decay_reentry", metrics)
     return metrics
@@ -5091,6 +7066,12 @@ def run_disambiguation_audit(seed: int, out: Path, run_config: RunConfig, cfg_ob
     cut = max(1, int((1.0 - cfg_obj.validation_fraction) * len(order)))
     train_pairs = [pairs[i] for i in order[:cut]]
     val_pairs = [pairs[i] for i in order[cut:]]
+    recipe_order = list(recipes)
+    rng.shuffle(recipe_order)
+    n_val_recipes = max(1, int(round(float(cfg_obj.validation_fraction) * len(recipe_order))))
+    val_recipe_names = set(recipe_order[:n_val_recipes])
+    train_recipe_pairs = [p for p in pairs if p.recipe_name not in val_recipe_names]
+    val_recipe_pairs = [p for p in pairs if p.recipe_name in val_recipe_names]
     _record_common_artifacts(out, seed, cfg_obj, recipes, PREFERENCE_NAMES)
     per_threshold: Dict[str, Any] = {}
     for thr in cfg_obj.thresholds:
@@ -5115,9 +7096,37 @@ def run_disambiguation_audit(seed: int, out: Path, run_config: RunConfig, cfg_ob
             gate_rows.append({"threshold": thr, "pair": pair.label, "gt": gt_gate, "pred": pred_gate, "correct": gt_gate == pred_gate})
         matrix = confusion_labels([r["predicted"] for r in rows], [r["ground_truth"] for r in rows])
         report = classifier_report(matrix, MEMORY_STATE_LABELS)
-        per_threshold[str(thr)] = {**report, "confusion_matrix": matrix.tolist(), "rows": rows, "gate_decision": _gate_report(gate_rows)}
+        recipe_agent = make_agent("full", base_config(seed, run_config, jaccard_threshold=float(thr)))
+        recipe_map: Dict[str, str] = {}
+        for pair in train_recipe_pairs:
+            observe_episode(recipe_agent, pair, recipe_map)
+        recipe_train_labels = {p.label for p in train_recipe_pairs}
+        recipe_train_recipes = {p.recipe_name for p in train_recipe_pairs}
+        recipe_checkpoint = recipe_agent.snapshot()
+        recipe_rows = []
+        recipe_gate_rows = []
+        for pair in val_recipe_pairs:
+            gt = _memory_state_gt(recipe_agent, pair, recipe_map, recipe_train_labels, recipe_train_recipes)
+            pred = _classify_memory_state_pair(recipe_agent, pair, recipe_map, threshold=float(thr))
+            recipe_rows.append({"threshold": thr, "pair": pair.label, "recipe": pair.recipe_name, "preference": pair.preference_name, "gt": gt, "pred": pred, "correct": gt == pred})
+            recipe_agent.restore_from(recipe_checkpoint)
+            gate_row, _steps = assist_episode(recipe_agent, pair, dict(recipe_map), run_config=run_config, commit=True, event_tag={"threshold": thr, "condition": "recipe_holdout_gate_decision"})
+            pred_gate = "observe" if bool(gate_row.get("needs_observation")) else "assist"
+            recipe_gate_rows.append({"threshold": thr, "pair": pair.label, "gt": "observe", "pred": pred_gate, "correct": pred_gate == "observe"})
+        recipe_matrix = confusion_labels([r["pred"] for r in recipe_rows], [r["gt"] for r in recipe_rows])
+        per_threshold[str(thr)] = {
+            **report,
+            "confusion_matrix": matrix.tolist(),
+            "rows": rows,
+            "gate_decision": _gate_report(gate_rows),
+            "recipe_holdout_classification": {**classifier_report(recipe_matrix, MEMORY_STATE_LABELS), "confusion_matrix": recipe_matrix.tolist(), "rows": recipe_rows},
+            "recipe_holdout_gate_decision": _gate_report(recipe_gate_rows),
+            "gate_ground_truth_policy": "observe only for recipes absent from the training recipe map; pruned known recipes are treated as assistable reentry cases",
+        }
         _append_jsonl(out / "classification_rows.jsonl", rows)
         _append_jsonl(out / "gate_decision_rows.jsonl", gate_rows)
+        _append_jsonl(out / "recipe_holdout_classification_rows.jsonl", recipe_rows)
+        _append_jsonl(out / "recipe_holdout_gate_rows.jsonl", recipe_gate_rows)
     best_threshold = max(per_threshold, key=lambda t: per_threshold[t].get("macro_f1", 0.0)) if per_threshold else None
     boundary: Dict[str, Any] = {}
     preference_axis_degradation: Dict[str, Any] = {}
@@ -5135,8 +7144,20 @@ def run_disambiguation_audit(seed: int, out: Path, run_config: RunConfig, cfg_ob
             pred = _classify_memory_state_pair(base_agent, pair, name_to_rid, actions=dropped)
             rows.append({"drop_fraction": frac, "pair": pair.label, "gt": gt, "pred": pred, "correct": gt == pred})
         matrix = confusion_labels([r["pred"] for r in rows], [r["gt"] for r in rows])
-        boundary[str(frac)] = {**classifier_report(matrix, MEMORY_STATE_LABELS), "confusion_matrix": matrix.tolist(), "rows": rows, "interpretation": "online_prefix_robustness"}
+        boundary[str(frac)] = {**classifier_report(matrix, MEMORY_STATE_LABELS), "confusion_matrix": matrix.tolist(), "rows": rows, "interpretation": "missing_observation_robustness"}
         _append_jsonl(out / "boundary_rows.jsonl", rows)
+    prefix_robustness: Dict[str, Any] = {}
+    for frac in cfg_obj.prefix_fractions:
+        rows = []
+        for pair in val_pairs:
+            n_prefix = max(1, int(math.ceil(float(frac) * len(pair.actions))))
+            prefix_actions = list(pair.actions[:n_prefix])
+            gt = _memory_state_gt(base_agent, pair, name_to_rid, observed_labels, observed_recipes)
+            pred = _classify_memory_state_pair(base_agent, pair, name_to_rid, actions=prefix_actions)
+            rows.append({"prefix_fraction": frac, "pair": pair.label, "n_prefix": n_prefix, "gt": gt, "pred": pred, "correct": gt == pred})
+        matrix = confusion_labels([r["pred"] for r in rows], [r["gt"] for r in rows])
+        prefix_robustness[str(frac)] = {**classifier_report(matrix, MEMORY_STATE_LABELS), "confusion_matrix": matrix.tolist(), "rows": rows, "interpretation": "growing_prefix_online_robustness"}
+        _append_jsonl(out / "prefix_rows.jsonl", rows)
     identity_by_recipe = {
         recipe: materialize_pair(recipe, "identity", fn)
         for recipe, fn in select_recipe_builders(seed, cfg_obj.n_recipes)
@@ -5175,8 +7196,10 @@ def run_disambiguation_audit(seed: int, out: Path, run_config: RunConfig, cfg_ob
         "best_threshold": best_threshold,
         "boundary_degradation": boundary,
         "online_prefix_boundary_degradation": boundary,
+        "prefix_robustness": prefix_robustness,
         "preference_axis_degradation": preference_axis_degradation,
         "action_gate_curve": gate_curve,
+        "gate_ground_truth_policy": "pruned known recipes are treated as assistable; only recipe-heldout probes require observe",
     }
     _write_json(out / "metrics.json", metrics)
     _render_seed_publication_figures(out, "disambiguation_audit", metrics)
@@ -5199,8 +7222,15 @@ def run_materiality_preflight(seed: int, out: Path, run_config: RunConfig, cfg_o
         if pair is not None and not pair.base_pref and not pair.applied_axes:
             filtered_pairs.append(pair.label)
     for recipe, vals in sorted(by_recipe.items()):
-        effective = len({pair_by_label[v["label"]].actions for v in vals if v["label"] in pair_by_label})
+        recipe_pairs = [pair_by_label[v["label"]] for v in vals if v["label"] in pair_by_label]
+        effective = len({p.actions for p in recipe_pairs})
         kendalls = [float(v["kendall_from_identity"]) for v in vals if v["preference"] != "identity"]
+        pairwise_kendalls = [
+            kendall_tau_distance(a.actions, b.actions)
+            for i, a in enumerate(recipe_pairs)
+            for b in recipe_pairs[i + 1:]
+            if a.actions != b.actions
+        ]
         summary.append({
             "recipe": recipe,
             "n_preferences": len(vals),
@@ -5208,6 +7238,7 @@ def run_materiality_preflight(seed: int, out: Path, run_config: RunConfig, cfg_o
             "duplicate_count": sum(1 for v in vals if v["is_duplicate"]),
             "min_kendall_from_identity": min(kendalls) if kendalls else 0.0,
             "mean_kendall_from_identity": _mean(kendalls),
+            "min_pairwise_kendall_per_recipe": min(pairwise_kendalls) if pairwise_kendalls else 0.0,
             "passes_min_effective": effective >= int(cfg_obj.min_effective_preferences),
         })
     pass_preflight = all(r["passes_min_effective"] for r in summary)
@@ -5232,7 +7263,7 @@ def run_materiality_preflight(seed: int, out: Path, run_config: RunConfig, cfg_o
 
 
 def run_cl_regularizer_comparison(seed: int, out: Path, run_config: RunConfig, cfg_obj: ComputeTradeoffConfig) -> Dict[str, Any]:
-    cl_run = replace(run_config, baselines=("full", "adaptive", "l2_anchor", "ewc", "online_ewc", "experience_replay_bc", "no_replay"))
+    cl_run = replace(run_config, baselines=("full", "adaptive", "fixed_decay", "no_decay", "latest_only", "l2_anchor", "ewc", "online_ewc", "experience_replay_bc", "no_replay"))
     return run_deployment_stream(seed, out, cl_run, DeploymentStreamConfig(n_recipes=cfg_obj.n_recipes, n_phase_b_events=cfg_obj.n_events))
 
 
@@ -5368,6 +7399,12 @@ def aggregate_run(run_dir: str | Path) -> Dict[str, Any]:
         ],
     }
     _write_json_file(aggregate_root / "run.json", run_summary)
+    try:
+        run_summary["artifact_guides"] = generate_artifact_guides(root)
+        _write_json_file(aggregate_root / "run.json", run_summary)
+    except Exception as exc:
+        run_summary["artifact_guide_error"] = str(exc)
+        _write_json_file(aggregate_root / "run.json", run_summary)
     return run_summary
 
 
@@ -5381,11 +7418,22 @@ def render_figures(run_dir: str | Path) -> Dict[str, Any]:
             continue
         experiment = str(result.get("metadata", {}).get("experiment") or result_path.parents[1].name)
         if experiment in set(CANONICAL_SCENARIOS) | set(APPENDIX_EXPERIMENTS):
-            _render_seed_publication_figures(result_path.parent, experiment, result.get("metrics", {}) or {})
+            seed_raw = (result.get("metadata", {}) or {}).get("seed")
+            try:
+                seed = int(seed_raw if seed_raw is not None else result_path.parent.name.rsplit("_", 1)[-1])
+            except Exception:
+                seed = 0
+            previous_active = _ACTIVE_RESULT
+            collector = _SeedResultCollector(experiment, seed, result_path.parent, result.get("config", {}) or {})
+            _set_active_result(collector)
+            try:
+                _render_seed_publication_figures(result_path.parent, experiment, result.get("metrics", {}) or {})
+            finally:
+                _set_active_result(previous_active)
             existing = result.get("figures", {}) or {}
             refreshed: Dict[str, Any] = {}
             for path in sorted(result_path.parent.glob("*.png")):
-                row = dict(existing.get(path.name, {}) or {})
+                row = dict(collector.figures.get(path.name) or existing.get(path.name, {}) or {})
                 row["path"] = path.name
                 row["bytes"] = int(path.stat().st_size)
                 refreshed[path.name] = row
@@ -5417,6 +7465,140 @@ def _eta_text(start_s: float, completed: int, total: int) -> str:
     remaining = max(0, total - completed)
     eta = elapsed * remaining / max(1, completed)
     return f"elapsed={elapsed:.1f}s ETA={eta:.1f}s"
+
+
+def _format_seconds(seconds: Optional[float]) -> str:
+    if seconds is None or not isinstance(seconds, (int, float)) or not math.isfinite(float(seconds)):
+        return "unknown"
+    total = max(0, int(round(float(seconds))))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def _median(values: Sequence[float]) -> Optional[float]:
+    vals = sorted(float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(float(v)))
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return vals[mid]
+    return 0.5 * (vals[mid - 1] + vals[mid])
+
+
+def _parallel_batch_duration(wall_times: Sequence[float], workers: int) -> float:
+    """Estimate elapsed wall time for seed jobs packed onto `workers` slots."""
+    slots = [0.0] * max(1, int(workers))
+    for wall_s in sorted((float(v) for v in wall_times if isinstance(v, (int, float)) and math.isfinite(float(v))), reverse=True):
+        idx = min(range(len(slots)), key=lambda i: slots[i])
+        slots[idx] += max(0.0, wall_s)
+    return float(max(slots) if slots else 0.0)
+
+
+_STATUS_STATE_RE = re.compile(r'"state"\s*:\s*"([^"]+)"')
+_STATUS_WALL_RE = re.compile(r'"wall_s"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
+
+
+def _read_result_status_fast(result_path: Path) -> Dict[str, Any]:
+    try:
+        path = Path(result_path)
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            head = handle.read(8192)
+            try:
+                handle.seek(max(0, path.stat().st_size - 8192))
+                head += handle.read(8192)
+            except OSError:
+                pass
+    except Exception:
+        return {}
+    state = _STATUS_STATE_RE.search(head)
+    wall_s = _STATUS_WALL_RE.search(head)
+    if not state or not wall_s:
+        return {}
+    return {"state": state.group(1), "wall_s": float(wall_s.group(1))}
+
+
+def _historical_experiment_duration_estimates(output_root: str | Path, experiments: Sequence[str], workers: int, n_seeds: Optional[int] = None) -> Dict[str, float]:
+    """Median per-experiment batch duration from prior result.json files.
+
+    The suite runs experiments sequentially, but seed jobs inside one experiment
+    usually run in parallel. Historical ETA therefore uses the packed seed-batch
+    duration for each experiment rather than treating every seed as serial work.
+    """
+    root = Path(output_root)
+    wanted = set(str(e) for e in experiments)
+    samples: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
+    if not root.exists():
+        return {}
+    candidate_roots = [p for p in root.iterdir() if p.is_dir()]
+    if any((root / exp).is_dir() for exp in wanted):
+        candidate_roots.append(root)
+    for run_root in candidate_roots:
+        for exp in wanted:
+            exp_dir = run_root / exp
+            if not exp_dir.is_dir():
+                continue
+            seed_walls: List[float] = []
+            for result_path in exp_dir.glob("seed_*/result.json"):
+                status = _read_result_status_fast(result_path)
+                if status.get("state") != "completed":
+                    continue
+                wall_s = status.get("wall_s")
+                if isinstance(wall_s, (int, float)) and math.isfinite(float(wall_s)):
+                    seed_walls.append(float(wall_s))
+            if seed_walls:
+                samples[exp].append((len(seed_walls), _parallel_batch_duration(seed_walls, workers)))
+    estimates: Dict[str, float] = {}
+    for exp, rows in samples.items():
+        vals = [duration for count, duration in rows if n_seeds is None or int(count) == int(n_seeds)]
+        if not vals:
+            vals = [duration for _count, duration in rows]
+        med = _median(vals[-5:])
+        if med is not None:
+            estimates[exp] = float(med)
+    return estimates
+
+
+def _suite_eta_status(
+    names: Sequence[str],
+    current_index: int,
+    suite_start_s: float,
+    experiment_start_s: float,
+    completed_experiment_wall_s: Mapping[str, float],
+    historical_estimates: Mapping[str, float],
+) -> str:
+    now = time.perf_counter()
+    elapsed = now - suite_start_s
+    current_name = str(names[current_index]) if 0 <= current_index < len(names) else ""
+    current_elapsed = now - experiment_start_s
+    current_est = historical_estimates.get(current_name)
+    current_remaining = max(0.0, float(current_est) - current_elapsed) if current_est is not None else 0.0
+    fallback_pool = list(historical_estimates.values()) or list(completed_experiment_wall_s.values())
+    fallback = _median(fallback_pool)
+    future_known = 0
+    future_missing = 0
+    future_remaining = 0.0
+    for future_name in names[current_index + 1:]:
+        est = historical_estimates.get(str(future_name))
+        if est is None:
+            future_missing += 1
+            if fallback is not None:
+                future_remaining += float(fallback)
+        else:
+            future_known += 1
+            future_remaining += float(est)
+    eta = current_remaining + future_remaining
+    detail = f"history={future_known}/{max(0, len(names) - current_index - 1)} future"
+    if future_missing and fallback is None:
+        detail += f", {future_missing} unknown"
+        return f"elapsed={_format_seconds(elapsed)} ETA=unknown ({detail})"
+    if future_missing:
+        detail += f", {future_missing} fallback"
+    return f"elapsed={_format_seconds(elapsed)} ETA={_format_seconds(eta)} ({detail})"
 
 
 def _mp_context() -> mp.context.BaseContext:
@@ -5568,10 +7750,16 @@ def run_suite(
     total_jobs = len(names) * len(run_config.seeds)
     done_jobs = 0
     suite_t0 = time.perf_counter()
-    for name in names:
+    historical_eta = _historical_experiment_duration_estimates(run_config.output_root, names, workers, len(run_config.seeds))
+    completed_experiment_wall_s: Dict[str, float] = {}
+    for exp_index, name in enumerate(names):
         exp_dir = _ensure(run_dir / name)
         cfg_obj = _experiment_config(suite_config, name)
-        print(f"[{name}] start: {len(run_config.seeds)} seeds, workers={workers}", flush=True)
+        exp_t0 = time.perf_counter()
+        estimated = historical_eta.get(str(name))
+        start_eta = _suite_eta_status(names, exp_index, suite_t0, exp_t0, completed_experiment_wall_s, historical_eta)
+        estimate_text = f", historical batch estimate={_format_seconds(estimated)}" if estimated is not None else ", historical batch estimate=unknown"
+        print(f"[{name}] start: {len(run_config.seeds)} seeds, workers={workers}{estimate_text}; {start_eta}", flush=True)
         seed_results: List[Dict[str, Any]] = []
         if workers <= 1 or len(run_config.seeds) <= 1:
             for seed in run_config.seeds:
@@ -5579,7 +7767,8 @@ def run_suite(
                 seed_results.append(r)
                 done_jobs += 1
                 state = "done" if r.get("ok") else "FAILED"
-                print(f"  [{name}] seed {seed} {state} in {r.get('wall_s', 0.0):.1f}s ({done_jobs}/{total_jobs}, {_eta_text(suite_t0, done_jobs, total_jobs)})", flush=True)
+                eta_status = _suite_eta_status(names, exp_index, suite_t0, exp_t0, completed_experiment_wall_s, historical_eta)
+                print(f"  [{name}] seed {seed} {state} in {_format_seconds(r.get('wall_s', 0.0))} ({done_jobs}/{total_jobs}, {eta_status})", flush=True)
         else:
             ctx = _mp_context()
             with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
@@ -5595,7 +7784,8 @@ def run_suite(
                     state = "done" if r.get("ok") else "FAILED"
                     if not r.get("ok"):
                         failures[f"{name}/seed_{seed}"] = str(r.get("error", "unknown error"))
-                    print(f"  [{name}] seed {seed} {state} in {r.get('wall_s', 0.0):.1f}s ({done_jobs}/{total_jobs}, {_eta_text(suite_t0, done_jobs, total_jobs)})", flush=True)
+                    eta_status = _suite_eta_status(names, exp_index, suite_t0, exp_t0, completed_experiment_wall_s, historical_eta)
+                    print(f"  [{name}] seed {seed} {state} in {_format_seconds(r.get('wall_s', 0.0))} ({done_jobs}/{total_jobs}, {eta_status})", flush=True)
         for r in seed_results:
             if not r.get("ok"):
                 failures[f"{name}/seed_{r.get('seed')}"] = str(r.get("error", "unknown error"))
@@ -5607,9 +7797,11 @@ def run_suite(
             partial.append(name)
         else:
             failures.setdefault(name, "all seeds failed")
+        completed_experiment_wall_s[name] = float(time.perf_counter() - exp_t0)
         manifest["status"] = {"state": "running", "completed": completed, "partial": partial, "failed": sorted(failures)}
         _write_json_file(run_dir / "run.json", manifest)
-        print(f"[{name}] {state}", flush=True)
+        done_eta = _suite_eta_status(names, exp_index + 1, suite_t0, time.perf_counter(), completed_experiment_wall_s, historical_eta)
+        print(f"[{name}] {state} in {_format_seconds(completed_experiment_wall_s[name])}; {done_eta}", flush=True)
     run_summary = aggregate_run(run_dir)
     result = ExperimentResult(str(run_dir), tuple(completed), failures).as_dict()
     result["partial_experiments"] = partial
@@ -5668,5 +7860,6 @@ __all__ = [
     "run_appendix",
     "render_figures",
     "aggregate_run",
+    "generate_artifact_guides",
     "main",
 ]

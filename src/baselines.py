@@ -15,6 +15,18 @@ from .posterior import PreferencePrototypeLearner, RecipePrototypeLearner
 State = Tuple[int, ...]
 
 
+def _symbolic_fit_stats(model_family: str, trajectories: Sequence[Trajectory], estimated_flops: float = 0.0) -> Dict[str, object]:
+    n_examples = sum(1 for traj in trajectories for _state, action in traj if action != "stop")
+    n_actions = len({action for traj in trajectories for _state, action in traj if action != "stop"})
+    return {
+        "model_family": model_family,
+        "estimated_flops": float(estimated_flops),
+        "n_demonstrations": float(len(trajectories)),
+        "n_examples": float(n_examples),
+        "n_actions": float(n_actions),
+    }
+
+
 # Behavior-cloning support used by BC, EWC, and replay baselines.
 def _softmax(logits: np.ndarray) -> np.ndarray:
     if logits.size == 0:    return logits.astype(np.float32)
@@ -41,6 +53,7 @@ class BehaviorCloningHead:
         self._ewc_theta_b: Optional[np.ndarray] = None
         self._ewc_fisher_w: Optional[np.ndarray] = None
         self._ewc_fisher_b: Optional[np.ndarray] = None
+        self.last_fit_stats: Dict[str, object] = {}
 
     def reset(self) -> None:
         self.weights = None
@@ -52,6 +65,7 @@ class BehaviorCloningHead:
         self._ewc_theta_b = None
         self._ewc_fisher_w = None
         self._ewc_fisher_b = None
+        self.last_fit_stats = {"model_family": "behavior_cloning", "estimated_flops": 0.0}
 
     def _history_dim(self) -> int:
         return max(8, int(self.cfg.bc_history_bins)) * max(1, int(self.cfg.bc_history_len)) + 1
@@ -171,11 +185,12 @@ class BehaviorCloningHead:
             model_b = np.zeros(len(action_to_idx), dtype=np.float32)
             epochs = int(self.cfg.bc_epochs_cold)
 
-        theta_w, theta_b, fisher_w, fisher_b = self._aligned_ewc(feature_dim, action_to_idx)
         total_weight = max(float(np.sum(sample_weights)), 1e-8)
         lr = float(self.cfg.bc_learning_rate)
         l2 = float(self.cfg.bc_l2)
         lam = float(self.cfg.ewc_lambda if self.use_ewc else 0.0)
+        theta_w, theta_b, fisher_w, fisher_b = self._aligned_ewc(feature_dim, action_to_idx)
+        ewc_active = bool(lam > 0.0 and theta_w is not None and theta_b is not None and fisher_w is not None and fisher_b is not None)
 
         for _ in range(max(1, epochs)):
             logits = xs @ model_w + model_b[None, :]
@@ -185,7 +200,7 @@ class BehaviorCloningHead:
             delta *= (sample_weights[:, None] / total_weight).astype(np.float32)
             grad_w = (xs.T @ delta).astype(np.float32) + l2 * model_w
             grad_b = np.sum(delta, axis=0).astype(np.float32)
-            if (lam > 0.0 and theta_w is not None and theta_b is not None and fisher_w is not None and fisher_b is not None):
+            if ewc_active:
                 grad_w += lam * fisher_w * (model_w - theta_w)
                 grad_b += lam * fisher_b * (model_b - theta_b)
             model_w -= lr * grad_w
@@ -199,6 +214,32 @@ class BehaviorCloningHead:
         self._ewc_theta_w = self.weights.copy()
         self._ewc_theta_b = self.bias.copy()
         self._ewc_fisher_w, self._ewc_fisher_b = self._compute_fisher(xs, ys, sample_weights, self.weights, self.bias)
+        n_examples = int(xs.shape[0])
+        n_actions = int(len(action_to_idx))
+        param_count = int(feature_dim * n_actions + n_actions)
+        # Dense softmax regression accounting from the actual fit: forward
+        # matmul, softmax/delta work, gradient matmul, parameter regularization,
+        # update, plus the Fisher pass computed after every fit.
+        forward = 2.0 * n_examples * feature_dim * n_actions
+        softmax_delta = 7.0 * n_examples * n_actions
+        grad = 2.0 * feature_dim * n_examples * n_actions + float(n_examples * n_actions)
+        regularize_update = 3.0 * param_count
+        ewc_penalty = 3.0 * param_count if ewc_active else 0.0
+        fisher = forward + softmax_delta + (2.0 * feature_dim * n_examples * n_actions) + (3.0 * param_count)
+        estimated_flops = float(max(1, epochs) * (forward + softmax_delta + grad + regularize_update + ewc_penalty) + fisher)
+        self.last_fit_stats = {
+            "model_family": "behavior_cloning",
+            "estimated_flops": estimated_flops,
+            "n_demonstrations": float(len(demonstrations)),
+            "n_examples": float(n_examples),
+            "n_actions": float(n_actions),
+            "feature_dim": float(feature_dim),
+            "state_feature_dim": float(self.state_feature_dim),
+            "history_dim": float(self._history_dim()),
+            "epochs": float(max(1, epochs)),
+            "warm_start": 1.0 if warm_start else 0.0,
+            "ewc_enabled": 1.0 if ewc_active else 0.0,
+        }
 
     def predict(self, state: State, prefix: Sequence[str]) -> Dict[str, float]:
         if self.weights is None or self.bias is None or not self.idx_to_action: return {}
@@ -434,13 +475,18 @@ class BehaviorCloningAgent(AdaptiveHRCAgent):
         self.bc.fit(trajectories, weights)
 
     def _estimate_retrain_flops(self, trajectories) -> float:
-        """Approximate BC fit cost for reporting; not used by the learner."""
+        """Approximate BC fit cost from the fit that actually just ran."""
+        stats = getattr(self.bc, "last_fit_stats", {}) or {}
+        estimate = stats.get("estimated_flops") if isinstance(stats, dict) else None
+        if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)):
+            return float(estimate)
+        # Fallback for legacy/unfit heads only. This path should not be used for
+        # current retrain events because BehaviorCloningHead.fit records epochs.
         n_examples = sum(1 for traj in trajectories for _state, action in traj if action != "stop")
         n_actions = max(1, len({action for traj in trajectories for _state, action in traj if action != "stop"}))
         state_dim = len(trajectories[0][0][0]) if trajectories and trajectories[0] else 1
         feature_dim = max(1, state_dim + self.bc._history_dim())
-        warm_start = self.bc.weights is not None and self.bc.bias is not None
-        epochs = int(self.cfg.bc_epochs_warm if warm_start else self.cfg.bc_epochs_cold)
+        epochs = int(self.cfg.bc_epochs_cold)
         return float(2 * n_examples * n_actions * feature_dim * max(1, epochs))
 
     def _prepare_retrain_fit(self) -> None:
@@ -604,6 +650,10 @@ class NearestNeighborAgent(AdaptiveHRCAgent):
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
 
+    def _fit_heads(self, trajectories, weights) -> None:
+        self._reset_heads()
+        self._custom_fit_stats = _symbolic_fit_stats("nearest_neighbor", trajectories, estimated_flops=0.0)
+
     def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
         prefix = list(prefix) if prefix is not None else list(self.current_prefix)
         prefix = self._coerce_prefix_tokens(prefix)
@@ -635,16 +685,23 @@ class BigramOnlyAgent(AdaptiveHRCAgent):
         # Replace the parent's IRL/Markov/Graph fits with a flat bigram pass.
         self._bigram = {}
         self._unigram = {}
+        scalar_updates = 0
         for traj in trajectories:
             seq = [a for _, a in traj if a != "stop"]
             for i, a in enumerate(seq):
                 self._unigram[a] = self._unigram.get(a, 0) + 1
+                scalar_updates += 1
                 if i == 0: continue
                 prev = seq[i - 1]
                 row = self._bigram.setdefault(prev, {})
                 row[a] = row.get(a, 0) + 1
+                scalar_updates += 1
         # Wipe the parent heads so any accidental call returns nothing.
         self._reset_heads()
+        self._custom_fit_stats = {
+            **_symbolic_fit_stats("bigram", trajectories, estimated_flops=0.0),
+            "scalar_counter_updates": float(scalar_updates),
+        }
 
     def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
         prefix = list(prefix) if prefix is not None else list(self.current_prefix)
@@ -689,6 +746,7 @@ class FrequencyConditionedBigramAgent(AdaptiveHRCAgent):
 
     def _fit_heads(self, trajectories, weights) -> None:
         self._reset_heads()
+        self._custom_fit_stats = _symbolic_fit_stats("frequency_conditioned_bigram", trajectories, estimated_flops=0.0)
 
     def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
         prefix = list(prefix) if prefix is not None else list(self.current_prefix)
@@ -737,6 +795,7 @@ class UniformValidActionAgent(AdaptiveHRCAgent):
     def _fit_heads(self, trajectories, weights) -> None:
         # Vocabulary is built lazily from active demo tokens at predict time.
         self._reset_heads()
+        self._custom_fit_stats = _symbolic_fit_stats("uniform_valid", trajectories, estimated_flops=0.0)
 
     def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
         vocab: set = set()
@@ -755,6 +814,10 @@ class OracleCeilingAgent(AdaptiveHRCAgent):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
         self._oracle_target: Optional[List[str]] = None
         self._oracle_step: int = 0
+
+    def _fit_heads(self, trajectories, weights) -> None:
+        self._reset_heads()
+        self._custom_fit_stats = _symbolic_fit_stats("oracle_ceiling", trajectories, estimated_flops=0.0)
 
     def set_oracle_target(self, actions: Sequence[str]) -> None:
         """Harness hook: tell the oracle which (recipe, pref) ordering is next."""
@@ -796,6 +859,10 @@ class MostFrequentNextAgent(AdaptiveHRCAgent):
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
+
+    def _fit_heads(self, trajectories, weights) -> None:
+        self._reset_heads()
+        self._custom_fit_stats = _symbolic_fit_stats("most_frequent", trajectories, estimated_flops=0.0)
 
     def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
         prefix = list(prefix) if prefix is not None else list(self.current_prefix)

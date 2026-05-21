@@ -233,7 +233,7 @@ def _aligned_next_index(prefix: Sequence[str], ordering: Sequence[str]) -> int:
     last_matched_j = -1
     while i > 0 and j > 0:
         if prefix[i - 1] == ordering[j - 1]:
-            last_matched_j = j - 1
+            last_matched_j = max(last_matched_j, j - 1)
             i -= 1
             j -= 1
         elif dp[i - 1][j] >= dp[i][j - 1]:  i -= 1
@@ -412,6 +412,8 @@ class DecayManager:
                 per_recipe_maxes.sort()
                 mid = len(per_recipe_maxes) // 2
                 horizon = max(horizon, per_recipe_maxes[mid])
+        elif self._reuse_gap_window:
+            horizon = max(horizon, max(self._reuse_gap_window))
         self.base_rate = 1.0 / float(horizon)
 
     def _recompute_effective(self, step: int) -> None:
@@ -422,6 +424,8 @@ class DecayManager:
         if step != getattr(self, "_last_count_append_step", -1):
             self._active_count_window.append(active_count)
             self._last_count_append_step = step
+        elif self._active_count_window:
+            self._active_count_window[-1] = max(int(self._active_count_window[-1]), active_count)
         d_recent_max = max(max(self._active_count_window), d_active) if self._active_count_window else d_active
         exponent = float(self.cfg.size_rescale_exponent)
 
