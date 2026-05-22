@@ -76,10 +76,9 @@ APPENDIX_BASELINES: Tuple[str, ...] = (
 FACTOR_BASELINES: Tuple[str, ...] = (
     "full",
     "experience_replay_bc",
-    "irl_ngram_graph_only",
+    "irl_ngram_only",
     "no_preference_prototype",
     "no_recipe_prototype",
-    "no_state_graph",
     "no_posterior",
     "no_weighted_rehearsal",
     "latest_only",
@@ -107,10 +106,9 @@ _BASELINE_COLORS: Dict[str, str] = {
     "uniform_weight": "#6b7280",
     "no_preference_prototype": "#b45309",
     "no_recipe_prototype": "#7c2d12",
-    "no_state_graph": "#4b5563",
     "no_posterior": "#111827",
     "no_weighted_rehearsal": "#ea580c",
-    "irl_ngram_graph_only": "#2563eb",
+    "irl_ngram_only": "#2563eb",
     "oracle_preference_label": "#16a34a",
     "oracle_recipe_and_preference_label": "#15803d",
     "oracle_ceiling": "#000000",
@@ -125,6 +123,7 @@ _BASELINE_DISPLAY_NAMES: Dict[str, str] = {
     "experience_replay_bc": "Experience replay BC",
     "bigram": "Bigram",
     "frequency_conditioned_bigram": "Weighted bigram",
+    "irl_ngram_only": "IRL+n-gram only",
     "oracle_ceiling": "Oracle ceiling",
     "oracle_preference_label": "Oracle preference",
     "oracle_recipe_and_preference_label": "Oracle recipe+preference",
@@ -142,6 +141,7 @@ _BASELINE_GROUPS: Dict[str, str] = {
     "frequency_conditioned_bigram": "Weak baselines / ablations",
     "latest_only": "Weak baselines / ablations",
     "no_decay": "Memory ablations",
+    "irl_ngram_only": "Weak baselines / ablations",
     "no_preference_prototype": "Weak baselines / ablations",
     "no_recipe_prototype": "Weak baselines / ablations",
     "oracle_ceiling": "Oracle",
@@ -2835,7 +2835,7 @@ def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: M
         if cycle_series:
             _plot_lines(out / "figures/S2_single_shot_sufficiency_curve.png", "S2 single-shot sufficiency curve", cycle_series, "diagonal cycles", "frozen diagonal top-1")
         comp_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        for baseline in ("full", "latest_only", "experience_replay_bc", "bigram", "no_preference_prototype", "no_state_graph"):
+        for baseline in ("full", "latest_only", "experience_replay_bc", "bigram", "no_preference_prototype"):
             comp = (metrics.get("per_baseline", {}).get(baseline, {}) or {}).get("novel_composition", {})
             if comp:
                 xs = sorted(int(k) for k in comp)
@@ -3401,7 +3401,7 @@ def _render_transfer_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dic
         means, ci = _aggregate_baseline_metric(seed_results, (metric,))
         _plot_bar_ci(aggregate_dir / f"{prefix}_{metric}.png", title, means, ci, ylabel=ylabel)
     comp_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-    for baseline in ("full", "latest_only", "experience_replay_bc", "bigram", "no_preference_prototype", "no_state_graph"):
+    for baseline in ("full", "latest_only", "experience_replay_bc", "bigram", "no_preference_prototype"):
         by_h: Dict[float, List[float]] = defaultdict(list)
         for result in _completed_seed_results(seed_results):
             comp = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "novel_composition"), {}) or {}
@@ -3891,14 +3891,12 @@ def make_agent(name: str, cfg: Config) -> AdaptiveHRCAgent:
         "no_weighted_rehearsal": "UniformWeight",
     }
     ablation_cfg: Optional[Config] = None
-    if key in ("irl_ngram_graph_only", "current_ensemble_only", "no_posterior"):
+    if key in ("irl_ngram_only", "current_ensemble_only", "no_posterior"):
         ablation_cfg = replace(cfg, ablation_disable_posterior=True)
     elif key in ("no_preference_prototype", "no_preference_head"):
         ablation_cfg = replace(cfg, ablation_disable_preference_head=True)
     elif key == "no_recipe_prototype":
         ablation_cfg = replace(cfg, ablation_disable_recipe_prototype=True)
-    elif key == "no_state_graph":
-        ablation_cfg = replace(cfg, ensemble_delta=0.0, conditioned_state_support_weight=0.0)
     elif key == "no_pruned_memory_prior":
         ablation_cfg = replace(cfg, ablation_disable_pruned_memory_prior=True)
     elif key == "oracle_preference_label":
@@ -5044,8 +5042,8 @@ def run_cross_recipe_preference_transfer(seed: int, out: Path, run_config: RunCo
     if "full" in matrix_rows:
         mat = [[matrix_rows["full"].get((recipe, pref), 0.0) for pref in prefs] for recipe in recipes]
         _plot_heatmap(out / "figures/full_transfer_heatmap.png", "full model off-diagonal live top-1", mat, prefs, recipes)
-    if "full" in per_baseline and "irl_ngram_graph_only" in per_baseline:
-        gain = float(per_baseline["full"]["live_top1"] - per_baseline["irl_ngram_graph_only"]["live_top1"])
+    if "full" in per_baseline and "irl_ngram_only" in per_baseline:
+        gain = float(per_baseline["full"]["live_top1"] - per_baseline["irl_ngram_only"]["live_top1"])
         metrics["full_minus_ensemble_live_top1"] = gain
         _write_json(out / "metrics.json", metrics)
     return metrics
@@ -5947,7 +5945,7 @@ def run_posterior_ablation_matrix(seed: int, out: Path, run_config: RunConfig, c
         n_preferences=cfg_obj.n_preferences,
         diagonal_cycles=cfg_obj.diagonal_cycles,
         offdiag_repeats=cfg_obj.repeats,
-        baselines=("full", "irl_ngram_graph_only", "no_posterior", "no_pruned_memory_prior", "oracle_preference_label"),
+        baselines=("full", "irl_ngram_only", "no_posterior", "no_pruned_memory_prior", "oracle_preference_label"),
     )
     return run_cross_recipe_transfer_suite(seed, out, run_config, ab_cfg)
 
@@ -5958,7 +5956,7 @@ def run_recipe_preference_factor_ablation(seed: int, out: Path, run_config: RunC
         n_preferences=cfg_obj.n_preferences,
         diagonal_cycles=cfg_obj.diagonal_cycles,
         offdiag_repeats=cfg_obj.repeats,
-        baselines=("full", "no_preference_prototype", "no_recipe_prototype", "no_state_graph", "no_weighted_rehearsal", "bigram"),
+        baselines=("full", "no_preference_prototype", "no_recipe_prototype", "no_weighted_rehearsal", "bigram"),
     )
     return run_cross_recipe_transfer_suite(seed, out, run_config, ab_cfg)
 

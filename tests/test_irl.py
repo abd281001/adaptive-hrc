@@ -7,7 +7,6 @@ from src.models import (
     Config,
     MaxEntIRL2,
     NGramMarkov,
-    StateTransitionGraph,
     build_demo_trajectory,
     create_feature_matrix_2_0,
     create_state_action_mappings,
@@ -58,28 +57,16 @@ class LearningHeadTests(unittest.TestCase):
         dist = head.predict(demos[0][2][0], ["a", "b"])
         self.assertEqual(top_k(dist, k=1)[0], "c")
 
-    def test_state_transition_graph_uses_previous_action_fallback(self):
-        demos = [
-            build_demo_trajectory(["a", "x"]),
-            build_demo_trajectory(["b", "y"]),
-        ]
-        head = StateTransitionGraph(prob_floor=1e-6)
-        head.fit(demos, weights=[1.0, 1.0])
-        dist = head.predict(demos[0][1][0], ["a"])
-        self.assertEqual(top_k(dist, k=1)[0], "x")
-
     def test_ensemble_predict_normalises_and_top_k_orders_descending(self):
         cfg = Config(
             verbose=False,
             ensemble_alpha=0.5,
             ensemble_beta=0.3,
-            ensemble_delta=0.1,
             prob_floor=1e-6,
         )
         dist = ensemble_predict(
             {"a": 0.9, "b": 0.1},
             {"a": 0.8, "b": 0.2},
-            {"a": 0.6, "b": 0.4},
             cfg=cfg,
         )
         self.assertAlmostEqual(sum(dist.values()), 1.0, places=6)
@@ -106,9 +93,9 @@ class LearningHeadTests(unittest.TestCase):
 
 
 class WeightedLossContractTests(unittest.TestCase):
-    """The IRL head must respond to absolute weight magnitudes; the n-gram and
-    graph heads must be invariant to a uniform multiplicative scaling of weights
-    (per-context normalisation cancels constants)."""
+    """The IRL head must respond to absolute weight magnitudes; the n-gram head
+    must be invariant to a uniform multiplicative scaling of weights
+    because per-context normalisation cancels constants."""
 
     def _two_demos(self):
         return [
@@ -148,27 +135,6 @@ class WeightedLossContractTests(unittest.TestCase):
         head = NGramMarkov(order=1, prob_floor=1e-6)
         head.fit(demos, weights=[1.0, 4.0])
         dist = head.predict((1,), ["ctx"])
-        self.assertGreater(dist["high"], dist["low"])
-        self.assertEqual(top_k(dist, 1)[0], "high")
-
-    def test_graph_invariant_to_uniform_weight_scaling(self):
-        demos = self._two_demos()
-        g1 = StateTransitionGraph(prob_floor=1e-6); g1.fit(demos, weights=[1.0, 1.0])
-        g2 = StateTransitionGraph(prob_floor=1e-6); g2.fit(demos, weights=[0.4, 0.4])
-        d1 = g1.predict(demos[0][1][0], ["transfer (pot, from=storage, to=cooking_station)"])
-        d2 = g2.predict(demos[0][1][0], ["transfer (pot, from=storage, to=cooking_station)"])
-        self.assertEqual(set(d1), set(d2))
-        for k in d1:
-            self.assertAlmostEqual(d1[k], d2[k], places=9)
-
-    def test_graph_responds_to_relative_weights(self):
-        demos = [
-            [((0,), "ctx"), ((1,), "low"), ((2,), "stop")],
-            [((0,), "ctx"), ((1,), "high"), ((3,), "stop")],
-        ]
-        graph = StateTransitionGraph(prob_floor=1e-6)
-        graph.fit(demos, weights=[1.0, 4.0])
-        dist = graph.predict((1,), ["ctx"])
         self.assertGreater(dist["high"], dist["low"])
         self.assertEqual(top_k(dist, 1)[0], "high")
 

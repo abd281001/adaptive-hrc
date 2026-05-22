@@ -1,4 +1,4 @@
-"""State-feature learning models: MaxEnt IRL 2.0, n-gram Markov 2.0, state-transition graph 2.0, and log-linear fusion.
+"""State-feature learning models: MaxEnt IRL 2.0, n-gram Markov 2.0, and log-linear fusion.
 
 This module uses the following state-aware learning design:
     * fixed-dimensional engineered feature matrix from symbolic states      * discounted feature expectations               * demo-augmented MDP with virtual deviate action -> null state
@@ -95,11 +95,9 @@ class Config:
     # ensemble
     ensemble_alpha: float = 0.42
     ensemble_beta:  float = 0.24
-    ensemble_delta: float = 0.18
     markov_order:   int   = 3
     prob_floor:     float = 1e-6
     recipe_score_prefix_weight: float = 0.75
-    recipe_score_graph_weight:  float = 0.25
     transfer_pref_order_strength: float = 2.0
     transfer_recipe_mass_weight:  float = 0.5
     # MaxEnt IRL 2.0
@@ -142,7 +140,6 @@ class Config:
     posterior_tau_memory:       float = 1.0
     recipe_frontier_align_weight: float = 0.45  # Remaining mass goes to recipe-level candidates, enabling cross-recipe preference transfer beyond exact replay.
     recipe_frontier_transfer_align_weight: float = 0.0  # When a pref prototype has not seen this recipe, suppress exact-variant alignment so the recipe prototype exposes reorderable candidates.
-    conditioned_state_support_weight: float = 0.03  # Weak graph-feasibility prior inside the factorized frontier. Kept small so it cannot erase cross-recipe preference transfer.
     # Preference-conditioned next-action gate.
     posterior_action_confidence_threshold: float = 0.20
     posterior_action_topk:          int     = 16
@@ -860,89 +857,23 @@ class NGramMarkov(_StateNNMixin):
         return {a: u for a in self.vocab}
 
 
-class StateTransitionGraph(_StateNNMixin):
-    """State-conditioned transition graph with action-prefix fallback."""
-
-    def __init__(self, prob_floor = 1e-6):
-        self.prob_floor = prob_floor
-        self.state_edges: Dict[int, Counter] = defaultdict(Counter)
-        self.prev_edges: Dict[str, Counter] = defaultdict(Counter)
-        self.vocab: set = set()
-        self.state_to_idx: Dict[State, int] = {}
-        self.idx_to_state: Dict[int, State] = {}
-        self.feature_matrix: Optional[np.ndarray] = None
-        self.col_min: Optional[np.ndarray] = None
-        self.col_max: Optional[np.ndarray] = None
-        self.normalizer: Optional[WelfordFeatureNormalizer] = None
-
-    def fit(self, demonstrations: Sequence[Trajectory], weights: Optional[Sequence[float]] = None, state_to_idx: Optional[Dict[State, int]] = None, idx_to_state: Optional[Dict[int, State]] = None, feature_matrix: Optional[np.ndarray] = None, col_min: Optional[np.ndarray] = None, col_max: Optional[np.ndarray] = None, normalizer: Optional[WelfordFeatureNormalizer] = None) -> None:
-        self.state_edges = defaultdict(Counter)
-        self.prev_edges  = defaultdict(Counter)
-        self.vocab       = set()
-        self.state_to_idx = dict(state_to_idx or {})
-        self.idx_to_state = dict(idx_to_state or {})
-        self.feature_matrix = feature_matrix
-        self.col_min    = col_min
-        self.col_max    = col_max
-        self.normalizer = normalizer
-        if weights is None:     weights = [1.0] * len(demonstrations)
-
-        # Same weighted-rehearsal contract as NGramMarkov.fit.
-        for traj, w in zip(demonstrations, weights):
-            wf = float(w)
-            if wf <= 0:          continue
-            seq = [a for _, a in traj if a != "stop"]
-            for i, action in enumerate(seq):
-                self.vocab.add(action)
-                state = traj[i][0]
-                s_idx = self.state_to_idx.get(state)
-                if s_idx is not None:   self.state_edges[s_idx][action] += wf
-                if i > 0:               self.prev_edges[seq[i - 1]][action] += wf
-
-    def predict(self, state: State, prefix: Sequence[str]) -> Dict[str, float]:
-        if not self.vocab:              return {}
-        state_dist: Dict[str, float] = {}
-        s_idx = self._nearest_state_idx(tuple(state))
-        if s_idx is not None and self.state_edges.get(s_idx):
-            c = self.state_edges[s_idx]
-            z = float(sum(c.values()))
-            state_dist = {a: c[a] / max(z, 1e-9) for a in c}
-
-        prev_dist: Dict[str, float] = {}
-        if prefix:
-            c = self.prev_edges.get(prefix[-1])
-            if c:
-                z = float(sum(c.values()))
-                prev_dist = {a: c[a] / max(z, 1e-9) for a in c}
-
-        if state_dist and prev_dist:
-            vocab = set(state_dist) | set(prev_dist)
-            mix = {a: 0.7 * state_dist.get(a, 0.0) + 0.3 * prev_dist.get(a, 0.0) for a in vocab}
-            return _normalise_dist(mix, self.prob_floor)
-        if state_dist:  return _normalise_dist(state_dist, self.prob_floor)
-        if prev_dist:   return _normalise_dist(prev_dist, self.prob_floor)
-        u = 1.0 / len(self.vocab)
-        return {a: u for a in self.vocab}
-
-
-def ensemble_predict(p_irl: Dict[str, float], p_markov: Dict[str, float], p_graph: Optional[Dict[str, float]] = None, cfg: Config = DEFAULT_CONFIG) -> Dict[str, float]:
-    """Fuse distributions as p ∝ p_irl^a · p_markov^b · p_graph^d. Fusion-time masking: setting any exponent (a/b/d or irl_weight) to 0 via Config collapses that head's contribution to p^0 = 1 without disturbing upstream training. This is how ablation variants remove a head at fusion time only."""
-    vocab = set(p_irl) | set(p_markov) | (set(p_graph) if p_graph else set())
+def ensemble_predict(p_irl: Dict[str, float], p_markov: Dict[str, float], cfg: Config = DEFAULT_CONFIG) -> Dict[str, float]:
+    """Fuse the MaxEnt IRL and state-aware n-gram heads as p ∝ p_irl^a · p_markov^b."""
+    vocab = set(p_irl) | set(p_markov)
     if not vocab: return {}
     floor = cfg.prob_floor
     # Importance weighting + normalization
-    a, b, d = cfg.ensemble_alpha * cfg.irl_weight, cfg.ensemble_beta, cfg.ensemble_delta
-    factor = 1/(a+b+d)
-    a, b, d = a*factor, b*factor, d*factor
-    # a = cfg.ensemble_alpha * cfg.irl_weight
-    # b = cfg.ensemble_beta
-    # d = cfg.ensemble_delta
+    a, b = cfg.ensemble_alpha * cfg.irl_weight, cfg.ensemble_beta
+    total = a + b
+    if total <= 0.0:
+        a = b = 0.5
+    else:
+        a, b = a / total, b / total
     out: Dict[str, float] = {}
     for act in vocab:
         pi = max(p_irl.get(act, floor), floor) if p_irl else 1.0
         pm = max(p_markov.get(act, floor), floor) if p_markov else 1.0
-        pg = max(p_graph.get(act, floor), floor) if p_graph else 1.0
-        out[act] = (pi ** a) * (pm ** b) * (pg ** d)
+        out[act] = (pi ** a) * (pm ** b)
     s = sum(out.values())
     if s <= 0:
         u = 1.0 / len(vocab)

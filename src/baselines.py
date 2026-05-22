@@ -416,7 +416,7 @@ class FixedDecayAgent(AdaptiveHRCAgent):
 
 
 class NoDecayAgent(AdaptiveHRCAgent):
-    """Decay is fully disabled: weights never decrease, nothing is ever pruned. Keeps registration and retraining active so the IRL/Markov/graph heads still learn. This is the complement to FixedDecayAgent for ablations where we want to see what happens with infinite perfect memory."""
+    """Decay is fully disabled: weights never decrease, nothing is ever pruned. Keeps registration and retraining active so the IRL and Markov heads still learn. This is the complement to FixedDecayAgent for ablations where we want to see what happens with infinite perfect memory."""
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
@@ -457,7 +457,6 @@ class L2AnchorAgent(AdaptiveHRCAgent):
         ewc_fisher = (np.ones_like(self._prev_theta) if self._prev_theta is not None else None)
         self.irl.fit(trajectories, weights, ewc_theta_star=ewc_theta_star, ewc_fisher=ewc_fisher)
         self.markov.fit(trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
-        self.graph.fit(trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
         # Snapshot the new theta for next anchor.
         self._prev_theta = None if self.irl.theta is None else self.irl.theta.copy()
 
@@ -562,7 +561,6 @@ class EWCAgent(AdaptiveHRCAgent):
     def _fit_heads(self, trajectories, weights) -> None:
         self.irl.fit(trajectories, weights, ewc_theta_star=self._ewc_theta_star, ewc_fisher=self._ewc_fisher)
         self.markov.fit(trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
-        self.graph.fit(trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
         # Snapshot AFTER the new fit so subsequent retrains anchor toward this task's optimum.
         if self.irl.theta is not None:
             self._ewc_theta_star = self.irl.theta.copy()
@@ -674,7 +672,7 @@ class NearestNeighborAgent(AdaptiveHRCAgent):
 
 class BigramOnlyAgent(AdaptiveHRCAgent):
     """True bigram floor: a fresh `Counter[(prev_token, next_token)] -> Categorical`.
-    Does NOT inherit the parent's state-conditional N-gram head. Predict reads from this agent's own bigram counter, populated on each retrain from the active set with unit counts. The predict path completely ignores IRL, graph, and posterior signals; the baseline answers "what does a vanilla last-token Markov chain give?"."""
+    Does NOT inherit the parent's state-conditional N-gram head. Predict reads from this agent's own bigram counter, populated on each retrain from the active set with unit counts. The predict path completely ignores IRL and posterior signals; the baseline answers "what does a vanilla last-token Markov chain give?"."""
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
@@ -682,7 +680,7 @@ class BigramOnlyAgent(AdaptiveHRCAgent):
         self._unigram: Dict[str, int] = {}
 
     def _fit_heads(self, trajectories, weights) -> None:
-        # Replace the parent's IRL/Markov/Graph fits with a flat bigram pass.
+        # Replace the parent's IRL/Markov fits with a flat bigram pass.
         self._bigram = {}
         self._unigram = {}
         scalar_updates = 0

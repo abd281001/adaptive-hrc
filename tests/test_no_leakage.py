@@ -189,7 +189,7 @@ class SingleIdentityHeadTests(unittest.TestCase):
         """The scalar `_score_recipes` path must not exist."""
         agent = AdaptiveHRCAgent(cfg=Config())
         self.assertFalse(hasattr(agent, "_score_recipes"), "_score_recipes must be removed (Phase 1.4)")
-        self.assertFalse(hasattr(agent, "_graph_frontier_score"), "_graph_frontier_score must be removed (Phase 1.4)")
+        self.assertFalse(hasattr(agent, "_legacy_frontier_score"), "legacy frontier scoring must be removed (Phase 1.4)")
         self.assertFalse(hasattr(agent, "_task_signature_compatibility"), "_task_signature_compatibility must be removed (Phase 1.4)")
 
     def test_eval_uses_posterior_not_disambiguator_for_recipe_identity(self):

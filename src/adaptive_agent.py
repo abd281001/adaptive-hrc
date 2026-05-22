@@ -3,7 +3,7 @@
 Modes:
     MODE_OBSERVE:   The human is showing a brand-new recipe. The agent buffers actions silently until ``end_demo()`` is called, then classifies the buffer against existing variants. The disambiguator decides whether to create a new recipe or treat the demo as a new preference variant.
 
-    MODE_ONLINE:    Default mode. The agent predicts at every step. If the human action disagrees with top-1, the agent uses partial disambiguation to track the best-matching known variant for session-boundary commit. Prediction remains in the IRL, n-gram, and state-graph heads. On `end_demo()`, the matched variant is 
+    MODE_ONLINE:    Default mode. The agent predicts at every step. If the human action disagrees with top-1, the agent uses partial disambiguation to track the best-matching known variant for session-boundary commit. Prediction remains in the IRL and state-aware n-gram heads. On `end_demo()`, the matched variant is 
     promoted to latest and its rehearsal weight is reset to 1.0. Retraining runs synchronously after each end_demo() or online preference commit. Each ordinary retrain rebuilds predictors from the active replay set so pruned demos cannot survive through warm-started model parameters or feature-normalizer statistics.
 
 Terminology:         "Adaptive rehearsal weighting" operates on per-demo replay weights `w_i`. It does not decay the IRL parameters `theta`. Online fine-tuning is supervised next-action imitation over weighted active rehearsal; observed human actions are the ground-truth labels.
@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .environment import StateTracker
 from .memory import (Classification,    DecayManager,       Disambiguator,  Variant,        VariantKey,                 VariantMemory,      _aligned_next_index, variant_hash)
-from .models import (Config,            DEFAULT_CONFIG,     MaxEntIRL2,     NGramMarkov,    StateTransitionGraph,       ensemble_predict,   top_k)
+from .models import (Config,            DEFAULT_CONFIG,     MaxEntIRL2,     NGramMarkov,       ensemble_predict,   top_k)
 from .posterior import (OnlinePreferencePosterior,      PosteriorWeights,   PreferencePrototypeLearner, RecipePrototypeLearner)
 from .representations import (ActionObservation,    ActionVector,   PreferenceSignature,    ROLE_UNKNOWN_OR_NOOP,   TaskSignature,  apply_transition_vector,    observations_from_actions,  preference_signature_from_roles,    role_from_transition,   task_signature_from_tokens)
 
@@ -77,7 +77,6 @@ class AdaptiveHRCAgent:
 
         self.irl = MaxEntIRL2(cfg=cfg)
         self.markov = NGramMarkov(order=cfg.markov_order, prob_floor=cfg.prob_floor)
-        self.graph = StateTransitionGraph(prob_floor=cfg.prob_floor)
 
         self.mode = MODE_ONLINE
         self.pending_demo: List[str] = []
@@ -663,8 +662,7 @@ class AdaptiveHRCAgent:
             state = self._state_from_prefix(prefix_tokens)
             p_irl = self.irl.predict(state)
             p_mk = self.markov.predict(state, prefix_tokens)
-            p_graph = self.graph.predict(state, prefix_tokens)
-            ensemble_dist = ensemble_predict(p_irl, p_mk, p_graph, cfg=self.cfg)
+            ensemble_dist = ensemble_predict(p_irl, p_mk, cfg=self.cfg)
             ensemble_confidence, ensemble_entropy, ensemble_margin = self._distribution_stats(ensemble_dist)
 
             if getattr(self.cfg, "ablation_disable_posterior", False):
@@ -743,7 +741,7 @@ class AdaptiveHRCAgent:
         with self._profile("predict_with_oracle"):
             prefix_tokens = self._coerce_prefix_tokens(prefix) if prefix is not None else list(self.current_prefix)
             state = self._state_from_prefix(prefix_tokens)
-            ensemble_dist = ensemble_predict(self.irl.predict(state), self.markov.predict(state, prefix_tokens), self.graph.predict(state, prefix_tokens), cfg=self.cfg)
+            ensemble_dist = ensemble_predict(self.irl.predict(state), self.markov.predict(state, prefix_tokens), cfg=self.cfg)
             if oracle_recipe_id is None: return ensemble_dist
             # `_conditioned_distribution` already applies preference rescoring internally when a pref_id is supplied (see its docstring); the previous implementation re-applied the same rescore here, which squared the preference score and double-shrunk the distribution.
             conditioned = self._conditioned_distribution(prefix_tokens, oracle_recipe_id, oracle_pref_id)
@@ -802,18 +800,11 @@ class AdaptiveHRCAgent:
         roles_by_token = {token: self.token_to_role.get(token, ROLE_UNKNOWN_OR_NOOP) for token in frontier}
         candidate_roles = list(roles_by_token.values())
         recipe_proto = self.recipe_prototypes.get(top_rid)
-        graph_prior: Dict[str, float] = {}
-        state_support_weight = max(0.0, float(getattr(self.cfg, "conditioned_state_support_weight", 0.0)))
-        # Same-recipe graph support is useful as a weak feasibility cue, but
-        # for cross-recipe preference transfer it mostly encodes the old order.
-        if state_support_weight > 0.0 and not transfer_pair:
-            graph_prior = self.graph.predict(self._state_from_prefix(prefix_tokens), prefix_tokens)
         rescored: Dict[str, float] = {}
         for token, p in frontier.items():
             role = roles_by_token.get(token, ROLE_UNKNOWN_OR_NOOP)
             pref_score = self.preference_prototypes.score_action_role(role, prefix_roles, top_pid, candidate_roles)
             pref_score *= self._same_role_order_score(token, role, roles_by_token, recipe_proto)
-            if graph_prior: pref_score *= max(graph_prior.get(token, self.cfg.prob_floor), self.cfg.prob_floor) ** state_support_weight
             rescored[token] = p * pref_score
         z = sum(rescored.values())
         if z <= 0: return frontier
@@ -1168,12 +1159,10 @@ class AdaptiveHRCAgent:
     def _fit_heads(self, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]], weights: Sequence[float]) -> None:
         self.irl.fit(trajectories, weights)
         self.markov.fit(trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
-        self.graph.fit( trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
 
     def _reset_heads(self) -> None:
         self.irl = MaxEntIRL2(cfg=self.cfg)
         self.markov = NGramMarkov(order=self.cfg.markov_order, prob_floor=self.cfg.prob_floor)
-        self.graph = StateTransitionGraph(prob_floor=self.cfg.prob_floor)
 
     def _prepare_retrain_fit(self) -> None:
         """Drop fitted predictor state before fitting the current active set."""
@@ -1251,10 +1240,8 @@ class AdaptiveHRCAgent:
         trajectories, _ = self._build_trajectories(demos)
         fresh_irl = MaxEntIRL2(cfg=self.cfg)
         fresh_markov = NGramMarkov(order=self.cfg.markov_order, prob_floor=self.cfg.prob_floor)
-        fresh_graph = StateTransitionGraph(prob_floor=self.cfg.prob_floor)
         fresh_irl.fit(trajectories, weights)
         fresh_markov.fit(trajectories, weights, state_to_idx=fresh_irl.state_to_idx, idx_to_state=fresh_irl.idx_to_state, feature_matrix=fresh_irl.feature_matrix, col_min=fresh_irl.col_min, col_max=fresh_irl.col_max, normalizer=fresh_irl.normalizer)
-        fresh_graph.fit(trajectories, weights, state_to_idx=fresh_irl.state_to_idx, idx_to_state=fresh_irl.idx_to_state, feature_matrix=fresh_irl.feature_matrix, col_min=fresh_irl.col_min, col_max=fresh_irl.col_max, normalizer=fresh_irl.normalizer)
         prefixes: List[Tuple[str, ...]] = []
         seen: Set[Tuple[str, ...]] = set()
         for e in entries:
@@ -1272,8 +1259,8 @@ class AdaptiveHRCAgent:
         active_memory = {rid: {h: v for h, v in slot.items() if (rid, h) in active_keys} for rid, slot in self.memory.variants.items()}
         for pref in prefixes:
             state = self._state_from_prefix(pref)
-            cur = ensemble_predict(self.irl.predict(state), self.markov.predict(state, pref), self.graph.predict(state, pref), cfg=self.cfg)
-            ref = ensemble_predict(fresh_irl.predict(state), fresh_markov.predict(state, pref), fresh_graph.predict(state, pref), cfg=self.cfg)
+            cur = ensemble_predict(self.irl.predict(state), self.markov.predict(state, pref), cfg=self.cfg)
+            ref = ensemble_predict(fresh_irl.predict(state), fresh_markov.predict(state, pref), cfg=self.cfg)
             keys = set(cur.keys()) | set(ref.keys())
             head_diffs.append(sum(abs(float(cur.get(k, 0.0)) - float(ref.get(k, 0.0))) for k in keys))
             for rid in sorted({e.recipe_id for e in entries}):

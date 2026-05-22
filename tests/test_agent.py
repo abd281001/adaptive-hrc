@@ -117,7 +117,6 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         ))
         ag.irl.predict = lambda state: {"a": 0.90, "b": 0.10}
         ag.markov.predict = lambda state, prefix: {"a": 0.90, "b": 0.10}
-        ag.graph.predict = lambda state, prefix: {"a": 0.90, "b": 0.10}
 
         dist = ag.predict_next_tokens([])
         gate = ag.assist_gate_stats()
@@ -134,7 +133,6 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         ag._register_if_live("R1", [a, b], step=1)
         ag.irl.predict = lambda state: {a: 0.50, b: 0.50}
         ag.markov.predict = lambda state, prefix: {a: 0.50, b: 0.50}
-        ag.graph.predict = lambda state, prefix: {a: 0.50, b: 0.50}
         ag.posterior.reset()
 
         ag.predict_next_tokens([])
@@ -499,12 +497,13 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         self.assertEqual(set(ag.memory.variants), {rid})
         self.assertEqual({e.recipe_id for e in ag.decay.active_entries()}, {rid})
 
-    def test_recipe_scoring_uses_graph_consistency_weights(self):
+    def test_state_transition_graph_head_is_removed(self):
         ag = AdaptiveHRCAgent(Config(verbose=False))
         self.assertTrue(hasattr(ag.cfg, "recipe_score_prefix_weight"))
-        self.assertTrue(hasattr(ag.cfg, "recipe_score_graph_weight"))
         self.assertGreaterEqual(ag.cfg.recipe_score_prefix_weight, 0.0)
-        self.assertGreaterEqual(ag.cfg.recipe_score_graph_weight, 0.0)
+        self.assertFalse(hasattr(ag.cfg, "recipe_score_graph_weight"))
+        self.assertFalse(hasattr(ag.cfg, "conditioned_state_support_weight"))
+        self.assertFalse(hasattr(ag, "graph"))
 
     def _patch_posterior(self, agent, joint):
         """Make `posterior.update` a no-op and force the joint snapshot."""

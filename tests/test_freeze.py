@@ -122,7 +122,7 @@ class TestFreezePrimitive(unittest.TestCase):
         self.assertEqual(agent.session_counter, sc_before, "Mutation inside frozen window must be rolled back on exit")
 
     def test_frozen_rollback_covers_predictor_heads(self):
-        """Mutating IRL theta, n-gram counts, graph edges, or the codebook inside frozen()
+        """Mutating IRL theta, n-gram counts, or the codebook inside frozen()
         must be rolled back on exit. The structural-summary snapshot did not catch these;
         the deepcopy contract does."""
         import numpy as np
