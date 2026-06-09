@@ -1,7 +1,7 @@
 import unittest
 
 from src.adaptive_agent import AdaptiveHRCAgent, MODE_ONLINE
-from src.memory import _aligned_next_index
+from src.memory import Classification, _aligned_next_index, variant_hash
 from src.representations import observations_from_actions
 from src.environment import gen
 from src.models import Config, top_k
@@ -71,7 +71,7 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         obs = observations_from_actions(RECIPE_TOMATO_ONION_SOUP[:1])[0]
         seen_during_predict = []
 
-        def spy_predict(prefix=None, recipe_id=None, pref_hash=None):
+        def spy_predict(prefix=None):
             seen_during_predict.append(obs.action_vector in ag.action_vector_to_token)
             return {}
 
@@ -162,7 +162,7 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         c = ag._token_for_vector((1, 1))
         ag._register_if_live("R1", [a, b, c], step=1)
         locked = ag._register_if_live("R1", [a, c, b], step=2)
-        ag.locked_variant_key = ("R1", locked.pref_hash)
+        ag.locked_variant_key = ("R1", locked.variant_hash)
         ag.locked_pref_id = ag.variant_pref_ids.get(ag.locked_variant_key)
         pid = ag.locked_pref_id or ag.last_pref_id or "P1"
         ag.posterior._joint = {("R1", pid): 1.0}
@@ -270,7 +270,7 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         ids = {e.recipe_id for e in ag.decay.active_entries()}
         self.assertEqual(ids, {cls_a.recipe_id, cls_b.recipe_id})
 
-    def test_variant_lru_eviction_discards_decay_entry(self):
+    def test_variant_cap_does_not_delete_recognition_registry(self):
         ag = AdaptiveHRCAgent(Config(verbose=False, max_variants_per_recipe=2))
         ag._register_if_live("R1", ["a", "b"], step=1)
         ag._register_if_live("R1", ["b", "a"], step=2)
@@ -280,8 +280,125 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
             for rid, slot in ag.memory.variants.items()
             for h in slot
         }
-        self.assertLessEqual(len(memory_keys), 2)
+        self.assertEqual(len(memory_keys), 3)
         self.assertTrue(set(ag.decay.active).issubset(memory_keys))
+        self.assertIn(("R1", ag.memory.latest["R1"]), ag.decay.latest_keys)
+
+    def test_discard_latest_requires_explicit_escape_hatch(self):
+        ag = AdaptiveHRCAgent(Config(verbose=False))
+        v = ag._register_if_live("R1", ["a", "b"], step=1)
+        with self.assertRaises(RuntimeError):
+            ag.decay.discard("R1", v.variant_hash)
+        ag.decay.discard("R1", v.variant_hash, allow_latest=True)
+        self.assertNotIn(("R1", v.variant_hash), ag.decay.active)
+
+    def test_online_observation_gate_is_step_local(self):
+        ag = AdaptiveHRCAgent(Config(verbose=False, online_new_recipe_partial_threshold=0.50, online_unknown_confirm_streak=3))
+        ag._register_if_live("R1", ["a", "b", "c"], step=1)
+
+        ag._needs_observation = True
+        self.assertTrue(ag._prefix_needs_observation(["x", "y", "z"]))
+        self.assertTrue(ag._needs_observation)
+        self.assertEqual(ag._online_step_status, "unknown_candidate")
+
+        self.assertTrue(ag._prefix_needs_observation(["x", "y", "z", "q"]))
+        self.assertEqual(ag._online_step_status, "unknown_candidate")
+
+        self.assertTrue(ag._prefix_needs_observation(["x", "y", "z", "q", "r"]))
+        self.assertTrue(ag._needs_observation)
+        self.assertEqual(ag._online_step_status, "unknown_candidate")
+
+        self.assertFalse(ag._prefix_needs_observation(["a", "b", "c"]))
+        self.assertTrue(ag._needs_observation)
+        self.assertIn(ag._online_step_status, {"known_confident", "known_ambiguous"})
+
+    def test_uncertain_online_commit_is_tentative_then_promotes_on_late_alignment(self):
+        ag = AdaptiveHRCAgent(
+            Config(
+                verbose=False,
+                maxent_iters_cold=1,
+                maxent_iters_warm=1,
+                maxent_mc_rollouts=1,
+                online_commit_full_threshold=0.75,
+                online_commit_tentative_threshold=0.45,
+                provisional_confirm_top1=0.60,
+                provisional_min_recipe_jaccard=0.95,
+            )
+        )
+        ag._register_if_live("R1", ["a", "b", "c"], step=1)
+        seq = ["a", "c", "b"]
+        h = variant_hash(seq)
+        commit_cls = Classification("preference_shift", "R1", None, 1.0, 0.0)
+
+        ag.current_prefix = list(seq)
+        ag.inferred_recipe = "R1"
+        ag._online_commit_confidence = lambda _rid, _prefix, _cls: (
+            0.50,
+            {
+                "recipe_jaccard": 1.0,
+                "late_window_prediction_agreement": 0.50,
+                "posterior_recipe_confidence": 0.50,
+            },
+        )
+        tentative = ag._end_online_session(commit_cls, apply_decay=False)
+
+        self.assertEqual(tentative.kind, "tentative_preference_shift")
+        self.assertNotIn(h, ag.memory.variants["R1"])
+        self.assertIn(("R1", h), ag.decay.active)
+        self.assertNotEqual(ag.memory.latest["R1"], h)
+
+        ag.current_prefix = list(seq)
+        ag.inferred_recipe = "R1"
+        ag._online_commit_confidence = lambda _rid, _prefix, _cls: (
+            0.50,
+            {
+                "recipe_jaccard": 1.0,
+                "late_window_prediction_agreement": 0.80,
+                "posterior_recipe_confidence": 0.50,
+            },
+        )
+        promoted = ag._end_online_session(commit_cls, apply_decay=False)
+
+        self.assertEqual(promoted.kind, "preference_shift")
+        self.assertIn(h, ag.memory.variants["R1"])
+        self.assertEqual(ag.memory.latest["R1"], h)
+        self.assertEqual(ag.decay.latest_by_recipe["R1"], h)
+        self.assertTrue(
+            any(
+                e.get("event") == "provisional_commit_promoted"
+                and "late_window_prediction_alignment" in e.get("promotion_reasons", [])
+                for e in ag.online_commit_events
+            )
+        )
+
+    def test_low_confidence_online_commit_does_not_modify_confirmed_memory(self):
+        ag = AdaptiveHRCAgent(
+            Config(
+                verbose=False,
+                maxent_iters_cold=1,
+                maxent_iters_warm=1,
+                maxent_mc_rollouts=1,
+                online_commit_tentative_threshold=0.45,
+            )
+        )
+        ag._register_if_live("R1", ["a", "b", "c"], step=1)
+        original_latest = ag.memory.latest["R1"]
+        seq = ["x", "y", "z"]
+        h = variant_hash(seq)
+        ag.current_prefix = list(seq)
+        ag.inferred_recipe = "R1"
+        ag._online_commit_confidence = lambda _rid, _prefix, _cls: (
+            0.20,
+            {"recipe_jaccard": 0.20, "late_window_prediction_agreement": 0.0, "posterior_recipe_confidence": 0.20},
+        )
+
+        cls = ag._end_online_session(Classification("preference_shift", "R1", None, 0.20, 1.0), apply_decay=False)
+
+        self.assertEqual(cls.kind, "needs_observation")
+        self.assertEqual(ag.memory.latest["R1"], original_latest)
+        self.assertNotIn(h, ag.memory.variants["R1"])
+        self.assertNotIn(("R1", h), ag.decay.active)
+        self.assertTrue(ag._needs_observation)
 
     def test_refresh_after_prune_clears_stale_predictors(self):
         ag = AdaptiveHRCAgent(
@@ -336,7 +453,7 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         base_observations = observations_from_actions(RECIPE_TOMATO_ONION_SOUP)
         ag.observe_observation(base_observations[0], ground_truth_recipe="tomato_onion_soup_v1")
         ag.observe_observation(base_observations[1], ground_truth_recipe="tomato_onion_soup_v1")
-        self.assertEqual(ag.memory.latest_variant(rid).pref_hash, latest_after_preference.pref_hash)
+        self.assertEqual(ag.memory.latest_variant(rid).variant_hash, latest_after_preference.variant_hash)
 
         for obs in base_observations[2:]:
             ag.observe_observation(obs, ground_truth_recipe="tomato_onion_soup_v1")
@@ -496,14 +613,6 @@ class AdaptiveHRCAgentTests(unittest.TestCase):
         self.assertEqual(len(ag.retrain_events), retrain_before)
         self.assertEqual(set(ag.memory.variants), {rid})
         self.assertEqual({e.recipe_id for e in ag.decay.active_entries()}, {rid})
-
-    def test_state_transition_graph_head_is_removed(self):
-        ag = AdaptiveHRCAgent(Config(verbose=False))
-        self.assertTrue(hasattr(ag.cfg, "recipe_score_prefix_weight"))
-        self.assertGreaterEqual(ag.cfg.recipe_score_prefix_weight, 0.0)
-        self.assertFalse(hasattr(ag.cfg, "recipe_score_graph_weight"))
-        self.assertFalse(hasattr(ag.cfg, "conditioned_state_support_weight"))
-        self.assertFalse(hasattr(ag, "graph"))
 
     def _patch_posterior(self, agent, joint):
         """Make `posterior.update` a no-op and force the joint snapshot."""

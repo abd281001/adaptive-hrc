@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
-from .environment import (_FEAT, CONTAINERS, COOKABLES, CUTTABLES, GRATABLE, INGREDIENTS, ITEMS, LOCATIONS, SEASONINGS, StateTracker)
+from .environment import (_FEAT, CONTAINERS, COOKABLES, CUTTABLES, GRATABLE, INGREDIENTS, ITEMS, LOCATIONS, SEASONINGS)
 
 State = Tuple[int, ...]
 Trajectory = List[Tuple[State, str]]
@@ -21,7 +21,9 @@ Trajectory = List[Tuple[State, str]]
 
 def _sample_categorical(probs: Sequence[float], rng: Optional[random.Random] = None) -> int:
     """Sample an index from a categorical distribution in Python space.
-    Pass ``rng`` (a ``random.Random`` instance, typically ``cfg.prng``) for seeded reproducibility. Falls back to the global ``random`` module only when no rng is supplied — that fallback is for legacy callers and should not be exercised inside the IRL fit loop.
+    Pass ``rng`` (a ``random.Random`` instance, typically ``cfg.prng``) for
+    seeded reproducibility. Falls back to the global ``random`` module only
+    when no rng is supplied; the IRL fit loop should pass the configured RNG.
     """
     if len(probs) == 0: raise ValueError("cannot sample from an empty probability vector")
 
@@ -87,19 +89,17 @@ class Config:
     protect_latest_preference:  bool  = True     # Experimental condition: protect the latest preference variant of each recipe from decay/pruning. This is enabled for the main adaptive agent only; baselines explicitly disable it.
     pref_transfer_alpha:        float = 0.6      # blend weight for preference signal in cross-recipe transfer
     posterior_switch_margin:     float = 0.30   # min log-ratio for recipe identity switch
-    posterior_switch_agreement:  int   = 2      # consecutive steps new argmax must win
+    posterior_switch_agreement:  int   = 3      # consecutive steps new argmax must win
+    posterior_switch_min_confidence: float = 0.55
+    posterior_switch_min_gap:        float = 0.05
     # disambiguator
     jaccard_threshold:          float = 0.95
-    ordering_tolerance:         float = 0.05
     ordering_unmatched_penalty: float = 0.5
     # ensemble
     ensemble_alpha: float = 0.42
     ensemble_beta:  float = 0.24
     markov_order:   int   = 3
     prob_floor:     float = 1e-6
-    recipe_score_prefix_weight: float = 0.75
-    transfer_pref_order_strength: float = 2.0
-    transfer_recipe_mass_weight:  float = 0.5
     # MaxEnt IRL 2.0
     maxent_gamma:           float = 0.9
     maxent_temperature:     float = 0.5
@@ -117,6 +117,7 @@ class Config:
     irl_weight: float   = 1.0
     # EWC (model Fisher-diagonal) regularisation weight
     ewc_lambda: float   = 0.4
+    ewc_fisher_clip: float = 100.0
     # Behavior-cloning baselines
     bc_learning_rate:   float = 0.1
     bc_l2:              float = 1e-4
@@ -124,20 +125,51 @@ class Config:
     bc_history_bins:    int   = 64
     bc_epochs_cold:     int   = 120
     bc_epochs_warm:     int   = 60
-    # Experience replay baseline (reservoir sampling with uniform weights). er_buffer_size is the reservoir capacity; er_batch_size is the number of replay trajectories drawn at each retrain. Defaults replay the full reservoir so settled evaluation is not dominated by vocabulary dropout.
+    # Experience replay baselines. er_buffer_size is the reservoir capacity;
+    # er_batch_size is the number of replay trajectories drawn at each retrain.
+    # Defaults replay the full reservoir so settled evaluation is not dominated
+    # by vocabulary dropout. Recency-prioritized ER uses the same capacity/head
+    # with a blended recency/uniform sampler.
     er_buffer_size: int = 256
     er_batch_size:  int = 256
+    er_recency_alpha: float = 1.0
+    er_uniform_mix: float = 0.05
     # narration
     verbose: bool = True
     # diagnostic profiling: when True, the agent and disambiguator accumulate per-event call counts + wall_s into self.profile / self.disambig.profile. Off by default; negligible overhead when off (one bool check per wrap).
     profile: bool = False
-    # Posterior log-linear factorization weights and temperatures. Defaults are sensible starting values; held-out grid fit should be the eventual calibration source.
-    posterior_lambda_recipe:    float = 1.0
-    posterior_lambda_pref:      float = 1.5
-    posterior_lambda_memory:    float = 0.5
-    posterior_tau_recipe:       float = 1.0
-    posterior_tau_pref:         float = 1.0
-    posterior_tau_memory:       float = 1.0
+    # Posterior expert-combination weights and temperatures. Each factor is
+    # normalized into an expert distribution before the alpha weights combine
+    # them, so alpha values are interpretable across differently-scaled factors.
+    posterior_alpha_recipe:      float = 1.0
+    posterior_alpha_pref:        float = 1.5
+    posterior_alpha_memory:      float = 0.5
+    posterior_temperature_recipe: float = 1.0
+    posterior_temperature_pref:   float = 1.0
+    posterior_temperature_memory: float = 1.0
+    posterior_global_temperature: float = 1.0
+    memory_prior_floor:          float = 1e-6
+    active_prior_floor:          float = 0.05
+    pruned_prior_initial:        float = 0.50
+    pruned_prior_half_life:      float = 10.0
+    absent_prior:                float = 0.10
+    recipe_match_token_weight:      float = 0.70
+    recipe_match_precedence_weight: float = 0.30
+    phase_score_retrieve_boost:      float = 5.0
+    phase_score_prep_boost:          float = 4.0
+    phase_score_early_add_suppress:  float = 0.18
+    phase_score_prep_done_boost:     float = 3.0
+    phase_score_early_cook_suppress: float = 0.20
+    phase_score_cleanup_early_supp:  float = 0.20
+    phase_score_cleanup_late_boost:  float = 2.0
+    phase_score_threshold:           float = 0.65
+    phase_score_cleanup_eager_threshold: float = 0.35
+    phase_score_position_base:       float = 0.85
+    phase_score_position_match_weight: float = 0.30
+    phase_score_container_base:      float = 0.65
+    phase_score_container_lead_weight: float = 0.70
+    phase_score_max_clamp:           float = 6.0
+    phase_score_strength:            float = 1.0
     recipe_frontier_align_weight: float = 0.45  # Remaining mass goes to recipe-level candidates, enabling cross-recipe preference transfer beyond exact replay.
     recipe_frontier_transfer_align_weight: float = 0.0  # When a pref prototype has not seen this recipe, suppress exact-variant alignment so the recipe prototype exposes reorderable candidates.
     # Preference-conditioned next-action gate.
@@ -161,6 +193,14 @@ class Config:
     posterior_action_entropy_threshold: float = 0.85
     online_new_recipe_min_prefix:   int     = 3
     online_new_recipe_partial_threshold: float = 0.30
+    min_classify_length: int = 6
+    online_unknown_confirm_streak: int = 3
+    online_commit_full_threshold: float = 0.75
+    online_commit_tentative_threshold: float = 0.45
+    provisional_commit_weight: float = 0.20
+    provisional_confirm_window: int = 5
+    provisional_confirm_top1: float = 0.60
+    provisional_min_recipe_jaccard: float = 0.95
     # Ablation switches. Each disables one component of the preference-conditioned pathway so the experiment matrix can attribute gains to specific components. All default to False (full system).
     ablation_disable_preference_head:       bool = False
     ablation_disable_recipe_prototype:      bool = False
@@ -177,29 +217,6 @@ class Config:
 
 
 DEFAULT_CONFIG = Config()
-
-
-def build_demo_trajectory(actions: Sequence[str], return_dropped = False):
-    """Build a state-action trajectory (+ terminal stop) from action strings.
-    If `return_dropped` is True, returns `(trajectory, dropped_count)` where `dropped_count` counts actions whose preconditions were not satisfied in the current symbolic state. These actions are kept in the trajectory (the state freezes) so the sequence order is preserved, but
-    reporting the count lets downstream consumers see how many actions were silently no-op'd under preference-modified orderings.
-    """
-    tracker = StateTracker()
-    tracker.reset()
-    traj: Trajectory = []
-    dropped = 0
-    for action in actions:
-        traj.append((tuple(tracker.get_state_vector().tolist()), action))
-        try:
-            tracker.apply_action(action)
-        except ValueError:
-            # Abstract test tokens preserve sequence order while leaving the symbolic state unchanged.
-            dropped += 1
-            continue
-
-    traj.append((tuple(tracker.get_state_vector().tolist()), "stop"))
-    if return_dropped: return traj, dropped
-    return traj
 
 
 def create_state_action_mappings(demonstrations: Sequence[Trajectory], unique_actions: Optional[Sequence[str]] = None):
@@ -760,6 +777,9 @@ class MaxEntIRL2:
                 fisher += wf * (phi * phi).astype(np.float32)
                 total += wf
         if total > 0.0:     fisher /= total
+        clip = float(getattr(self.cfg, "ewc_fisher_clip", 0.0))
+        if clip > 0.0:
+            fisher = np.clip(fisher, 0.0, clip).astype(np.float32)
         return fisher
 
 
@@ -858,17 +878,25 @@ class NGramMarkov(_StateNNMixin):
 
 
 def ensemble_predict(p_irl: Dict[str, float], p_markov: Dict[str, float], cfg: Config = DEFAULT_CONFIG) -> Dict[str, float]:
-    """Fuse the MaxEnt IRL and state-aware n-gram heads as p ∝ p_irl^a · p_markov^b."""
+    """Fuse the MaxEnt IRL and state-aware n-gram heads as p ∝ p_irl^a · p_markov^b.
+
+    ``a = cfg.ensemble_alpha * cfg.irl_weight`` and ``b = cfg.ensemble_beta`` are
+    used **without** normalising to a+b=1.  This preserves the absolute scale of
+    each exponent so that:
+      - higher |a|+|b| sharpens the combined distribution toward argmax;
+      - the ratio a/b sets the relative IRL vs. Markov influence;
+      - ``irl_weight`` is a genuine multiplicative scaling of the IRL contribution,
+        not a no-op masked by subsequent renormalisation.
+    The output distribution is normalised to sum to 1 via the final division by s.
+    """
     vocab = set(p_irl) | set(p_markov)
-    if not vocab: return {}
+    if not vocab:
+        return {}
     floor = cfg.prob_floor
-    # Importance weighting + normalization
-    a, b = cfg.ensemble_alpha * cfg.irl_weight, cfg.ensemble_beta
-    total = a + b
-    if total <= 0.0:
-        a = b = 0.5
-    else:
-        a, b = a / total, b / total
+    a = max(0.0, float(cfg.ensemble_alpha) * float(cfg.irl_weight))
+    b = max(0.0, float(cfg.ensemble_beta))
+    if a <= 0.0 and b <= 0.0:
+        a = b = 0.5  # degenerate config — fall back to equal weighting
     out: Dict[str, float] = {}
     for act in vocab:
         pi = max(p_irl.get(act, floor), floor) if p_irl else 1.0

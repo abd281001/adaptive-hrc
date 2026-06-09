@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from src.representations import roles_from_actions
 from src.environment import gen
@@ -129,6 +130,32 @@ class ClusteringTests(unittest.TestCase):
         self.assertAlmostEqual(proto.mass, 1.25)
         self.assertLess(proto.bigram_counts[("stage_serving_vessel", "serve")], 1.0)
         self.assertAlmostEqual(proto.bigram_counts[("stage_serving_vessel", "serve")], 0.25)
+
+    def test_phase_score_strength_zero_disables_phase_prior(self):
+        roles = ["retrieve_ingredient", "prepare_ingredient", "add_to_container",
+                 "cook_or_blend", "serve"]
+        default_learner = PreferencePrototypeLearner()
+        default_pid = default_learner.update_from_roles(roles, recipe_id="R1")
+        default_score = default_learner._phase_action_score(
+            "retrieve_ingredient",
+            [],
+            default_learner.prototypes[default_pid],
+            candidate_roles=roles,
+        )
+
+        disabled_learner = PreferencePrototypeLearner(
+            cfg=SimpleNamespace(phase_score_strength=0.0)
+        )
+        disabled_pid = disabled_learner.update_from_roles(roles, recipe_id="R1")
+        disabled_score = disabled_learner._phase_action_score(
+            "retrieve_ingredient",
+            [],
+            disabled_learner.prototypes[disabled_pid],
+            candidate_roles=roles,
+        )
+
+        self.assertGreater(default_score, disabled_score)
+        self.assertAlmostEqual(disabled_score, 1.0, places=6)
 
 
 class CrossRecipeTransferTests(unittest.TestCase):

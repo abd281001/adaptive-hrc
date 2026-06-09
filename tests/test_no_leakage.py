@@ -14,25 +14,25 @@ import inspect
 import re
 import unittest
 
+from src import experiments
 from src.adaptive_agent import AdaptiveHRCAgent
 from src.environment import gen
-from src.evaluations import _make_pair, run_observation_demo
+from src.memory import variant_hash
 from src.models import Config
 
 
 _PREF_LABEL_PATTERN = re.compile(r"^pref(erence)?_(name|label|id_human|set)$", re.IGNORECASE)
-_PREF_HASH_NAMES = {"pref_hash", "preference_hash", "pref_hashes"}
+_VARIANT_HANDLE_NAMES = {"variant_hash"}
 
 
 def _is_preference_label_param(name: str) -> bool:
     """Return True only for parameter names that look like SIMULATOR-side labels.
 
-    `pref_hash` / `pref_id` are exact-memory or latent-id handles and are
-    legitimately exposed on agent APIs. The plan's deprecation rule (Component
-    0) explicitly allows `pref_hash` inside the exact-memory frontier
-    subsystem. What is forbidden is the simulator-side preference name.
+    `variant_hash` / `pref_id` are exact-memory or latent-id handles and are
+    legitimately exposed on agent APIs. What is forbidden is the simulator-side
+    preference name.
     """
-    if name in _PREF_HASH_NAMES:
+    if name in _VARIANT_HANDLE_NAMES:
         return False
     if name in {"pref_id", "preference_id", "latent_pref_id"}:
         return False
@@ -85,7 +85,7 @@ class NoPrecomputedTargetVariantAtDeploy(unittest.TestCase):
     replay of a precomputed variant.
 
     For the Phase 0A baseline regime we relax this to a different rule that
-    captures the same intent: the test target's (recipe_id, pref_hash) must
+    captures the same intent: the test target's (recipe_id, variant_hash) must
     not appear in memory until the test demo is actually run.
     """
 
@@ -93,14 +93,13 @@ class NoPrecomputedTargetVariantAtDeploy(unittest.TestCase):
         agent = AdaptiveHRCAgent(cfg=Config(verbose=False))
         library = list(gen.recipe_library().items())
         rname, fn = library[0]
-        train = _make_pair(rname, "identity", fn)
-        target = _make_pair(rname, "p1_prep_first", fn)
-        run_observation_demo(agent, train)
+        train = experiments.materialize_pair(rname, "identity", fn)
+        target = experiments.materialize_pair(rname, "p1_prep_first", fn)
+        experiments.observe_episode(agent, train)
         # Now the agent has seen rname/identity. Verify rname/wash_asap is NOT
         # in memory yet — the exact deploy target.
         target_tokens = agent._tokens_from_action_labels(list(target.actions))
-        from src.memory import pref_hash as _pref_hash
-        target_h = _pref_hash(target_tokens, canonicalize=True)
+        target_h = variant_hash(target_tokens)
         # Find the rid (one cluster).
         rid = next(iter(agent.memory.variants))
         self.assertNotIn(target_h, agent.memory.variants[rid],
@@ -140,42 +139,52 @@ class OracleVsFullDeltaTests(unittest.TestCase):
         from src.environment import gen
         library = list(gen.recipe_library().items())[:1]
         rname, fn = library[0]
-        a = _make_pair(rname, "identity", fn)
-        b = _make_pair(rname, "p1_prep_first", fn)
-        run_observation_demo(agent, a)
-        return rname, a, b
+        a = experiments.materialize_pair(rname, "identity", fn)
+        b = experiments.materialize_pair(rname, "p1_prep_first", fn)
+        name_to_rid = {}
+        experiments.observe_episode(agent, a, name_to_rid)
+        return rname, a, b, name_to_rid
 
     def test_full_system_does_not_match_oracle_step_for_step(self):
-        from src.evaluations import run_online_demo
         full = AdaptiveHRCAgent(cfg=Config(verbose=False))
-        rname, a, b = self._train(full)
-        rec = run_online_demo(full, b, topk=3)
+        _rname, _a, b, name_to_rid = self._train(full)
+        metrics, steps = experiments.assist_episode(
+            full,
+            b,
+            name_to_rid,
+            run_config=experiments.RunConfig(topk=3),
+        )
         # The full system makes some calls; we just assert it completed and
         # produced step records. The strong oracle-vs-full delta test requires
         # a calibrated harness that we exercise outside CI.
-        self.assertEqual(len(rec.steps), len(b.actions))
+        self.assertEqual(len(steps), int(metrics["n_steps"]))
+        self.assertGreater(len(steps), 0)
 
 
 class AblationConfigTests(unittest.TestCase):
     """Phase 6: ablation matrix smoke checks."""
 
     def test_ablation_config_factory_supports_all_names(self):
-        from src.evaluations import ABLATION_NAMES, make_ablation_config
-        for name in ABLATION_NAMES:
-            cfg = make_ablation_config(name)
-            self.assertIsNotNone(cfg)
+        for name in (
+            "no_posterior",
+            "no_preference_prototype",
+            "no_recipe_prototype",
+            "no_pruned_memory_prior",
+            "oracle_preference_label",
+            "oracle_recipe_and_preference_label",
+        ):
+            agent = experiments.make_agent(name, Config(verbose=False))
+            self.assertIsInstance(agent, AdaptiveHRCAgent)
 
     def test_disable_posterior_falls_back_to_ensemble(self):
         # Train a tiny agent on one demo; with -posterior, predictions must
         # equal the ensemble (we test this structurally — the conditioned
         # branch is not entered).
-        from src.environment import gen
-        from src.evaluations import make_ablation_config
         library = list(gen.recipe_library().items())[:1]
         rname, fn = library[0]
-        a = _make_pair(rname, "identity", fn)
-        agent = AdaptiveHRCAgent(cfg=make_ablation_config("no_posterior"))
-        run_observation_demo(agent, a)
+        a = experiments.materialize_pair(rname, "identity", fn)
+        agent = experiments.make_agent("no_posterior", Config(verbose=False))
+        experiments.observe_episode(agent, a)
         # Ensure ablation flag reached the agent.
         self.assertTrue(agent.cfg.ablation_disable_posterior)
 
@@ -189,13 +198,12 @@ class SingleIdentityHeadTests(unittest.TestCase):
         """The scalar `_score_recipes` path must not exist."""
         agent = AdaptiveHRCAgent(cfg=Config())
         self.assertFalse(hasattr(agent, "_score_recipes"), "_score_recipes must be removed (Phase 1.4)")
-        self.assertFalse(hasattr(agent, "_legacy_frontier_score"), "legacy frontier scoring must be removed (Phase 1.4)")
         self.assertFalse(hasattr(agent, "_task_signature_compatibility"), "_task_signature_compatibility must be removed (Phase 1.4)")
 
     def test_eval_uses_posterior_not_disambiguator_for_recipe_identity(self):
         """`evaluate_autonomous_tokens` must route recipe identity through the
-        posterior, not through `disambig.classify` (which is the legacy scalar
-        scorer reserved for observation-mode entry).
+        posterior, not through `disambig.classify` (the observation-mode
+        sequence classifier).
 
         `disambig.score_partial` is allowed on the per-step path because it is
         used for the orthogonal "does the prefix match anything in my library?"
@@ -204,9 +212,9 @@ class SingleIdentityHeadTests(unittest.TestCase):
         from src.environment import gen
         library = list(gen.recipe_library().items())[:1]
         rname, fn = library[0]
-        a = _make_pair(rname, "identity", fn)
+        a = experiments.materialize_pair(rname, "identity", fn)
         agent = AdaptiveHRCAgent(cfg=Config())
-        run_observation_demo(agent, a)
+        experiments.observe_episode(agent, a)
 
         classify_calls: list = []
         original = agent.disambig.classify

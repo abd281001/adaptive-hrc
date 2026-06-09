@@ -13,15 +13,17 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
+import json
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .environment import StateTracker
-from .memory import (Classification,    DecayManager,       Disambiguator,  Variant,        VariantKey,                 VariantMemory,      _aligned_next_index, variant_hash)
+from .memory import (Classification,    DecayManager,       Disambiguator,  Variant,        VariantKey,                 VariantMemory,      _aligned_next_index, kendall_tau_distance, variant_hash)
 from .models import (Config,            DEFAULT_CONFIG,     MaxEntIRL2,     NGramMarkov,       ensemble_predict,   top_k)
-from .posterior import (OnlinePreferencePosterior,      PosteriorWeights,   PreferencePrototypeLearner, RecipePrototypeLearner)
+from .posterior import (MemoryPrior, OnlinePreferencePosterior,      PosteriorWeights,   PreferencePrototypeLearner, RecipePrototypeLearner)
 from .representations import (ActionObservation,    ActionVector,   PreferenceSignature,    ROLE_UNKNOWN_OR_NOOP,   TaskSignature,  apply_transition_vector,    observations_from_actions,  preference_signature_from_roles,    role_from_transition,   task_signature_from_tokens)
 
 MODE_OBSERVE = "observe"
@@ -41,7 +43,8 @@ class StepResult:
     correct: bool
     mode: str
     inferred_recipe: Optional[str]
-    inferred_pref: Optional[str]
+    inferred_variant_hash: Optional[str]
+    inferred_latent_pref_id: Optional[str] = None
     event: str = ""   # free-form tag for the narrator
 
 
@@ -53,18 +56,24 @@ class AdaptiveHRCAgent:
         self.decay = DecayManager(cfg)
         self.memory = VariantMemory(cfg)
         self.disambig = Disambiguator(cfg)
-        self.recipe_prototypes = RecipePrototypeLearner()
-        self.preference_prototypes = PreferencePrototypeLearner()
+        self.recipe_prototypes = RecipePrototypeLearner(cfg)
+        self.preference_prototypes = PreferencePrototypeLearner(cfg=cfg)
         self.task_signatures: Dict[str, TaskSignature] = {}
         self.preference_signatures: Dict[str, PreferenceSignature] = {}
         # Online posterior over (recipe_id, pref_id). Owned by the agent so the freeze snapshot can include it.
         posterior_weights = PosteriorWeights(
-            lambda_recipe=getattr(  cfg,    "posterior_lambda_recipe",  1.0),
-            lambda_pref=getattr(    cfg,    "posterior_lambda_pref",    1.0),
-            lambda_memory=getattr(  cfg,    "posterior_lambda_memory",  0.5),
-            tau_recipe=getattr(     cfg,    "posterior_tau_recipe",     1.0),
-            tau_pref=getattr(       cfg,    "posterior_tau_pref",       1.0),
-            tau_memory=getattr(     cfg,    "posterior_tau_memory",     1.0))
+            alpha_recipe=getattr(  cfg,    "posterior_alpha_recipe",  1.0),
+            alpha_pref=getattr(    cfg,    "posterior_alpha_pref",    1.5),
+            alpha_memory=getattr(  cfg,    "posterior_alpha_memory",  0.5),
+            temperature_recipe=getattr(     cfg,    "posterior_temperature_recipe",     1.0),
+            temperature_pref=getattr(       cfg,    "posterior_temperature_pref",       1.0),
+            temperature_memory=getattr(     cfg,    "posterior_temperature_memory",     1.0),
+            global_temperature=getattr(     cfg,    "posterior_global_temperature",     1.0),
+            memory_prior_floor=getattr(     cfg,    "memory_prior_floor",     1e-6),
+            active_prior_floor=getattr(     cfg,    "active_prior_floor",     0.05),
+            pruned_prior_initial=getattr(   cfg,    "pruned_prior_initial",   0.50),
+            pruned_prior_half_life=getattr( cfg,    "pruned_prior_half_life", 10.0),
+            absent_prior=getattr(           cfg,    "absent_prior",           0.10))
         self.posterior = OnlinePreferencePosterior(weights=posterior_weights)
         # token -> abstract role tag, populated as observations stream through observe_observation. This lets the agent build role sequences for preference prototypes without storing raw action labels there.
         self.token_to_role: Dict[str, str] = {}
@@ -74,6 +83,11 @@ class AdaptiveHRCAgent:
         self.variant_pref_ids: Dict[VariantKey, str] = {}
         self.locked_variant_key: Optional[VariantKey] = None
         self.locked_pref_id: Optional[str] = None
+        self.preference_id_registry: Dict[str, str] = {}
+        self.prototype_events: List[Dict[str, Any]] = []
+        self.online_commit_events: List[Dict[str, Any]] = []
+        self._active_pref_clusters: Dict[str, Set[VariantKey]] = {}
+        self._active_pref_cluster_roles: Dict[str, Dict[VariantKey, Tuple[str, ...]]] = {}
 
         self.irl = MaxEntIRL2(cfg=cfg)
         self.markov = NGramMarkov(order=cfg.markov_order, prob_floor=cfg.prob_floor)
@@ -83,8 +97,13 @@ class AdaptiveHRCAgent:
         # Online state
         self.current_prefix: List[str] = []
         self.inferred_recipe: Optional[str] = None
-        self.inferred_pref: Optional[str] = None
+        self.inferred_variant_hash: Optional[str] = None
+        self.inferred_latent_pref_id: Optional[str] = None
         self._needs_observation: bool = False
+        self._online_unknown_streak: int = 0
+        self._online_step_status: str = "known_confident"
+        self._online_policy_gate_history: List[Dict[str, Any]] = []
+        self.provisional_commits: Dict[VariantKey, Dict[str, Any]] = {}
         self._last_assist_gate: Dict[str, Any] = {
             "assist_used": False,
             "action_confidence": None,
@@ -120,7 +139,8 @@ class AdaptiveHRCAgent:
         # Metrics for the paper
         self.step_log: List[StepResult] = []
         self.accuracy_events: List[Tuple[int, str, bool]] = []  # (step,recipe,correct)
-        # Each entry: {"step": int, "dropped_actions": int, "active_demos": int} where dropped_actions is the total count of actions whose preconditions failed during trajectory construction across all demos fit in this retrain (see build_demo_trajectory).
+        # Each entry records retrain timing and the number of no-op action
+        # transitions detected while converting active demos into trajectories.
         self.retrain_events: List[Dict[str, Any]] = []
         self.retrain_fit_wall_times: List[float] = []
         self.retrain_total_wall_times: List[float] = []
@@ -185,25 +205,112 @@ class AdaptiveHRCAgent:
             self._freeze_snapshot = None
             self._frozen = False
 
+    def _frozen_structural_digest(self) -> Dict[str, Any]:
+        """Small diagnostic digest for state that must not change in frozen eval."""
+        active = tuple(sorted(
+            (
+                rid,
+                h,
+                tuple(e.ordering),
+                round(float(e.weight), 12),
+                int(e.added_step),
+                int(e.added_cycle),
+                int(e.last_seen_step),
+                None if e.prior_lifespan is None else int(e.prior_lifespan),
+            )
+            for (rid, h), e in self.decay.active.items()
+        ))
+        pruned = tuple(sorted(
+            (
+                rid,
+                h,
+                tuple(e.ordering),
+                int(e.added_step),
+                int(e.removed_step),
+                int(e.added_cycle),
+                int(e.removed_cycle),
+                int(e.last_seen_step),
+            )
+            for (rid, h), e in self.decay.pruned.items()
+        ))
+        variant_keys = tuple(sorted((rid, h) for rid, slot in self.memory.variants.items() for h in slot))
+        return {
+            "mode": self.mode,
+            "step_counter": int(self.step_counter),
+            "session_counter": int(self.session_counter),
+            "retrain_cycle": int(self.retrain_cycle),
+            "current_prefix": tuple(self.current_prefix),
+            "pending_demo": tuple(self.pending_demo),
+            "step_log_len": len(self.step_log),
+            "classification_events_len": len(self.classification_events),
+            "accuracy_events_len": len(self.accuracy_events),
+            "retrain_events_len": len(self.retrain_events),
+            "prototype_events_len": len(self.prototype_events),
+            "online_commit_events_len": len(self.online_commit_events),
+            "active": active,
+            "pruned": pruned,
+            "variant_keys": variant_keys,
+            "memory_latest": tuple(sorted(self.memory.latest.items())),
+            "latest_by_recipe": tuple(sorted(self.decay.latest_by_recipe.items())),
+            "latest_keys": tuple(sorted(self.decay.latest_keys)),
+            "last_fit_fingerprint": tuple(sorted(self._last_fit_fingerprint)) if self._last_fit_fingerprint is not None else None,
+        }
+
     @contextlib.contextmanager
     def frozen(self):
         self.set_frozen(True)
-        # Capture a lightweight structural digest for the mutation check.
-        _before_active = frozenset(self.decay.active.keys())
-        _before_variants = frozenset((rid, h) for rid, slot in self.memory.variants.items() for h in slot)
+        _before = self._frozen_structural_digest()
         try:
             yield self
         finally:
             # Capture BEFORE restore so mutated state is still visible.
-            _after_active = frozenset(self.decay.active.keys())
-            _after_variants = frozenset((rid, h) for rid, slot in self.memory.variants.items() for h in slot)
+            _after = self._frozen_structural_digest()
             self.set_frozen(False)   # restores snapshot
-            if __debug__:
-                assert _before_active == _after_active, (
-                    f"frozen() invariant violated: decay.active keys changed "
-                    f"(added={_after_active - _before_active}, "
-                    f"removed={_before_active - _after_active})")
-                assert _before_variants == _after_variants, ("frozen() invariant violated: memory.variants keys changed")
+            if _before != _after:
+                changed = sorted(k for k in _before if _before.get(k) != _after.get(k))
+                raise RuntimeError(f"frozen() invariant violated: structural state changed ({', '.join(changed)})")
+
+    # codebook serialisation
+    def save_codebook(self) -> Dict[str, Any]:
+        """Serialise the action codebook for checkpoint reproducibility.
+
+        The codebook maps anonymous token IDs (e.g. ``'act_0001'``) to the action
+        vectors seen during training.  Without it, per-action metrics saved to
+        ``result.json`` cannot be decoded back to symbolic kitchen actions after the
+        fact.  Include this alongside the agent state in any experiment checkpoint.
+
+        Returns a JSON-serialisable dict with keys:
+          ``token_to_vector``  – token_id -> list(action_vector)
+          ``vector_to_token``  – str(action_vector) -> token_id
+          ``n_tokens``         – total number of registered tokens
+        """
+        return {
+            "token_to_vector": {tok: list(vec) for tok, vec in self.token_to_action_vector.items()},
+            "vector_to_token": {str(list(vec)): tok for vec, tok in self.action_vector_to_token.items()},
+            "n_tokens": len(self.action_vector_to_token),
+        }
+
+    def load_codebook(self, codebook: Dict[str, Any]) -> None:
+        """Restore the action codebook from a previously saved dict.
+
+        Call **before** any ``observe_observation`` or ``step`` calls when loading
+        a checkpoint; otherwise the agent will allocate fresh token IDs that conflict
+        with those embedded in the saved memory/decay state.
+
+        Args:
+            codebook: A dict produced by a prior call to ``save_codebook()``.
+
+        Raises:
+            ValueError: If the codebook format is invalid.
+        """
+        if "token_to_vector" not in codebook:
+            raise ValueError("codebook must contain 'token_to_vector'; got: " + str(list(codebook)))
+        self.action_vector_to_token = {}
+        self.token_to_action_vector = {}
+        for tok, vec_list in codebook["token_to_vector"].items():
+            vec = tuple(vec_list)
+            self.token_to_action_vector[str(tok)] = vec
+            self.action_vector_to_token[vec] = str(tok)
 
     # mode control
     def start_demo(self) -> None:
@@ -211,7 +318,13 @@ class AdaptiveHRCAgent:
         if self._frozen: return
         self.mode = MODE_OBSERVE
         self.pending_demo = []
+        self.inferred_recipe = None
+        self.inferred_variant_hash = None
+        self.inferred_latent_pref_id = None
         self._needs_observation = False
+        self._online_unknown_streak = 0
+        self._online_step_status = "known_confident"
+        self._online_policy_gate_history = []
         self._clear_preference_lock()
         self.observation_mode_entries += 1
         self.narrate(f"[step {self.step_counter}] MODE -> OBSERVE (new-demo gate ON)")
@@ -229,8 +342,12 @@ class AdaptiveHRCAgent:
         if self.mode == MODE_ONLINE and not self.current_prefix:
             self.current_prefix = []
             self.inferred_recipe = None
-            self.inferred_pref = None
+            self.inferred_variant_hash = None
+            self.inferred_latent_pref_id = None
             self._needs_observation = False
+            self._online_unknown_streak = 0
+            self._online_step_status = "known_confident"
+            self._online_policy_gate_history = []
             self._clear_preference_lock()
             return Classification("known", None, None, 0.0, 0.0)
         if self.mode == MODE_OBSERVE:
@@ -239,9 +356,7 @@ class AdaptiveHRCAgent:
 
         commit_cls, reentry_from_pruned = self._classify_online_prefix(self.current_prefix)
         # Diagnostic: check if posterior's live inference agrees with commit-time Jaccard. Log the mismatch rate so it can be tracked in evaluation.
-        if (self.inferred_recipe is not None
-                and commit_cls.recipe_id is not None
-                and self.inferred_recipe != commit_cls.recipe_id):
+        if (self.inferred_recipe is not None and commit_cls.recipe_id is not None and self.inferred_recipe != commit_cls.recipe_id):
             self.narrate(f"[step {self.step_counter}] COMMIT MISMATCH: posterior tracked '{self.inferred_recipe}' but commit resolved to '{commit_cls.recipe_id}'")
             # Track as a metric for the paper.
             if not hasattr(self, "_commit_mismatches"): self._commit_mismatches: List[Tuple[int, str, str]] = []
@@ -251,8 +366,12 @@ class AdaptiveHRCAgent:
             self.classification_events.append((self.step_counter, cls))
             self.current_prefix = []
             self.inferred_recipe = None
-            self.inferred_pref = None
+            self.inferred_variant_hash = None
+            self.inferred_latent_pref_id = None
             self._needs_observation = True
+            self._online_unknown_streak = int(getattr(self.cfg, "online_unknown_confirm_streak", 3))
+            self._online_step_status = "unknown_confirmed"
+            self._online_policy_gate_history = []
             self._clear_preference_lock()
             self.narrate(f"[step {self.step_counter}] online sequence did not match known recipes; observation mode required")
             return cls
@@ -273,18 +392,57 @@ class AdaptiveHRCAgent:
 
     def _clear_preference_lock(self) -> None:
         if self._frozen: return
+        locked_key = self.locked_variant_key
         self.locked_variant_key = None
         self.locked_pref_id = None
+        if locked_key is not None and self.inferred_variant_hash == locked_key[1]: self.inferred_variant_hash = None
+
+    def _latest_active_variant_key(self) -> Optional[VariantKey]:
+        candidates: List[Tuple[int, str, str]] = []
+        for rid, variant_hash_ in self.memory.latest.items():
+            key = (rid, variant_hash_)
+            if key not in self.variant_pref_ids:    continue
+            variant = self.memory.variants.get(rid, {}).get(variant_hash_)
+            if variant is None:                     continue
+            candidates.append((int(variant.last_seen_step), rid, variant_hash_))
+        if not candidates:      return None
+        _step, rid, variant_hash_ = max(candidates, key=lambda item: (item[0], item[1], item[2]))
+        return (rid, variant_hash_)
+
+    def _remap_preference_ids_after_rebuild(self) -> None:
+        if self.locked_variant_key is not None:
+            remapped = self.variant_pref_ids.get(self.locked_variant_key)
+            if remapped is None:
+                self.prototype_events.append({"step": self.step_counter, "event": "stale_preference_lock_cleared", "locked_variant_key": list(self.locked_variant_key)})
+                self._clear_preference_lock()
+            else:
+                self.locked_pref_id = remapped
+        latest_key = self._latest_active_variant_key()
+        self.last_pref_id = self.variant_pref_ids.get(latest_key) if latest_key is not None else None
 
     def _register_if_live(self, rid: str, seq: List[str], step: int) -> Variant:
         """Register in memory + decay only when not frozen. Returns the Variant. Also folds the demo into the recipe and latent preference prototypes. Both are read-only structural summaries used by the posterior and the preference-conditioned policy; they are independent of the decay/replay path."""
         v = self.memory.register(rid, seq, step)
         if not self._frozen:
-            evicted = getattr(self.memory, "last_evicted_key", None)
-            if evicted is not None: self.decay.discard(*evicted)
-            self.decay.register(rid, v.pref_hash, tuple(seq), self.session_counter, self.retrain_cycle)
+            self.decay.register(rid, v.variant_hash, tuple(seq), self.session_counter, self.retrain_cycle)
             self._rebuild_active_prototypes(self.decay.active_entries())
+            self._assert_latest_pin_invariant(rid)
         return v
+
+    def _assert_latest_pin_invariant(self, rid: Optional[str] = None) -> None:
+        if self._frozen or not getattr(self.cfg, "protect_latest_preference", True): return
+        recipe_ids = [rid] if rid is not None else [r for r, slot in self.memory.variants.items() if slot]
+        for recipe_id in recipe_ids:
+            slot = self.memory.variants.get(recipe_id, {})
+            if not slot: continue
+            latest = self.memory.latest.get(recipe_id)
+            key = (recipe_id, latest) if latest is not None else None
+            if latest is None or latest not in slot:                    raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: memory.latest missing from registry")
+            if self.decay.latest_by_recipe.get(recipe_id) != latest:    raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: decay latest does not match memory latest")
+            if key not in self.decay.latest_keys:       raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is not pinned")
+            if key not in self.decay.active:            raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is not active")
+            if key in self.decay.pruned:                raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is pruned")
+            if self.decay.active[key].weight != 1.0:    raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest weight is not 1.0")
 
     def _sync_preference_signature(self, pref_id: str, fallback_roles: Optional[Sequence[str]] = None) -> None:
         """Expose an aggregate PreferenceSignature for the latent prototype."""
@@ -297,11 +455,12 @@ class AdaptiveHRCAgent:
 
     def _rebuild_active_prototypes(self, entries: Optional[Sequence[Any]] = None) -> None:
         """Rebuild all learner-facing prototypes from active weighted memory."""
-        active_entries = list(self.decay.active_entries() if entries is None else entries)
-        recipe_learner = RecipePrototypeLearner()
-        pref_learner = PreferencePrototypeLearner()
+        active_entries = sorted(list(self.decay.active_entries() if entries is None else entries), key=lambda e: (e.recipe_id, e.variant_hash))
+        recipe_learner = RecipePrototypeLearner(self.cfg)
+        pref_learner = PreferencePrototypeLearner(cfg=self.cfg)
         tokens_by_recipe: Dict[str, List[str]] = {}
         variant_pref_ids: Dict[VariantKey, str] = {}
+        members_by_pid: Dict[str, List[Tuple[VariantKey, Tuple[str, ...]]]] = {}
         last_pid: Optional[str] = None
         for entry in active_entries:
             seq = list(entry.ordering)
@@ -311,37 +470,185 @@ class AdaptiveHRCAgent:
             if not getattr(self.cfg, "ablation_disable_preference_head", False):
                 last_pid = pref_learner.update_from_roles(self._roles_for_tokens(seq), recipe_id=entry.recipe_id, weight=w)
                 variant_pref_ids[entry.key] = last_pid
+                members_by_pid.setdefault(last_pid, []).append((entry.key, tuple(self._roles_for_tokens(seq))))
+        if members_by_pid:
+            id_map, semantic_key_by_pid = self._stable_preference_id_map(members_by_pid)
+            stable_members: Dict[str, Set[VariantKey]] = {}
+            stable_roles: Dict[str, Dict[VariantKey, Tuple[str, ...]]] = {}
+            for old_pid, members in members_by_pid.items():
+                stable_pid = id_map.get(old_pid, old_pid)
+                for key, roles in members:
+                    stable_members.setdefault(stable_pid, set()).add(key)
+                    stable_roles.setdefault(stable_pid, {})[key] = tuple(roles)
+            continuity_map = self._prototype_continuity_id_map(stable_members, stable_roles)
+            if continuity_map:
+                for old_pid, stable_pid in list(id_map.items()):
+                    final_pid = continuity_map.get(stable_pid, stable_pid)
+                    id_map[old_pid] = final_pid
+                    if final_pid != stable_pid and old_pid in semantic_key_by_pid: self.preference_id_registry[semantic_key_by_pid[old_pid]] = final_pid
+            remapped = PreferencePrototypeLearner(cfg=self.cfg)
+            remapped.match_threshold = pref_learner.match_threshold
+            remapped.novelty_max_similarity = pref_learner.novelty_max_similarity
+            remapped.novelty_entropy_min = pref_learner.novelty_entropy_min
+            remapped.tau_pref_cluster = pref_learner.tau_pref_cluster
+            remapped.axis_split_threshold = pref_learner.axis_split_threshold
+            remapped.prototypes = {}
+            for old_pid, proto in pref_learner.prototypes.items():
+                new_pid = id_map.get(old_pid, old_pid)
+                proto.pref_id = new_pid
+                remapped.prototypes[new_pid] = proto
+            pref_learner = remapped
+            variant_pref_ids = {key: id_map.get(pid, pid) for key, pid in variant_pref_ids.items()}
+            last_pid = id_map.get(last_pid, last_pid) if last_pid is not None else None
         self.recipe_prototypes = recipe_learner
         self.preference_prototypes = pref_learner
         self.variant_pref_ids = variant_pref_ids
-        if self.locked_variant_key is not None and self.locked_variant_key not in self.variant_pref_ids:
-            self._clear_preference_lock()
+        old_ids = set(getattr(self, "preference_signatures", {}).keys())
+        new_ids = set(self.preference_prototypes.all_pref_ids())
+        new_clusters: Dict[str, Set[VariantKey]] = {}
+        new_cluster_roles: Dict[str, Dict[VariantKey, Tuple[str, ...]]] = {}
+        for key, pid in self.variant_pref_ids.items():
+            new_clusters.setdefault(pid, set()).add(key)
+        for _raw_pid, members in members_by_pid.items():
+            final_pid = id_map.get(_raw_pid, _raw_pid) if members_by_pid else _raw_pid
+            for key, roles in members: new_cluster_roles.setdefault(final_pid, {})[key] = tuple(roles)
+        stability = self._prototype_stability_report(self._active_pref_clusters, new_clusters)
+        if old_ids or new_ids: self.prototype_events.append({"step": self.step_counter, "event": "prototype_rebuild", "prototype_new": sorted(new_ids - old_ids), "prototype_retired": sorted(old_ids - new_ids), "prototype_persisted": sorted(old_ids & new_ids), **stability})
+        self._active_pref_clusters = {pid: set(keys) for pid, keys in new_clusters.items()}
+        self._active_pref_cluster_roles = {pid: dict(rows) for pid, rows in new_cluster_roles.items()}
         self.task_signatures = {rid: task_signature_from_tokens(tokens, self.token_to_action_vector, self.token_to_role) for rid, tokens in tokens_by_recipe.items()}
         self.preference_signatures = {}
         for pid in self.preference_prototypes.all_pref_ids(): self._sync_preference_signature(pid)
-        self.last_pref_id = last_pid
+        self._remap_preference_ids_after_rebuild()
+        if not self.current_prefix: self.posterior.reset()
 
-    def _rebuild_active_recipe_prototypes(self, entries: Optional[Sequence[Any]] = None) -> None:
-        """Backwards-compatible wrapper for callers/tests."""
-        self._rebuild_active_prototypes(entries)
+    def _stable_preference_id_map(self, members_by_pid: Dict[str, List[Tuple[VariantKey, Tuple[str, ...]]]]) -> Tuple[Dict[str, str], Dict[str, str]]:
+        id_map: Dict[str, str] = {}
+        semantic_key_by_pid: Dict[str, str] = {}
+        used: Set[str] = set()
+        for pid, members in sorted(members_by_pid.items(), key=lambda kv: kv[0]):
+            medoid_key, medoid_roles = min(members, key=lambda item: (sum(self._role_sequence_distance(item[1], other_roles) for _other_key, other_roles in members), item[0][0], item[0][1]))
+            semantic_key = json.dumps({"roles": list(medoid_roles)}, sort_keys=True)
+            semantic_key_by_pid[pid] = semantic_key
+            payload = semantic_key.encode("utf-8")
+            base = f"P_{hashlib.sha256(payload).hexdigest()[:8]}"
+            stable = self.preference_id_registry.get(semantic_key, base)
+            if stable in used:
+                semantic_key = json.dumps({"roles": list(medoid_roles), "medoid": list(medoid_key)}, sort_keys=True)
+                semantic_key_by_pid[pid] = semantic_key
+                payload = semantic_key.encode("utf-8")
+                stable = self.preference_id_registry.get(semantic_key, f"P_{hashlib.sha256(payload).hexdigest()[:8]}")
+            suffix = 2
+            while stable in used:
+                suffix_payload = json.dumps({"roles": list(medoid_roles), "tie": list(medoid_key), "suffix": suffix}, sort_keys=True).encode("utf-8")
+                stable = f"P_{hashlib.sha256(suffix_payload).hexdigest()[:8]}"
+                suffix += 1
+            self.preference_id_registry[semantic_key] = stable
+            used.add(stable)
+            id_map[pid] = stable
+        return id_map, semantic_key_by_pid
+
+    def _prototype_continuity_id_map(self, new_clusters: Dict[str, Set[VariantKey]], new_roles: Dict[str, Dict[VariantKey, Tuple[str, ...]]]) -> Dict[str, str]:
+        """Reuse a prior stable ID when the active-member cluster clearly persists."""
+        old_clusters = getattr(self, "_active_pref_clusters", {}) or {}
+        if not old_clusters or not new_clusters: return {}
+        intersection = set().union(*old_clusters.values(), set()) & set().union(*new_clusters.values(), set())
+        candidates: List[Tuple[float, float, str, str]] = []
+        for new_pid, new_keys in new_clusters.items():
+            for old_pid, old_keys in old_clusters.items():
+                overlap = len((new_keys & old_keys) & intersection)
+                overlap_score = 0.0
+                if overlap > 0:
+                    denom = max(1, min(len(new_keys & intersection), len(old_keys & intersection)))
+                    overlap_score = overlap / denom
+                role_score = self._cluster_role_similarity(new_roles.get(new_pid, {}), self._active_pref_cluster_roles.get(old_pid, {}))
+                score = max(overlap_score, role_score)
+                if overlap_score >= 0.50 or role_score >= 0.95: candidates.append((score, overlap_score, new_pid, old_pid))
+        if not candidates: return {}
+        candidates.sort(key=lambda row: (-row[0], -row[1], row[2], row[3]))
+        used_new: Set[str] = set()
+        used_old: Set[str] = set()
+        occupied_ids = set(new_clusters)
+        out: Dict[str, str] = {}
+        for _score, _overlap, new_pid, old_pid in candidates:
+            if new_pid in used_new or old_pid in used_old:      continue
+            if new_pid != old_pid and old_pid in occupied_ids:  continue
+            out[new_pid] = old_pid
+            used_new.add(new_pid)
+            used_old.add(old_pid)
+        return {new_pid: old_pid for new_pid, old_pid in out.items() if new_pid != old_pid}
+
+    def _cluster_role_similarity(self, a: Dict[VariantKey, Tuple[str, ...]], b: Dict[VariantKey, Tuple[str, ...]]) -> float:
+        if not a or not b: return 0.0
+        shared = sorted(set(a) & set(b))
+        if shared:
+            vals = [1.0 - self._role_sequence_distance(a[key], b[key]) for key in shared]
+            return max(0.0, min(1.0, sum(vals) / max(1, len(vals))))
+        best = 0.0
+        for roles_a in a.values():
+            for roles_b in b.values(): best = max(best, 1.0 - self._role_sequence_distance(roles_a, roles_b))
+        return max(0.0, min(1.0, best))
+
+    def _prototype_stability_report(self, old_clusters: Dict[str, Set[VariantKey]], new_clusters: Dict[str, Set[VariantKey]]) -> Dict[str, Any]:
+        if not old_clusters and not new_clusters: return {"prototype_split": {}, "prototype_merge": {}, "prototype_split_count": 0, "prototype_merge_count": 0, "prototype_stability_ari": None, "prototype_active_intersection": 0}
+        old_assign = {key: pid for pid, keys in old_clusters.items() for key in keys}
+        new_assign = {key: pid for pid, keys in new_clusters.items() for key in keys}
+        intersection = sorted(set(old_assign) & set(new_assign))
+        old_to_new: Dict[str, Set[str]] = {}
+        new_to_old: Dict[str, Set[str]] = {}
+        for key in intersection:
+            old_pid = old_assign[key]
+            new_pid = new_assign[key]
+            old_to_new.setdefault(old_pid, set()).add(new_pid)
+            new_to_old.setdefault(new_pid, set()).add(old_pid)
+        splits = {pid: sorted(vals) for pid, vals in old_to_new.items() if len(vals) > 1}
+        merges = {pid: sorted(vals) for pid, vals in new_to_old.items() if len(vals) > 1}
+        ari = self._adjusted_rand_index([old_assign[key] for key in intersection], [new_assign[key] for key in intersection]) if intersection else None
+        return {"prototype_split": splits, "prototype_merge": merges, "prototype_split_count": len(splits), "prototype_merge_count": len(merges), "prototype_stability_ari": ari, "prototype_active_intersection": len(intersection)}
+
+    @staticmethod
+    def _adjusted_rand_index(labels_a: Sequence[str], labels_b: Sequence[str]) -> Optional[float]:
+        n = len(labels_a)
+        if n != len(labels_b):  raise ValueError("ARI inputs must have equal length")
+        if n < 2:               return None
+
+        def comb2(x: int) -> float: return float(x * (x - 1) / 2)
+
+        counts_a: Dict[str, int] = {}
+        counts_b: Dict[str, int] = {}
+        table: Dict[Tuple[str, str], int] = {}
+        for a, b in zip(labels_a, labels_b):
+            counts_a[a] = counts_a.get(a, 0) + 1
+            counts_b[b] = counts_b.get(b, 0) + 1
+            table[(a, b)] = table.get((a, b), 0) + 1
+        sum_table = sum(comb2(v) for v in table.values())
+        sum_a = sum(comb2(v) for v in counts_a.values())
+        sum_b = sum(comb2(v) for v in counts_b.values())
+        total = comb2(n)
+        if total <= 0: return None
+        expected = (sum_a * sum_b) / total
+        max_index = 0.5 * (sum_a + sum_b)
+        denom = max_index - expected
+        if abs(denom) <= 1e-12: return 1.0
+        return max(-1.0, min(1.0, (sum_table - expected) / denom))
+
+    @staticmethod
+    def _role_sequence_distance(a: Sequence[str], b: Sequence[str]) -> float:
+        return kendall_tau_distance(a, b)
 
     def _end_observe_demo(self, apply_decay: bool = False) -> Classification:
         seq = list(self.pending_demo)
         active_keys = self._active_keys()
         active_lib = self.memory.library(allowed_keys=active_keys)
         cls = self.disambig.classify(seq, active_lib)
-        # Pruned-reentry detection: when active-only says new_recipe, check the
-        # full library. If a pruned variant matches, restore it rather than
-        # creating a new recipe ID.
+        # Pruned-reentry detection: when active-only says new_recipe, check the full library. If a pruned variant matches, restore it rather than creating a new recipe ID.
         if cls.kind == "new_recipe" and active_keys:
             full_lib = self.memory.library()
             if len(full_lib) > len(active_lib):
                 archived_cls = self.disambig.classify(seq, full_lib)
                 if archived_cls.kind != "new_recipe":
                     cls = archived_cls          # restore under original recipe_id
-                    self.narrate(
-                        f"[step {self.step_counter}] observe-mode: "
-                        f"restoring pruned variant of '{cls.recipe_id}'")
+                    self.narrate(f"[step {self.step_counter}] observe-mode: restoring pruned variant of '{cls.recipe_id}'")
 
         self.classification_events.append((self.step_counter, cls))
         # Register in memory + decay.
@@ -359,6 +666,10 @@ class AdaptiveHRCAgent:
             self.narrate(f"[step {self.step_counter}] classified {kind_msg} of '{rid}' (jaccard={cls.jaccard:.2f}, tau={cls.order_distance:.2f})")
         self.mode = MODE_ONLINE
         self.pending_demo = []
+        self._needs_observation = False
+        self._online_unknown_streak = 0
+        self._online_step_status = "known_confident"
+        self._online_policy_gate_history = []
         if apply_decay: self.decay.step(self.session_counter, self.retrain_cycle)
         self._retrain()
         return cls
@@ -399,17 +710,64 @@ class AdaptiveHRCAgent:
             # Nothing to commit.
             self.current_prefix = []
             self.inferred_recipe = None
-            self.inferred_pref = None
+            self.inferred_variant_hash = None
+            self.inferred_latent_pref_id = None
+            self._online_unknown_streak = 0
+            self._online_step_status = "known_confident"
+            self._online_policy_gate_history = []
             self._clear_preference_lock()
             return Classification("known", None, None, 0.0, 0.0)
 
         if commit_cls.kind == "new_recipe":     raise RuntimeError("online new-recipe commit reached mutating path")
         else:                                   rid = commit_cls.recipe_id
+        if rid is None:
+            if apply_decay and self.session_counter > 0: self.session_counter -= 1
+            cls = Classification("needs_observation", None, None, commit_cls.jaccard, commit_cls.order_distance)
+            self.classification_events.append((self.step_counter, cls))
+            self.current_prefix = []
+            self.inferred_recipe = None
+            self.inferred_variant_hash = None
+            self.inferred_latent_pref_id = None
+            self._needs_observation = True
+            self._online_step_status = "unknown_confirmed"
+            self._online_policy_gate_history = []
+            self._clear_preference_lock()
+            self.posterior.reset()
+            return cls
 
         h = variant_hash(prefix)
+        confidence, confidence_parts = self._online_commit_confidence(rid, prefix, commit_cls)
+        key = (rid, h)
+        full_threshold = float(getattr(self.cfg, "online_commit_full_threshold", 0.75))
+        tentative_threshold = float(getattr(self.cfg, "online_commit_tentative_threshold", 0.45))
+        promotion_reasons = self._provisional_promotion_reasons(rid, h, confidence, confidence_parts)
+        if promotion_reasons:
+            confidence = max(confidence, full_threshold)
+            confidence_parts["provisional_promotion"] = 1.0
+        if confidence < tentative_threshold:
+            if apply_decay and self.session_counter > 0: self.session_counter -= 1
+            cls = Classification("needs_observation", rid, None, commit_cls.jaccard, commit_cls.order_distance)
+            self.classification_events.append((self.step_counter, cls))
+            self.current_prefix = []
+            self.inferred_recipe = None
+            self.inferred_variant_hash = None
+            self.inferred_latent_pref_id = None
+            self._needs_observation = True
+            self._online_step_status = "unknown_confirmed"
+            self._online_policy_gate_history = []
+            self._clear_preference_lock()
+            self.posterior.reset()
+            return cls
         latest = self.memory.latest_variant(rid)
         known_variant = h in self.memory.variants.get(rid, {})
-        if known_variant:
+        if confidence < full_threshold and not known_variant:
+            weight = max(float(getattr(self.cfg, "provisional_commit_weight", 0.20)), min(0.75, confidence))
+            self.decay.register(rid, h, tuple(prefix), self.session_counter, self.retrain_cycle, weight=weight, pin_latest=False)
+            self.provisional_commits[key] = {"first_session": self.session_counter, "last_session": self.session_counter, "weight": weight, "confidence": confidence, "parts": confidence_parts, "promotion_eligible_until": self.session_counter + int(getattr(self.cfg, "provisional_confirm_window", 5))}
+            self._rebuild_active_prototypes(self.decay.active_entries())
+            cls = Classification("tentative_preference_shift", rid, h, commit_cls.jaccard, commit_cls.order_distance)
+            self.narrate(f"[step {self.step_counter}] tentative online variant for '{rid}' (confidence={confidence:.2f})")
+        elif known_variant:
             # Known replay: promote it at the session boundary, update timestamps/weights, and retrain.
             v = self._register_if_live(rid, list(prefix), self.step_counter)
             cls = commit_cls or Classification("known", rid, h, 1.0, 0.0)
@@ -418,9 +776,11 @@ class AdaptiveHRCAgent:
             v = self._register_if_live(rid, list(prefix), self.step_counter)
             cls_kind = "preference_shift"
             if reentry_from_pruned: cls_kind = "reentry_from_pruned"
-            cls = Classification(cls_kind, rid, v.pref_hash, commit_cls.jaccard, commit_cls.order_distance if commit_cls.kind != "new_recipe" else (0.0 if latest is None else 1.0))
+            cls = Classification(cls_kind, rid, v.variant_hash, commit_cls.jaccard, commit_cls.order_distance if commit_cls.kind != "new_recipe" else (0.0 if latest is None else 1.0))
             cls.recipe_id = rid
-            cls.pref_hash = v.pref_hash
+            cls.variant_hash = v.variant_hash
+            self.provisional_commits.pop((rid, v.variant_hash), None)
+            if promotion_reasons: self.online_commit_events.append({"step": self.step_counter, "event": "provisional_commit_promoted", "recipe_id": rid, "variant_hash": v.variant_hash, "promotion_reasons": promotion_reasons, "commit_confidence": confidence, "commit_confidence_parts": dict(confidence_parts)})
             self.narrate(f"[step {self.step_counter}] committing preference variant of '{rid}' from online session")
         if apply_decay: self.decay.step(self.session_counter, self.retrain_cycle)
         # Retrain after every completed demo because weights are updated by the decay/register path on every session.
@@ -428,11 +788,70 @@ class AdaptiveHRCAgent:
         self.classification_events.append((self.step_counter, cls))
         self.current_prefix = []
         self.inferred_recipe = None
-        self.inferred_pref = None
+        self.inferred_variant_hash = None
+        self.inferred_latent_pref_id = None
         self._needs_observation = False
+        self._online_unknown_streak = 0
+        self._online_step_status = "known_confident"
+        self._online_policy_gate_history = []
         self._clear_preference_lock()
         self.posterior.reset()
         return cls
+
+    def _late_window_prediction_agreement(self, prefix: Sequence[str]) -> float:
+        n = len(prefix)
+        if n <= 0 or not self.step_log: return 0.0
+        session_rows = self.step_log[-n:]
+        if not session_rows:            return 0.0
+        width = max(1, int(math.ceil(len(session_rows) * 0.40)))
+        late_rows = session_rows[-width:]
+        usable = [row for row in late_rows if row.predicted is not None]
+        if not usable:                  return 0.0
+        return sum(1 for row in usable if row.predicted == row.actual) / max(1, len(usable))
+
+    def _provisional_promotion_reasons(self, rid: str, variant_hash_: str, confidence: float, confidence_parts: Dict[str, float]) -> List[str]:
+        key = (rid, variant_hash_)
+        provisional = self.provisional_commits.get(key)
+        if provisional is None: return []
+        window = int(getattr(self.cfg, "provisional_confirm_window", 5))
+        first_session = int(provisional.get("first_session", self.session_counter))
+        if self.session_counter - first_session > window:
+            self.provisional_commits.pop(key, None)
+            return []
+        reasons = ["same_variant_hash_recurred"]
+        full_threshold = float(getattr(self.cfg, "online_commit_full_threshold", 0.75))
+        if confidence >= full_threshold:                                                                                                                                            reasons.append("commit_confidence_full_threshold")
+        if float(confidence_parts.get("posterior_recipe_confidence", 0.0)) >= float(getattr(self.cfg, "provisional_confirm_top1", 0.60)):                                           reasons.append("posterior_recipe_confidence_full_threshold")
+        late_agreement = float(confidence_parts.get("late_window_prediction_agreement", 0.0))
+        recipe_jaccard = float(confidence_parts.get("recipe_jaccard", 0.0))
+        if (late_agreement >= float(getattr(self.cfg, "provisional_confirm_top1", 0.60)) and recipe_jaccard >= float(getattr(self.cfg, "provisional_min_recipe_jaccard", 0.95))):   reasons.append("late_window_prediction_alignment")
+        provisional["last_session"] = self.session_counter
+        provisional["last_confidence"] = confidence
+        provisional["last_parts"] = dict(confidence_parts)
+        return reasons
+
+    def _online_commit_confidence(self, rid: str, prefix: Sequence[str], commit_cls: Classification) -> Tuple[float, Dict[str, float]]:
+        marginals = self.posterior.marginal_recipe()
+        p_recipe = float(marginals.get(rid, 0.0))
+        second_recipe = max((float(p) for r, p in marginals.items() if r != rid), default=0.0)
+        recipe_gap = max(0.0, p_recipe - second_recipe)
+        active_lib = self.memory.library(allowed_keys=self._active_keys())
+        full_lib = self.memory.library()
+        scored: List[Tuple[str, float]] = []
+        for v in full_lib: scored.append((v.recipe_id, self.disambig.classify(prefix, [v]).jaccard))
+        best_for_rid = max((score for recipe_id, score in scored if recipe_id == rid), default=float(commit_cls.jaccard or 0.0))
+        second_jaccard = max((score for recipe_id, score in scored if recipe_id != rid), default=0.0)
+        jaccard_margin = max(0.0, best_for_rid - second_jaccard)
+        policy_gates = list(self._online_policy_gate_history)
+        online_policy_confidence = sum(float(g.get("action_gate_score") or 0.0) for g in policy_gates) / max(1, len(policy_gates)) if policy_gates else 0.0
+        posterior_agrees = 1.0 if self.inferred_recipe is None or self.inferred_recipe == rid else 0.0
+        late_agreement = self._late_window_prediction_agreement(prefix)
+        # Known recipe preference shifts often have strong full-sequence materiality before the online posterior has fully recovered. Keep the Jaccard term dominant and use posterior/policy-confidence evidence as safeguards.
+        score = (0.46 * min(1.0, best_for_rid) + 0.18 * min(1.0, jaccard_margin / 0.25 if jaccard_margin > 0 else 0.0) + 0.20 * min(1.0, p_recipe) + 0.08 * min(1.0, recipe_gap / 0.10 if recipe_gap > 0 else 0.0) + 0.04 * online_policy_confidence + 0.04 * posterior_agrees)
+        score = min(1.0, score + 0.06 * late_agreement)
+        if commit_cls.kind == "known" and best_for_rid >= 0.99: score = max(score, 0.90)
+        if active_lib and not full_lib:                         score = min(score, 0.40)
+        return max(0.0, min(1.0, float(score))), {"posterior_recipe_confidence": p_recipe, "posterior_recipe_gap": recipe_gap, "recipe_jaccard": best_for_rid, "recipe_jaccard_margin": jaccard_margin, "online_policy_confidence": online_policy_confidence, "posterior_commit_recipe_agreement": posterior_agrees, "late_window_prediction_agreement": late_agreement}
 
     # interaction
     def _active_keys(self) -> Set[VariantKey]:
@@ -441,8 +860,7 @@ class AdaptiveHRCAgent:
 
     def _token_for_vector(self, vector: ActionVector) -> str:
         token = self.action_vector_to_token.get(vector)
-        if token is not None:
-            return token
+        if token is not None: return token
         if self._frozen:
             # Frozen prediction must not mutate the codebook. Unseen vectors map to a sentinel token that downstream predictors treat as OOV.
             return "act_unseen"
@@ -499,72 +917,35 @@ class AdaptiveHRCAgent:
     def assist_gate_stats(self) -> Dict[str, Any]:
         return dict(self._last_assist_gate)
 
-    def _set_assist_gate(
-        self,
-        used: bool,
-        confidence: Optional[float],
-        entropy: Optional[float],
-        reason: str,
-        *,
-        raw_confidence: Optional[float] = None,
-        gate_score: Optional[float] = None,
-        margin: Optional[float] = None,
-        threshold: Optional[float] = None,
-        source: Optional[str] = None,
-        final_confidence: Optional[float] = None,
-        final_entropy: Optional[float] = None,
-        final_margin: Optional[float] = None,
-        conditioned_confidence: Optional[float] = None,
-        ensemble_confidence: Optional[float] = None,
-        agreement: Optional[bool] = None,
-        blend_strength: Optional[float] = None,
-    ) -> None:
+    def _set_assist_gate(self, used: bool, confidence: Optional[float], entropy: Optional[float], reason: str, *, raw_confidence: Optional[float] = None, gate_score: Optional[float] = None, margin: Optional[float] = None, threshold: Optional[float] = None, source: Optional[str] = None, 
+        final_confidence: Optional[float] = None, final_entropy: Optional[float] = None, final_margin: Optional[float] = None, conditioned_confidence: Optional[float] = None, ensemble_confidence: Optional[float] = None, agreement: Optional[bool] = None, blend_strength: Optional[float] = None,) -> None:
         if self._frozen: return
         score = confidence if gate_score is None else gate_score
         raw = confidence if raw_confidence is None else raw_confidence
-        self._last_assist_gate = {
-            "assist_used": bool(used),
-            "action_confidence": score,
-            "raw_action_confidence": raw,
-            "action_gate_score": score,
-            "action_margin": margin,
-            "action_entropy": entropy,
-            "action_gate_threshold": threshold,
-            "assist_source": source,
-            "final_action_confidence": final_confidence,
-            "final_action_margin": final_margin,
-            "final_action_entropy": final_entropy,
-            "conditioned_action_confidence": conditioned_confidence,
-            "ensemble_action_confidence": ensemble_confidence,
-            "policy_agreement": agreement,
-            "blend_strength": blend_strength,
-            "reason": reason,
-        }
+        self._last_assist_gate = {"assist_used": bool(used), "action_confidence": score, "raw_action_confidence": raw, "action_gate_score": score, "action_margin": margin, "action_entropy": entropy, "action_gate_threshold": threshold, "assist_source": source, "final_action_confidence": final_confidence,
+            "final_action_margin": final_margin, "final_action_entropy": final_entropy, "conditioned_action_confidence": conditioned_confidence, "ensemble_action_confidence": ensemble_confidence, "policy_agreement": agreement, "blend_strength": blend_strength, "reason": reason,}
 
     def _action_confidence_threshold(self) -> float:
         return float(getattr(self.cfg, "posterior_action_confidence_threshold", 0.5))
 
     def _calibrated_action_gate_score(self, confidence: Optional[float], entropy: Optional[float], margin: Optional[float]) -> float:
-        if confidence is None:
-            return 0.0
+        if confidence is None: return 0.0
         conf = max(0.0, min(1.0, float(confidence)))
         temp = max(1e-6, float(getattr(self.cfg, "posterior_action_gate_temperature", 1.0)))
         margin_weight = max(0.0, float(getattr(self.cfg, "posterior_action_gate_margin_weight", 0.0)))
         entropy_weight = max(0.0, float(getattr(self.cfg, "posterior_action_gate_entropy_weight", 0.0)))
         calibrated = conf ** temp
         calibrated += margin_weight * max(0.0, min(1.0, float(margin or 0.0)))
-        if entropy is not None:
-            calibrated += entropy_weight * max(0.0, min(1.0, 1.0 - float(entropy)))
+        if entropy is not None: calibrated += entropy_weight * max(0.0, min(1.0, 1.0 - float(entropy)))
         return max(0.0, min(1.0, float(calibrated)))
 
     def _distribution_stats(self, dist: Dict[str, float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        if not dist:
-            return None, None, None
+        if not dist: return None, None, None
         vals = sorted((float(v) for v in dist.values()), reverse=True)
         confidence = vals[0] if vals else None
         margin = vals[0] - vals[1] if len(vals) >= 2 else (vals[0] if vals else None)
         entropy = 0.0
-        for p in vals:
+        for p in vals: 
             if p > 0: entropy -= p * math.log(p)
         if len(vals) > 1: entropy = entropy / math.log(len(vals))
         return confidence, entropy, margin
@@ -580,14 +961,7 @@ class AdaptiveHRCAgent:
         min_conf = float(getattr(self.cfg, "posterior_action_margin_min_confidence", 0.10))
         margin_thr = float(getattr(self.cfg, "posterior_action_margin_threshold", 0.06))
         entropy_thr = float(getattr(self.cfg, "posterior_action_entropy_threshold", 0.85))
-        margin_entropy_signal = (
-            confidence is not None
-            and margin is not None
-            and entropy is not None
-            and float(confidence) >= min_conf
-            and float(margin) >= margin_thr
-            and float(entropy) <= entropy_thr
-        )
+        margin_entropy_signal = (confidence is not None and margin is not None and entropy is not None and float(confidence) >= min_conf and float(margin) >= margin_thr and float(entropy) <= entropy_thr)
         if score >= threshold:
             reason = "margin_entropy_gate" if margin_entropy_signal and raw_score < threshold else "action_gate_score"
             return True, score, reason
@@ -600,13 +974,7 @@ class AdaptiveHRCAgent:
     def _ensure_posterior_for_prefix(self, prefix_tokens: Sequence[str]) -> None:
         if self.posterior.joint(): return
         if not self.recipe_prototypes.all(): return
-        self.posterior.update(
-            prefix_tokens=prefix_tokens,
-            prefix_roles=self._roles_for_tokens(prefix_tokens),
-            recipe_protos=self.recipe_prototypes,
-            pref_protos=self.preference_prototypes,
-            memory_state_for_recipe=self._memory_state_for_recipe,
-        )
+        self.posterior.update(prefix_tokens=prefix_tokens, prefix_roles=self._roles_for_tokens(prefix_tokens), recipe_protos=self.recipe_prototypes, pref_protos=self.preference_prototypes, memory_state_for_recipe=self._memory_state_for_recipe)
 
     def _final_gate_threshold(self, source: str) -> float:
         threshold = self._action_confidence_threshold()
@@ -621,20 +989,33 @@ class AdaptiveHRCAgent:
         return allowed, score, reason, confidence, entropy, margin, threshold
 
     def _prefix_needs_observation(self, prefix_tokens: Sequence[str]) -> bool:
-        if self._needs_observation: return True
+        # _needs_observation is a session-end outcome flag. Prefix-time gating must remain step-local so one bad path cannot silence the rest of an active online session.
         min_prefix = int(getattr(self.cfg, "online_new_recipe_min_prefix", 3))
-        if len(prefix_tokens) < max(1, min_prefix): return False
+        if len(prefix_tokens) < max(1, min_prefix):
+            if not self._frozen:
+                self._online_step_status = "known_ambiguous" if prefix_tokens else "known_confident"
+                self._online_unknown_streak = 0
+            return False
         active_keys = self._active_keys()
         active_lib = self.memory.library(allowed_keys=active_keys)
         if not active_lib:
-            if not self._frozen:    self._needs_observation = bool(self.memory.library())
-            return self._needs_observation
+            needs_step_observation = bool(self.memory.library())
+            if not self._frozen:
+                self._online_unknown_streak = self._online_unknown_streak + 1 if needs_step_observation else 0
+                self._online_step_status = "unknown_candidate" if needs_step_observation else "known_ambiguous"
+            return needs_step_observation
         threshold = float(getattr(self.cfg, "online_new_recipe_partial_threshold", 0.30))
         best_active = max((s for _v, s in self.disambig.score_partial(prefix_tokens, active_lib)), default=0.0)
         active_recipes = {v.recipe_id for v in active_lib}
         best_recipe = max((self.recipe_prototypes.recipe_match(prefix_tokens, rid) for rid in active_recipes), default=0.0)
-        if max(best_active, best_recipe) >= threshold: return False
-        if not self._frozen:        self._needs_observation = True
+        if max(best_active, best_recipe) >= threshold:
+            if not self._frozen:
+                self._online_unknown_streak = 0
+                self._online_step_status = "known_confident" if best_active >= threshold else "known_ambiguous"
+            return False
+        if not self._frozen:
+            self._online_unknown_streak += 1
+            self._online_step_status = "unknown_candidate"
         return True
 
     def _state_from_prefix(self, prefix: Sequence[str]) -> Tuple[int, ...]:
@@ -647,15 +1028,13 @@ class AdaptiveHRCAgent:
                 state = apply_transition_vector(state, vector)
             return state
 
-    def predict_next_tokens(self, prefix: Optional[Sequence[str]] = None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
+    def predict_next_tokens(self, prefix: Optional[Sequence[str]] = None) -> Dict[str, float]:
         """Posterior- and preference-conditioned next-action distribution.
 
         Fusion order:
-            1. Compute the unconditioned ensemble distribution (legacy).
+            1. Compute the unconditioned ensemble distribution.
             2. If the posterior is empty or action confidence is too low, fall back to the ensemble.
             3. Otherwise, build a posterior-conditioned distribution from the active recipe frontier + preference-head re-weighting under the top latent pref_id, then mix with the ensemble at strength `cfg.posterior_assist_strength`.
-
-        `recipe_id` and `pref_hash` parameters are retained for backwards-compatible call sites; the conditioned path uses the posterior's own marginals, not these arguments. ``pref_hash`` is treated only as an exact-memory frontier handle (deprecation boundary, plan / Component 0); it is not exposed to the preference head.
         """
         with self._profile("predict_next_tokens"):
             prefix_tokens = self._coerce_prefix_tokens(prefix) if prefix is not None else list(self.current_prefix)
@@ -674,66 +1053,23 @@ class AdaptiveHRCAgent:
             self._ensure_posterior_for_prefix(prefix_tokens)
             if not self.posterior.joint():
                 allowed, score, reason, final_confidence, final_entropy, final_margin, threshold = self._final_gate_allows(ensemble_dist, "ensemble_posterior_empty")
-                self._set_assist_gate(
-                    allowed,
-                    score,
-                    final_entropy,
-                    reason if allowed else "posterior_empty",
-                    raw_confidence=final_confidence,
-                    gate_score=score,
-                    margin=final_margin,
-                    threshold=threshold,
-                    source="ensemble_posterior_empty",
-                    final_confidence=final_confidence,
-                    final_entropy=final_entropy,
-                    final_margin=final_margin,
-                    ensemble_confidence=ensemble_confidence,
-                )
+                self._set_assist_gate(allowed, score, final_entropy, reason if allowed else "posterior_empty", raw_confidence=final_confidence, gate_score=score, margin=final_margin, threshold=threshold, source="ensemble_posterior_empty",
+                    final_confidence=final_confidence, final_entropy=final_entropy, final_margin=final_margin, ensemble_confidence=ensemble_confidence)
                 return ensemble_dist
 
             conditioned, confidence, entropy, margin = self._action_marginal_distribution(prefix_tokens)
             if not conditioned:
                 allowed, score, reason, final_confidence, final_entropy, final_margin, threshold = self._final_gate_allows(ensemble_dist, "ensemble_no_conditioned_frontier")
-                self._set_assist_gate(
-                    allowed,
-                    score,
-                    final_entropy,
-                    reason if allowed else "no_conditioned_frontier",
-                    raw_confidence=final_confidence,
-                    gate_score=score,
-                    margin=final_margin,
-                    threshold=threshold,
-                    source="ensemble_no_conditioned_frontier",
-                    final_confidence=final_confidence,
-                    final_entropy=final_entropy,
-                    final_margin=final_margin,
-                    conditioned_confidence=confidence,
-                    ensemble_confidence=ensemble_confidence,
-                )
+                self._set_assist_gate(allowed, score, final_entropy, reason if allowed else "no_conditioned_frontier", raw_confidence=final_confidence, gate_score=score, margin=final_margin, threshold=threshold, source="ensemble_no_conditioned_frontier",
+                    final_confidence=final_confidence, final_entropy=final_entropy, final_margin=final_margin, conditioned_confidence=confidence, ensemble_confidence=ensemble_confidence)
                 return ensemble_dist
 
             agreement = self._top_token(conditioned) == self._top_token(ensemble_dist)
             blend_strength = self._posterior_blend_strength(conditioned, ensemble_dist, confidence, entropy, margin, ensemble_confidence, ensemble_entropy, ensemble_margin)
             final_dist = self._mix_distributions(conditioned, ensemble_dist, strength=blend_strength)
             allowed, score, reason, final_confidence, final_entropy, final_margin, threshold = self._final_gate_allows(final_dist, "conditioned_blend")
-            self._set_assist_gate(
-                allowed,
-                score,
-                final_entropy,
-                reason,
-                raw_confidence=final_confidence,
-                gate_score=score,
-                margin=final_margin,
-                threshold=threshold,
-                source="conditioned_blend",
-                final_confidence=final_confidence,
-                final_entropy=final_entropy,
-                final_margin=final_margin,
-                conditioned_confidence=confidence,
-                ensemble_confidence=ensemble_confidence,
-                agreement=agreement,
-                blend_strength=blend_strength,
-            )
+            self._set_assist_gate(allowed, score, final_entropy, reason, raw_confidence=final_confidence, gate_score=score, margin=final_margin, threshold=threshold, source="conditioned_blend", final_confidence=final_confidence, final_entropy=final_entropy,
+                final_margin=final_margin, conditioned_confidence=confidence, ensemble_confidence=ensemble_confidence, agreement=agreement, blend_strength=blend_strength)
             return final_dist
 
     def predict_with_oracle(self, prefix: Optional[Sequence[str]], oracle_recipe_id: Optional[str], oracle_pref_id: Optional[str]) -> Dict[str, float]:
@@ -749,16 +1085,13 @@ class AdaptiveHRCAgent:
             return self._mix_distributions(conditioned, ensemble_dist)
 
     def _same_role_order_score(self, token: str, role: str, roles_by_token: Dict[str, str], recipe_proto: Any) -> float:
-        if recipe_proto is None:
-            return 1.0
+        if recipe_proto is None:    return 1.0
         same_role = [other for other, other_role in roles_by_token.items() if other != token and other_role == role]
-        if not same_role:
-            return 1.0
+        if not same_role:           return 1.0
         blockers = sum(float(recipe_proto.precedence_counts.get((other, token), 0.0)) for other in same_role)
         leads = sum(float(recipe_proto.precedence_counts.get((token, other), 0.0)) for other in same_role)
         total = blockers + leads
-        if total <= 0.0:
-            return 1.0
+        if total <= 0.0:            return 1.0
         order_score = (1.0 + leads) / (2.0 + total)
         return max(0.35, min(1.45, 0.60 + 0.80 * order_score))
 
@@ -770,7 +1103,7 @@ class AdaptiveHRCAgent:
         weights_map = {entry.key: float(entry.weight) for entry in self.decay.active_entries()}
         variant_orderings: List[Tuple[Sequence[str], float]] = []
         for v in active_variants:
-            w = weights_map.get((top_rid, v.pref_hash), 1.0)
+            w = weights_map.get((top_rid, v.variant_hash), 1.0)
             variant_orderings.append((v.ordering, w))
         if not variant_orderings:
             return {}
@@ -812,13 +1145,13 @@ class AdaptiveHRCAgent:
 
     def _locked_variant_frontier(self, prefix_tokens: Sequence[str]) -> Dict[str, float]:
         key = self.locked_variant_key
-        if key is None:
+        if key is None: 
             return {}
         if key not in self._active_keys():
             self._clear_preference_lock()
             return {}
-        rid, pref_hash_ = key
-        variant = self.memory.variants.get(rid, {}).get(pref_hash_)
+        rid, variant_hash_ = key
+        variant = self.memory.variants.get(rid, {}).get(variant_hash_)
         if variant is None:
             self._clear_preference_lock()
             return {}
@@ -864,17 +1197,8 @@ class AdaptiveHRCAgent:
         confidence, entropy, margin = self._distribution_stats(out)
         return out, confidence, entropy, margin
 
-    def _posterior_blend_strength(
-        self,
-        conditioned: Dict[str, float],
-        ensemble: Dict[str, float],
-        conditioned_confidence: Optional[float] = None,
-        conditioned_entropy: Optional[float] = None,
-        conditioned_margin: Optional[float] = None,
-        ensemble_confidence: Optional[float] = None,
-        ensemble_entropy: Optional[float] = None,
-        ensemble_margin: Optional[float] = None,
-    ) -> float:
+    def _posterior_blend_strength(self, conditioned: Dict[str, float], ensemble: Dict[str, float], conditioned_confidence: Optional[float] = None, conditioned_entropy: Optional[float] = None, conditioned_margin: Optional[float] = None, ensemble_confidence: Optional[float] = None,
+        ensemble_entropy: Optional[float] = None, ensemble_margin: Optional[float] = None) -> float:
         base = float(getattr(self.cfg, "posterior_assist_strength", 0.70))
         lo = float(getattr(self.cfg, "posterior_assist_strength_min", 0.15))
         hi = float(getattr(self.cfg, "posterior_assist_strength_max", 0.90))
@@ -887,16 +1211,13 @@ class AdaptiveHRCAgent:
             e = float(ensemble_confidence or 0.0)
             strength -= float(getattr(self.cfg, "posterior_assist_disagreement_penalty", 0.45)) * max(0.0, e - c)
             strength += 0.15 * max(0.0, c - e)
-            if conditioned_margin is not None and ensemble_margin is not None:
-                strength += 0.10 * max(0.0, float(conditioned_margin) - float(ensemble_margin))
-            if conditioned_entropy is not None and ensemble_entropy is not None:
-                strength += 0.10 * max(0.0, float(ensemble_entropy) - float(conditioned_entropy))
+            if conditioned_margin is not None and ensemble_margin is not None: strength += 0.10 * max(0.0, float(conditioned_margin) - float(ensemble_margin))
+            if conditioned_entropy is not None and ensemble_entropy is not None: strength += 0.10 * max(0.0, float(ensemble_entropy) - float(conditioned_entropy))
         return max(0.0, min(1.0, max(lo, min(hi, strength))))
 
     def _mix_distributions(self, conditioned: Dict[str, float], ensemble: Dict[str, float], strength: Optional[float] = None) -> Dict[str, float]:
         """Convex-combine conditioned and ensemble distributions."""
-        if strength is None:
-            strength = self._posterior_blend_strength(conditioned, ensemble)
+        if strength is None: strength = self._posterior_blend_strength(conditioned, ensemble)
         strength = max(0.0, min(1.0, strength))
         out: Dict[str, float] = {}
         keys = set(conditioned.keys()) | set(ensemble.keys())
@@ -908,14 +1229,20 @@ class AdaptiveHRCAgent:
     def predict_next(self, prefix: Optional[Sequence[str]] = None) -> Dict[str, float]:
         return self._decode_distribution(self.predict_next_tokens(prefix))
 
-    def observe_observation(self, observation: ActionObservation, ground_truth_recipe: Optional[str] = None) -> StepResult:
+    def observe_observation(
+        self,
+        observation: ActionObservation,
+        ground_truth_recipe: Optional[str] = None,
+        *,
+        precomputed_distribution: Optional[Mapping[str, float]] = None,
+    ) -> StepResult:
         """Consume one state/action-vector observation. `ground_truth_recipe` is optional and used only for metrics.  The behavior policy only sees the anonymous action token derived from the binary transition vector. """
         if self._frozen:
             action = self.action_vector_to_token.get(observation.action_vector, "act_unseen")
             prefix = list(self.current_prefix)
-            dist = self.predict_next_tokens(prefix)
+            dist = dict(precomputed_distribution) if precomputed_distribution is not None else self.predict_next_tokens(prefix)
             predicted_token = top_k(dist, k=1)[0] if dist else None
-            return StepResult(step=self.step_counter, predicted=self._display_token(predicted_token), actual=action, correct=predicted_token == action, mode=self.mode, inferred_recipe=self.inferred_recipe, inferred_pref=self.inferred_pref, event="frozen_prediction",)
+            return StepResult(step=self.step_counter, predicted=self._display_token(predicted_token), actual=action, correct=predicted_token == action, mode=self.mode, inferred_recipe=self.inferred_recipe, inferred_variant_hash=self.inferred_variant_hash, inferred_latent_pref_id=self.inferred_latent_pref_id, event="frozen_prediction",)
         self.step_counter += 1
         # NOTE: decay advances once per session (see end_demo), not per action; otherwise weights collapse within one demo.
 
@@ -923,11 +1250,14 @@ class AdaptiveHRCAgent:
             action = self._token_for_vector(observation.action_vector)
             self._cache_token_role(action, observation)
             self.pending_demo.append(action)
-            result = StepResult(step=self.step_counter, predicted=None, actual=self._display_token(action) or action, correct=False, mode=self.mode, inferred_recipe=None, inferred_pref=None, event="observing")
+            result = StepResult(step=self.step_counter, predicted=None, actual=self._display_token(action) or action, correct=False, mode=self.mode, inferred_recipe=None, inferred_variant_hash=None, inferred_latent_pref_id=None, event="observing")
             self.step_log.append(result)
             return result
         # ONLINE mode.
-        dist = self.predict_next_tokens(self.current_prefix)
+        dist = dict(precomputed_distribution) if precomputed_distribution is not None else self.predict_next_tokens(self.current_prefix)
+        # With a precomputed distribution, the caller must have just produced it
+        # through the policy path that set _last_assist_gate for this prefix.
+        self._online_policy_gate_history.append(dict(self._last_assist_gate))
         predicted_token = top_k(dist, k=1)[0] if dist else None
         action = self.action_vector_to_token.get(observation.action_vector)
         if action is None: action = self._token_for_vector(observation.action_vector)
@@ -945,30 +1275,34 @@ class AdaptiveHRCAgent:
             ranked = self.disambig.score_partial(self.current_prefix, variants)
             if ranked:
                 top_variant, _ = ranked[0]
-                if top_variant.pref_hash != self.inferred_pref:
-                    # Do not mutate inferred_pref when frozen; probes should not alter persistent inference state across calls.
+                if top_variant.variant_hash != self.inferred_variant_hash:
+                    # Do not mutate inferred_variant_hash when frozen; probes should not alter persistent inference state across calls.
                     if not self._frozen:
-                        self.inferred_pref = top_variant.pref_hash
-                        self.locked_variant_key = (top_variant.recipe_id, top_variant.pref_hash)
+                        self.inferred_variant_hash = top_variant.variant_hash
+                        self.locked_variant_key = (top_variant.recipe_id, top_variant.variant_hash)
                         self.locked_pref_id = self.variant_pref_ids.get(self.locked_variant_key)
                     event = "preference_shift_locked"
-                    self.narrate(f"[step {self.step_counter}] MISMATCH (predicted '{self._display_token(predicted_token)}', got '{self._display_token(action)}') -> locking onto variant {top_variant.pref_hash[:24]}...")
+                    self.narrate(f"[step {self.step_counter}] MISMATCH (predicted '{self._display_token(predicted_token)}', got '{self._display_token(action)}') -> locking onto variant {top_variant.variant_hash[:24]}...")
 
-        result = StepResult(step=self.step_counter, predicted=self._display_token(predicted_token), actual=self._display_token(action) or action, correct=correct, mode=self.mode, inferred_recipe=self.inferred_recipe, inferred_pref=self.inferred_pref, event=event)
+        result = StepResult(step=self.step_counter, predicted=self._display_token(predicted_token), actual=self._display_token(action) or action, correct=correct, mode=self.mode, inferred_recipe=self.inferred_recipe, inferred_variant_hash=self.inferred_variant_hash, inferred_latent_pref_id=self.inferred_latent_pref_id, event=event)
         self.step_log.append(result)
         self.accuracy_events.append((self.step_counter, ground_truth_recipe or (self.inferred_recipe or "?"), correct))
         return result
 
     # recipe identification (online, running posterior)
-    def _memory_state_for_recipe(self, rid: str) -> str:
-        """active | pruned | absent for live posterior use. The posterior consumes this without ever seeing pref_hash directly (the deprecation boundary in plan / Component 0)."""
-        active_recipes = {r for (r, _h) in self.decay.active.keys()}
-        if rid in active_recipes:
-            return "active"
-        pruned_recipes = {r for (r, _h) in self.decay.pruned.keys()}
-        if rid in pruned_recipes and not getattr(self.cfg, "ablation_disable_pruned_memory_prior", False):
-            return "pruned"
-        return "absent"
+    def _memory_state_for_recipe(self, rid: str) -> MemoryPrior:
+        """Continuous memory prior for live posterior use."""
+        active_entries = [e for (recipe_id, _h), e in self.decay.active.items() if recipe_id == rid]
+        if active_entries:
+            latest_hash = self.decay.latest_by_recipe.get(rid)
+            latest_key = (rid, latest_hash) if latest_hash is not None else None
+            return MemoryPrior(state="active", active_weight=max(float(e.weight) for e in active_entries), is_latest=bool(latest_key in self.decay.latest_keys))
+        if not getattr(self.cfg, "ablation_disable_pruned_memory_prior", False):
+            pruned_entries = [p for (recipe_id, _h), p in self.decay.pruned.items() if recipe_id == rid]
+            if pruned_entries:
+                sessions_since_pruned = min(max(0, int(self.session_counter) - int(p.removed_step)) for p in pruned_entries)
+                return MemoryPrior(state="pruned", sessions_since_pruned=sessions_since_pruned)
+        return MemoryPrior("absent")
 
     def _refresh_recipe_inference(self, prefix: Sequence[str]) -> None:
         """Posterior-driven recipe inference. Single online identity head. The posterior owns the running belief. The disambiguator is no longer consulted on the per-step path; it runs only at observation-mode entry (`_end_observe_demo` / `_classify_online_prefix`). The `ablation_disable_posterior` flag now means: 
@@ -979,16 +1313,17 @@ class AdaptiveHRCAgent:
         self.posterior.update(prefix_tokens=prefix_tokens, prefix_roles=prefix_roles, recipe_protos=self.recipe_prototypes, pref_protos=self.preference_prototypes, memory_state_for_recipe=self._memory_state_for_recipe)
         self._prefix_needs_observation(prefix_tokens)
         new_rid = self.posterior.argmax_recipe()
+        new_pid = self.posterior.argmax_preference()
+        if not self._frozen: self.inferred_latent_pref_id = new_pid
         if self._frozen: return
         old_rid = self.inferred_recipe
 
         # Cold commit: no current identity, accept the first non-None argmax.
         if old_rid is None:
-            if new_rid is not None:
+            if new_rid is not None and self._cold_recipe_evidence_ok(new_rid):
                 self.inferred_recipe = new_rid
-                self.inferred_pref = None
-                if self.locked_variant_key is not None and self.locked_variant_key[0] != new_rid:
-                    self._clear_preference_lock()
+                self.inferred_variant_hash = None
+                if self.locked_variant_key is not None and self.locked_variant_key[0] != new_rid: self._clear_preference_lock()
                 self._pending_argmax = None
                 self._pending_count = 0
                 self.narrate(f"[step {self.step_counter}] posterior set recipe = '{new_rid}' (confidence={self.posterior.confidence():.2f})")
@@ -1001,10 +1336,7 @@ class AdaptiveHRCAgent:
             return
 
         # Disagreement. Apply the hysteresis gate: log-ratio margin AND K consecutive steps of agreement on the new argmax.
-        margin = self.posterior.marginal_recipe()
-        log_p_new = math.log(max(margin.get(new_rid, 1e-9), 1e-9))
-        log_p_cur = math.log(max(margin.get(old_rid, 1e-9), 1e-9))
-        if log_p_new - log_p_cur < float(getattr(self.cfg, "posterior_switch_margin", 0.30)): return
+        if not self._switch_recipe_evidence_ok(old_rid, new_rid): return
         if new_rid != self._pending_argmax:
             self._pending_argmax = new_rid
             self._pending_count = 1
@@ -1014,51 +1346,79 @@ class AdaptiveHRCAgent:
 
         # Commit the switch.
         self.inferred_recipe = new_rid
-        self.inferred_pref = None
-        if self.locked_variant_key is not None and self.locked_variant_key[0] != new_rid:
-            self._clear_preference_lock()
+        self.inferred_variant_hash = None
+        if self.locked_variant_key is not None and self.locked_variant_key[0] != new_rid: self._clear_preference_lock()
         self._pending_argmax = None
         self._pending_count = 0
         self.narrate(f"[step {self.step_counter}] posterior switched recipe '{old_rid}' -> '{new_rid}' (confidence={self.posterior.confidence():.2f})")
 
+    def _cold_recipe_evidence_ok(self, new_rid: str) -> bool:
+        marginals = self.posterior.marginal_recipe()
+        p_new = float(marginals.get(new_rid, 0.0))
+        second = max((float(p) for rid, p in marginals.items() if rid != new_rid), default=0.0)
+        min_conf = max(0.35, float(getattr(self.cfg, "posterior_switch_min_confidence", 0.55)) - 0.10)
+        min_gap = float(getattr(self.cfg, "posterior_switch_min_gap", 0.05))
+        return p_new >= min_conf and (p_new - second) >= min_gap
+
+    def _switch_recipe_evidence_ok(self, old_rid: str, new_rid: str) -> bool:
+        marginals = self.posterior.marginal_recipe()
+        p_new = float(marginals.get(new_rid, 0.0))
+        p_old = float(marginals.get(old_rid, 0.0))
+        if p_new < float(getattr(self.cfg, "posterior_switch_min_confidence", 0.55)): return False
+        second = max((float(p) for rid, p in marginals.items() if rid != new_rid), default=0.0)
+        if p_new - second < float(getattr(self.cfg, "posterior_switch_min_gap", 0.05)): return False
+        log_ratio = math.log(max(p_new, 1e-9)) - math.log(max(p_old, 1e-9))
+        return log_ratio >= float(getattr(self.cfg, "posterior_switch_margin", 0.30))
+
     def evaluate_autonomous_tokens(self, ordering: Sequence[str], topn: int = 3, ground_truth_recipe: Optional[str] = None, ground_truth_pref: Optional[str] = None) -> Dict[str, float]:
         tokens = self._coerce_prefix_tokens(ordering)
         total = len(tokens)
-        if total == 0: return {"top1": 0.0, "top3": 0.0, "coverage": 0.0, "abstain_rate": 0.0, "cross_entropy": 0.0}
+        topn = max(1, int(topn))
+        if total == 0:
+            out = {"top1": 0.0, "topk": 0.0, "prediction_available_rate": 0.0, "empty_prediction_rate": 0.0, "cross_entropy": 0.0}
+            out[f"top{topn}"] = 0.0
+            return out
         prefix: List[str] = []
         inferred_recipe: Optional[str] = None
-        inferred_pref: Optional[str] = None
+        inferred_latent_pref_id: Optional[str] = None
         top1_hits = 0
         topk_hits = 0
-        covered = 0
-        abstentions = 0
+        available = 0
+        empty_predictions = 0
         nll = 0.0
         recipe_hits = 0
         pref_hits = 0
         floor = max(float(self.cfg.prob_floor), 1e-12)
 
         for actual in tokens:
-            dist = self.predict_next_tokens(prefix, recipe_id=inferred_recipe, pref_hash=inferred_pref)
+            dist = self.predict_next_tokens(prefix)
             ranked = top_k(dist, k=topn) if dist else []
             predicted = ranked[0] if ranked else None
             if dist:
-                covered += 1
+                available += 1
                 top1_hits += int(predicted == actual)
                 topk_hits += int(actual in ranked)
                 nll -= math.log(max(float(dist.get(actual, floor)), floor))
             else:
-                abstentions += 1
+                empty_predictions += 1
                 nll -= math.log(floor)
 
             prefix.append(actual)
             # Single identity head: refresh the posterior and read its argmaxes. This is the same path predict_next_tokens uses in deployment, so eval and online inference cannot diverge. The deepcopy frozen() contract rolls back any posterior mutation on context exit.
             self._refresh_recipe_inference(prefix)
             inferred_recipe = self.posterior.argmax_recipe()
-            inferred_pref = self.posterior.argmax_preference()
+            inferred_latent_pref_id = self.posterior.argmax_preference()
             if ground_truth_recipe is not None:     recipe_hits += int(inferred_recipe == ground_truth_recipe)
-            if ground_truth_pref is not None:       pref_hits += int(inferred_pref == ground_truth_pref)
+            if ground_truth_pref is not None:       pref_hits += int(inferred_latent_pref_id == ground_truth_pref)
 
-        out = {"top1": top1_hits / total,   "top3": topk_hits / total,  "coverage": covered / total,    "abstain_rate": abstentions / total,    "cross_entropy": nll / total}
+        out = {
+            "top1": top1_hits / total,
+            "topk": topk_hits / total,
+            "prediction_available_rate": available / total,
+            "empty_prediction_rate": empty_predictions / total,
+            "cross_entropy": nll / total,
+        }
+        out[f"top{topn}"] = topk_hits / total
         if ground_truth_recipe is not None: out["recipe_accuracy"] = recipe_hits / total
         if ground_truth_pref is not None:   out["preference_accuracy"] = pref_hits / total
         return out
@@ -1078,43 +1438,21 @@ class AdaptiveHRCAgent:
                 vector = self._vector_for_token(token)
                 if vector is not None:
                     new_state = apply_transition_vector(state, vector)
-                    if new_state == state:
-                        dropped_total += 1   # no-op transition = failed precondition
+                    if new_state == state: dropped_total += 1   # no-op transition = failed precondition
                     state = new_state
             traj.append((state, "stop"))
             trajs.append(traj)
         return trajs, dropped_total
 
-    def _record_retrain_event(
-        self,
-        dropped_actions: int,
-        active_demos: int,
-        *,
-        total_wall_s: float = 0.0,
-        build_wall_s: float = 0.0,
-        fit_wall_s: float = 0.0,
-        flop_estimate: float = 0.0,
-        skipped: bool = False,
-    ) -> None:
+    def _record_retrain_event(self, dropped_actions: int, active_demos: int, *, total_wall_s: float = 0.0, build_wall_s: float = 0.0, fit_wall_s: float = 0.0, flop_estimate: float = 0.0, skipped: bool = False) -> None:
         """Append a structured retrain event. All agent variants funnel through this."""
         fit_stats = self._latest_fit_stats() if not skipped else {}
         if not skipped and float(flop_estimate) <= 0.0:
             estimate = fit_stats.get("estimated_flops") if isinstance(fit_stats, dict) else None
-            if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)):
-                flop_estimate = float(estimate)
-        event = {
-            "step": self.step_counter,
-            "cycle": int(self.retrain_cycle),
-            "dropped_actions": int(dropped_actions),
-            "active_demos": int(active_demos),
-            "total_wall_s": float(total_wall_s),
-            "build_wall_s": float(build_wall_s),
-            "fit_wall_s": float(fit_wall_s),
-            "flop_estimate": float(flop_estimate),
-            "skipped": bool(skipped),
-        }
-        if fit_stats:
-            event["fit_stats"] = fit_stats
+            if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)): flop_estimate = float(estimate)
+        event = {"step": self.step_counter, "cycle": int(self.retrain_cycle), "dropped_actions": int(dropped_actions), "active_demos": int(active_demos), "total_wall_s": float(total_wall_s), "build_wall_s": float(build_wall_s),
+            "fit_wall_s": float(fit_wall_s), "flop_estimate": float(flop_estimate), "skipped": bool(skipped)}
+        if fit_stats: event["fit_stats"] = fit_stats
         self.retrain_events.append(event)
         if not skipped:
             self.retrain_total_wall_times.append(float(total_wall_s))
@@ -1126,14 +1464,11 @@ class AdaptiveHRCAgent:
         """Return structured accounting from the model head fit that just ran."""
         stats: Dict[str, Any] = {}
         irl_stats = getattr(getattr(self, "irl", None), "last_fit_stats", None)
-        if isinstance(irl_stats, dict) and irl_stats:
-            stats.update(irl_stats)
+        if isinstance(irl_stats, dict) and irl_stats:       stats.update(irl_stats)
         bc_stats = getattr(getattr(self, "bc", None), "last_fit_stats", None)
-        if isinstance(bc_stats, dict) and bc_stats:
-            stats.update(bc_stats)
+        if isinstance(bc_stats, dict) and bc_stats:         stats.update(bc_stats)
         custom_stats = getattr(self, "_custom_fit_stats", None)
-        if isinstance(custom_stats, dict) and custom_stats:
-            stats.update(custom_stats)
+        if isinstance(custom_stats, dict) and custom_stats: stats.update(custom_stats)
         return stats
 
     def _estimate_retrain_flops(self, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]]) -> float:
@@ -1141,13 +1476,12 @@ class AdaptiveHRCAgent:
         stats = self._latest_fit_stats()
         estimate = stats.get("estimated_flops") if isinstance(stats, dict) else None
         if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)):
-            if stats.get("model_family") != "maxent_irl":
-                return float(estimate)
+            if stats.get("model_family") != "maxent_irl": return float(estimate)
             n_transitions = sum(max(0, len(traj) - 1) for traj in trajectories)
             count_head_flops = float(n_transitions * max(1, int(getattr(self.cfg, "markov_order", 1)) + 2))
             return float(estimate) + count_head_flops
-        # Legacy fallback for externally supplied heads that do not expose
-        # last_fit_stats. Current MaxEntIRL2 fits should not take this branch.
+        # Custom heads should expose last_fit_stats; this estimate is retained
+        # only for externally supplied heads that do not.
         n_transitions = sum(max(0, len(traj) - 1) for traj in trajectories)
         n_actions = max(1, len({action for traj in trajectories for _state, action in traj}))
         feature_dim = len(trajectories[0][0][0]) if trajectories and trajectories[0] else 1
@@ -1183,12 +1517,7 @@ class AdaptiveHRCAgent:
             with self._profile("retrain_skipped"):
                 self.retrain_cycle += 1
                 self.retrain_skipped_count += 1
-                self._record_retrain_event(
-                    dropped_actions=0,
-                    active_demos=len(self.decay.active),
-                    total_wall_s=time.perf_counter() - retrain_t0,
-                    skipped=True,
-                )
+                self._record_retrain_event(dropped_actions=0, active_demos=len(self.decay.active), total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
             return
         with self._profile("retrain_total"):
             self.retrain_cycle += 1
@@ -1196,7 +1525,7 @@ class AdaptiveHRCAgent:
             if not entries:
                 self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
                 self._reset_heads()
-                self._rebuild_active_recipe_prototypes(entries)
+                self._rebuild_active_prototypes(entries)
                 self._last_fit_fingerprint = None
                 if self.cfg.verbose: self.narrate(f"[step {self.step_counter}] cleared predictors because active memory is empty (cycle {self.retrain_cycle})")
                 return
@@ -1209,15 +1538,8 @@ class AdaptiveHRCAgent:
             fit_t0 = time.perf_counter()
             with self._profile("retrain_fit_heads"):            self._fit_heads(trajectories, weights)
             fit_wall_s = time.perf_counter() - fit_t0
-            self._record_retrain_event(
-                dropped_actions=dropped_total,
-                active_demos=len(demos),
-                total_wall_s=time.perf_counter() - retrain_t0,
-                build_wall_s=build_wall_s,
-                fit_wall_s=fit_wall_s,
-                flop_estimate=self._estimate_retrain_flops(trajectories),
-            )
-            self._rebuild_active_recipe_prototypes(entries)
+            self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(demos), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
+            self._rebuild_active_prototypes(entries)
             self._last_fit_fingerprint = fp
             if self.cfg.verbose:                                self.narrate(f"[step {self.step_counter}] retrained on {len(trajectories)} weighted demos (cycle {self.retrain_cycle}, global_rate={self.decay.global_rate:.6f}, dropped_actions={dropped_total})")
 

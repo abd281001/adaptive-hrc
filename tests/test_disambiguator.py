@@ -5,7 +5,7 @@ from src.memory import (
     KnownVariant,
     jaccard,
     kendall_tau_distance,
-    pref_hash,
+    variant_hash,
 )
 from src.models import Config
 
@@ -36,28 +36,21 @@ class TauTests(unittest.TestCase):
         self.assertGreater(d, 0.0)
 
 
-class PrefHashOrderPreservingTests(unittest.TestCase):
+class VariantHashOrderPreservingTests(unittest.TestCase):
     def test_raw_hash_distinguishes_orderings(self):
-        h1 = pref_hash(["a(x)", "a(y)", "b"])
-        h2 = pref_hash(["a(y)", "a(x)", "b"])
-        self.assertNotEqual(h1, h2)
-
-    def test_canonicalize_flag_no_longer_merges_same_type_swap(self):
-        # Same action-type swaps can encode preferences, so the compatibility
-        # flag must not collapse them.
-        h1 = pref_hash(["a(x)", "a(y)", "b"], canonicalize=True)
-        h2 = pref_hash(["a(y)", "a(x)", "b"], canonicalize=True)
+        h1 = variant_hash(["a(x)", "a(y)", "b"])
+        h2 = variant_hash(["a(y)", "a(x)", "b"])
         self.assertNotEqual(h1, h2)
 
     def test_order_preserving_hash_preserves_different_type_order(self):
-        h1 = pref_hash(["a", "b", "c"], canonicalize=True)
-        h2 = pref_hash(["b", "a", "c"], canonicalize=True)
+        h1 = variant_hash(["a", "b", "c"])
+        h2 = variant_hash(["b", "a", "c"])
         self.assertNotEqual(h1, h2)
 
 
 class DisambiguatorTests(unittest.TestCase):
     def setUp(self):
-        self.cfg = Config(jaccard_threshold=0.6, ordering_tolerance=0.05)
+        self.cfg = Config(jaccard_threshold=0.6)
         self.d = Disambiguator(self.cfg)
 
     def test_empty_library_is_new(self):
@@ -65,19 +58,19 @@ class DisambiguatorTests(unittest.TestCase):
         self.assertEqual(c.kind, "new_recipe")
 
     def test_identical_is_known(self):
-        lib = [KnownVariant(TOMATO_ONION_SOUP, pref_hash(["a", "b", "c"]), ("a", "b", "c"))]
+        lib = [KnownVariant(TOMATO_ONION_SOUP, variant_hash(["a", "b", "c"]), ("a", "b", "c"))]
         c = self.d.classify(["a", "b", "c"], lib)
         self.assertEqual(c.kind, "known")
         self.assertEqual(c.recipe_id, TOMATO_ONION_SOUP)
 
     def test_same_set_different_order_is_pref_shift(self):
-        lib = [KnownVariant(TOMATO_ONION_SOUP, pref_hash(["a", "b", "c"]), ("a", "b", "c"))]
+        lib = [KnownVariant(TOMATO_ONION_SOUP, variant_hash(["a", "b", "c"]), ("a", "b", "c"))]
         c = self.d.classify(["c", "b", "a"], lib)
         self.assertEqual(c.kind, "preference_shift")
         self.assertEqual(c.recipe_id, TOMATO_ONION_SOUP)
 
     def test_disjoint_is_new(self):
-        lib = [KnownVariant(TOMATO_ONION_SOUP, pref_hash(["a", "b"]), ("a", "b"))]
+        lib = [KnownVariant(TOMATO_ONION_SOUP, variant_hash(["a", "b"]), ("a", "b"))]
         c = self.d.classify(["x", "y", "z"], lib)
         self.assertEqual(c.kind, "new_recipe")
 
@@ -85,7 +78,7 @@ class DisambiguatorTests(unittest.TestCase):
         v1 = KnownVariant(TOMATO_ONION_SOUP, BASE_PREF, ("a", "b", "c", "d"))
         v2 = KnownVariant(TOMATO_ONION_SOUP, ALT_PREF, ("a", "c", "b", "d"))
         ranked = self.d.score_partial(["a", "b"], [v1, v2])
-        self.assertEqual(ranked[0][0].pref_hash, BASE_PREF)
+        self.assertEqual(ranked[0][0].variant_hash, BASE_PREF)
 
 
 if __name__ == "__main__":

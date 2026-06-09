@@ -111,8 +111,7 @@ class TestFreezePrimitive(unittest.TestCase):
         self.assertEqual(snap, snap_after, "Agent state changed inside frozen() context")
 
     def test_frozen_rollback_on_accidental_mutation(self):
-        """Under the deepcopy contract, mutation inside frozen() is rolled back on exit.
-        The contract is restore-on-exit, not raise-on-exit."""
+        """Manual set_frozen() windows restore direct mutations on exit."""
         agent = _make_agent()
         sc_before = agent.session_counter
         agent.set_frozen(True)
@@ -120,6 +119,14 @@ class TestFreezePrimitive(unittest.TestCase):
         agent.session_counter += 999
         agent.set_frozen(False)
         self.assertEqual(agent.session_counter, sc_before, "Mutation inside frozen window must be rolled back on exit")
+
+    def test_frozen_context_reports_structural_mutation(self):
+        agent = _make_agent()
+        prefix_before = tuple(agent.current_prefix)
+        with self.assertRaises(RuntimeError):
+            with agent.frozen():
+                agent.current_prefix.append("mutated_inside_frozen")
+        self.assertEqual(tuple(agent.current_prefix), prefix_before)
 
     def test_frozen_rollback_covers_predictor_heads(self):
         """Mutating IRL theta, n-gram counts, or the codebook inside frozen()

@@ -22,7 +22,16 @@ class AxisDefinitionTests(unittest.TestCase):
     def test_axes_match_plan(self):
         self.assertEqual(
             AXES,
-            ("ingredient_flow", "equipment_setup", "serving_setup", "cleanup_timing"),
+            (
+                "ingredient_flow",
+                "equipment_setup",
+                "serving_setup",
+                "cleanup_timing",
+                "seasoning_timing",
+                "container_loading_style",
+                "cook_start_timing",
+                "serving_priority",
+            ),
         )
 
     def test_each_axis_has_two_values(self):
@@ -153,10 +162,20 @@ class PresetCompositionTests(unittest.TestCase):
         self.assertEqual(p.equipment_setup, "frontloaded")
         self.assertEqual(p.serving_setup, "frontloaded")
         self.assertEqual(p.cleanup_timing, "as_soon_as_free")
+        self.assertEqual(p.seasoning_timing, "late")
+        self.assertEqual(p.container_loading_style, "batch_before_cook")
+        self.assertEqual(p.cook_start_timing, "deferred")
+        self.assertEqual(p.serving_priority, "cleanup_before_serve")
+
+    def test_new_axis_presets_are_available(self):
+        self.assertEqual(PRESET_PREFERENCES["p7_late_seasoning"].seasoning_timing, "late")
+        self.assertEqual(PRESET_PREFERENCES["p8_batch_container_loading"].container_loading_style, "batch_before_cook")
+        self.assertEqual(PRESET_PREFERENCES["p9_deferred_cook_start"].cook_start_timing, "deferred")
+        self.assertEqual(PRESET_PREFERENCES["p10_cleanup_before_serve"].serving_priority, "cleanup_before_serve")
 
 
-class APICompatTests(unittest.TestCase):
-    """Modifier surface mirrors the legacy module enough for consumer migration."""
+class WorkflowPreferenceAPITests(unittest.TestCase):
+    """Current modifier API contract."""
 
     def test_modify_recipe_returns_list(self):
         modifier = WorkflowPreferenceModifier()

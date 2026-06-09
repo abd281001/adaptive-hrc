@@ -10,6 +10,10 @@ from src.memory import DecayManager
 from src.models import Config, DEFAULT_CONFIG
 
 
+def _record_gap(dm: DecayManager, gap: int) -> None:
+    dm._record_reuse_gap(("R", "variant"), gap, step=gap)
+
+
 class TestMaxOverWindow(unittest.TestCase):
 
     def test_base_rate_tracks_max_over_window(self):
@@ -18,20 +22,20 @@ class TestMaxOverWindow(unittest.TestCase):
         dm = DecayManager(cfg)
 
         for g in (5, 20, 8, 40, 15):
-            dm._adapt_base_from_reuse(g)
+            _record_gap(dm, g)
         # window is full: [5, 20, 8, 40, 15]; max=40
         self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
 
         # push five gap=10 entries; evicts 5, 20, 8, 40, 15 one by one
-        dm._adapt_base_from_reuse(10)   # window [20, 8, 40, 15, 10]; max=40
+        _record_gap(dm, 10)   # window [20, 8, 40, 15, 10]; max=40
         self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
-        dm._adapt_base_from_reuse(10)   # [8, 40, 15, 10, 10]; max=40
+        _record_gap(dm, 10)   # [8, 40, 15, 10, 10]; max=40
         self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
-        dm._adapt_base_from_reuse(10)   # [40, 15, 10, 10, 10]; max=40
+        _record_gap(dm, 10)   # [40, 15, 10, 10, 10]; max=40
         self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
-        dm._adapt_base_from_reuse(10)   # [15, 10, 10, 10, 10]; max=15
+        _record_gap(dm, 10)   # [15, 10, 10, 10, 10]; max=15
         self.assertAlmostEqual(dm.base_rate, 1.0 / 15, places=9)
-        dm._adapt_base_from_reuse(10)   # [10, 10, 10, 10, 10]; max=10
+        _record_gap(dm, 10)   # [10, 10, 10, 10, 10]; max=10
         self.assertAlmostEqual(dm.base_rate, 1.0 / 10, places=9)
 
     def test_window_eviction_removes_old_influence(self):
@@ -41,11 +45,11 @@ class TestMaxOverWindow(unittest.TestCase):
         dm = DecayManager(cfg)
 
         for _ in range(3):
-            dm._adapt_base_from_reuse(100)
+            _record_gap(dm, 100)
         self.assertAlmostEqual(dm.base_rate, 1.0 / 100, places=9)
 
         for _ in range(3):
-            dm._adapt_base_from_reuse(2)
+            _record_gap(dm, 2)
         self.assertAlmostEqual(dm.base_rate, 1.0 / 10, places=9)
 
     def test_window_size_1_tracks_instant_gap(self):
@@ -53,10 +57,10 @@ class TestMaxOverWindow(unittest.TestCase):
         cfg = replace(DEFAULT_CONFIG, mwr_window=1, decay_init=0.2)
         dm = DecayManager(cfg)
 
-        dm._adapt_base_from_reuse(5)
+        _record_gap(dm, 5)
         self.assertAlmostEqual(dm.base_rate, 1.0 / 10, places=9)
 
-        dm._adapt_base_from_reuse(40)
+        _record_gap(dm, 40)
         self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
 
     def test_gap_larger_than_window_is_stored(self):
@@ -64,7 +68,7 @@ class TestMaxOverWindow(unittest.TestCase):
         cfg = replace(DEFAULT_CONFIG, mwr_window=30, decay_init=0.1)
         dm = DecayManager(cfg)
 
-        dm._adapt_base_from_reuse(38)
+        _record_gap(dm, 38)
         self.assertEqual(dm.window_snapshot(), [38])
         self.assertAlmostEqual(dm.base_rate, 1.0 / 38, places=9)
 
@@ -73,7 +77,7 @@ class TestMaxOverWindow(unittest.TestCase):
         cfg = replace(DEFAULT_CONFIG, mwr_window=5, decay_init=0.1)
         dm = DecayManager(cfg)
 
-        dm._adapt_base_from_reuse(2)
+        _record_gap(dm, 2)
         self.assertAlmostEqual(dm.base_rate, 0.1, places=9)
         self.assertEqual(dm.base_rate, 1.0 / cfg.decay_horizon_init)
 
@@ -82,7 +86,7 @@ class TestMaxOverWindow(unittest.TestCase):
         cfg = replace(DEFAULT_CONFIG, mwr_window=4)
         dm = DecayManager(cfg)
         for i in range(20):
-            dm._adapt_base_from_reuse(i + 1)
+            _record_gap(dm, i + 1)
         snap = dm.window_snapshot()
         self.assertLessEqual(len(snap), 4)
 
@@ -91,7 +95,7 @@ class TestMaxOverWindow(unittest.TestCase):
         cfg = replace(DEFAULT_CONFIG, mwr_window=5, decay_init=0.3)
         dm = DecayManager(cfg)
         rate_before = dm.base_rate
-        dm._adapt_base_from_reuse(0)
+        _record_gap(dm, 0)
         self.assertEqual(dm.base_rate, rate_before)
         self.assertEqual(dm.window_snapshot(), [])
 
@@ -110,16 +114,16 @@ class TestMaxOverWindow(unittest.TestCase):
 
         # Fill both with gap=100, pinning base_rate low.
         for _ in range(3):
-            dm_fast._adapt_base_from_reuse(100)
+            _record_gap(dm_fast, 100)
         for _ in range(30):
-            dm_slow._adapt_base_from_reuse(100)
+            _record_gap(dm_slow, 100)
 
         # Feed 5 short gaps of 5. The fast window (size=3) evicts all 100s
         # within 3 samples and should now track 1/5; the slow window still has
         # 100s dominating the max.
         for _ in range(5):
-            dm_fast._adapt_base_from_reuse(5)
-            dm_slow._adapt_base_from_reuse(5)
+            _record_gap(dm_fast, 5)
+            _record_gap(dm_slow, 5)
 
         self.assertGreater(
             dm_fast.base_rate,

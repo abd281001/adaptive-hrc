@@ -4,6 +4,10 @@ from src.memory import DecayManager
 from src.models import Config
 
 
+def _record_gap(dm: DecayManager, gap: int, step: int = 0) -> None:
+    dm._record_reuse_gap(("R", "variant"), gap, step=step)
+
+
 TOMATO_ONION_SOUP = "tomato_onion_soup_v1"
 TOMATO_SOUP = "tomato_soup"
 MUSHROOM_SOUP = "mushroom_soup"
@@ -81,15 +85,15 @@ class DecayManagerTests(unittest.TestCase):
         e = dm.active[(TOMATO_ONION_SOUP, BASE_PREF)]
         self.assertAlmostEqual(e.weight, 1.0, places=9)
         # Force the global_rate down to 0.05 by recording a long re-entry gap.
-        dm._adapt_base_from_reuse(20)  # backwards-compat shim: feeds reuse window
-        dm._rescale_rate_by_size(step=1)
+        _record_gap(dm, 20)
+        dm._recompute_effective(step=1)
         self.assertAlmostEqual(dm.global_rate, 0.05, places=9)
         # Stepping deducts the CURRENT global_rate (0.05), not a snapshot at register time.
         dm.step(1, cycle=0)
         self.assertAlmostEqual(dm.active[(TOMATO_ONION_SOUP, BASE_PREF)].weight, 0.95, places=9)
         # Now move global_rate back up via a short gap. Existing entry must adapt.
-        dm._adapt_base_from_reuse(2)
-        dm._rescale_rate_by_size(step=2)
+        _record_gap(dm, 2)
+        dm._recompute_effective(step=2)
         self.assertAlmostEqual(dm.global_rate, 0.5, places=9)
         dm.step(2, cycle=0)
         self.assertAlmostEqual(dm.active[(TOMATO_ONION_SOUP, BASE_PREF)].weight, 0.45, places=9)
@@ -147,6 +151,13 @@ class DecayManagerTests(unittest.TestCase):
         self.assertNotIn((TOMATO_ONION_SOUP, BASE_PREF), self.dm.pruned)
         self.assertAlmostEqual(self.dm.active[(TOMATO_ONION_SOUP, BASE_PREF)].weight, 1.0)
 
+    def test_discard_refuses_latest_pin_by_default(self):
+        self.dm.register(TOMATO_ONION_SOUP, BASE_PREF, ("a",), now=0, cycle=0)
+        with self.assertRaises(RuntimeError):
+            self.dm.discard(TOMATO_ONION_SOUP, BASE_PREF)
+        self.dm.discard(TOMATO_ONION_SOUP, BASE_PREF, allow_latest=True)
+        self.assertNotIn((TOMATO_ONION_SOUP, BASE_PREF), self.dm.active)
+
     def test_latest_protection_can_be_disabled(self):
         dm = DecayManager(Config(
             decay_init=0.1,
@@ -161,12 +172,12 @@ class DecayManagerTests(unittest.TestCase):
         dm = DecayManager(Config(decay_init=0.1, mwr_window=1, size_rescale_exponent=0.0))
         dm.register(TOMATO_ONION_SOUP, BASE_PREF, ("a",), now=0, cycle=0)
         # Long gaps are bounded by the explicit deployment floor.
-        dm._adapt_rate_from_reuse(10_000, step=10_000)
-        dm._rescale_rate_by_size(step=10_000)
+        _record_gap(dm, 10_000, step=10_000)
+        dm._recompute_effective(step=10_000)
         self.assertAlmostEqual(dm.global_rate, dm.cfg.min_global_rate, places=9)
         # Short gaps cannot make retention shorter than H_init.
-        dm._adapt_rate_from_reuse(1, step=10_001)
-        dm._rescale_rate_by_size(step=10_001)
+        _record_gap(dm, 1, step=10_001)
+        dm._recompute_effective(step=10_001)
         self.assertAlmostEqual(dm.global_rate, 0.1, places=9)
 
     def test_size_rescaling_slows_with_more_recipes(self):
@@ -184,7 +195,7 @@ class DecayManagerTests(unittest.TestCase):
         crowded_rate = dm.global_rate
         for key in [(TOMATO_SOUP, BASE_PREF), (MUSHROOM_SOUP, BASE_PREF), (SEASONED_MIXTURE_SOUP, BASE_PREF)]:
             del dm.active[key]
-        dm._rescale_rate_by_size(step=1)
+        dm._recompute_effective(step=1)
         self.assertAlmostEqual(dm.global_rate, crowded_rate, places=9)
 
     def test_pruning_boost_uses_recent_largest_active_count(self):
@@ -208,11 +219,11 @@ class DecayManagerTests(unittest.TestCase):
             dm.register(rid, BASE_PREF, ("a",), now=0, cycle=0)
         crowded_rate = dm.global_rate
         self.assertAlmostEqual(crowded_rate, dm.base_rate / (len(recipe_ids) ** cfg.size_rescale_exponent), places=9)
-        self.assertEqual(max(dm.active_count_window_snapshot()), len(recipe_ids))
+        self.assertEqual(max(dm.active_recipe_count_window_snapshot()), len(recipe_ids))
 
         for rid in recipe_ids[1:]:
             del dm.active[(rid, BASE_PREF)]
-        dm._rescale_rate_by_size(step=1)
+        dm._recompute_effective(step=1)
 
         self.assertAlmostEqual(dm.global_rate, crowded_rate, places=9)
 

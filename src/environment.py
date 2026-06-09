@@ -1,7 +1,7 @@
 """Kitchen-domain environment: vocabulary, state tracker, and recipe library.
 
 This module owns the *symbolic* side of the HRC benchmark:
-  * A fixed vocabulary (containers, ingredients, locations, tools, etc.) from which every feature name and every action symbol is derived.
+  * A fixed vocabulary (containers, ingredients, locations, appliances, etc.) from which every feature name and every action symbol is derived.
   * `StateTracker` — a PDDL-style world model that maintains a fixed-width binary feature vector and applies parsed action strings with precondition checks.
   * `RecipeGenerator` — hand-written reference recipes used as teacher demonstrations.
 
@@ -9,9 +9,6 @@ The feature-vector layout is built exactly once at class level (see `StateTracke
 """
 import numpy as np
 
-# Notebook-level trace flags used by notebook wrappers.
-SHOW_STEPS    = False   # per-step predictions during online observation
-SHOW_CF_STEPS = False   # per-step predictions in forgetting checks
 #  Kitchen-domain vocabulary
 # Every feature name, every action argument, and every preference hook in the whole codebase is derived from these lists. Adding a new ingredient or location here automatically enlarges the raw state vector (and therefore the IRL feature space) in a consistent way.
 
@@ -33,14 +30,6 @@ COOKABLES   = ["meat", "egg", "rice", "tomato", "onion", "mushroom", "chicken", 
 SEASONINGS  = ["salt", "spice1", "spice2", "garlic"]
 
 LOCATIONS   = ["storage", "prep_station", "cooking_station", "plating_station", "serving_station", "washing_station", "blending_station"]
-
-# Tool vocabulary bound to each station.
-TOOLS = {
-    "prep_station":     ["cutting_board", "grater"],
-    "cooking_station":  ["stove"],
-    "washing_station":  ["sink"],
-    "blending_station": ["blender"],
-}
 
 
 # ═════════════════════════════════════════════════════════════════════════════

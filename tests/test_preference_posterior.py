@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import unittest
 
+from src import experiments
 from src.adaptive_agent import AdaptiveHRCAgent
 from src.environment import gen
-from src.evaluations import _make_pair, run_observation_demo, run_online_demo
 from src.models import Config
 from src.posterior import (
+    MemoryPrior,
     OnlinePreferencePosterior,
     PreferencePrototypeLearner,
+    PosteriorWeights,
     RecipePrototypeLearner,
 )
 
@@ -45,6 +47,47 @@ class PosteriorUnitTests(unittest.TestCase):
         )
         m = post.marginal_recipe()
         self.assertGreater(m["R_active"], m["R_pruned"])
+
+    def test_pruned_memory_prior_decays_with_reuse_gap(self):
+        weights = PosteriorWeights(pruned_prior_initial=0.5, pruned_prior_half_life=10.0)
+        recent = OnlinePreferencePosterior._log_p_memory(
+            MemoryPrior("pruned", sessions_since_pruned=1),
+            weights,
+        )
+        stale = OnlinePreferencePosterior._log_p_memory(
+            MemoryPrior("pruned", sessions_since_pruned=50),
+            weights,
+        )
+        self.assertGreater(recent, stale)
+
+    def test_normalized_factor_combination_keeps_joint_distribution_valid(self):
+        recipe = RecipePrototypeLearner()
+        recipe.update_from_demo("R1", ["a", "b", "c"])
+        recipe.update_from_demo("R2", ["x", "y", "z"])
+        pref = PreferencePrototypeLearner()
+        pref.update_from_roles(["retrieve_ingredient", "prepare_ingredient"], recipe_id="R1")
+        pref.update_from_roles(["stage_serving_vessel", "serve"], recipe_id="R2")
+        post = OnlinePreferencePosterior(
+            PosteriorWeights(
+                alpha_recipe=1.0,
+                alpha_pref=1.0,
+                alpha_memory=1.0,
+                temperature_recipe=0.5,
+                temperature_pref=2.0,
+                temperature_memory=1.5,
+            )
+        )
+        joint = post.update(
+            prefix_tokens=["a", "b"],
+            prefix_roles=["retrieve_ingredient", "prepare_ingredient"],
+            recipe_protos=recipe,
+            pref_protos=pref,
+            memory_state_for_recipe=lambda r: MemoryPrior("active", active_weight=1.0)
+            if r == "R1" else MemoryPrior("pruned", sessions_since_pruned=20),
+        )
+        self.assertAlmostEqual(sum(joint.values()), 1.0, places=6)
+        for p in joint.values():
+            self.assertGreaterEqual(p, 0.0)
 
     def test_normalized_entropy_in_unit_interval(self):
         post = OnlinePreferencePosterior()
@@ -86,13 +129,13 @@ class PosteriorAgentIntegrationTests(unittest.TestCase):
         agent = AdaptiveHRCAgent(cfg=Config(verbose=False))
         library = list(gen.recipe_library().items())
         rname, fn = library[0]
-        a = _make_pair(rname, "identity", fn)
-        run_observation_demo(agent, a)
+        a = experiments.materialize_pair(rname, "identity", fn)
+        experiments.observe_episode(agent, a)
         # The posterior may have been touched during refresh paths; force a
         # second observation demo, then verify the posterior is empty after
         # session commit.
-        b = _make_pair(rname, "identity", fn)
-        run_observation_demo(agent, b)
+        b = experiments.materialize_pair(rname, "identity", fn)
+        experiments.observe_episode(agent, b)
         # After end_demo() the agent resets the posterior.
         self.assertEqual(agent.posterior.joint(), {})
 
@@ -100,20 +143,26 @@ class PosteriorAgentIntegrationTests(unittest.TestCase):
         agent = AdaptiveHRCAgent(cfg=Config(verbose=False))
         library = list(gen.recipe_library().items())
         rname, fn = library[0]
-        a = _make_pair(rname, "identity", fn)
-        run_observation_demo(agent, a)
-        rec = run_online_demo(agent, a)
+        a = experiments.materialize_pair(rname, "identity", fn)
+        name_to_rid = {}
+        experiments.observe_episode(agent, a, name_to_rid)
+        _metrics, steps = experiments.assist_episode(
+            agent,
+            a,
+            name_to_rid,
+            run_config=experiments.RunConfig(topk=3),
+        )
         # During the online episode, posterior should have identified the
         # recipe (we capture inferred_recipe at each step).
-        recs = [s.inferred_recipe for s in rec.steps if s.inferred_recipe is not None]
+        recs = [s.get("inferred_recipe") for s in steps if s.get("inferred_recipe") is not None]
         self.assertGreater(len(recs), 0)
 
     def test_posterior_does_not_mutate_under_frozen(self):
         agent = AdaptiveHRCAgent(cfg=Config(verbose=False))
         library = list(gen.recipe_library().items())
         rname, fn = library[0]
-        a = _make_pair(rname, "identity", fn)
-        run_observation_demo(agent, a)
+        a = experiments.materialize_pair(rname, "identity", fn)
+        experiments.observe_episode(agent, a)
         # frozen() snapshot includes the posterior; any mutation during
         # frozen would assert on exit. Run a frozen prediction loop.
         with agent.frozen():

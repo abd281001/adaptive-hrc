@@ -1,20 +1,18 @@
 """Fast invariants for paper-facing headline metrics.
 
-These tests protect against silent regressions where a figure still renders but
-the metric support is structurally invalid.
+These tests protect against silent regressions where headline metric support is
+structurally invalid.
 """
 from __future__ import annotations
 
 import math
 import unittest
 
-from src.evaluations import (
-    LiveEpisodeRecord,
-    LiveStepRecord,
-    bwt_fwt_checkpoints,
-    four_cell_key,
+from src.experiments import (
+    _four_cell,
+    bwt_zero_shot_checkpoints,
+    calibration_curve_from_steps,
     mean_ci95,
-    pooled_calibration_from_episodes,
 )
 from src.models import DEFAULT_CONFIG
 
@@ -32,7 +30,7 @@ class HeadlineInvariantTests(unittest.TestCase):
         self.assertTrue(math.isnan(empty_mean))
         self.assertEqual(empty_ci, 0.0)
 
-    def test_bwt_fwt_requires_nonempty_holdout_support(self):
+    def test_bwt_zero_shot_requires_nonempty_holdout_support(self):
         phase_a = {
             "train": {"top1": 0.8},
             "heldout": {"top1": 0.4},
@@ -41,44 +39,21 @@ class HeadlineInvariantTests(unittest.TestCase):
             "train": {"top1": 0.7},
             "heldout": {"top1": 0.6},
         }
-        out = bwt_fwt_checkpoints(phase_a, final, phase_a_seen_labels=["train"])
-        self.assertEqual(out["n_fwt_tasks"], 1)
-        self.assertFalse(math.isnan(out["fwt"]))
+        out = bwt_zero_shot_checkpoints(phase_a, final, phase_a_seen_labels=["train"])
+        self.assertEqual(out["n_zero_shot_tasks"], 1)
+        self.assertFalse(math.isnan(out["zero_shot_transfer"]))
 
-    def test_pooled_calibration_uses_quantile_support_not_episode_mean(self):
-        steps = [
-            LiveStepRecord(
-                step=i,
-                predicted="a",
-                actual="a",
-                correct_top1=(i % 2 == 0),
-                correct_top3=True,
-                topk=("a",),
-                inferred_recipe="R",
-                inferred_pref="P",
-                posterior_confidence=i / 99,
-            )
+    def test_calibration_curve_uses_step_confidence_support(self):
+        rows = [
+            {"policy_diagnostics": {"policy_confidence": i / 99}, "correct_top1": i % 2 == 0}
             for i in range(100)
         ]
-        record = LiveEpisodeRecord(
-            pair_label="R/P",
-            recipe_id="R",
-            preference_name="P",
-            memory_state="active_memory",
-            mode="online",
-            steps=tuple(steps),
-            live_top1=0.5,
-            live_top3=1.0,
-            n=len(steps),
-            first_mismatch_step=1,
-        )
-        out = pooled_calibration_from_episodes([record])
-        self.assertEqual(out["n_pooled"], 100)
-        self.assertGreaterEqual(out["n_bins"], 3)
-        self.assertLessEqual(out["n_bins"], 15)
+        out = calibration_curve_from_steps(rows, n_bins=10)
+        self.assertEqual(sum(int(row["n_steps"]) for row in out), 100)
+        self.assertEqual(len(out), 10)
 
-    def test_cross_product_offdiagonal_cell_is_seen_recipe_unseen_pref(self):
-        self.assertEqual(four_cell_key(seen_recipe=True, seen_preference=False), "seen_unseen")
+    def test_cross_product_offdiagonal_cell_is_known_recipe_new_preference(self):
+        self.assertEqual(_four_cell(seen_recipe=True, seen_preference=False), "seen_recipe_new_preference")
 
 
 if __name__ == "__main__":

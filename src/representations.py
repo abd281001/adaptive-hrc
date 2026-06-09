@@ -69,7 +69,6 @@ ROLE_UNKNOWN_OR_NOOP       = "unknown_or_noop"
 
 ROLES: Tuple[str, ...] = (ROLE_RETRIEVE_INGREDIENT,     ROLE_RETRIEVE_CONTAINER,     ROLE_PREPARE_INGREDIENT,    ROLE_ADD_TO_CONTAINER,      ROLE_MOVE_CONTAINER,        ROLE_ACTIVATE_APPLIANCE,    ROLE_DEACTIVATE_APPLIANCE,
                             ROLE_COOK_OR_BLEND,         ROLE_STAGE_SERVING_VESSEL,   ROLE_SERVE,                 ROLE_CLEAN_CONTAINER,       ROLE_OTHER_VALID,           ROLE_UNKNOWN_OR_NOOP)
-ROLE_TO_INDEX = {r: i for i, r in enumerate(ROLES)}
 
 
 # Precomputed feature-index sets used by the role decoder

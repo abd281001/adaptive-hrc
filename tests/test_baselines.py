@@ -8,10 +8,11 @@ from src.baselines import (
     ExperienceReplayAgent,
     FixedDecayAgent,
     LatestOnlyPreferenceAgent,
-    NearestNeighborAgent,
     NoDecayAgent,
     NoReplayAgent,
+    RecencyPrioritizedReplayAgent,
     UniformWeightAgent,
+    BASELINE_AGENTS,
 )
 from src.models import Config
 
@@ -48,11 +49,11 @@ class BaselineAgentTests(unittest.TestCase):
             NoDecayAgent,
             NoReplayAgent,
             UniformWeightAgent,
-            NearestNeighborAgent,
             L2AnchorAgent,
             BehaviorCloningAgent,
             EWCAgent,
             ExperienceReplayAgent,
+            RecencyPrioritizedReplayAgent,
         ]:
             agent = AgentClass(Config(verbose=False))
             agent.decay.register(TOMATO_ONION_SOUP, BASE_PREF, ("a",), now=0, cycle=0)
@@ -201,7 +202,7 @@ class BaselineAgentTests(unittest.TestCase):
         agent._retrain()
         # Second fit re-snapshots; theta shape preserved.
         self.assertEqual(agent.irl.theta.shape, first_shape)
-        # No legacy BC head on the EWC agent anymore.
+        # EWC routes through the IRL head, not a BC head.
         self.assertFalse(hasattr(agent, "bc"), "EWCAgent must not carry a BC head — Phase 1.6 routes through IRL")
 
     def test_experience_replay_uses_unfiltered_reservoir(self):
@@ -230,16 +231,28 @@ class BaselineAgentTests(unittest.TestCase):
         self.assertTrue(dist, "ER-BC replay head should emit an online distribution after refit")
         self.assertTrue({cook, plate} & set(dist))
 
-    def test_nearest_neighbor_predicts_from_best_prefix_match(self):
-        agent = NearestNeighborAgent(cfg=Config(verbose=False))
+    def test_nearest_neighbor_baseline_is_removed_from_public_registry(self):
+        self.assertNotIn("NearestNeighbor", BASELINE_AGENTS)
+
+    def test_recency_prioritized_replay_reports_policy_metadata(self):
+        cfg = Config(verbose=False, er_buffer_size=2, er_batch_size=2, er_recency_alpha=2.0, er_uniform_mix=0.1, bc_epochs_cold=8, bc_epochs_warm=4)
+        agent = RecencyPrioritizedReplayAgent(cfg=cfg)
         prep = agent._token_for_vector((1, 0))
         cook = agent._token_for_vector((0, 1))
         serve = agent._token_for_vector((1, 1))
-        e1 = agent.decay.register(TOMATO_ONION_SOUP, BASE_PREF, (prep, cook), now=1, cycle=0)
-        e2 = agent.decay.register(TOMATO_SOUP, ALT_PREF, (prep, serve), now=2, cycle=0)
-        e1.weight = 1.0
-        e2.weight = 0.2
-        self.assertEqual(agent.predict_next_tokens([prep]), {cook: 1.0})
+        plate = agent._token_for_vector((0, 0, 1))
+        agent.decay.register(TOMATO_ONION_SOUP, BASE_PREF, (prep, cook), now=1, cycle=0)
+        agent._retrain()
+        agent.decay.register(TOMATO_SOUP, ALT_PREF, (prep, serve), now=5, cycle=1)
+        agent.decay.register("salad", "fresh", (prep, plate), now=6, cycle=2)
+        agent._retrain()
+        meta = agent.replay_buffer_metadata()
+        self.assertEqual(meta["policy"], "recency_prioritized")
+        self.assertEqual(meta["er_buffer_size"], 2)
+        self.assertEqual(meta["er_batch_size"], 2)
+        self.assertLessEqual(meta["n_buffered"], 2)
+        self.assertEqual(meta["alpha"], 2.0)
+        self.assertTrue(agent.predict_next_tokens([prep]))
 
 
 class NewBaselineTests(unittest.TestCase):

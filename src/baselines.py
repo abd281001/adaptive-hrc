@@ -5,7 +5,7 @@ import math
 import random
 import time
 import zlib
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .adaptive_agent import AdaptiveHRCAgent, MODE_ONLINE
@@ -18,16 +18,10 @@ State = Tuple[int, ...]
 def _symbolic_fit_stats(model_family: str, trajectories: Sequence[Trajectory], estimated_flops: float = 0.0) -> Dict[str, object]:
     n_examples = sum(1 for traj in trajectories for _state, action in traj if action != "stop")
     n_actions = len({action for traj in trajectories for _state, action in traj if action != "stop"})
-    return {
-        "model_family": model_family,
-        "estimated_flops": float(estimated_flops),
-        "n_demonstrations": float(len(trajectories)),
-        "n_examples": float(n_examples),
-        "n_actions": float(n_actions),
-    }
+    return {"model_family": model_family, "estimated_flops": float(estimated_flops), "n_demonstrations": float(len(trajectories)), "n_examples": float(n_examples), "n_actions": float(n_actions)}
 
 
-# Behavior-cloning support used by BC, EWC, and replay baselines.
+# Behavior-cloning support used by BC and replay baselines.
 def _softmax(logits: np.ndarray) -> np.ndarray:
     if logits.size == 0:    return logits.astype(np.float32)
     shifted = logits - np.max(logits, axis=1, keepdims=True)
@@ -39,20 +33,14 @@ def _softmax(logits: np.ndarray) -> np.ndarray:
 
 class BehaviorCloningHead:
     """Linear softmax imitation model over state and hashed prefix features."""
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, use_ewc: bool = False):
+    def __init__(self, cfg: Config = DEFAULT_CONFIG):
         self.cfg = cfg
-        self.use_ewc = bool(use_ewc)
         self.normalizer = WelfordFeatureNormalizer()
         self.state_feature_dim: int = 0
         self.weights: Optional[np.ndarray] = None
         self.bias: Optional[np.ndarray] = None
         self.action_to_idx: Dict[str, int] = {}
         self.idx_to_action: Dict[int, str] = {}
-        self._ewc_actions: Tuple[str, ...] = ()
-        self._ewc_theta_w: Optional[np.ndarray] = None
-        self._ewc_theta_b: Optional[np.ndarray] = None
-        self._ewc_fisher_w: Optional[np.ndarray] = None
-        self._ewc_fisher_b: Optional[np.ndarray] = None
         self.last_fit_stats: Dict[str, object] = {}
 
     def reset(self) -> None:
@@ -60,11 +48,6 @@ class BehaviorCloningHead:
         self.bias = None
         self.action_to_idx = {}
         self.idx_to_action = {}
-        self._ewc_actions = ()
-        self._ewc_theta_w = None
-        self._ewc_theta_b = None
-        self._ewc_fisher_w = None
-        self._ewc_fisher_b = None
         self.last_fit_stats = {"model_family": "behavior_cloning", "estimated_flops": 0.0}
 
     def _history_dim(self) -> int:
@@ -122,48 +105,6 @@ class BehaviorCloningHead:
             bias[new_idx] = self.bias[old_idx]
         return weights, bias
 
-    def _aligned_ewc(self, feature_dim: int, action_to_idx: Dict[str, int]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-        if not self.use_ewc: return None, None, None, None
-        if (self._ewc_theta_w is None or self._ewc_theta_b is None or self._ewc_fisher_w is None or self._ewc_fisher_b is None): return None, None, None, None
-        theta_w = np.zeros((feature_dim, len(action_to_idx)), dtype=np.float32)
-        theta_b = np.zeros(len(action_to_idx), dtype=np.float32)
-        fisher_w = np.zeros((feature_dim, len(action_to_idx)), dtype=np.float32)
-        fisher_b = np.zeros(len(action_to_idx), dtype=np.float32)
-        old_map = {action: idx for idx, action in enumerate(self._ewc_actions)}
-        for action, new_idx in action_to_idx.items():
-            old_idx = old_map.get(action)
-            if old_idx is None: continue
-            theta_w[:, new_idx] = self._ewc_theta_w[:, old_idx]
-            theta_b[new_idx] = self._ewc_theta_b[old_idx]
-            fisher_w[:, new_idx] = self._ewc_fisher_w[:, old_idx]
-            fisher_b[new_idx] = self._ewc_fisher_b[old_idx]
-        return theta_w, theta_b, fisher_w, fisher_b
-
-    def _compute_fisher(self, xs: np.ndarray, ys: np.ndarray, sample_weights: np.ndarray, weights: np.ndarray, bias: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        if xs.size == 0: return (np.zeros_like(weights, dtype=np.float32), np.zeros_like(bias, dtype=np.float32))
-        # probs = _softmax(xs @ weights + bias[None, :])
-        # delta = probs.copy()
-        # delta[np.arange(len(ys)), ys] -= 1.0
-        # total = max(float(np.sum(sample_weights)), 1e-8)
-        # weighted_delta_sq = (sample_weights[:, None] * (delta ** 2)).astype(np.float32)
-        # fisher_w = ((xs ** 2).T @ weighted_delta_sq / total).astype(np.float32)
-        # fisher_b = (np.sum(weighted_delta_sq, axis=0) / total).astype(np.float32)
-        # return fisher_w, fisher_b
-
-        # ys is intentionally unused here.
-        # This computes the model Fisher: E_{x ~ data, y ~ p_theta(.|x)}[(grad log p_theta(y|x))^2] rather than the empirical Fisher using observed labels.
-        del ys
-        x = xs.astype(np.float64, copy=False)
-        sw = sample_weights.astype(np.float64, copy=False)
-        probs = _softmax(x @ weights + bias[None, :]).astype(np.float64, copy=False)
-        total = max(float(np.sum(sw)), 1e-8)
-        # Exact diagonal Fisher w.r.t. softmax logits:
-        # E_y[(1[y=k] - p_k)^2] = p_k * (1 - p_k)
-        fisher_logits = sw[:, None] * probs * (1.0 - probs)
-        fisher_w = ((x ** 2).T @ fisher_logits) / total
-        fisher_b = np.sum(fisher_logits, axis=0) / total
-        return fisher_w.astype(np.float32), fisher_b.astype(np.float32)
-
     def fit(self, demonstrations: Sequence[Trajectory], demo_weights: Optional[Sequence[float]] = None) -> None:
         if not demonstrations:
             self.reset()
@@ -188,9 +129,6 @@ class BehaviorCloningHead:
         total_weight = max(float(np.sum(sample_weights)), 1e-8)
         lr = float(self.cfg.bc_learning_rate)
         l2 = float(self.cfg.bc_l2)
-        lam = float(self.cfg.ewc_lambda if self.use_ewc else 0.0)
-        theta_w, theta_b, fisher_w, fisher_b = self._aligned_ewc(feature_dim, action_to_idx)
-        ewc_active = bool(lam > 0.0 and theta_w is not None and theta_b is not None and fisher_w is not None and fisher_b is not None)
 
         for _ in range(max(1, epochs)):
             logits = xs @ model_w + model_b[None, :]
@@ -200,9 +138,6 @@ class BehaviorCloningHead:
             delta *= (sample_weights[:, None] / total_weight).astype(np.float32)
             grad_w = (xs.T @ delta).astype(np.float32) + l2 * model_w
             grad_b = np.sum(delta, axis=0).astype(np.float32)
-            if ewc_active:
-                grad_w += lam * fisher_w * (model_w - theta_w)
-                grad_b += lam * fisher_b * (model_b - theta_b)
             model_w -= lr * grad_w
             model_b -= lr * grad_b
 
@@ -210,36 +145,17 @@ class BehaviorCloningHead:
         self.bias = model_b.astype(np.float32)
         self.action_to_idx = dict(action_to_idx)
         self.idx_to_action = dict(idx_to_action)
-        self._ewc_actions = tuple(self.idx_to_action[i] for i in range(len(self.idx_to_action)))
-        self._ewc_theta_w = self.weights.copy()
-        self._ewc_theta_b = self.bias.copy()
-        self._ewc_fisher_w, self._ewc_fisher_b = self._compute_fisher(xs, ys, sample_weights, self.weights, self.bias)
         n_examples = int(xs.shape[0])
         n_actions = int(len(action_to_idx))
         param_count = int(feature_dim * n_actions + n_actions)
-        # Dense softmax regression accounting from the actual fit: forward
-        # matmul, softmax/delta work, gradient matmul, parameter regularization,
-        # update, plus the Fisher pass computed after every fit.
+        # Dense softmax regression accounting from the actual fit.
         forward = 2.0 * n_examples * feature_dim * n_actions
         softmax_delta = 7.0 * n_examples * n_actions
         grad = 2.0 * feature_dim * n_examples * n_actions + float(n_examples * n_actions)
         regularize_update = 3.0 * param_count
-        ewc_penalty = 3.0 * param_count if ewc_active else 0.0
-        fisher = forward + softmax_delta + (2.0 * feature_dim * n_examples * n_actions) + (3.0 * param_count)
-        estimated_flops = float(max(1, epochs) * (forward + softmax_delta + grad + regularize_update + ewc_penalty) + fisher)
-        self.last_fit_stats = {
-            "model_family": "behavior_cloning",
-            "estimated_flops": estimated_flops,
-            "n_demonstrations": float(len(demonstrations)),
-            "n_examples": float(n_examples),
-            "n_actions": float(n_actions),
-            "feature_dim": float(feature_dim),
-            "state_feature_dim": float(self.state_feature_dim),
-            "history_dim": float(self._history_dim()),
-            "epochs": float(max(1, epochs)),
-            "warm_start": 1.0 if warm_start else 0.0,
-            "ewc_enabled": 1.0 if ewc_active else 0.0,
-        }
+        estimated_flops = float(max(1, epochs) * (forward + softmax_delta + grad + regularize_update))
+        self.last_fit_stats = {"model_family": "behavior_cloning", "estimated_flops": estimated_flops, "n_demonstrations": float(len(demonstrations)), "n_examples": float(n_examples), "n_actions": float(n_actions), "feature_dim": float(feature_dim), "state_feature_dim": float(self.state_feature_dim),
+            "history_dim": float(self._history_dim()), "epochs": float(max(1, epochs)), "warm_start": 1.0 if warm_start else 0.0}
 
     def predict(self, state: State, prefix: Sequence[str]) -> Dict[str, float]:
         if self.weights is None or self.bias is None or not self.idx_to_action: return {}
@@ -270,31 +186,29 @@ class NoReplayAgent(AdaptiveHRCAgent):
     def _clear_memory(self) -> None:
         self.memory.variants.clear()
         self.memory.latest.clear()
-        self.memory.last_evicted_key = None
         self.decay.active.clear()
         self.decay.pruned.clear()
         self.decay.latest_by_recipe.clear()
         self.decay.latest_keys.clear()
-        # Clear action codebooks so the IRL feature matrix cannot see tokens from
-        # cleared recipes. Without this, states from pruned recipes remain in the
-        # state_to_idx table and influence feature normalization on the next retrain.
+        # Clear action codebooks so the IRL feature matrix cannot see tokens from cleared recipes. Without this, states from pruned recipes remain in the state_to_idx table and influence feature normalization on the next retrain.
         self.action_vector_to_token.clear()
         self.token_to_action_vector.clear()
         self.token_to_role.clear()
         
         self.decay.reuse_gaps.clear()
-        self.decay._gap_window.clear()
-        self.decay._active_count_window.clear()
+        self.decay._reuse_gap_window.clear()
+        self.decay._active_recipe_count_window.clear()
         self.decay.base_rate = 1.0 / max(1, int(getattr(self.cfg, "decay_horizon_init", 10)))
         self.decay.global_rate = self.decay.base_rate
         self.decay.rate_history.append((self.session_counter, self.decay.global_rate))
-        self.recipe_prototypes = RecipePrototypeLearner()
-        self.preference_prototypes = PreferencePrototypeLearner()
+        self.recipe_prototypes = RecipePrototypeLearner(self.cfg)
+        self.preference_prototypes = PreferencePrototypeLearner(cfg=self.cfg)
         self.task_signatures.clear()
         self.preference_signatures.clear()
         self.last_pref_id = None
         self.inferred_recipe = None
-        self.inferred_pref = None
+        self.inferred_variant_hash = None
+        self.inferred_latent_pref_id = None
         self.posterior.reset()
         self._last_fit_fingerprint = None
 
@@ -327,7 +241,8 @@ class NoReplayAgent(AdaptiveHRCAgent):
         if not prefix:
             self.current_prefix = []
             self.inferred_recipe = None
-            self.inferred_pref = None
+            self.inferred_variant_hash = None
+            self.inferred_latent_pref_id = None
             return Classification("known", None, None, 0.0, 0.0)
         if commit_cls.kind == "new_recipe" or commit_cls.recipe_id is None: raise RuntimeError("online new-recipe commit reached mutating path")
 
@@ -340,7 +255,8 @@ class NoReplayAgent(AdaptiveHRCAgent):
         self.classification_events.append((self.step_counter, cls))
         self.current_prefix = []
         self.inferred_recipe = None
-        self.inferred_pref = None
+        self.inferred_variant_hash = None
+        self.inferred_latent_pref_id = None
         return cls
 
     def _retrain(self) -> None:
@@ -360,14 +276,7 @@ class NoReplayAgent(AdaptiveHRCAgent):
         fit_t0 = time.perf_counter()
         self._fit_heads(trajectories, [1.0])
         fit_wall_s = time.perf_counter() - fit_t0
-        self._record_retrain_event(
-            dropped_actions=dropped_total,
-            active_demos=1,
-            total_wall_s=time.perf_counter() - retrain_t0,
-            build_wall_s=build_wall_s,
-            fit_wall_s=fit_wall_s,
-            flop_estimate=self._estimate_retrain_flops(trajectories),
-        )
+        self._record_retrain_event(dropped_actions=dropped_total, active_demos=1, total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
 
 
 class UniformWeightAgent(AdaptiveHRCAgent):
@@ -393,14 +302,7 @@ class UniformWeightAgent(AdaptiveHRCAgent):
         fit_t0 = time.perf_counter()
         self._fit_heads(trajectories, [1.0] * len(trajectories))
         fit_wall_s = time.perf_counter() - fit_t0
-        self._record_retrain_event(
-            dropped_actions=dropped_total,
-            active_demos=len(demos),
-            total_wall_s=time.perf_counter() - retrain_t0,
-            build_wall_s=build_wall_s,
-            fit_wall_s=fit_wall_s,
-            flop_estimate=self._estimate_retrain_flops(trajectories),
-        )
+        self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(demos), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
 
 
 class FixedDecayAgent(AdaptiveHRCAgent):
@@ -408,7 +310,6 @@ class FixedDecayAgent(AdaptiveHRCAgent):
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-        self.decay._adapt_base_from_reuse = lambda *args, **kwargs: None  # type: ignore
         self.decay._record_reuse_gap = lambda *args, **kwargs: None       # type: ignore
         self.decay._recompute_effective = lambda *args, **kwargs: None    # type: ignore
         self.decay.base_rate = cfg.decay_init
@@ -435,11 +336,11 @@ class LatestOnlyPreferenceAgent(AdaptiveDecayAgent):
     def _register_if_live(self, rid: str, seq: List[str], step: int):
         variant = super()._register_if_live(rid, seq, step)
         slot = self.memory.variants.get(rid, {})
-        for pref_hash in list(slot.keys()):
-            if pref_hash == variant.pref_hash: continue
-            del slot[pref_hash]
-            self.decay.discard(rid, pref_hash)
-        self.memory.latest[rid] = variant.pref_hash
+        for variant_hash in list(slot.keys()):
+            if variant_hash == variant.variant_hash: continue
+            del slot[variant_hash]
+            self.decay.discard(rid, variant_hash)
+        self.memory.latest[rid] = variant.variant_hash
         return variant
 
 
@@ -464,11 +365,9 @@ class L2AnchorAgent(AdaptiveHRCAgent):
 class BehaviorCloningAgent(AdaptiveHRCAgent):
     """Supervised next-action imitation baseline with adaptive rehearsal weights."""
 
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, use_ewc: bool = False, **kw):
+    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-        self._use_ewc = bool(use_ewc)
-        self.bc = BehaviorCloningHead(cfg=self.cfg, use_ewc=self._use_ewc)
-        self._bc_anchor_keys = set()
+        self.bc = BehaviorCloningHead(cfg=self.cfg)
 
     def _fit_heads(self, trajectories, weights) -> None:
         self.bc.fit(trajectories, weights)
@@ -479,8 +378,8 @@ class BehaviorCloningAgent(AdaptiveHRCAgent):
         estimate = stats.get("estimated_flops") if isinstance(stats, dict) else None
         if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)):
             return float(estimate)
-        # Fallback for legacy/unfit heads only. This path should not be used for
-        # current retrain events because BehaviorCloningHead.fit records epochs.
+        # Fallback for unfitted heads only. Current retrain events should use
+        # BehaviorCloningHead.fit statistics.
         n_examples = sum(1 for traj in trajectories for _state, action in traj if action != "stop")
         n_actions = max(1, len({action for traj in trajectories for _state, action in traj if action != "stop"}))
         state_dim = len(trajectories[0][0][0]) if trajectories and trajectories[0] else 1
@@ -489,18 +388,11 @@ class BehaviorCloningAgent(AdaptiveHRCAgent):
         return float(2 * n_examples * n_actions * feature_dim * max(1, epochs))
 
     def _prepare_retrain_fit(self) -> None:
-        if self._use_ewc:
-            active_keys = {e.key for e in self.decay.active_entries()}
-            if not self._bc_anchor_keys.issubset(active_keys): self.bc = BehaviorCloningHead(cfg=self.cfg, use_ewc=self._use_ewc)
-            self._bc_anchor_keys = set(active_keys)
-            AdaptiveHRCAgent._reset_heads(self)
-            return
         self._reset_heads()
 
     def _reset_heads(self) -> None:
         super()._reset_heads()
-        self.bc = BehaviorCloningHead(cfg=self.cfg, use_ewc=self._use_ewc)
-        self._bc_anchor_keys = set()
+        self.bc = BehaviorCloningHead(cfg=self.cfg)
 
     def pruned_influence_audit(self, max_prefixes: int = 24, tolerance: float = 5e-2) -> Dict[str, object]:
         entries = self.decay.active_entries()
@@ -508,7 +400,7 @@ class BehaviorCloningAgent(AdaptiveHRCAgent):
         demos = [list(e.ordering) for e in entries]
         weights = [float(e.weight) for e in entries]
         trajectories, _ = self._build_trajectories(demos)
-        fresh_bc = BehaviorCloningHead(cfg=self.cfg, use_ewc=self._use_ewc)
+        fresh_bc = BehaviorCloningHead(cfg=self.cfg)
         fresh_bc.fit(trajectories, weights)
         prefixes: List[Tuple[str, ...]] = []
         seen = set()
@@ -532,7 +424,7 @@ class BehaviorCloningAgent(AdaptiveHRCAgent):
         mean_l1 = sum(diffs) / max(len(diffs), 1)
         return {"max_l1": float(max_l1), "mean_l1": float(mean_l1), "n_prefixes": len(diffs), "passed": bool(max_l1 <= tolerance), "tolerance": float(tolerance), "model_family": "behavior_cloning"}
 
-    def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
+    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
         prefix_tokens = list(prefix) if prefix is not None else list(self.current_prefix)
         prefix_tokens = self._coerce_prefix_tokens(prefix_tokens)
         state = self._state_from_prefix(prefix_tokens)
@@ -549,9 +441,19 @@ class BehaviorCloningAgent(AdaptiveHRCAgent):
         return dist
 
 
-class EWCAgent(AdaptiveHRCAgent):
-    """Diagonal-Fisher EWC on the IRL head. After every successful refit, snapshots `(theta_star, fisher)` from `MaxEntIRL2.fisher_diagonal` (linear-softmax approximation: the diagonal Fisher under the data distribution) and feeds them back on the NEXT fit
-    so the new theta is anchored toward the previous task's optimum weighted by per-feature curvature. This is the published EWC formulation (Kirkpatrick et al. 2017) on the same model class as the proposed agent."""
+class ProgressiveAnchorEWCAgent(AdaptiveHRCAgent):
+    """Single-task-anchor EWC (sliding variant).
+
+    After each refit the consolidation point is overwritten with the most
+    recently completed task's theta and Fisher.  Only the LAST task boundary
+    is protected — earlier tasks receive no penalty once a new snapshot is
+    taken.  Fisher is replaced (not accumulated), so this is NOT the original
+    Kirkpatrick et al. 2017 formulation.
+
+    Retained as a lightweight ablation: it answers "how much does the proposed
+    agent benefit from protecting the latest task alone?"  For the full
+    multi-task Kirkpatrick formulation see EWCAgent.
+    """
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
@@ -561,10 +463,102 @@ class EWCAgent(AdaptiveHRCAgent):
     def _fit_heads(self, trajectories, weights) -> None:
         self.irl.fit(trajectories, weights, ewc_theta_star=self._ewc_theta_star, ewc_fisher=self._ewc_fisher)
         self.markov.fit(trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
-        # Snapshot AFTER the new fit so subsequent retrains anchor toward this task's optimum.
+        # Overwrite anchor with THIS task's optimum.
         if self.irl.theta is not None:
             self._ewc_theta_star = self.irl.theta.copy()
             self._ewc_fisher = self.irl.fisher_diagonal(trajectories, weights)
+
+
+class EWCAgent(AdaptiveHRCAgent):
+    """Kirkpatrick et al. (2017) diagonal-Fisher EWC on the IRL head.
+
+    Maintains precision-weighted running accumulators across all observed task
+    boundaries so that the effective EWC penalty is equivalent to summing
+    per-task quadratic terms:
+
+        penalty = sum_i  F_i * (theta - theta_i*)^2
+
+    Because the per-task terms share the same quadratic form, they can be
+    collapsed into a single consolidated penalty:
+
+        F_total        = sum_i F_i
+        theta_star_total = (sum_i F_i * theta_i*) / F_total   [precision-weighted anchor]
+        penalty        = F_total * (theta - theta_star_total)^2
+
+    This single-anchor form is what MaxEntIRL2.fit receives via its
+    `ewc_theta_star` / `ewc_fisher` arguments, keeping the fit interface
+    unchanged while correctly representing all past tasks.
+
+    When feature dimensionality increases (new recipes introduce new states),
+    accumulators are zero-padded so old-task Fisher mass is preserved and
+    new dimensions start unconstrained.
+    """
+
+    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
+        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
+        # Running accumulators (feature-space vectors)
+        self._ewc_fisher_total: Optional[np.ndarray] = None        # sum_i F_i
+        self._ewc_fisher_theta_total: Optional[np.ndarray] = None  # sum_i F_i * theta_i*
+        # Consolidated anchor passed to irl.fit — recomputed after every task.
+        self._ewc_theta_star_consolidated: Optional[np.ndarray] = None
+        self._ewc_fisher_consolidated: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _resize_to(arr: Optional[np.ndarray], n: int) -> np.ndarray:
+        """Return a float32 vector of length n, zero-padding or truncating arr."""
+        if arr is None:
+            return np.zeros(n, dtype=np.float32)
+        if arr.shape[0] == n:
+            return arr
+        out = np.zeros(n, dtype=np.float32)
+        k = min(arr.shape[0], n)
+        out[:k] = arr[:k]
+        return out
+
+    def _fit_heads(self, trajectories, weights) -> None:
+        self.irl.fit(
+            trajectories, weights,
+            ewc_theta_star=self._ewc_theta_star_consolidated,
+            ewc_fisher=self._ewc_fisher_consolidated,
+        )
+        self.markov.fit(
+            trajectories, weights,
+            state_to_idx=self.irl.state_to_idx,
+            idx_to_state=self.irl.idx_to_state,
+            feature_matrix=self.irl.feature_matrix,
+            col_min=self.irl.col_min,
+            col_max=self.irl.col_max,
+            normalizer=self.irl.normalizer,
+        )
+        if self.irl.theta is None:
+            return
+
+        new_theta = self.irl.theta.astype(np.float32)   # theta_i*
+        new_fisher = self.irl.fisher_diagonal(trajectories, weights)
+        if new_fisher is None:
+            return
+        new_fisher = new_fisher.astype(np.float32)       # F_i
+
+        n = new_theta.shape[0]
+        # Resize accumulators to current feature dimension, preserving history.
+        self._ewc_fisher_total = self._resize_to(self._ewc_fisher_total, n)
+        self._ewc_fisher_theta_total = self._resize_to(self._ewc_fisher_theta_total, n)
+
+        # Accumulate: F_total += F_i,  (F*theta)_total += F_i * theta_i*
+        self._ewc_fisher_total += new_fisher
+        self._ewc_fisher_theta_total += new_fisher * new_theta
+
+        # Consolidated precision-weighted anchor.
+        # theta_star_total = (sum_i F_i * theta_i*) / sum_i F_i
+        eps = float(getattr(self.cfg, "ewc_precision_eps", 1e-12))
+        fisher_clip = float(getattr(self.cfg, "ewc_fisher_clip", 1e3))
+        fisher_safe = np.maximum(self._ewc_fisher_total, eps)
+        self._ewc_theta_star_consolidated = (
+            self._ewc_fisher_theta_total / fisher_safe
+        ).astype(np.float32)
+        self._ewc_fisher_consolidated = np.clip(
+            self._ewc_fisher_total, 0.0, fisher_clip
+        ).astype(np.float32)
 
 
 class ExperienceReplayAgent(BehaviorCloningAgent):
@@ -577,6 +571,7 @@ class ExperienceReplayAgent(BehaviorCloningAgent):
         self._buffered_keys: set = set()
         self._seen: int = 0
         self._rng = random.Random(getattr(cfg, "seed", 1337))
+        self._last_replay_metadata: Dict[str, Any] = self.replay_buffer_metadata()
 
     def _buffer_add(self, ordering: List[str]) -> None:
         cap = max(1, int(self.cfg.er_buffer_size))
@@ -587,17 +582,19 @@ class ExperienceReplayAgent(BehaviorCloningAgent):
         j = self._rng.randrange(self._seen)
         if j < cap: self._buffer[j] = list(ordering)
 
+    def replay_buffer_metadata(self) -> Dict[str, Any]:
+        n_buffered = len(getattr(self, "_buffer", []))
+        footprint = sum(len(ordering) for ordering in getattr(self, "_buffer", []))
+        return {"policy": "uniform_reservoir", "er_buffer_size": int(self.cfg.er_buffer_size), "er_batch_size": int(self.cfg.er_batch_size), "n_buffered": int(n_buffered), "replay_memory_footprint": int(footprint), "replay_memory_steps": int(footprint)}
+
     def _retrain(self) -> None:
         if self._frozen: return
         retrain_t0 = time.perf_counter()
         self.retrain_cycle += 1
-        # Reservoir-add newly committed active entries. This baseline disables
-        # latest-preference protection, so `decay.latest_keys` may be empty; using
-        # it here silently starves replay and yields an empty predictor.
+        # Reservoir-add newly committed active entries. This baseline disables latest-preference protection, so `decay.latest_keys` may be empty; using it here silently starves replay and yields an empty predictor.
         entries = self.decay.active_entries()
         for entry in entries:
-            if entry.key in self._buffered_keys:
-                continue
+            if entry.key in self._buffered_keys: continue
             self._buffered_keys.add(entry.key)
             self._buffer_add(list(entry.ordering))
 
@@ -621,6 +618,7 @@ class ExperienceReplayAgent(BehaviorCloningAgent):
             self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
             self._reset_heads()
             return
+        self._last_replay_metadata = {**self.replay_buffer_metadata(), "n_sampled": int(len(demos)), "sampler": "uniform_without_replacement"}
 
         build_t0 = time.perf_counter()
         trajectories, dropped_total = self._build_trajectories(demos)
@@ -630,44 +628,102 @@ class ExperienceReplayAgent(BehaviorCloningAgent):
         fit_t0 = time.perf_counter()
         self._fit_heads(trajectories, weights)
         fit_wall_s = time.perf_counter() - fit_t0
-        self._record_retrain_event(
-            dropped_actions=dropped_total,
-            active_demos=len(demos),
-            total_wall_s=time.perf_counter() - retrain_t0,
-            build_wall_s=build_wall_s,
-            fit_wall_s=fit_wall_s,
-            flop_estimate=self._estimate_retrain_flops(trajectories),
-        )
-        # Dummy reference to silence unused-var lint on `entries`.
-        _ = entries
+        self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(demos), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
 
 
-class NearestNeighborAgent(AdaptiveHRCAgent):
-    """Predicts the next action from the nearest-prefix demo in memory."""
+class RecencyPrioritizedReplayAgent(ExperienceReplayAgent):
+    """BC replay baseline with the same nominal buffer as ER, but sampled by recency. The buffer stores one record per observed variant: `(ordering, last_seen_session, seen_count)`. Sampling uses p_i proportional to `(sessions_since_seen_i + 1)^(-alpha)` mixed with a
+    small uniform component. This is a stronger memory-policy comparator than a uniform reservoir because it answers whether adaptive selective forgetting still helps against a fair recency replay policy."""
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
+        super().__init__(cfg=cfg, **kw)
+        self._recency_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._buffer = []
+        self._last_replay_metadata = self.replay_buffer_metadata()
 
-    def _fit_heads(self, trajectories, weights) -> None:
+    def _refresh_buffer_view(self) -> None:
+        ordered = sorted(self._recency_records.values(), key=lambda r: (int(r.get("last_seen_session", 0)), tuple(r.get("ordering", ()))), reverse=True)
+        self._buffer = [list(r.get("ordering", ())) for r in ordered]
+
+    def _upsert_record(self, entry) -> None:
+        cap = max(1, int(self.cfg.er_buffer_size))
+        key = entry.key
+        existing = self._recency_records.get(key)
+        if existing is None and len(self._recency_records) >= cap:
+            evict_key = min(
+                self._recency_records,
+                key=lambda k: (int(self._recency_records[k].get("last_seen_session", 0)), int(self._recency_records[k].get("seen_count", 0)), k))
+            self._recency_records.pop(evict_key, None)
+        rec = self._recency_records.setdefault(key, {"ordering": list(entry.ordering), "last_seen_session": int(entry.last_seen_step), "seen_count": 0})
+        rec["ordering"] = list(entry.ordering)
+        rec["last_seen_session"] = int(entry.last_seen_step)
+        rec["seen_count"] = int(rec.get("seen_count", 0)) + 1
+
+    def _sample_records(self, k: int) -> List[Dict[str, Any]]:
+        records = list(self._recency_records.values())
+        if not records or k <= 0: return []
+        now = max([int(r.get("last_seen_session", 0)) for r in records] + [int(self.session_counter)])
+        alpha = max(0.0, float(self.cfg.er_recency_alpha))
+        mix = min(max(float(self.cfg.er_uniform_mix), 0.0), 1.0)
+        remaining = list(records)
+        sampled: List[Dict[str, Any]] = []
+        while remaining and len(sampled) < min(k, len(records)):
+            raw = [(max(0, now - int(r.get("last_seen_session", 0))) + 1.0) ** (-alpha) for r in remaining]
+            total_raw = max(float(sum(raw)), 1e-12)
+            uniform = 1.0 / len(remaining)
+            weights = [(1.0 - mix) * (w / total_raw) + mix * uniform for w in raw]
+            choice = self._rng.random()
+            acc = 0.0
+            picked = len(remaining) - 1
+            for idx, weight in enumerate(weights):
+                acc += float(weight)
+                if choice <= acc:
+                    picked = idx
+                    break
+            sampled.append(remaining.pop(picked))
+        return sampled
+
+    def replay_buffer_metadata(self) -> Dict[str, Any]:
+        records = list(getattr(self, "_recency_records", {}).values())
+        footprint = sum(len(r.get("ordering", ())) for r in records)
+        return { "policy": "recency_prioritized",       "alpha": float(self.cfg.er_recency_alpha),      "uniform_mix": float(self.cfg.er_uniform_mix),      "er_buffer_size": int(self.cfg.er_buffer_size),     "er_batch_size": int(self.cfg.er_batch_size),
+                "n_buffered": int(len(records)),        "replay_memory_footprint": int(footprint),      "replay_memory_steps": int(footprint)}
+
+    def _retrain(self) -> None:
+        if self._frozen: return
+        retrain_t0 = time.perf_counter()
+        self.retrain_cycle += 1
+        entries = self.decay.active_entries()
+        for entry in entries: self._upsert_record(entry)
+        self._refresh_buffer_view()
+        if not self._recency_records:
+            self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
+            self._reset_heads()
+            return
+        batch_size = max(1, int(self.cfg.er_batch_size))
+        sampled = self._sample_records(batch_size)
+        demos: List[List[str]] = []
+        seen_keys: set = set()
+        for record in sampled:
+            demo = list(record.get("ordering", ()))
+            key = tuple(demo)
+            if not demo or key in seen_keys: continue
+            seen_keys.add(key)
+            demos.append(demo)
+        if not demos:
+            self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
+            self._reset_heads()
+            return
+        self._last_replay_metadata = {**self.replay_buffer_metadata(), "n_sampled": int(len(demos)), "sampler": "recency_prioritized_without_replacement"}
+        build_t0 = time.perf_counter()
+        trajectories, dropped_total = self._build_trajectories(demos)
+        build_wall_s = time.perf_counter() - build_t0
+        weights = [1.0] * len(demos)
         self._reset_heads()
-        self._custom_fit_stats = _symbolic_fit_stats("nearest_neighbor", trajectories, estimated_flops=0.0)
-
-    def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
-        prefix = list(prefix) if prefix is not None else list(self.current_prefix)
-        prefix = self._coerce_prefix_tokens(prefix)
-        best = None
-        best_score = -1.0
-        for e in self.decay.active_entries():
-            m = min(len(prefix), len(e.ordering))
-            if m == 0: continue
-            ident = sum(1 for x, y in zip(prefix, e.ordering[:m]) if x == y) / m
-            score = ident * e.weight
-            if score > best_score:
-                best_score = score
-                best = e
-        if best is None or len(prefix) >= len(best.ordering): return {}
-        nxt = best.ordering[len(prefix)]
-        return {nxt: 1.0}
+        fit_t0 = time.perf_counter()
+        self._fit_heads(trajectories, weights)
+        fit_wall_s = time.perf_counter() - fit_t0
+        self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(demos), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
 
 
 class BigramOnlyAgent(AdaptiveHRCAgent):
@@ -696,12 +752,9 @@ class BigramOnlyAgent(AdaptiveHRCAgent):
                 scalar_updates += 1
         # Wipe the parent heads so any accidental call returns nothing.
         self._reset_heads()
-        self._custom_fit_stats = {
-            **_symbolic_fit_stats("bigram", trajectories, estimated_flops=0.0),
-            "scalar_counter_updates": float(scalar_updates),
-        }
+        self._custom_fit_stats = {**_symbolic_fit_stats("bigram", trajectories, estimated_flops=0.0), "scalar_counter_updates": float(scalar_updates)}
 
-    def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
+    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
         prefix = list(prefix) if prefix is not None else list(self.current_prefix)
         prefix = self._coerce_prefix_tokens(prefix)
         if not prefix:
@@ -746,7 +799,7 @@ class FrequencyConditionedBigramAgent(AdaptiveHRCAgent):
         self._reset_heads()
         self._custom_fit_stats = _symbolic_fit_stats("frequency_conditioned_bigram", trajectories, estimated_flops=0.0)
 
-    def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
+    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
         prefix = list(prefix) if prefix is not None else list(self.current_prefix)
         prefix = self._coerce_prefix_tokens(prefix)
         counts: Dict[str, float] = {}
@@ -754,8 +807,7 @@ class FrequencyConditionedBigramAgent(AdaptiveHRCAgent):
             ordering = list(entry.ordering)
             weight = float(entry.weight)
             if not prefix:
-                if ordering:
-                    counts[ordering[0]] = counts.get(ordering[0], 0.0) + weight
+                if ordering: counts[ordering[0]] = counts.get(ordering[0], 0.0) + weight
                 continue
             prev = prefix[-1]
             for i in range(len(ordering) - 1):
@@ -764,8 +816,7 @@ class FrequencyConditionedBigramAgent(AdaptiveHRCAgent):
                     counts[nxt] = counts.get(nxt, 0.0) + weight
         if not counts:
             for entry in self.decay.active_entries():
-                for action in entry.ordering:
-                    counts[action] = counts.get(action, 0.0) + float(entry.weight)
+                for action in entry.ordering: counts[action] = counts.get(action, 0.0) + float(entry.weight)
         total = float(sum(counts.values()))
         if total <= 0:
             self._set_assist_gate(False, None, None, "baseline_empty")
@@ -774,10 +825,8 @@ class FrequencyConditionedBigramAgent(AdaptiveHRCAgent):
         conf = max(dist.values())
         ent = 0.0
         for p in dist.values():
-            if p > 0:
-                ent -= float(p) * math.log(float(p))
-        if len(dist) > 1:
-            ent /= math.log(len(dist))
+            if p > 0: ent -= float(p) * math.log(float(p))
+        if len(dist) > 1: ent /= math.log(len(dist))
         threshold = self._action_confidence_threshold()
         self._set_assist_gate(conf >= threshold, conf, ent, "baseline_policy" if conf >= threshold else "low_action_confidence")
         return dist
@@ -795,7 +844,7 @@ class UniformValidActionAgent(AdaptiveHRCAgent):
         self._reset_heads()
         self._custom_fit_stats = _symbolic_fit_stats("uniform_valid", trajectories, estimated_flops=0.0)
 
-    def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
+    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
         vocab: set = set()
         for e in self.decay.active_entries(): vocab.update(e.ordering)
         if not vocab: return {}
@@ -826,7 +875,7 @@ class OracleCeilingAgent(AdaptiveHRCAgent):
         super().start_demo()
         self._oracle_step = 0
 
-    def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
+    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
         if self._oracle_target is None: return {}
         prefix = list(prefix) if prefix is not None else list(self.current_prefix)
         idx = len(prefix)  # position to predict
@@ -834,9 +883,22 @@ class OracleCeilingAgent(AdaptiveHRCAgent):
         return {self._oracle_target[idx]: 1.0}
 
 
-class OnlineEWCAgent(EWCAgent):
-    """Online EWC (Schwarz et al. 2018): maintain a running EMA of the Fisher diagonal across tasks instead of snapshotting only the most recent.
-    The anchor `theta_star` is also EMA'd toward the running average so the penalty pulls toward a long-horizon equilibrium rather than just the previous task. Decay rates `gamma_fisher` and `gamma_theta` default to 0.95; the closer to 1.0 the longer the effective history."""
+class OnlineEWCAgent(ProgressiveAnchorEWCAgent):
+    """Online EWC (Schwarz et al. 2018 Progress & Compress, EWC++ variant).
+
+    Inherits from ProgressiveAnchorEWCAgent (single sliding anchor) and
+    replaces its hard-overwrite update with exponential moving averages:
+
+        theta_star ← gamma_theta * theta_star_prev + (1-gamma_theta) * theta_i*
+        fisher     ← gamma_fisher * fisher_prev     + (1-gamma_fisher) * F_i
+
+    With gamma → 1 the history is long; gamma = 0 reduces to ProgressiveAnchorEWCAgent.
+    Unlike the cumulative-Fisher EWCAgent, old tasks are gradually down-weighted,
+    making this suitable for non-stationary streams where old recipes become irrelevant.
+
+    Note: parent class field names (_ewc_theta_star, _ewc_fisher) are reused;
+    EMA is applied in-place after super()._fit_heads() updates them.
+    """
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, gamma_fisher: float = 0.95, gamma_theta: float = 0.95, **kw):
         super().__init__(cfg=cfg, **kw)
@@ -844,12 +906,24 @@ class OnlineEWCAgent(EWCAgent):
         self._gamma_theta = float(gamma_theta)
 
     def _fit_heads(self, trajectories, weights) -> None:
-        # Reuse the parent's EWC plumbing for the fit, then EMA-update the snapshots instead of overwriting.
+        # Capture previous snapshots before parent overwrites them.
         prev_theta = None if self._ewc_theta_star is None else self._ewc_theta_star.copy()
         prev_fisher = None if self._ewc_fisher is None else self._ewc_fisher.copy()
-        super()._fit_heads(trajectories, weights)  # writes snapshot of THIS task
-        if prev_theta is not None and self._ewc_theta_star is not None and prev_theta.shape == self._ewc_theta_star.shape:  self._ewc_theta_star    = (self._gamma_theta * prev_theta + (1.0 - self._gamma_theta) * self._ewc_theta_star).astype(np.float32)
-        if prev_fisher is not None and self._ewc_fisher is not None and prev_fisher.shape == self._ewc_fisher.shape:        self._ewc_fisher        = (self._gamma_fisher * prev_fisher + (1.0 - self._gamma_fisher) * self._ewc_fisher).astype(np.float32)
+        # Parent writes this task's theta_star and fisher to self._ewc_*.
+        super()._fit_heads(trajectories, weights)
+        # EMA-blend: move slowly toward the new task's anchor.
+        if (prev_theta is not None and self._ewc_theta_star is not None
+                and prev_theta.shape == self._ewc_theta_star.shape):
+            self._ewc_theta_star = (
+                self._gamma_theta * prev_theta
+                + (1.0 - self._gamma_theta) * self._ewc_theta_star
+            ).astype(np.float32)
+        if (prev_fisher is not None and self._ewc_fisher is not None
+                and prev_fisher.shape == self._ewc_fisher.shape):
+            self._ewc_fisher = (
+                self._gamma_fisher * prev_fisher
+                + (1.0 - self._gamma_fisher) * self._ewc_fisher
+            ).astype(np.float32)
 
 
 class MostFrequentNextAgent(AdaptiveHRCAgent):
@@ -862,7 +936,7 @@ class MostFrequentNextAgent(AdaptiveHRCAgent):
         self._reset_heads()
         self._custom_fit_stats = _symbolic_fit_stats("most_frequent", trajectories, estimated_flops=0.0)
 
-    def predict_next_tokens(self, prefix=None, recipe_id: Optional[str] = None, pref_hash: Optional[str] = None) -> Dict[str, float]:
+    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
         prefix = list(prefix) if prefix is not None else list(self.current_prefix)
         counts: Dict[str, float] = {}
         for e in self.decay.active_entries():
@@ -875,29 +949,24 @@ class MostFrequentNextAgent(AdaptiveHRCAgent):
 
 
 BASELINE_AGENTS = {
-    "AdaptiveDecay": AdaptiveDecayAgent,
-    "adaptive_decay": AdaptiveDecayAgent,
-    "LatestOnlyPreference": LatestOnlyPreferenceAgent,
     "latest_only": LatestOnlyPreferenceAgent,
-    "NoReplay": NoReplayAgent,
-    "UniformWeight": UniformWeightAgent,
-    "FixedDecay": FixedDecayAgent,
-    "NearestNeighbor": NearestNeighborAgent,
-    "NoDecay": NoDecayAgent,
-    "L2Anchor": L2AnchorAgent,
-    "BC": BehaviorCloningAgent,
-    "EWC": EWCAgent,
-    "OnlineEWC": OnlineEWCAgent,
+    "no_replay": NoReplayAgent,
+    "uniform_weight": UniformWeightAgent,
+    "fixed_decay": FixedDecayAgent,
+    "no_decay": NoDecayAgent,
+    "l2_anchor": L2AnchorAgent,
+    "bc": BehaviorCloningAgent,
+    # Kirkpatrick et al. 2017: cumulative-Fisher, precision-weighted anchor.
+    "ewc": EWCAgent,
+    # Sliding single-anchor variant (ablation: only last task protected).
+    "progressive_anchor_ewc": ProgressiveAnchorEWCAgent,
+    # Schwarz et al. 2018 EWC++: EMA of single-anchor Fisher and theta.
     "online_ewc": OnlineEWCAgent,
-    "ER": ExperienceReplayAgent,
-    "ExperienceReplay": ExperienceReplayAgent,
-    "BigramOnly": BigramOnlyAgent,
+    "experience_replay_bc": ExperienceReplayAgent,
+    "recency_prioritized_replay": RecencyPrioritizedReplayAgent,
     "bigram": BigramOnlyAgent,
-    "FrequencyConditionedBigram": FrequencyConditionedBigramAgent,
     "frequency_conditioned_bigram": FrequencyConditionedBigramAgent,
-    "MostFrequentNext": MostFrequentNextAgent,
-    "UniformValid": UniformValidActionAgent,
+    "most_frequent": MostFrequentNextAgent,
     "uniform_valid": UniformValidActionAgent,
-    "OracleCeiling": OracleCeilingAgent,
     "oracle_ceiling": OracleCeilingAgent,
 }

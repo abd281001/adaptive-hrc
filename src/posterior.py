@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from .memory import _aligned_next_index
 from .representations import (ROLE_ADD_TO_CONTAINER, ROLE_ACTIVATE_APPLIANCE, ROLE_CLEAN_CONTAINER, ROLE_COOK_OR_BLEND, ROLE_PREPARE_INGREDIENT, ROLE_RETRIEVE_CONTAINER, ROLE_RETRIEVE_INGREDIENT, ROLE_SERVE, ROLE_STAGE_SERVING_VESSEL, ROLES, role_bigrams, role_trigrams)
@@ -42,7 +42,8 @@ class RecipePrototype:
 class RecipePrototypeLearner:
     """Registry of RecipePrototype objects keyed by recipe_id. Owns no variant data; it consumes whatever the agent passes in. Variant storage, active/pruned status, and replay weighting remain in VariantMemory and DecayManager."""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: Optional[Any] = None) -> None:
+        self.cfg = cfg
         self.prototypes: Dict[str, RecipePrototype] = {}
 
     # updates
@@ -89,7 +90,11 @@ class RecipePrototypeLearner:
             fwd = float(proto.precedence_counts.get((a, b), 0.0))
             rev = float(proto.precedence_counts.get((b, a), 0.0))
             ok += 1.0 if fwd >= rev and fwd > 0.0 else 0.0
-        return 0.70 * overlap + 0.30 * (ok / max(len(pairs), 1))
+        token_w = max(0.0, float(getattr(self.cfg, "recipe_match_token_weight", 0.70)))
+        precedence_w = max(0.0, float(getattr(self.cfg, "recipe_match_precedence_weight", 0.30)))
+        total_w = token_w + precedence_w
+        if total_w <= 0.0: return overlap
+        return (token_w * overlap + precedence_w * (ok / max(len(pairs), 1))) / total_w
 
     def frontier(self, prefix_tokens: Sequence[str], recipe_id: str, variants: Sequence[Tuple[Sequence[str], float]], align_weight: float = 0.45) -> Dict[str, float]:
         """Distribution over plausible next tokens for this recipe. Exact variant alignment is only part of the signal. The remaining prototype mass keeps recipe-valid but unseen-order actions available so a preference prototype learned on another recipe can transfer."""
@@ -282,7 +287,8 @@ class PreferencePrototypeLearner:
     """Soft-clustering registry of latent preference prototypes.
     Decision rule per completed demo: material workflow-axis gaps create a new prototype; otherwise `max_sim >= MATCH_THRESHOLD` hard-updates the argmax; low-similarity/high-entropy cases create novelty; ambiguous cases soft-update the top prototypes."""
 
-    def __init__(self, match_threshold: float = MATCH_THRESHOLD, novelty_max_similarity: float = NOVELTY_MAX_SIMILARITY, novelty_entropy_min: float = NOVELTY_ENTROPY_MIN, tau_pref_cluster: float = TAU_PREF_CLUSTER, axis_split_threshold: float = AXIS_SPLIT_THRESHOLD) -> None:
+    def __init__(self, match_threshold: float = MATCH_THRESHOLD, novelty_max_similarity: float = NOVELTY_MAX_SIMILARITY, novelty_entropy_min: float = NOVELTY_ENTROPY_MIN, tau_pref_cluster: float = TAU_PREF_CLUSTER, axis_split_threshold: float = AXIS_SPLIT_THRESHOLD, cfg: Optional[Any] = None) -> None:
+        self.cfg = cfg
         self.prototypes: Dict[str, PreferencePrototype] = {}
         self._next_pref_id = 1
         self.match_threshold = float(match_threshold)
@@ -421,6 +427,10 @@ class PreferencePrototypeLearner:
         return max(1e-6, 0.20 * local + 0.80 * phase)
 
     def _phase_action_score(self, candidate_role: str, prefix_roles: Sequence[str], proto: PreferencePrototype, candidate_roles: Optional[Sequence[str]] = None) -> float:
+        def cfg_float(name: str, default: float) -> float: return float(getattr(self.cfg, name, default))
+        def phase_factor(factor: float) -> float:
+            strength = max(0.0, cfg_float("phase_score_strength", 1.0))
+            return max(float(factor), 1e-9) ** strength
         profile = proto.scalar_profile()
         target_retrieve = self._scalar_value(profile, "retrieval_before_first_add")
         target_prep = self._scalar_value(profile, "prep_before_first_add")
@@ -435,26 +445,24 @@ class PreferencePrototypeLearner:
         served_seen = ROLE_SERVE in prefix_roles
         progress = len(prefix_roles) / max(len(prefix_roles) + max(len(roles_left), 1), 1)
         score = 1.0
-        if candidate_role == ROLE_RETRIEVE_CONTAINER:
-            score *= 0.65 + 0.70 * self._scalar_value(profile, "container_setup_lead_time")
+        threshold = cfg_float("phase_score_threshold", 0.65)
+        if candidate_role == ROLE_RETRIEVE_CONTAINER: score *= phase_factor(cfg_float("phase_score_container_base", 0.65) + cfg_float("phase_score_container_lead_weight", 0.70) * self._scalar_value(profile, "container_setup_lead_time"))
         if not first_add_seen:
-            if candidate_role == ROLE_RETRIEVE_INGREDIENT and target_retrieve >= 0.65: score *= 5.0
-            if candidate_role == ROLE_PREPARE_INGREDIENT and target_prep >= 0.65 and not has_left(ROLE_RETRIEVE_INGREDIENT): score *= 4.0
+            if candidate_role == ROLE_RETRIEVE_INGREDIENT and target_retrieve >= threshold:                                         score *= phase_factor(cfg_float("phase_score_retrieve_boost", 5.0))
+            if candidate_role == ROLE_PREPARE_INGREDIENT and target_prep >= threshold and not has_left(ROLE_RETRIEVE_INGREDIENT):   score *= phase_factor(cfg_float("phase_score_prep_boost", 4.0))
             if candidate_role == ROLE_ADD_TO_CONTAINER:
-                if target_retrieve >= 0.65 and has_left(ROLE_RETRIEVE_INGREDIENT): score *= 0.18
-                if target_prep >= 0.65 and has_left(ROLE_PREPARE_INGREDIENT): score *= 0.18
+                if target_retrieve >= threshold and has_left(ROLE_RETRIEVE_INGREDIENT):                                             score *= phase_factor(cfg_float("phase_score_early_add_suppress", 0.18))
+                if target_prep >= threshold and has_left(ROLE_PREPARE_INGREDIENT):                                                  score *= phase_factor(cfg_float("phase_score_early_add_suppress", 0.18))
         if not first_cook_seen:
-            if candidate_role == ROLE_PREPARE_INGREDIENT and target_prep_done >= 0.65: score *= 3.0
-            if candidate_role == ROLE_COOK_OR_BLEND and target_prep_done >= 0.65 and has_left(ROLE_PREPARE_INGREDIENT): score *= 0.20
-        if candidate_role == ROLE_STAGE_SERVING_VESSEL:
-            score *= 0.85 + 0.30 * (1.0 - min(1.0, abs(progress - target_stage) * 2.0))
-        if candidate_role == ROLE_ACTIVATE_APPLIANCE:
-            score *= 0.85 + 0.30 * (1.0 - min(1.0, abs(progress - target_activate) * 2.0))
+            if candidate_role == ROLE_PREPARE_INGREDIENT and target_prep_done >= threshold:                                         score *= phase_factor(cfg_float("phase_score_prep_done_boost", 3.0))
+            if candidate_role == ROLE_COOK_OR_BLEND and target_prep_done >= threshold and has_left(ROLE_PREPARE_INGREDIENT):        score *= phase_factor(cfg_float("phase_score_early_cook_suppress", 0.20))
+        if candidate_role == ROLE_STAGE_SERVING_VESSEL:                                                                             score *= phase_factor(cfg_float("phase_score_position_base", 0.85) + cfg_float("phase_score_position_match_weight", 0.30) * (1.0 - min(1.0, abs(progress - target_stage) * 2.0)))
+        if candidate_role == ROLE_ACTIVATE_APPLIANCE:                                                                               score *= phase_factor(cfg_float("phase_score_position_base", 0.85) + cfg_float("phase_score_position_match_weight", 0.30) * (1.0 - min(1.0, abs(progress - target_activate) * 2.0)))
         if candidate_role == ROLE_CLEAN_CONTAINER:
-            if target_cleanup >= 0.65 and not served_seen: score *= 0.20
-            if target_cleanup <= 0.35 and not served_seen: score *= 2.0
-            if target_cleanup >= 0.65 and served_seen: score *= 2.0
-        return max(1e-6, min(score, 6.0))
+            if target_cleanup >= threshold and not served_seen:                                                                     score *= phase_factor(cfg_float("phase_score_cleanup_early_supp", 0.20))
+            if target_cleanup <= cfg_float("phase_score_cleanup_eager_threshold", 0.35) and not served_seen:                        score *= phase_factor(cfg_float("phase_score_cleanup_late_boost", 2.0))
+            if target_cleanup >= threshold and served_seen:                                                                         score *= phase_factor(cfg_float("phase_score_cleanup_late_boost", 2.0))
+        return max(1e-6, min(score, cfg_float("phase_score_max_clamp", 6.0)))
 
     def all_pref_ids(self) -> List[str]: return list(self.prototypes.keys())
 
@@ -463,15 +471,42 @@ class PreferencePrototypeLearner:
 _LOG_FLOOR = 1e-6
 
 
+@dataclass(frozen=True)
+class MemoryPrior:
+    state: str
+    active_weight: float = 0.0
+    sessions_since_pruned: Optional[int] = None
+    is_latest: bool = False
+
+
 @dataclass
 class PosteriorWeights:
-    """Calibration knobs for the posterior log-linear factorization."""
-    lambda_recipe: float = 1.0
-    lambda_pref:   float = 1.0
-    lambda_memory: float = 0.5
-    tau_recipe:    float = 1.0
-    tau_pref:      float = 1.0
-    tau_memory:    float = 1.0
+    """Calibration knobs for normalized posterior expert combination."""
+    alpha_recipe: float = 1.0
+    alpha_pref:   float = 1.5
+    alpha_memory: float = 0.5
+    temperature_recipe: float = 1.0
+    temperature_pref:   float = 1.0
+    temperature_memory: float = 1.0
+    global_temperature: float = 1.0
+    memory_prior_floor: float = 1e-6
+    active_prior_floor: float = 0.05
+    pruned_prior_initial: float = 0.50
+    pruned_prior_half_life: float = 10.0
+    absent_prior: float = 0.10
+
+
+def _softmax_log_values(log_values: Mapping[Any, float], temperature: float = 1.0) -> Dict[Any, float]:
+    if not log_values: return {}
+    temp = max(float(temperature), 1e-8)
+    scaled = {k: float(v) / temp for k, v in log_values.items()}
+    m = max(scaled.values())
+    exps = {k: math.exp(v - m) for k, v in scaled.items()}
+    z = sum(exps.values())
+    if z <= 0.0 or not math.isfinite(z):
+        uniform = 1.0 / max(1, len(exps))
+        return {k: uniform for k in exps}
+    return {k: v / z for k, v in exps.items()}
 
 
 class OnlinePreferencePosterior:
@@ -489,35 +524,39 @@ class OnlinePreferencePosterior:
         self._joint = {}
 
     def update(self, prefix_tokens: Sequence[str], prefix_roles: Sequence[str], recipe_protos: RecipePrototypeLearner, pref_protos:   PreferencePrototypeLearner, memory_state_for_recipe) -> Dict[Tuple[str, str], float]:
-        """Recompute the posterior given the current prefix. `memory_state_for_recipe` is a callable `rid -> str` returning one of {"active", "pruned", "absent"}; the posterior uses it to weight `log_p_memory` without ever consulting `pref_hash`."""
+        """Recompute the posterior from normalized recipe, preference, and memory experts."""
         recipe_ids = [p.recipe_id for p in recipe_protos.all()]
         if not recipe_ids:  recipe_ids = [self.UNSEEN_RECIPE]
         pref_ids = pref_protos.all_pref_ids()
         if not pref_ids:    pref_ids = [self.UNSEEN_PREF]
 
+        log_recipe = {rid: self._log_p_recipe(prefix_tokens, rid, recipe_protos) for rid in recipe_ids}
+        log_pref = {pid: self._log_p_pref(prefix_roles, pid, pref_protos) for pid in pref_ids}
+        memory_priors = {rid: (MemoryPrior("absent") if rid == self.UNSEEN_RECIPE else self._coerce_memory_prior(memory_state_for_recipe(rid))) for rid in recipe_ids}
+        log_memory = {rid: self._log_p_memory(prior, self.weights) for rid, prior in memory_priors.items()}
+        p_recipe = _softmax_log_values(log_recipe, self.weights.temperature_recipe)
+        p_pref = _softmax_log_values(log_pref, self.weights.temperature_pref)
+        p_memory = _softmax_log_values(log_memory, self.weights.temperature_memory)
         log_scores: Dict[Tuple[str, str], float] = {}
         for rid in recipe_ids:
-            log_pr = self._log_p_recipe(prefix_tokens, rid, recipe_protos)
-            mem_state = memory_state_for_recipe(rid) if rid != self.UNSEEN_RECIPE else "absent"
-            log_pm = self._log_p_memory(mem_state)
             for pid in pref_ids:
-                log_pp = self._log_p_pref(prefix_roles, pid, pref_protos)
-                score = (self.weights.lambda_recipe * log_pr / max(self.weights.tau_recipe, 1e-8) + self.weights.lambda_pref * log_pp / max(self.weights.tau_pref, 1e-8) + self.weights.lambda_memory * log_pm / max(self.weights.tau_memory, 1e-8))
+                score = (self.weights.alpha_recipe * math.log(max(p_recipe.get(rid, 0.0), _LOG_FLOOR)) + self.weights.alpha_pref * math.log(max(p_pref.get(pid, 0.0), _LOG_FLOOR)) + self.weights.alpha_memory * math.log(max(p_memory.get(rid, 0.0), _LOG_FLOOR)))
                 log_scores[(rid, pid)] = score
 
         # Softmax-normalize.
         if not log_scores:
             self._joint = {}
             return self._joint
-        m = max(log_scores.values())
-        exps = {k: math.exp(v - m) for k, v in log_scores.items()}
-        z = sum(exps.values())
-        if z <= 0:
-            uniform = 1.0 / len(exps)
-            self._joint = {k: uniform for k in exps}
-        else:
-            self._joint = {k: v / z for k, v in exps.items()}
+        self._joint = _softmax_log_values(log_scores, self.weights.global_temperature)
         return self._joint
+
+    @staticmethod
+    def _coerce_memory_prior(value: Any) -> MemoryPrior:
+        if isinstance(value, MemoryPrior):  return value
+        if isinstance(value, Mapping):      return MemoryPrior(state=str(value.get("state", "absent")), active_weight=float(value.get("active_weight", 0.0) or 0.0), sessions_since_pruned=value.get("sessions_since_pruned"), is_latest=bool(value.get("is_latest", False)))
+        state = str(value)
+        if state == "active":               return MemoryPrior("active", active_weight=1.0)
+        return MemoryPrior(state)
 
     @staticmethod
     def _log_p_recipe(prefix_tokens: Sequence[str], rid: str, recipe_protos: RecipePrototypeLearner) -> float:
@@ -537,11 +576,21 @@ class OnlinePreferencePosterior:
         return pref_protos.score_prefix(prefix_roles, pid) + 0.10 * math.log(mass)
 
     @staticmethod
-    def _log_p_memory(state: str) -> float:
-        """log P(recipe, preference_state). The plan calls for high prior on active recipes, lower on pruned, lowest on absent. We use fixed bands; calibration adjusts the temperature, not these constants."""
-        if state == "active":   return math.log(1.0)    #  0.0
-        if state == "pruned":   return math.log(0.5)    # ≈ -0.693
-        return math.log(0.1)                            # ≈ -2.30
+    def _log_p_memory(prior: MemoryPrior, weights: PosteriorWeights) -> float:
+        """Continuous memory prior with active weights and pruned half-life."""
+        floor = max(float(weights.memory_prior_floor), _LOG_FLOOR)
+        if prior.is_latest:
+            return math.log(1.0)
+        if prior.state == "active":
+            active_weight = max(0.0, min(1.0, float(prior.active_weight)))
+            p = float(weights.active_prior_floor) + (1.0 - float(weights.active_prior_floor)) * active_weight
+            return math.log(max(p, floor))
+        if prior.state == "pruned":
+            half_life = max(float(weights.pruned_prior_half_life), 1.0)
+            sessions = max(0.0, float(prior.sessions_since_pruned or 0.0))
+            discount = 2.0 ** (-(sessions / half_life))
+            return math.log(max(float(weights.pruned_prior_initial) * discount, floor))
+        return math.log(max(float(weights.absent_prior), floor))
 
     # queries
     def joint(self) -> Dict[Tuple[str, str], float]:

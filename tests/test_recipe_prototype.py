@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from src.posterior import RecipePrototypeLearner
 
@@ -38,6 +39,26 @@ class PrototypeBasicTests(unittest.TestCase):
     def test_recipe_match_zero_for_unknown_recipe(self):
         learner = RecipePrototypeLearner()
         self.assertEqual(learner.recipe_match(["a"], "R_missing"), 0.0)
+
+    def test_recipe_match_weights_are_configurable(self):
+        prefix = ["a", "c", "b"]
+        token_only = RecipePrototypeLearner(
+            SimpleNamespace(
+                recipe_match_token_weight=1.0,
+                recipe_match_precedence_weight=0.0,
+            )
+        )
+        token_only.update_from_demo("R1", ["a", "b", "c"])
+        precedence_only = RecipePrototypeLearner(
+            SimpleNamespace(
+                recipe_match_token_weight=0.0,
+                recipe_match_precedence_weight=1.0,
+            )
+        )
+        precedence_only.update_from_demo("R1", ["a", "b", "c"])
+
+        self.assertAlmostEqual(token_only.recipe_match(prefix, "R1"), 1.0)
+        self.assertLess(precedence_only.recipe_match(prefix, "R1"), 1.0)
 
 
 class FrontierTests(unittest.TestCase):

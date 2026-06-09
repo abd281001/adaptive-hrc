@@ -1,5 +1,12 @@
 """Main workflow-preference generator for adaptive HRC experiments. This module is the canonical preference generator. It uses orthogonal workflow axes:
-    ingredient_flow:  serial | prep_first               equipment_setup:  frontloaded | just_in_time                serving_setup:    frontloaded | just_in_time                cleanup_timing:   after_service | as_soon_as_free
+    ingredient_flow:          serial | prep_first
+    equipment_setup:          frontloaded | just_in_time
+    serving_setup:            frontloaded | just_in_time
+    cleanup_timing:           after_service | as_soon_as_free
+    seasoning_timing:         before_cook | late
+    container_loading_style:  incremental | batch_before_cook
+    cook_start_timing:        as_soon_as_ready | deferred
+    serving_priority:         serve_when_ready | cleanup_before_serve
 Key invariants:
     * No action is inserted, deleted, or rewritten — every transform is a reordering of the base recipe's existing actions.
     * Every emitted candidate is validated against the kitchen environment; invalid/no-effect axes are reportable so experiments can filter or stratify no-op preferences.
@@ -15,12 +22,34 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .environment import CONTAINERS, INGREDIENTS, validate_ordering
 
 # Axes & presets
-INGREDIENT_FLOW_VALUES   = ("serial", "prep_first")
-EQUIPMENT_SETUP_VALUES   = ("frontloaded", "just_in_time")
-SERVING_SETUP_VALUES     = ("frontloaded", "just_in_time")
-CLEANUP_TIMING_VALUES    = ("after_service", "as_soon_as_free")
-AXES: Tuple[str, ...] = (                   "ingredient_flow",                              "equipment_setup",                              "serving_setup",                                "cleanup_timing")
-AXIS_VALUES: Dict[str, Tuple[str, ...]] = {"ingredient_flow":  INGREDIENT_FLOW_VALUES,      "equipment_setup":  EQUIPMENT_SETUP_VALUES,    "serving_setup":    SERVING_SETUP_VALUES,        "cleanup_timing":   CLEANUP_TIMING_VALUES,}
+INGREDIENT_FLOW_VALUES          = ("serial", "prep_first")
+EQUIPMENT_SETUP_VALUES          = ("frontloaded", "just_in_time")
+SERVING_SETUP_VALUES            = ("frontloaded", "just_in_time")
+CLEANUP_TIMING_VALUES           = ("after_service", "as_soon_as_free")
+SEASONING_TIMING_VALUES         = ("before_cook", "late")
+CONTAINER_LOADING_STYLE_VALUES  = ("incremental", "batch_before_cook")
+COOK_START_TIMING_VALUES        = ("as_soon_as_ready", "deferred")
+SERVING_PRIORITY_VALUES         = ("serve_when_ready", "cleanup_before_serve")
+AXES: Tuple[str, ...] = (
+    "ingredient_flow",
+    "equipment_setup",
+    "serving_setup",
+    "cleanup_timing",
+    "seasoning_timing",
+    "container_loading_style",
+    "cook_start_timing",
+    "serving_priority",
+)
+AXIS_VALUES: Dict[str, Tuple[str, ...]] = {
+    "ingredient_flow":          INGREDIENT_FLOW_VALUES,
+    "equipment_setup":          EQUIPMENT_SETUP_VALUES,
+    "serving_setup":            SERVING_SETUP_VALUES,
+    "cleanup_timing":           CLEANUP_TIMING_VALUES,
+    "seasoning_timing":         SEASONING_TIMING_VALUES,
+    "container_loading_style":  CONTAINER_LOADING_STYLE_VALUES,
+    "cook_start_timing":        COOK_START_TIMING_VALUES,
+    "serving_priority":         SERVING_PRIORITY_VALUES,
+}
 
 @dataclass(frozen=True)
 class WorkflowPreference:
@@ -28,13 +57,36 @@ class WorkflowPreference:
     equipment_setup: str = "just_in_time"
     serving_setup: str = "just_in_time"
     cleanup_timing: str = "after_service"
+    seasoning_timing: str = "before_cook"
+    container_loading_style: str = "incremental"
+    cook_start_timing: str = "as_soon_as_ready"
+    serving_priority: str = "serve_when_ready"
     def __post_init__(self):
-        for axis, value in ((               "ingredient_flow", self.ingredient_flow),      ("equipment_setup", self.equipment_setup),      ("serving_setup",   self.serving_setup),        ("cleanup_timing",  self.cleanup_timing)):
+        for axis, value in self.as_dict().items():
             if value not in AXIS_VALUES[axis]: raise ValueError(f"invalid {axis} value: {value!r}")
     @property
-    def label(self) -> str: return (f"if-{self.ingredient_flow}" f"_eq-{self.equipment_setup}" f"_sv-{self.serving_setup}" f"_cu-{self.cleanup_timing}")
+    def label(self) -> str:
+        return (
+            f"if-{self.ingredient_flow}"
+            f"_eq-{self.equipment_setup}"
+            f"_sv-{self.serving_setup}"
+            f"_cu-{self.cleanup_timing}"
+            f"_se-{self.seasoning_timing}"
+            f"_cl-{self.container_loading_style}"
+            f"_co-{self.cook_start_timing}"
+            f"_sp-{self.serving_priority}"
+        )
     def as_dict(self) -> Dict[str, str]:
-        return {                            "ingredient_flow": self.ingredient_flow,         "equipment_setup": self.equipment_setup,       "serving_setup":   self.serving_setup,          "cleanup_timing":  self.cleanup_timing}
+        return {
+            "ingredient_flow": self.ingredient_flow,
+            "equipment_setup": self.equipment_setup,
+            "serving_setup": self.serving_setup,
+            "cleanup_timing": self.cleanup_timing,
+            "seasoning_timing": self.seasoning_timing,
+            "container_loading_style": self.container_loading_style,
+            "cook_start_timing": self.cook_start_timing,
+            "serving_priority": self.serving_priority,
+        }
 
 @dataclass(frozen=True)
 class ModificationResult:
@@ -59,7 +111,15 @@ PRESET_PREFERENCES: Dict[str, WorkflowPreference] = {
     # P5: prep-first mise-en-place with eager cleanup.
     "p5_prep_stage_clean": WorkflowPreference(ingredient_flow="prep_first",                 equipment_setup="just_in_time",                 serving_setup="frontloaded",                    cleanup_timing="as_soon_as_free"),
     # P6: all non-default workflow axes for maximal restructuring.
-    "p6_full_restructure": WorkflowPreference(ingredient_flow="prep_first",                 equipment_setup="frontloaded",                  serving_setup="frontloaded",                    cleanup_timing="as_soon_as_free"),}
+    "p6_full_restructure": WorkflowPreference(ingredient_flow="prep_first",                 equipment_setup="frontloaded",                  serving_setup="frontloaded",                    cleanup_timing="as_soon_as_free",               seasoning_timing="late",                         container_loading_style="batch_before_cook",     cook_start_timing="deferred",                    serving_priority="cleanup_before_serve"),
+    # P7-P10 isolate the newly added workflow axes so transfer experiments can hold out one axis family cleanly.
+    "p7_late_seasoning": WorkflowPreference(seasoning_timing="late"),
+    "p8_batch_container_loading": WorkflowPreference(container_loading_style="batch_before_cook"),
+    "p9_deferred_cook_start": WorkflowPreference(cook_start_timing="deferred"),
+    "p10_cleanup_before_serve": WorkflowPreference(serving_priority="cleanup_before_serve"),
+    # Composed presets for non-diagonal preference-composition probes.
+    "p11_late_season_batch_load": WorkflowPreference(seasoning_timing="late",               container_loading_style="batch_before_cook"),
+    "p12_defer_cook_cleanup_before_serve": WorkflowPreference(cook_start_timing="deferred", serving_priority="cleanup_before_serve"),}
 PREFERENCE_NAMES: Tuple[str, ...] = tuple(PRESET_PREFERENCES.keys())
 
 
@@ -118,9 +178,38 @@ def _move_one_action(actions: Sequence[str], action: str, *, earliest: bool, low
     return current, idx
 
 
+def _move_matching_block(actions: Sequence[str], predicate, *, earliest: bool) -> List[str]:
+    """Move all matching actions as one stable block to the earliest/latest valid position."""
+    indexed = [(i, a) for i, a in enumerate(actions) if predicate(a)]
+    if not indexed:
+        return list(actions)
+    picked_indices = {i for i, _a in indexed}
+    block = [a for _i, a in indexed]
+    rest = [a for i, a in enumerate(actions) if i not in picked_indices]
+    positions = range(0, len(rest) + 1) if earliest else range(len(rest), -1, -1)
+    for k in positions:
+        candidate = rest[:k] + block + rest[k:]
+        if _try_validate(candidate):
+            return candidate
+    return list(actions)
+
+
 def _is_equipment_setup(action: str) -> bool:               return (_verb(action) in ("transfer", "move_container") and _arg0(action) in CONTAINERS and _arg0(action) != "plate" and _source(action) == "storage")
 
 def _is_cleanup_transport(action: str, item: str) -> bool:  return (_verb(action) in ("transfer", "move_container") and _arg0(action) == item and _destination(action) == "washing_station")
+
+def _is_seasoning_action(action: str) -> bool:              return _verb(action) in ("season", "season_container")
+
+def _is_productive_load(action: str) -> bool:
+    args = _args(action)
+    return _verb(action) == "load" and len(args) >= 2 and args[1] not in ("plate", "glass")
+
+def _is_cook_block_action(action: str) -> bool:             return _verb(action) in ("turn_on", "turn_off", "cook", "cook_contents", "blend")
+
+def _is_serving_action(action: str) -> bool:
+    if _verb(action) == "serve":
+        return True
+    return _verb(action) == "move_container" and _arg0(action) in ("plate", "glass") and _destination(action) == "serving_station"
 
 def _cleanup_blocks(actions: Sequence[str]) -> Tuple[List[str], List[List[str]]]:
     """Split actions into non-cleanup actions and cleanup transport+wash blocks. The old transform moved only ``wash`` actions, which made eager cleanup a no-op because the item was not at the washing station yet. Treating the immediately preceding transport to washing_station as part of the same block keeps cleanup physically meaningful while preserving the exact action set."""
@@ -242,11 +331,65 @@ def _apply_cleanup_timing(actions: Sequence[str], value: str) -> List[str]:
 
     return list(actions)
 
+
+def _apply_seasoning_timing(actions: Sequence[str], value: str) -> List[str]:
+    """`late` delays seasoning to the latest executable point. The default leaves the recipe's native seasoning order unchanged."""
+    if value == "before_cook":
+        return list(actions)
+    if value == "late":
+        return _move_matching_block(actions, _is_seasoning_action, earliest=False)
+    return list(actions)
+
+
+def _apply_container_loading_style(actions: Sequence[str], value: str) -> List[str]:
+    """`batch_before_cook` pulls non-serving load actions earlier when dependencies permit it."""
+    if value == "incremental":
+        return list(actions)
+    if value == "batch_before_cook":
+        return _move_matching_block(actions, _is_productive_load, earliest=True)
+    return list(actions)
+
+
+def _apply_cook_start_timing(actions: Sequence[str], value: str) -> List[str]:
+    """`deferred` pushes stove/blender activation and cooking/blending actions later as one block."""
+    if value == "as_soon_as_ready":
+        return list(actions)
+    if value == "deferred":
+        return _move_matching_block(actions, _is_cook_block_action, earliest=False)
+    return list(actions)
+
+
+def _apply_serving_priority(actions: Sequence[str], value: str) -> List[str]:
+    """`cleanup_before_serve` delays the serving move/serve block so cleanup can occur first when physically valid."""
+    if value == "serve_when_ready":
+        return list(actions)
+    if value == "cleanup_before_serve":
+        return _move_matching_block(actions, _is_serving_action, earliest=False)
+    return list(actions)
+
 # Public modifier
 class WorkflowPreferenceModifier:
     """Apply a workflow preference to a base recipe action list."""
-    AXIS_ORDER: Tuple[str, ...] = ("ingredient_flow",                           "equipment_setup",                              "serving_setup",                            "cleanup_timing")
-    AXIS_FN = {                     "ingredient_flow": _apply_ingredient_flow,  "equipment_setup": _apply_equipment_setup,      "serving_setup":   _apply_serving_setup,    "cleanup_timing":  _apply_cleanup_timing}
+    AXIS_ORDER: Tuple[str, ...] = (
+        "ingredient_flow",
+        "equipment_setup",
+        "serving_setup",
+        "container_loading_style",
+        "seasoning_timing",
+        "cook_start_timing",
+        "cleanup_timing",
+        "serving_priority",
+    )
+    AXIS_FN = {
+        "ingredient_flow": _apply_ingredient_flow,
+        "equipment_setup": _apply_equipment_setup,
+        "serving_setup": _apply_serving_setup,
+        "container_loading_style": _apply_container_loading_style,
+        "seasoning_timing": _apply_seasoning_timing,
+        "cook_start_timing": _apply_cook_start_timing,
+        "cleanup_timing": _apply_cleanup_timing,
+        "serving_priority": _apply_serving_priority,
+    }
     DEFAULT_VALUES = WorkflowPreference().as_dict()
 
     def __init__(self) -> None:

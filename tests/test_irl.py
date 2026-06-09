@@ -7,7 +7,6 @@ from src.models import (
     Config,
     MaxEntIRL2,
     NGramMarkov,
-    build_demo_trajectory,
     create_feature_matrix_2_0,
     create_state_action_mappings,
     ensemble_predict,
@@ -15,12 +14,21 @@ from src.models import (
 )
 
 
-class IRLHelperTests(unittest.TestCase):
-    def test_build_demo_trajectory_preserves_actions_and_appends_stop(self):
-        traj = build_demo_trajectory(["abstract_action_1", "abstract_action_2"])
-        self.assertEqual([action for _, action in traj], ["abstract_action_1", "abstract_action_2", "stop"])
-        self.assertTrue(all(len(state) == len(traj[0][0]) for state, _ in traj))
+def _dummy_trajectory(actions):
+    return [((i,), action) for i, action in enumerate(actions)] + [((len(actions),), "stop")]
 
+
+def _valid_trajectory(actions):
+    tracker = StateTracker()
+    traj = []
+    for action in actions:
+        traj.append((tuple(tracker.get_state_vector().tolist()), action))
+        tracker.apply_action(action)
+    traj.append((tuple(tracker.get_state_vector().tolist()), "stop"))
+    return traj
+
+
+class IRLHelperTests(unittest.TestCase):
     def test_create_state_action_mappings_respects_unique_actions(self):
         demos = [[((0,), "a"), ((1,), "stop")], [((0,), "b"), ((2,), "stop")]]
         _, _, action_to_idx, idx_to_action = create_state_action_mappings(
@@ -51,7 +59,7 @@ class IRLHelperTests(unittest.TestCase):
 
 class LearningHeadTests(unittest.TestCase):
     def test_ngram_markov_prefers_matching_context(self):
-        demos = [build_demo_trajectory(["a", "b", "c"])]
+        demos = [_dummy_trajectory(["a", "b", "c"])]
         head = NGramMarkov(order=2, prob_floor=1e-6)
         head.fit(demos, weights=[1.0])
         dist = head.predict(demos[0][2][0], ["a", "b"])
@@ -73,7 +81,7 @@ class LearningHeadTests(unittest.TestCase):
         self.assertEqual(top_k(dist, k=2), ["a", "b"])
 
     def test_maxent_irl_fit_predict_smoke(self):
-        demo = build_demo_trajectory(
+        demo = _valid_trajectory(
             [
                 "transfer (pot, from=storage, to=cooking_station)",
                 "turn_on (stove, cooking_station)",
@@ -99,11 +107,11 @@ class WeightedLossContractTests(unittest.TestCase):
 
     def _two_demos(self):
         return [
-            build_demo_trajectory([
+            _valid_trajectory([
                 "transfer (pot, from=storage, to=cooking_station)",
                 "turn_on (stove, cooking_station)",
             ]),
-            build_demo_trajectory([
+            _valid_trajectory([
                 "transfer (pan, from=storage, to=cooking_station)",
                 "turn_on (stove, cooking_station)",
             ]),
@@ -151,7 +159,7 @@ class ReproducibilityTests(unittest.TestCase):
 
     def test_irl_reproducible(self):
         demos = [
-            build_demo_trajectory([
+            _valid_trajectory([
                 "transfer (pot, from=storage, to=cooking_station)",
                 "turn_on (stove, cooking_station)",
             ]),
@@ -164,7 +172,7 @@ class ReproducibilityTests(unittest.TestCase):
 
     def test_different_seeds_diverge(self):
         demos = [
-            build_demo_trajectory([
+            _valid_trajectory([
                 "transfer (pot, from=storage, to=cooking_station)",
                 "turn_on (stove, cooking_station)",
             ]),

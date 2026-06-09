@@ -1,14 +1,13 @@
 """Clean experimental harness for the adaptive HRC project.
 
-This module is intentionally separate from ``src.evaluations``. It keeps the
-paper-facing benchmark modular: each experiment has a logical name, a typed
-configuration, deterministic seed-based scenario selection, seed-level
-``result.json`` files, aggregate experiment summaries, and figure data that can
-be replotted without reruns.
+The paper-facing benchmark keeps each experiment under one current API: a
+logical name, a typed configuration, deterministic seed-based scenario
+selection, seed-level ``result.json`` files, aggregate experiment summaries,
+and structured logs for external analysis.
 """
 from __future__ import annotations
-import csv
 import datetime as _dt
+import itertools
 import json
 import math
 import multiprocessing as mp
@@ -34,17 +33,14 @@ for _v in (
     "VECLIB_MAXIMUM_THREADS",
 ):
     os.environ.setdefault(_v, "1")
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-hrc")
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
 from .adaptive_agent import AdaptiveHRCAgent
 from .baselines import BASELINE_AGENTS, OracleCeilingAgent
 from .environment import gen
-from .memory import jaccard, kendall_tau_distance, variant_hash
-from .models import Config, DEFAULT_CONFIG, top_k
+from .hrc_simulation import DEFAULT_HRC_TIMING, HRCDecisionContext, policy_distribution_diagnostics, run_alternating_hrc_episode
+from .memory import VariantKey, jaccard, kendall_tau_distance, variant_hash
+from .models import Config, DEFAULT_CONFIG
 from .preferences import (AXES as WORKFLOW_AXES, AXIS_VALUES as WORKFLOW_AXIS_VALUES, PRESET_PREFERENCES, PREFERENCE_NAMES, WorkflowPreference, WorkflowPreferenceModifier)
 from .representations import observations_from_actions
 
@@ -52,200 +48,76 @@ from .representations import observations_from_actions
 DEFAULT_SEEDS: Tuple[int, ...] = (1337, 2024, 7, 9001, 31415)
 PAPER_BASELINES: Tuple[str, ...] = (
     "full",
-    "adaptive",
+    "no_decay",
     "fixed_decay",
+    "latest_only",
+    "bc",
     "experience_replay_bc",
+    "recency_prioritized_replay",
     "ewc",
     "online_ewc",
-    "l2_anchor",
     "bigram",
-    "frequency_conditioned_bigram",
-    "latest_only",
-    "no_decay",
-    "no_preference_prototype",
-    "no_recipe_prototype",
-    "oracle_ceiling",
 )
-APPENDIX_BASELINES: Tuple[str, ...] = (
-    "no_replay",
-    "uniform_weight",
-    "uniform_valid",
-    "most_frequent",
-    "bc",
-)
-FACTOR_BASELINES: Tuple[str, ...] = (
-    "full",
-    "experience_replay_bc",
-    "irl_ngram_only",
-    "no_preference_prototype",
-    "no_recipe_prototype",
-    "no_posterior",
-    "no_weighted_rehearsal",
-    "latest_only",
-    "bigram",
+ORACLE_REFERENCE_BASELINES: Tuple[str, ...] = (
+    "oracle_recipe_label",
     "oracle_preference_label",
     "oracle_recipe_and_preference_label",
+    "oracle_ceiling",
+)
+TRANSFER_BASELINES: Tuple[str, ...] = (
+    "full",
+    "latest_only",
+    "bc",
+    "experience_replay_bc",
+    "recency_prioritized_replay",
+    "ewc",
+    "online_ewc",
+    "bigram",
+    "no_preference_prototype",
 )
 
-_BASELINE_COLORS: Dict[str, str] = {
-    "full": "#0f766e",
-    "adaptive": "#0369a1",
-    "fixed_decay": "#9333ea",
-    "no_decay": "#dc2626",
-    "no_replay": "#ea580c",
-    "latest_only": "#facc15",
-    "l2_anchor": "#a16207",
-    "ewc": "#0891b2",
-    "online_ewc": "#7c3aed",
-    "experience_replay_bc": "#be185d",
-    "bc": "#475569",
-    "bigram": "#94a3b8",
-    "frequency_conditioned_bigram": "#64748b",
-    "most_frequent": "#9ca3af",
-    "uniform_valid": "#cbd5e1",
-    "uniform_weight": "#6b7280",
-    "no_preference_prototype": "#b45309",
-    "no_recipe_prototype": "#7c2d12",
-    "no_posterior": "#111827",
-    "no_weighted_rehearsal": "#ea580c",
-    "irl_ngram_only": "#2563eb",
-    "oracle_preference_label": "#16a34a",
-    "oracle_recipe_and_preference_label": "#15803d",
-    "oracle_ceiling": "#000000",
-}
-
-_BASELINE_DISPLAY_NAMES: Dict[str, str] = {
-    "full": "Full",
-    "adaptive": "Adaptive decay",
-    "fixed_decay": "Fixed decay",
-    "no_decay": "Unbounded memory",
-    "latest_only": "Latest only",
-    "experience_replay_bc": "Experience replay BC",
-    "bigram": "Bigram",
-    "frequency_conditioned_bigram": "Weighted bigram",
-    "irl_ngram_only": "IRL+n-gram only",
-    "oracle_ceiling": "Oracle ceiling",
-    "oracle_preference_label": "Oracle preference",
-    "oracle_recipe_and_preference_label": "Oracle recipe+preference",
-}
-
-_BASELINE_GROUPS: Dict[str, str] = {
-    "full": "Proposed variants",
-    "adaptive": "Proposed variants",
-    "fixed_decay": "Proposed variants",
-    "experience_replay_bc": "CL baselines",
-    "ewc": "CL baselines",
-    "online_ewc": "CL baselines",
-    "l2_anchor": "CL baselines",
-    "bigram": "Weak baselines / ablations",
-    "frequency_conditioned_bigram": "Weak baselines / ablations",
-    "latest_only": "Weak baselines / ablations",
-    "no_decay": "Memory ablations",
-    "irl_ngram_only": "Weak baselines / ablations",
-    "no_preference_prototype": "Weak baselines / ablations",
-    "no_recipe_prototype": "Weak baselines / ablations",
-    "oracle_ceiling": "Oracle",
-    "oracle_preference_label": "Oracle",
-    "oracle_recipe_and_preference_label": "Oracle",
-}
-
-_BASELINE_GROUP_ORDER: Tuple[str, ...] = (
-    "Proposed variants",
-    "Memory ablations",
-    "CL baselines",
-    "Weak baselines / ablations",
-    "Oracle",
-)
-
-
-def _baseline_color(name: str) -> str:
-    return _BASELINE_COLORS.get(str(name), "#888888")
-
-
-def _baseline_label(name: str) -> str:
-    return _BASELINE_DISPLAY_NAMES.get(str(name), str(name))
-
-
-def _baseline_group(name: str) -> str:
-    return _BASELINE_GROUPS.get(str(name), "Other")
-
-
-def _ordered_baseline_names(names: Iterable[str]) -> List[str]:
-    names_set = list(dict.fromkeys(str(n) for n in names))
-    preferred = list(PAPER_BASELINES) + list(APPENDIX_BASELINES) + list(FACTOR_BASELINES)
-    by_name = {name: i for i, name in enumerate(preferred)}
-    group_rank = {group: i for i, group in enumerate(_BASELINE_GROUP_ORDER)}
-    return sorted(
-        names_set,
-        key=lambda n: (
-            group_rank.get(_baseline_group(n), len(group_rank)),
-            by_name.get(n, len(by_name)),
-            n,
-        ),
-    )
-
-CANONICAL_SCENARIOS: Tuple[str, ...] = (
+EXPERIMENTS: Tuple[str, ...] = (
     "materiality_preflight",
     "deployment_stream",
+    "deployment_ladder_heterogeneous_prefs",
+    "deployment_ladder_shared_pref",
     "cross_recipe_transfer",
-    "decay_reentry",
-    "disambiguation_audit",
-)
-
-DERIVED_VIEWS: Tuple[str, ...] = (
-    "memory_efficiency",
-    "compute_tradeoff",
-    "forgetting_curve",
-    "per_user_accuracy",
-    "coverage_accuracy_curve",
-    "transfer_heatmap",
-    "composition_curve",
-    "decay_rate_trace",
-)
-
-# Public defaults now follow the five-scenario harness design. Legacy runner
-# functions remain registered below for explicit debugging/back-compat only.
-MAIN_EXPERIMENTS: Tuple[str, ...] = CANONICAL_SCENARIOS
-
-APPENDIX_EXPERIMENTS: Tuple[str, ...] = (
+    "confidence_threshold_accuracy",
     "zipf_usage_sweep",
-    "cl_regularizer_comparison",
-    "posterior_ablation_matrix",
-)
-
-LEGACY_EXPERIMENTS: Tuple[str, ...] = (
-    "materiality_audit",
     "demo_count_sample_efficiency",
+    "adversarial_stress_suite",
+    "baseline_hyperparameter_tuning",
     "single_shot_reuse",
     "deployment_gate_preference_shift",
-    "cross_recipe_preference_transfer",
-    "preference_axis_holdout",
-    "novel_preference_composition",
-    "adaptive_decay_reentry",
-    "multi_user_continual_stream",
-    "bounded_memory_tradeoff",
-    "compute_tradeoff",
     "short_term_capacity_sweep",
-    "disambiguation_threshold_calibration",
-    "action_gate_threshold_calibration",
-    "boundary_degradation_disambiguation",
     "frequency_gap_decay_sweep",
     "mwr_window_sensitivity",
-    "reentry_gap_neutral_vs_distractor",
-    "active_pruned_decay_probe",
     "sparse_first_exposure_pool_sweep",
     "cycle_width_sparsity_sweep",
     "baseline_anchor_sweep",
     "continual_learning_regularizer_sweep",
+    "cl_regularizer_comparison",
+    "posterior_ablation_matrix",
     "recipe_preference_factor_ablation",
-    "confidence_calibration_reliability",
+    "memory_exhaustion_stress",
+    "prefix_collision_stress",
+    "preference_thrash_stress",
+    "rare_reentry_stress",
+    "late_distractor_stress",
     "seed_recipe_selection_audit",
     "runtime_scaling_sweep",
+    "catastrophic_vs_selective_forgetting",
+    "adaptation_speed_curve",
+    "decay_reentry",
+    "disambiguation_audit",
 )
 
-ALL_EXPERIMENTS: Tuple[str, ...] = MAIN_EXPERIMENTS + APPENDIX_EXPERIMENTS
-FOUR_CELL_KEYS: Tuple[str, ...] = ("seen_seen", "seen_unseen", "unseen_seen", "unseen_unseen")
-DEPLOYMENT_REPORT_CELLS: Tuple[str, ...] = ("seen_seen", "seen_unseen")
+FOUR_CELL_KEYS: Tuple[str, ...] = (
+    "known_recipe_known_preference",
+    "seen_recipe_new_preference",
+    "unseen_recipe_seen_preference",
+    "unseen_unseen",
+)
 TRANSFER_CELL_KEYS: Tuple[str, ...] = (
     "direct_retrieval",
     "seen_recipe_preference_seen_elsewhere",
@@ -256,74 +128,52 @@ TRANSFER_CELL_KEYS: Tuple[str, ...] = (
 PRIMARY_EVENT_TYPES: Tuple[str, ...] = (
     "routine_reuse",
     "preference_shift",
-    "gradual_shift",
-    "gradual_shift_followup",
     "cross_transfer_probe",
     "rare_reentry",
 )
 ASSIST_WRONG_PENALTY: float = 1.0
-ASSIST_HIDDEN_CORRECT_PENALTY: float = 0.25
+OBSERVATION_MODE_EXTRA_TIME_PER_STEP: float = 1.0
 
 SCENARIO_NARRATIVES: Dict[str, Dict[str, str]] = {
     "deployment_stream": {
-        "claim": "A single deployment stream can test routine reuse, preference shifts, gradual drift, user switches, transfer probes, reentry, memory, compute, and per-step latency without redundant reruns.",
-        "pressure": "Shared Phase A followed by a structured Phase B event mix with forgetting checkpoints, user-return blocks, latency logging, and coverage/accuracy curves.",
+        "claim": "A single deployment stream can test routine reuse, preference shifts, user switches, transfer probes, reentry, memory, compute, and per-step latency without redundant reruns.",
+        "pressure": "Shared Phase A followed by a structured Phase B event mix with online forgetting traces, user-return blocks, latency logging, and confidence-threshold diagnostics.",
+    },
+    "deployment_ladder_heterogeneous_prefs": {
+        "claim": "A deployed assistant should adapt when every known recipe receives a recipe-specific preference update in synchronized ladder rungs.",
+        "pressure": "First rung observes one variant per recipe; subsequent rungs present all recipes in assist mode with per-recipe seed-shuffled preference shifts followed by short settle phases.",
+    },
+    "deployment_ladder_shared_pref": {
+        "claim": "A deployed assistant should exploit a globally shared preference style when all recipes shift together, then stabilize after each synchronized update.",
+        "pressure": "First rung observes the same seed-shuffled preference across recipes; subsequent rungs use a new shared preference for all recipes in assist mode followed by settle phases.",
     },
     "cross_recipe_transfer": {
-        "claim": "Preference structure should transfer across recipes, compose across held-out axis values, and show single-shot sufficiency under one shared training checkpoint.",
-        "pressure": "Exclusive diagonal training snapshot reused for off-diagonal, axis-holdout, novel-composition, and diagonal-cycle sufficiency probes.",
+        "claim": "Preference structure should transfer across recipes, across held-out axis values, and under whole-axis family holdout.",
+        "pressure": "Three explicit conditions are reported separately: diagonal-to-offdiagonal recipe/preference transfer, cross-axis-value transfer across recipe splits, and axis-family holdout where non-default values for one preference axis are absent from training.",
+    },
+    "confidence_threshold_accuracy": {
+        "claim": "The assistant should know when its scheduled robot-turn predictions are reliable enough to be useful.",
+        "pressure": "Posthoc confidence-threshold accuracy curves over alternating-action robot turns; thresholds are reporting cuts on confidence, not action-gate policies.",
     },
     "decay_reentry": {
         "claim": "Adaptive decay should prune stale variants while recovering when a task re-enters after neutral time or distractor growth.",
         "pressure": "Neutral and distractor gap arms from the same prefix checkpoint.",
     },
     "disambiguation_audit": {
-        "claim": "Classification and action-gate thresholds should be justified by held-out calibration, not hard-coded by inspection.",
-        "pressure": "Jaccard threshold sweep, online-prefix degradation, observation-vs-assist gate decisions, and action-gate coverage/accuracy.",
+        "claim": "Classification thresholds should be justified by held-out calibration, not hard-coded by inspection.",
+        "pressure": "Jaccard threshold sweep, online-prefix degradation, active-memory availability diagnostics, and confidence calibration.",
     },
     "materiality_preflight": {
         "claim": "Preference transformations must materially change action orderings before learning claims are interpretable.",
         "pressure": "Seed-level duplicate/no-op filtering and per-recipe discriminability checks.",
-    },
-    "materiality_audit": {
-        "claim": "Preference labels must induce materially different action orderings before downstream learning claims are meaningful.",
-        "pressure": "Detect duplicate or no-op preference transformations per recipe.",
     },
     "single_shot_reuse": {
         "claim": "After one observation, the robot should assist on first reuse without re-entering observation mode.",
         "pressure": "First online reuse after a single observed demonstration.",
     },
     "deployment_gate_preference_shift": {
-        "claim": "The robot should assist known recipes with new preferences but safe-fail or request observation for truly novel recipes.",
-        "pressure": "Contrasts same-recipe preference shift against novel-recipe assist attempts.",
-    },
-    "cross_recipe_preference_transfer": {
-        "claim": "A preference learned on one recipe should transfer to another recipe without seeing that exact recipe-preference pair.",
-        "pressure": "Diagonal train set followed by off-diagonal transfer probes.",
-    },
-    "preference_axis_holdout": {
-        "claim": "Latent preference structure should generalize along held-out workflow axes.",
-        "pressure": "Train identity-axis values and probe non-identity values by axis.",
-    },
-    "novel_preference_composition": {
-        "claim": "The robot should compose unseen combinations of known preference axes.",
-        "pressure": "Train named presets and probe held-out axis-value compositions.",
-    },
-    "adaptive_decay_reentry": {
-        "claim": "Bounded memory should recover gracefully when a decayed task re-enters after a gap.",
-        "pressure": "Target, variant, gap, then reentry probe across gap sizes.",
-    },
-    "multi_user_continual_stream": {
-        "claim": "The robot should track changing preferences across users without manual preference labels.",
-        "pressure": "Narrative stream mixing routine reuse, preference shifts, user conflicts, reentry, and transfer probes.",
-    },
-    "bounded_memory_tradeoff": {
-        "claim": "Useful assistance should be retained with fewer active variants than unbounded memory.",
-        "pressure": "Multi-user continual stream evaluated as assistance per active-memory footprint.",
-    },
-    "compute_tradeoff": {
-        "claim": "Improved assistance should be justified against runtime and refit cost.",
-        "pressure": "Shared continual stream with wall-time and fit-count accounting.",
+        "claim": "For a known recipe, the robot should remain in assist mode while adapting to a new material preference.",
+        "pressure": "Known-recipe, new-preference assist-mode probes only; unseen recipes are handled by deployment_stream observation events.",
     },
     "zipf_usage_sweep": {
         "claim": "A deployed kitchen assistant should remain useful when demand concentrates on house favorites without losing rare customized workflows.",
@@ -339,14 +189,6 @@ DEPLOYMENT_EVENT_NARRATIVES: Dict[str, Dict[str, str]] = {
     "preference_shift": {
         "claim": "A known recipe may be reused with a different preference ordering.",
         "pressure": "Assist episodes keep the recipe fixed while changing the preference label.",
-    },
-    "gradual_shift": {
-        "claim": "Preference drift is gradual in realistic use; the system should track it step by step.",
-        "pressure": "Blended preference episodes at alpha=0.30, followed by a full target-preference episode.",
-    },
-    "gradual_shift_followup": {
-        "claim": "After a gradual drift signal, the system should recover on the fully shifted preference.",
-        "pressure": "The episode immediately after a blended demonstration uses the full target preference.",
     },
     "user_switch": {
         "claim": "Persistent user identity should modulate expected preferences across blocks.",
@@ -364,6 +206,22 @@ DEPLOYMENT_EVENT_NARRATIVES: Dict[str, Dict[str, str]] = {
         "claim": "The stream should continue acquiring genuinely new recipes during deployment.",
         "pressure": "Observation events introduce recipes outside the initial Phase-A recipe set.",
     },
+    "ladder_initial_observe": {
+        "claim": "The first ladder rung seeds recipe identities through normal observation.",
+        "pressure": "Each selected recipe is demonstrated exactly once before all later ladder additions switch to assist mode.",
+    },
+    "ladder_pref_update_heterogeneous": {
+        "claim": "Known recipes may each receive their own updated preference at the same deployment time.",
+        "pressure": "Every recipe is presented in assist mode with a new seed-shuffled preference distinct from its prior rung preference.",
+    },
+    "ladder_shared_pref_shift": {
+        "claim": "A shared style shift across all recipes should be reusable as a cross-recipe preference signal.",
+        "pressure": "Every recipe is presented in assist mode under the same new preference label for that rung.",
+    },
+    "ladder_settle": {
+        "claim": "After a synchronized preference update, short repeated use should stabilize online inference and assistance.",
+        "pressure": "Assist-only repeats over the current rung's recipe-preference set measure recovery after the ladder step.",
+    },
 }
 
 
@@ -374,13 +232,9 @@ class RunConfig:
     timestamp_subdir: bool = True
     workers: Optional[int] = None
     baselines: Tuple[str, ...] = PAPER_BASELINES
-    appendix_baselines: Tuple[str, ...] = PAPER_BASELINES + APPENDIX_BASELINES
-    quick: bool = False
     profile: bool = False
-    dpi: int = 140
     topk: int = 3
     log_full_distributions: bool = False
-    write_debug_jsonl: bool = False
     valid_action_expansion: bool = False
 
 
@@ -411,26 +265,7 @@ class CrossRecipeTransferConfig:
     n_preferences: int = 7
     diagonal_cycles: int = 1
     repeats: int = 2
-    baselines: Tuple[str, ...] = FACTOR_BASELINES
-
-
-@dataclass(frozen=True)
-class PreferenceAxisHoldoutConfig:
-    n_recipes: int = 10
-    settle_cycles: int = 2
-
-
-@dataclass(frozen=True)
-class NovelPreferenceCompositionConfig:
-    n_recipes: int = 10
-    settle_cycles: int = 2
-
-
-@dataclass(frozen=True)
-class AdaptiveDecayReentryConfig:
-    n_recipes: int = 12
-    gap_sweep: Tuple[int, ...] = (5, 10, 15, 30, 45)
-    neutral_filler: bool = True
+    baselines: Tuple[str, ...] = TRANSFER_BASELINES
 
 
 @dataclass(frozen=True)
@@ -438,16 +273,8 @@ class MultiUserStreamConfig:
     n_users: int = 5
     n_recipes: int = 10
     n_events: int = 120
-    observe_first_recipe: bool = True
     switch_probability: float = 0.45
     zipf_alpha: float = 1.2
-
-
-@dataclass(frozen=True)
-class MemoryTradeoffConfig:
-    n_recipes: int = 12
-    n_events: int = 150
-    zipf_alpha: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -460,34 +287,29 @@ class ComputeTradeoffConfig:
 class DeploymentStreamConfig:
     n_recipes: int = 10
     n_users: int = 4
-    n_phase_b_events: int = 120
+    n_phase_b_events: int = 250
     zipf_alpha: float = 1.2
     event_mix: Dict[str, float] = field(default_factory=lambda: {
-        "routine_reuse": 0.40,
-        "preference_shift": 0.12,
-        "gradual_shift": 0.10,
-        "user_switch": 0.16,
-        "cross_transfer_probe": 0.12,
+        "routine_reuse": 0.44,
+        "preference_shift": 0.14,
+        "user_switch": 0.18,
+        "cross_transfer_probe": 0.14,
         "rare_reentry": 0.10,
     })
     phase_a_non_identity_prob: float = 0.50
-    stay_same_user_prob: float = 0.70
-    preference_switch_prob: float = 0.20
-    tail_reentry_rate: float = 0.15
-    cross_product_probe_rate: float = 0.10
     new_recipe_obs_rate: float = 0.05
     user_block_size: int = 20
     transfer_warmup_events: int = 30
-    forgetting_checkpoint_interval: int = 10
-    coverage_curve_thresholds: Tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
-    calibrate_full_action_gate: bool = True
-    calibration_baselines: Tuple[str, ...] = ()
-    calibration_thresholds: Tuple[float, ...] = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80, 0.95, 1.01)
-    calibration_min_conditional_top1: float = 0.55
-    calibration_max_wrong_assist_rate: float = 0.45
-    calibration_wrong_assist_penalty: float = ASSIST_WRONG_PENALTY
-    calibration_hidden_correct_penalty: float = ASSIST_HIDDEN_CORRECT_PENALTY
-    calibration_n_probe_pairs: int = 24
+    event_mix_sweep_routine_fracs: Tuple[float, ...] = (0.20, 0.30, 0.40, 0.50, 0.60)
+
+
+@dataclass(frozen=True)
+class DeploymentLadderConfig:
+    n_recipes: int = 10
+    n_rungs: Optional[int] = None
+    max_rungs: int = 4
+    settle_repeats_per_recipe: int = 2
+    preferences: Tuple[str, ...] = PREFERENCE_NAMES
 
 
 @dataclass(frozen=True)
@@ -497,51 +319,64 @@ class TransferSuiteConfig:
     diagonal_cycles: int = 1
     offdiag_repeats: int = 2
     diagonal_cycle_sweep: Tuple[int, ...] = (1, 2, 3, 5)
-    include_axis_holdout: bool = True
+    include_cross_axis_value_transfer: bool = True
+    include_axis_family_holdout: bool = True
     include_novel_composition: bool = True
-    baselines: Tuple[str, ...] = FACTOR_BASELINES
+    baselines: Tuple[str, ...] = TRANSFER_BASELINES
 
 
 @dataclass(frozen=True)
 class DecayReentrySuiteConfig:
     n_recipes: int = 12
-    gap_sweep: Tuple[int, ...] = (5, 10, 15, 30, 45)
+    gap_sweep: Tuple[int, ...] = (0, 5, 10, 15, 20, 30)
+    distractor_counts: Tuple[int, ...] = (0, 2, 5, 10)
     n_target_recipes: int = 5
     run_neutral_arm: bool = True
     run_distractor_arm: bool = True
-    baselines: Tuple[str, ...] = ("full", "adaptive", "fixed_decay", "no_decay", "latest_only", "experience_replay_bc", "bigram")
+    baselines: Tuple[str, ...] = PAPER_BASELINES
 
 
 @dataclass(frozen=True)
 class DisambiguationAuditConfig:
     n_recipes: int = 12
     thresholds: Tuple[float, ...] = (0.85, 0.88, 0.90, 0.92, 0.94, 0.95, 0.97, 0.98, 0.99)
-    action_gate_thresholds: Tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+    online_partial_thresholds: Tuple[float, ...] = (0.10, 0.20, 0.30, 0.40, 0.50)
+    min_classify_lengths: Tuple[int, ...] = (3, 6, 9)
+    min_classify_fractions: Tuple[float, ...] = (0.25, 0.35, 0.50)
     validation_fraction: float = 0.30
     drop_fractions: Tuple[float, ...] = (0.10, 0.15, 0.20, 0.25)
     prefix_fractions: Tuple[float, ...] = (0.10, 0.25, 0.50, 0.75, 1.00)
+    posterior_alpha_grid: Tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0)
+    posterior_global_temperature_grid: Tuple[float, ...] = (0.5, 1.0, 2.0)
+    posterior_calibration_max_pairs: int = 12
+    posterior_calibration_max_grid_points: int = 75
 
 
 @dataclass(frozen=True)
 class MaterialityPreflightConfig:
     n_recipes: int = 15
     n_preferences: int = 7
-    min_effective_preferences: int = 5
+    min_effective_preferences: int = 3
+    min_classify_length: int = 6
     fail_on_noop: bool = True
+    fail_on_duplicate_ordering: bool = True
+    near_duplicate_tau_threshold: float = 0.05
 
 
 @dataclass(frozen=True)
 class CapacitySweepConfig:
-    demo_counts: Tuple[int, ...] = (3, 5, 10, 15)
+    demo_counts: Tuple[int, ...] = (1, 3, 5, 10, 15)
     n_preferences: int = 3
 
 
 @dataclass(frozen=True)
-class ThresholdCalibrationConfig:
-    n_recipes: int = 12
-    thresholds: Tuple[float, ...] = (0.85, 0.88, 0.90, 0.92, 0.94, 0.95, 0.97, 0.98, 0.99)
-    validation_fraction: float = 0.30
-    drop_fractions: Tuple[float, ...] = (0.10, 0.15, 0.20, 0.25)
+class ConfidenceThresholdAccuracyConfig:
+    n_recipes: int = 7
+    n_preferences: int = 7
+    diagonal_cycles: int = 1
+    offdiag_repeats: int = 2
+    confidence_thresholds: Tuple[float, ...] = (0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)
+    baselines: Tuple[str, ...] = TRANSFER_BASELINES
 
 
 @dataclass(frozen=True)
@@ -588,6 +423,29 @@ class StressConfig:
 
 
 @dataclass(frozen=True)
+class BaselineHyperparameterTuningConfig:
+    n_recipes: int = 8
+    n_preferences: int = 4
+    baselines: Tuple[str, ...] = ("bc", "experience_replay_bc", "recency_prioritized_replay", "ewc", "online_ewc")
+    validation_fraction: float = 0.35
+    max_eval_pairs: int = 24
+    max_grid_points_per_baseline: int = 24
+    bc_learning_rates: Tuple[float, ...] = (0.03, 0.10)
+    bc_l2_values: Tuple[float, ...] = (1e-4, 1e-3)
+    bc_history_lens: Tuple[int, ...] = (2, 3)
+    bc_history_bins_values: Tuple[int, ...] = (32, 64)
+    bc_epoch_pairs: Tuple[Tuple[int, int], ...] = ((60, 30), (120, 60))
+    er_buffer_sizes: Tuple[int, ...] = (64, 256)
+    er_batch_sizes: Tuple[int, ...] = (64, 256)
+    er_recency_alphas: Tuple[float, ...] = (0.5, 1.0, 2.0)
+    er_uniform_mixes: Tuple[float, ...] = (0.05,)
+    ewc_lambdas: Tuple[float, ...] = (0.1, 0.4, 1.0)
+    maxent_learning_rates: Tuple[float, ...] = (0.02, 0.05)
+    maxent_l2_values: Tuple[float, ...] = (0.005, 0.01)
+    maxent_iter_pairs: Tuple[Tuple[int, int], ...] = ((50, 20), (100, 40))
+
+
+@dataclass(frozen=True)
 class RuntimeScalingConfig:
     recipe_counts: Tuple[int, ...] = (3, 5, 10, 15)
     n_events: int = 50
@@ -596,29 +454,19 @@ class RuntimeScalingConfig:
 @dataclass(frozen=True)
 class ExperimentSuiteConfig:
     deployment_stream: DeploymentStreamConfig = field(default_factory=DeploymentStreamConfig)
+    deployment_ladder_heterogeneous_prefs: DeploymentLadderConfig = field(default_factory=DeploymentLadderConfig)
+    deployment_ladder_shared_pref: DeploymentLadderConfig = field(default_factory=DeploymentLadderConfig)
     cross_recipe_transfer: TransferSuiteConfig = field(default_factory=TransferSuiteConfig)
+    confidence_threshold_accuracy: ConfidenceThresholdAccuracyConfig = field(default_factory=ConfidenceThresholdAccuracyConfig)
     decay_reentry: DecayReentrySuiteConfig = field(default_factory=DecayReentrySuiteConfig)
     disambiguation_audit: DisambiguationAuditConfig = field(default_factory=DisambiguationAuditConfig)
     materiality_preflight: MaterialityPreflightConfig = field(default_factory=MaterialityPreflightConfig)
-    materiality_audit: MaterialityAuditConfig = field(default_factory=MaterialityAuditConfig)
     single_shot_reuse: SingleShotReuseConfig = field(default_factory=SingleShotReuseConfig)
     deployment_gate_preference_shift: DeploymentGateConfig = field(default_factory=DeploymentGateConfig)
-    cross_recipe_preference_transfer: CrossRecipeTransferConfig = field(default_factory=CrossRecipeTransferConfig)
-    preference_axis_holdout: PreferenceAxisHoldoutConfig = field(default_factory=PreferenceAxisHoldoutConfig)
-    novel_preference_composition: NovelPreferenceCompositionConfig = field(default_factory=NovelPreferenceCompositionConfig)
-    adaptive_decay_reentry: AdaptiveDecayReentryConfig = field(default_factory=AdaptiveDecayReentryConfig)
-    multi_user_continual_stream: MultiUserStreamConfig = field(default_factory=MultiUserStreamConfig)
-    bounded_memory_tradeoff: MemoryTradeoffConfig = field(default_factory=MemoryTradeoffConfig)
-    compute_tradeoff: ComputeTradeoffConfig = field(default_factory=ComputeTradeoffConfig)
     short_term_capacity_sweep: CapacitySweepConfig = field(default_factory=CapacitySweepConfig)
     demo_count_sample_efficiency: CapacitySweepConfig = field(default_factory=CapacitySweepConfig)
-    disambiguation_threshold_calibration: ThresholdCalibrationConfig = field(default_factory=ThresholdCalibrationConfig)
-    action_gate_threshold_calibration: ThresholdCalibrationConfig = field(default_factory=ThresholdCalibrationConfig)
-    boundary_degradation_disambiguation: ThresholdCalibrationConfig = field(default_factory=ThresholdCalibrationConfig)
     frequency_gap_decay_sweep: GapSweepConfig = field(default_factory=GapSweepConfig)
     mwr_window_sensitivity: MWRWindowSensitivityConfig = field(default_factory=MWRWindowSensitivityConfig)
-    reentry_gap_neutral_vs_distractor: GapSweepConfig = field(default_factory=GapSweepConfig)
-    active_pruned_decay_probe: GapSweepConfig = field(default_factory=GapSweepConfig)
     sparse_first_exposure_pool_sweep: SparsePoolConfig = field(default_factory=SparsePoolConfig)
     zipf_usage_sweep: ZipfUsageConfig = field(default_factory=ZipfUsageConfig)
     cl_regularizer_comparison: ComputeTradeoffConfig = field(default_factory=ComputeTradeoffConfig)
@@ -627,15 +475,17 @@ class ExperimentSuiteConfig:
     continual_learning_regularizer_sweep: ComputeTradeoffConfig = field(default_factory=ComputeTradeoffConfig)
     posterior_ablation_matrix: CrossRecipeTransferConfig = field(default_factory=CrossRecipeTransferConfig)
     recipe_preference_factor_ablation: CrossRecipeTransferConfig = field(default_factory=CrossRecipeTransferConfig)
-    coverage_accuracy_curve: ComputeTradeoffConfig = field(default_factory=ComputeTradeoffConfig)
-    confidence_calibration_reliability: ComputeTradeoffConfig = field(default_factory=ComputeTradeoffConfig)
     memory_exhaustion_stress: StressConfig = field(default_factory=StressConfig)
     prefix_collision_stress: StressConfig = field(default_factory=StressConfig)
     preference_thrash_stress: StressConfig = field(default_factory=StressConfig)
     rare_reentry_stress: StressConfig = field(default_factory=StressConfig)
     late_distractor_stress: StressConfig = field(default_factory=StressConfig)
+    adversarial_stress_suite: StressConfig = field(default_factory=StressConfig)
+    baseline_hyperparameter_tuning: BaselineHyperparameterTuningConfig = field(default_factory=BaselineHyperparameterTuningConfig)
     seed_recipe_selection_audit: MaterialityAuditConfig = field(default_factory=MaterialityAuditConfig)
     runtime_scaling_sweep: RuntimeScalingConfig = field(default_factory=RuntimeScalingConfig)
+    catastrophic_vs_selective_forgetting: Any = field(default_factory=lambda: CatastrophicSelectiveConfig())
+    adaptation_speed_curve: Any = field(default_factory=lambda: AdaptationSpeedConfig())
 
 
 @dataclass(frozen=True)
@@ -689,25 +539,27 @@ class LiveStepRecord:
     correct_topk: bool
     topk: Tuple[str, ...]
     inferred_recipe: Optional[str]
-    inferred_pref: Optional[str]
-    inferred_latent_pref: Optional[str] = None
+    inferred_variant_hash: Optional[str]
+    inferred_latent_pref_id: Optional[str] = None
     posterior_entropy: Optional[float] = None
     posterior_confidence: Optional[float] = None
     posterior_raw_entropy: Optional[float] = None
     posterior_max_prob: Optional[float] = None
     posterior_n_hypotheses: Optional[int] = None
-    assist_used: bool = False
-    raw_action_confidence: Optional[float] = None
-    action_gate_score: Optional[float] = None
-    action_margin: Optional[float] = None
-    action_gate_threshold: Optional[float] = None
-    action_marginal_entropy: Optional[float] = None
-    assist_source: Optional[str] = None
-    final_action_confidence: Optional[float] = None
-    final_action_margin: Optional[float] = None
-    final_action_entropy: Optional[float] = None
-    conditioned_action_confidence: Optional[float] = None
-    ensemble_action_confidence: Optional[float] = None
+    would_assist_under_gate: bool = False
+    policy_confidence: Optional[float] = None
+    policy_raw_confidence: Optional[float] = None
+    policy_gate_score: Optional[float] = None
+    policy_margin: Optional[float] = None
+    gate_threshold: Optional[float] = None
+    policy_entropy: Optional[float] = None
+    gate_source: Optional[str] = None
+    gate_reason: Optional[str] = None
+    policy_final_confidence: Optional[float] = None
+    policy_final_margin: Optional[float] = None
+    policy_final_entropy: Optional[float] = None
+    conditioned_policy_confidence: Optional[float] = None
+    ensemble_policy_confidence: Optional[float] = None
     policy_agreement: Optional[bool] = None
     blend_strength: Optional[float] = None
     prediction_wall_s: Optional[float] = None
@@ -725,7 +577,7 @@ class LiveEpisodeRecord:
     live_top1: float
     live_topk: float
     n: int
-    first_mismatch_step: Optional[int]
+    first_mismatch_robot_turn: Optional[int]
 
 
 class _JSONEncoder(json.JSONEncoder):
@@ -768,7 +620,6 @@ class _SeedResultCollector:
         }
         self.records: Dict[str, List[Dict[str, Any]]] = {}
         self.tables: Dict[str, List[Dict[str, Any]]] = {}
-        self.figures: Dict[str, Dict[str, Any]] = {}
         self.warnings: List[str] = []
         self.captured_json: Dict[str, Any] = {}
 
@@ -796,12 +647,6 @@ class _SeedResultCollector:
     def capture_table(self, path: Path, rows: Sequence[Dict[str, Any]]) -> None:
         self.tables[path.stem] = [_jsonable(r) for r in rows]
 
-    def capture_figure(self, path: Path, data: Dict[str, Any]) -> None:
-        self.figures[path.name] = {
-            "path": path.name,
-            "data": _jsonable(data),
-        }
-
     def finalize(self, metrics: Dict[str, Any], status: Dict[str, Any]) -> Dict[str, Any]:
         metrics = _jsonable(metrics)
         scenario = self._scenario_summary()
@@ -817,7 +662,6 @@ class _SeedResultCollector:
             "comparisons": _comparison_summary(metrics),
             "records": _jsonable(self.records),
             "tables": _jsonable(self.tables),
-            "figures": _jsonable(self.figures),
             "warnings": list(self.warnings) + _scenario_warnings(scenario) + _baseline_warnings(baseline_health),
         }
         _write_json_file(self.seed_dir / "result.json", result)
@@ -916,26 +760,6 @@ def _append_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> Path:
     return path
 
 
-def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> Path:
-    if _ACTIVE_RESULT is not None:
-        _ACTIVE_RESULT.capture_table(path, rows)
-        return path
-    _ensure(path.parent)
-    keys = sorted({k for row in rows for k in row})
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: _scalar(row.get(k)) for k in keys})
-    return path
-
-
-def _scalar(value: Any) -> Any:
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return json.dumps(value, sort_keys=True, cls=_JSONEncoder)
-
-
 def _mean(values: Sequence[float]) -> float:
     vals = [float(v) for v in values if isinstance(v, (int, float)) and not math.isnan(float(v))]
     return float(sum(vals) / len(vals)) if vals else 0.0
@@ -973,6 +797,9 @@ def _stderr95(values: Sequence[float]) -> float:
         18: 2.10,
         19: 2.09,
         20: 2.09,
+        21: 2.08,
+        22: 2.07,
+        23: 2.07,
         24: 2.06,
         29: 2.05,
         39: 2.02,
@@ -989,7 +816,7 @@ def _stderr95(values: Sequence[float]) -> float:
 
 
 def mean_ci95(values: Sequence[float]) -> Tuple[float, float]:
-    vals = [float(v) for v in values if isinstance(v, (int, float)) and not math.isnan(float(v))]
+    vals = [float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))]
     if not vals:
         return float("nan"), 0.0
     return _mean(vals), _stderr95(vals)
@@ -1001,6 +828,31 @@ def _p95(values: Sequence[float]) -> float:
         return 0.0
     idx = int(math.ceil(0.95 * len(vals))) - 1
     return float(vals[max(0, min(idx, len(vals) - 1))])
+
+
+def _histogram(values: Sequence[float], bins: Sequence[float] = (0.0, 0.01, 0.05, 0.10, 0.20, 0.40, 0.60, 0.80, 1.0)) -> Dict[str, Any]:
+    vals = [float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))]
+    edges = [float(v) for v in bins]
+    if len(edges) < 2:
+        edges = [0.0, 1.0]
+    counts = [0 for _ in range(len(edges) - 1)]
+    for val in vals:
+        placed = False
+        for idx in range(len(edges) - 1):
+            lo, hi = edges[idx], edges[idx + 1]
+            if (val >= lo and val < hi) or (idx == len(edges) - 2 and val <= hi):
+                counts[idx] += 1
+                placed = True
+                break
+        if not placed and val > edges[-1]:
+            counts[-1] += 1
+    return {
+        "bins": [
+            {"low": edges[i], "high": edges[i + 1], "count": int(counts[i])}
+            for i in range(len(counts))
+        ],
+        "n": int(len(vals)),
+    }
 
 
 def binary_decision_metrics(scores: Sequence[float], labels: Sequence[int], n_bins: int = 10) -> Dict[str, Any]:
@@ -1034,40 +886,42 @@ def binary_decision_metrics(scores: Sequence[float], labels: Sequence[int], n_bi
         s_norm = (s - float(s.min())) / max(float(s.max() - s.min()), 1e-9)
     else:
         s_norm = s
-    edges = np.linspace(0, 1, max(1, int(n_bins)) + 1)
+    n_eff_bins = max(1, min(int(n_bins), len(s_norm)))
+    ordered = np.argsort(s_norm)
+    bins = [idx for idx in np.array_split(ordered, n_eff_bins) if len(idx) > 0]
     calibration: List[Tuple[float, float, int]] = []
     ece = 0.0
-    for k in range(len(edges) - 1):
-        lo, hi = edges[k], edges[k + 1]
-        mask = ((s_norm >= lo) & (s_norm <= hi)) if k == len(edges) - 2 else ((s_norm >= lo) & (s_norm < hi))
-        if int(mask.sum()) == 0:
-            continue
-        mean_score = float(s_norm[mask].mean())
-        empirical = float(y[mask].mean())
-        count = int(mask.sum())
+    for idx in bins:
+        mean_score = float(s_norm[idx].mean())
+        empirical = float(y[idx].mean())
+        count = int(len(idx))
         ece += (count / len(s_norm)) * abs(mean_score - empirical)
         calibration.append((mean_score, empirical, count))
     brier = float(np.mean((s_norm - y) ** 2))
     return {"auroc": float(auroc), "auprc": float(auprc), "ece": float(ece), "brier": brier, "calibration": calibration}
 
 
-def behavioral_steps_to_lock(steps: Sequence[LiveStepRecord], window: int = 3, threshold: float = 0.75) -> int:
-    """Baseline-agnostic lock time based on sustained behavioral accuracy."""
+def behavioral_steps_to_lock(
+    steps: Sequence[LiveStepRecord],
+    window_fraction: float = 0.10,
+    threshold: float = 0.75,
+) -> int:
+    """Step at which the agent first achieves sustained behavioral accuracy.
+
+    The window size is ``max(2, min(5, round(window_fraction * n)))`` so short
+    and long recipes are treated proportionally rather than using a fixed count.
+    Returns -1 when the episode is too short to produce a meaningful window or
+    the threshold is never reached.
+    """
     n = len(steps)
-    width = max(1, int(window))
-    min_episode_steps = max(width, 5)
-    if n < min_episode_steps:
+    if n < 2:
         return -1
-    for k in range(n):
-        stable = True
-        for j in range(k, n):
-            chunk = steps[j:min(n, j + width)]
-            if not chunk:
-                continue
-            if _mean([1.0 if s.correct_top1 else 0.0 for s in chunk]) < float(threshold):
-                stable = False
-                break
-        if stable:
+    width = max(2, min(5, round(float(window_fraction) * n)))
+    if n < width:
+        return -1
+    for k in range(n - width + 1):
+        chunk = steps[k:k + width]
+        if _mean([1.0 if s.correct_top1 else 0.0 for s in chunk]) >= float(threshold):
             return k
     return -1
 
@@ -1081,176 +935,306 @@ def posterior_steps_to_lock(steps: Sequence[LiveStepRecord], true_rid: Optional[
     return -1
 
 
+ADAPTATION_RECOVERY_WINDOWS = (1, 2, 3)
+FIRST_MISMATCH_POSITION_BINS = 10
+
+
+def _adaptation_recovery_metrics(
+    correct_flags: Sequence[bool],
+    first_mismatch_robot_turn: Optional[int],
+) -> Dict[str, float]:
+    """Fixed-window recovery after the first wrong robot turn.
+
+    Recovery windows are censored unless the episode has the full requested
+    number of later robot turns. That keeps late first mismatches from being
+    averaged with less evidence than early first mismatches.
+    """
+    flags = [bool(v) for v in correct_flags]
+    n = len(flags)
+    try:
+        fm = int(first_mismatch_robot_turn) if first_mismatch_robot_turn is not None else -1
+    except (TypeError, ValueError):
+        fm = -1
+    has_mismatch = 0 <= fm < n
+    after = max(0, n - fm - 1) if has_mismatch else 0
+    out: Dict[str, float] = {
+        "first_mismatch_rate": 1.0 if has_mismatch else 0.0,
+        "no_mismatch_rate": 1.0 if n > 0 and not has_mismatch else 0.0,
+        "first_mismatch_robot_turn": float(fm if has_mismatch else -1),
+        "first_mismatch_robot_turn_normalized_position": (
+            float(fm / max(1, n - 1)) if has_mismatch else -1.0
+        ),
+        "robot_turns_after_first_mismatch": float(after),
+    }
+    for window in ADAPTATION_RECOVERY_WINDOWS:
+        eligible = has_mismatch and after >= window
+        censored = has_mismatch and not eligible
+        segment = flags[fm + 1:fm + 1 + window] if eligible else []
+        out[f"adaptation_recovery_top1_w{window}"] = _mean([1.0 if v else 0.0 for v in segment]) if eligible else 0.0
+        out[f"adaptation_recovery_eligible_w{window}"] = 1.0 if eligible else 0.0
+        out[f"adaptation_recovery_censored_w{window}"] = 1.0 if censored else 0.0
+        out[f"adaptation_recovery_support_w{window}"] = float(len(segment))
+    return out
+
+
+def _row_first_mismatch_robot_turn(row: Mapping[str, Any]) -> float:
+    value = row.get("first_mismatch_robot_turn", -1.0)
+    return float(value if isinstance(value, (int, float)) else -1.0)
+
+
+def _row_first_mismatch_robot_turn_position(row: Mapping[str, Any]) -> float:
+    value = row.get("first_mismatch_robot_turn_normalized_position", -1.0)
+    return float(value if isinstance(value, (int, float)) else -1.0)
+
+
+def _adaptation_recovery_window_curve(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, float]]:
+    mismatch_rows = [r for r in rows if float(r.get("first_mismatch_rate", 0.0)) > 0.0]
+    out: List[Dict[str, float]] = []
+    for window in ADAPTATION_RECOVERY_WINDOWS:
+        eligible_key = f"adaptation_recovery_eligible_w{window}"
+        censored_key = f"adaptation_recovery_censored_w{window}"
+        top1_key = f"adaptation_recovery_top1_w{window}"
+        support_key = f"adaptation_recovery_support_w{window}"
+        eligible = [r for r in mismatch_rows if float(r.get(eligible_key, 0.0)) > 0.0]
+        support = [max(1.0, float(r.get(support_key, window))) for r in eligible]
+        denom = max(1.0, sum(support))
+        recovery = (
+            sum(float(r.get(top1_key, 0.0)) * w for r, w in zip(eligible, support)) / denom
+            if eligible else 0.0
+        )
+        out.append({
+            "window": float(window),
+            "top1": float(recovery),
+            "eligible_rate": float(len(eligible) / max(1, len(mismatch_rows))),
+            "censored_rate": float(sum(float(r.get(censored_key, 0.0)) for r in mismatch_rows) / max(1, len(mismatch_rows))),
+            "n_eligible": float(len(eligible)),
+            "n_mismatch_episodes": float(len(mismatch_rows)),
+        })
+    return out
+
+
+def _first_mismatch_position_curve(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    n_bins: int = FIRST_MISMATCH_POSITION_BINS,
+) -> List[Dict[str, float]]:
+    n_bins = max(1, int(n_bins))
+    bins: List[List[Dict[str, Any]]] = [[] for _ in range(n_bins)]
+    for row in rows:
+        if float(row.get("first_mismatch_rate", 0.0)) <= 0.0:
+            continue
+        pos = _row_first_mismatch_robot_turn_position(row)
+        if pos < 0.0:
+            continue
+        idx = min(n_bins - 1, max(0, int(pos * n_bins)))
+        bins[idx].append(row)
+    curve: List[Dict[str, float]] = []
+    for idx, bucket in enumerate(bins):
+        lo = idx / n_bins
+        hi = (idx + 1) / n_bins
+        eligible = [r for r in bucket if float(r.get("adaptation_recovery_eligible_w3", 0.0)) > 0.0]
+        support = [max(1.0, float(r.get("adaptation_recovery_support_w3", 3.0))) for r in eligible]
+        recovery = (
+            sum(float(r.get("adaptation_recovery_top1_w3", 0.0)) * w for r, w in zip(eligible, support)) / max(1.0, sum(support))
+            if eligible else 0.0
+        )
+        curve.append({
+            "bin": float(idx),
+            "position_min": float(lo),
+            "position_max": float(hi),
+            "position_center": float((lo + hi) / 2.0),
+            "n_episodes": float(len(bucket)),
+            "mean_first_mismatch_robot_turn": _mean([_row_first_mismatch_robot_turn(r) for r in bucket]),
+            "mean_episode_top1": _mean([float(r.get("live_top1", 0.0)) for r in bucket]),
+            "adaptation_recovery_top1_w3": float(recovery),
+            "adaptation_recovery_eligible_rate_w3": float(len(eligible) / max(1, len(bucket))),
+            "adaptation_recovery_censored_rate_w3": float(sum(float(r.get("adaptation_recovery_censored_w3", 0.0)) for r in bucket) / max(1, len(bucket))),
+        })
+    return curve
+
+
+def _step_variant_hash(step: LiveStepRecord) -> Optional[str]:
+    return step.inferred_variant_hash
+
+
+def _step_latent_pref_id(step: LiveStepRecord) -> Optional[str]:
+    return step.inferred_latent_pref_id
+
+
+def _step_action_calibration_score(step: LiveStepRecord) -> Optional[float]:
+    for value in (
+        step.policy_final_confidence,
+        step.policy_confidence,
+        step.policy_gate_score,
+        step.policy_raw_confidence,
+    ):
+        if value is not None:
+            return float(value)
+    return None
+
+
 def live_episode_metrics(record: LiveEpisodeRecord, *, true_rid: Optional[str] = None) -> Dict[str, float]:
     n = max(1, int(record.n))
     if record.n <= 0:
         return {
             "live_top1": 0.0,
             "live_topk": 0.0,
-            "post_divergence_top1": 0.0,
-            "first_mismatch_step": -1.0,
-            "steps_to_lock": -1.0,
+            **_adaptation_recovery_metrics([], -1),
             "behavioral_steps_to_lock": -1.0,
             "posterior_steps_to_lock": -1.0,
             "adaptation_latency_steps": -1.0,
-            "assistance_coverage": 0.0,
-            "conditional_top1": 0.0,
-            "useful_assistance_rate": 0.0,
             "confidence_ece": 0.0,
             "confidence_brier": 0.0,
-            "correct_prediction_assist_recall": 0.0,
-            "wrong_prediction_assist_rate": 0.0,
-            "hidden_correct_rate": 0.0,
-            "abstention_error_rate": 0.0,
-            "abstention_recall": 0.0,
-            "mean_final_action_confidence": 0.0,
-            "mean_conditioned_action_confidence": 0.0,
-            "mean_ensemble_action_confidence": 0.0,
+            "robot_wrong_rate": 0.0,
+            "net_robot_action_value": 0.0,
+            "mean_policy_confidence": 0.0,
+            "mean_posterior_confidence": 0.0,
+            "mean_policy_final_confidence": 0.0,
+            "mean_conditioned_policy_confidence": 0.0,
+            "mean_ensemble_policy_confidence": 0.0,
             "policy_agreement_rate": 0.0,
             "mean_blend_strength": 0.0,
             "mean_prediction_wall_s": 0.0,
             "p95_prediction_wall_s": 0.0,
+            "posterior_pref_lock_consistency": 0.0,
+            "posterior_variant_lock_consistency": 0.0,
         }
-    fm = record.first_mismatch_step if record.first_mismatch_step is not None else -1
-    post_steps = record.steps[fm + 1:] if fm >= 0 else record.steps
-    assist_steps = [s for s in record.steps if s.assist_used]
-    closed_steps = [s for s in record.steps if not s.assist_used]
-    correct_steps = [s for s in record.steps if s.correct_top1]
+    fm = record.first_mismatch_robot_turn if record.first_mismatch_robot_turn is not None else -1
+    recovery_metrics = _adaptation_recovery_metrics([s.correct_top1 for s in record.steps], fm)
     wrong_steps = [s for s in record.steps if not s.correct_top1]
-    assist_correct_steps = [s for s in assist_steps if s.correct_top1]
-    assist_wrong_steps = [s for s in assist_steps if not s.correct_top1]
-    closed_correct_steps = [s for s in closed_steps if s.correct_top1]
-    confidences = [float(s.posterior_confidence) for s in record.steps if s.posterior_confidence is not None]
-    raw_confidences = [float(s.raw_action_confidence) for s in record.steps if s.raw_action_confidence is not None]
-    gate_scores = [float(s.action_gate_score) for s in record.steps if s.action_gate_score is not None]
-    margins = [float(s.action_margin) for s in record.steps if s.action_margin is not None]
-    final_confidences = [float(s.final_action_confidence) for s in record.steps if s.final_action_confidence is not None]
-    conditioned_confidences = [float(s.conditioned_action_confidence) for s in record.steps if s.conditioned_action_confidence is not None]
-    ensemble_confidences = [float(s.ensemble_action_confidence) for s in record.steps if s.ensemble_action_confidence is not None]
+    correct_steps = [s for s in record.steps if s.correct_top1]
+    posterior_confidences = [float(s.posterior_confidence) for s in record.steps if s.posterior_confidence is not None]
+    policy_confidences = [float(s.policy_confidence) for s in record.steps if s.policy_confidence is not None]
+    raw_policy_confidences = [float(s.policy_raw_confidence) for s in record.steps if s.policy_raw_confidence is not None]
+    policy_gate_scores = [float(s.policy_gate_score) for s in record.steps if s.policy_gate_score is not None]
+    policy_margins = [float(s.policy_margin) for s in record.steps if s.policy_margin is not None]
+    final_policy_confidences = [float(s.policy_final_confidence) for s in record.steps if s.policy_final_confidence is not None]
+    conditioned_policy_confidences = [float(s.conditioned_policy_confidence) for s in record.steps if s.conditioned_policy_confidence is not None]
+    ensemble_policy_confidences = [float(s.ensemble_policy_confidence) for s in record.steps if s.ensemble_policy_confidence is not None]
     agreement_flags = [1.0 if bool(s.policy_agreement) else 0.0 for s in record.steps if s.policy_agreement is not None]
     blend_strengths = [float(s.blend_strength) for s in record.steps if s.blend_strength is not None]
     entropies = [float(s.posterior_entropy) for s in record.steps if s.posterior_entropy is not None]
-    action_entropies = [float(s.action_marginal_entropy) for s in record.steps if s.action_marginal_entropy is not None]
+    policy_entropies = [float(s.policy_entropy) for s in record.steps if s.policy_entropy is not None]
     n_hypotheses = [int(s.posterior_n_hypotheses) for s in record.steps if s.posterior_n_hypotheses is not None]
-    scores = [float(s.posterior_confidence) for s in record.steps if s.posterior_confidence is not None]
-    labels = [1 if s.correct_top1 else 0 for s in record.steps if s.posterior_confidence is not None]
+    score_label_pairs = [
+        (score, 1 if s.correct_top1 else 0)
+        for s in record.steps
+        for score in [_step_action_calibration_score(s)]
+        if score is not None
+    ]
+    scores = [score for score, _label in score_label_pairs]
+    labels = [label for _score, label in score_label_pairs]
     calib = binary_decision_metrics(scores, labels, n_bins=10) if scores else {"ece": 0.0, "brier": 0.0}
-    steps_to_lock = behavioral_steps_to_lock(record.steps)
+    behavioral_lock = behavioral_steps_to_lock(record.steps)
     posterior_lock = posterior_steps_to_lock(record.steps, true_rid)
+    # adaptation_latency_steps: robot turns from first mismatch until recovery.
+    # Recovery requires a FULL 3-turn window with >=75% accuracy so that a
+    # single terminal correct prediction cannot falsely declare recovery.
+    # Episodes where fewer than 3 turns remain after the mismatch are censored
+    # (set to -1), consistent with _adaptation_recovery_metrics censoring logic.
     recovery_latency = -1
     if fm >= 0:
-        for k in range(fm + 1, len(record.steps)):
-            chunk = record.steps[k:k + 3]
-            if chunk and _mean([1.0 if s.correct_top1 else 0.0 for s in chunk]) >= 0.75:
-                recovery_latency = k - fm
-                break
+        steps_after_mismatch = len(record.steps) - fm - 1
+        if steps_after_mismatch >= 3:
+            for k in range(fm + 1, len(record.steps) - 2):
+                chunk = record.steps[k:k + 3]
+                if _mean([1.0 if s.correct_top1 else 0.0 for s in chunk]) >= 0.75:
+                    recovery_latency = k - fm
+                    break
     recipe_vocab = {s.actual for s in record.steps}
     recipe_vocab_hits = [1.0 if s.predicted in recipe_vocab else 0.0 for s in record.steps]
-    recipe_vocab_correct = [s for s in record.steps if s.predicted in recipe_vocab]
     prediction_wall = [float(s.prediction_wall_s) for s in record.steps if s.prediction_wall_s is not None]
-    recipe_vocab_conditional = _mean([1.0 if s.correct_top1 else 0.0 for s in recipe_vocab_correct])
+    single_record_preset = {record.pair_label: record.preference_name}
     return {
         "live_top1": float(record.live_top1),
         "live_topk": float(record.live_topk),
-        "post_divergence_top1": _mean([1.0 if s.correct_top1 else 0.0 for s in post_steps]),
-        "first_mismatch_step": float(fm),
-        "steps_to_lock": float(steps_to_lock),
-        "behavioral_steps_to_lock": float(steps_to_lock),
+        **recovery_metrics,
+        "behavioral_steps_to_lock": float(behavioral_lock),
         "posterior_steps_to_lock": float(posterior_lock),
         "adaptation_latency_steps": float(recovery_latency),
         "posterior_correct_recipe": _mean([1.0 if s.inferred_recipe == true_rid else 0.0 for s in record.steps]) if true_rid is not None else 0.0,
         "recipe_vocab_top1": _mean(recipe_vocab_hits),
-        "recipe_vocab_conditional_top1": recipe_vocab_conditional,
-        "preference_consistent_top1": recipe_vocab_conditional,
-        "assistance_coverage": len(assist_steps) / n,
-        "coverage": len(assist_steps) / n,
-        "conditional_top1": _mean([1.0 if s.correct_top1 else 0.0 for s in assist_steps]),
-        "useful_assistance_rate": (len(assist_steps) / n) * _mean([1.0 if s.correct_top1 else 0.0 for s in assist_steps]),
-        "assist_correct_rate": len(assist_correct_steps) / n,
-        "assist_wrong_rate": len(assist_wrong_steps) / n,
-        "net_assistance_value": (
-            len(assist_correct_steps)
-            - ASSIST_WRONG_PENALTY * len(assist_wrong_steps)
+        "robot_wrong_rate": len(wrong_steps) / n,
+        "net_robot_action_value": (
+            len(correct_steps)
+            - ASSIST_WRONG_PENALTY * len(wrong_steps)
         ) / n,
-        "correct_prediction_assist_recall": len(assist_correct_steps) / max(1, len(correct_steps)),
-        "wrong_prediction_assist_rate": len(assist_wrong_steps) / max(1, len(wrong_steps)),
-        "hidden_correct_rate": len(closed_correct_steps) / n,
-        "abstention_error_rate": _mean([1.0 if not s.correct_top1 else 0.0 for s in closed_steps]),
-        "abstention_recall": len([s for s in closed_steps if not s.correct_top1]) / max(1, len(wrong_steps)),
-        "mean_action_confidence": _mean(confidences),
-        "mean_raw_action_confidence": _mean(raw_confidences),
-        "mean_action_gate_score": _mean(gate_scores),
-        "mean_action_margin": _mean(margins),
-        "mean_final_action_confidence": _mean(final_confidences),
-        "mean_conditioned_action_confidence": _mean(conditioned_confidences),
-        "mean_ensemble_action_confidence": _mean(ensemble_confidences),
+        "mean_policy_confidence": _mean(policy_confidences or final_policy_confidences),
+        "mean_posterior_confidence": _mean(posterior_confidences),
+        "mean_policy_raw_confidence": _mean(raw_policy_confidences),
+        "mean_policy_gate_score": _mean(policy_gate_scores),
+        "mean_policy_margin": _mean(policy_margins),
+        "mean_policy_final_confidence": _mean(final_policy_confidences),
+        "mean_conditioned_policy_confidence": _mean(conditioned_policy_confidences),
+        "mean_ensemble_policy_confidence": _mean(ensemble_policy_confidences),
+        # would_assist_under_gate_rate intentionally omitted: always 1.0 under
+        # the forced alternating protocol (robot never abstains).  It is not a
+        # meaningful aggregate metric in this setting.
         "policy_agreement_rate": _mean(agreement_flags),
         "mean_blend_strength": _mean(blend_strengths),
         "mean_posterior_entropy": _mean(entropies),
-        "mean_action_marginal_entropy": _mean(action_entropies),
+        "mean_policy_entropy": _mean(policy_entropies),
         "posterior_degenerate_rate": _mean([1.0 if h <= 1 else 0.0 for h in n_hypotheses]),
         "confidence_ece": float(calib.get("ece", 0.0)),
         "confidence_brier": float(calib.get("brier", 0.0)),
         "mean_prediction_wall_s": _mean(prediction_wall),
         "p95_prediction_wall_s": _p95(prediction_wall),
+        "posterior_pref_lock_consistency": preference_lock_purity([record], single_record_preset, use_latent_pref=True),
+        "posterior_variant_lock_consistency": preference_lock_purity([record], single_record_preset, use_latent_pref=False),
     }
 
 
-def aggregate_live_episodes(records: Sequence[LiveEpisodeRecord]) -> Dict[str, float]:
-    if not records:
-        return _aggregate_episode_metrics([])
-    rows = [live_episode_metrics(r) for r in records]
-    weights = [max(1, int(r.n)) for r in records]
-    total = max(1, sum(weights))
-    keys = sorted({k for row in rows for k, v in row.items() if isinstance(v, (int, float))})
-    out: Dict[str, float] = {"n_episodes": float(len(records)), "n_steps": float(total), "n": float(total)}
-    for key in keys:
-        out[key] = sum(float(row.get(key, 0.0)) * w for row, w in zip(rows, weights)) / total
-    pooled_scores: List[float] = []
-    pooled_labels: List[int] = []
-    for record in records:
-        for step in record.steps:
-            if step.posterior_confidence is not None:
-                pooled_scores.append(float(step.posterior_confidence))
-                pooled_labels.append(1 if step.correct_top1 else 0)
-    if pooled_scores:
-        calib = binary_decision_metrics(pooled_scores, pooled_labels, n_bins=10)
-        out["pooled_ece"] = float(calib.get("ece", 0.0))
-        out["pooled_brier"] = float(calib.get("brier", 0.0))
-        out["pooled_auroc"] = float(calib.get("auroc", 0.5))
-        out["n_calib_pooled"] = float(len(pooled_scores))
-    else:
-        out["pooled_ece"] = 0.0
-        out["pooled_brier"] = 0.0
-        out["pooled_auroc"] = 0.5
-        out["n_calib_pooled"] = 0.0
-    return out
-
-
-def bwt_fwt_checkpoints(
+def bwt_zero_shot_checkpoints(
     phase_a_eval: Dict[str, Dict[str, float]],
     final_eval: Dict[str, Dict[str, float]],
     phase_a_seen_labels: Sequence[str],
+    isolated_eval: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, Any]:
+    """Compute BWT and zero-shot transfer from checkpoint evals.
+
+    BWT (backward transfer / forgetting):
+        Measures how much performance on Phase A tasks changed from their
+        isolated single-task peak to the end of the full deployment stream.
+        When ``isolated_eval`` is supplied it is used as the baseline (correct);
+        otherwise ``phase_a_eval`` is used as the Phase-A checkpoint baseline.
+
+    Zero-shot transfer:
+        Performance on tasks that were *not* in Phase A, evaluated at the Phase A
+        checkpoint.
+    """
     labels = sorted(k for k in final_eval if k in phase_a_eval)
     seen = set(phase_a_seen_labels)
+    bwt_baseline = isolated_eval if isolated_eval is not None else phase_a_eval
+    if isolated_eval is not None:
+        # Correct reference: single-task peak evaluated on a fresh agent that
+        # observed only task i before evaluation.  Approximates R_{i,i} from
+        # the standard BWT formula (Lopez-Paz & Ranzato 2017).
+        bwt_baseline_name = "isolated_single_task"
+    else:
+        # Fallback: Phase-A checkpoint AFTER all Phase-A tasks have been
+        # learned.  Phase-A within-stream interference is already baked in,
+        # so this reference is LOWER than the true R_{i,i}.  BWT values from
+        # this path may understate forgetting.  Label is distinct so that
+        # paper-facing results can be filtered to the correct reference only.
+        bwt_baseline_name = "bwt_phase_a_checkpoint_approx"
     bwt_terms = [
-        float(final_eval[label].get("top1", 0.0)) - float(phase_a_eval[label].get("top1", 0.0))
+        float(final_eval[label].get("top1", 0.0)) - float(bwt_baseline.get(label, {}).get("top1", 0.0))
         for label in labels
         if label in seen
     ]
-    fwt_terms = [
+    zero_shot_terms = [
         float(phase_a_eval[label].get("top1", 0.0))
         for label in labels
         if label not in seen
     ]
     return {
         "bwt": float(_mean(bwt_terms)) if bwt_terms else float("nan"),
-        "fwt": float(_mean(fwt_terms)) if fwt_terms else float("nan"),
+        "zero_shot_transfer": float(_mean(zero_shot_terms)) if zero_shot_terms else float("nan"),
+        "bwt_baseline": bwt_baseline_name,
         "n_bwt_tasks": len(bwt_terms),
-        "n_fwt_tasks": len(fwt_terms),
+        "n_zero_shot_tasks": len(zero_shot_terms),
         "bwt_terms": bwt_terms,
-        "fwt_terms": fwt_terms,
+        "zero_shot_terms": zero_shot_terms,
     }
 
 
@@ -1268,14 +1252,6 @@ def confusion_labels(
         if pred in idx and gt in idx:
             matrix[idx[gt], idx[pred]] += 1
     return matrix
-
-
-def confusion_3label(
-    predicted: Sequence[str],
-    ground_truth: Sequence[str],
-    labels: Sequence[str] = MEMORY_STATE_LABELS,
-) -> np.ndarray:
-    return confusion_labels(predicted, ground_truth, labels=labels)
 
 
 def classifier_report(matrix: np.ndarray, labels: Sequence[str]) -> Dict[str, Any]:
@@ -1305,6 +1281,8 @@ def classifier_report(matrix: np.ndarray, labels: Sequence[str]) -> Dict[str, An
 def preference_lock_purity(
     records: Sequence[LiveEpisodeRecord],
     preset_of_pair_label: Dict[str, str],
+    *,
+    use_latent_pref: bool = True,
 ) -> float:
     by_preset: Dict[str, List[str]] = {}
     for record in records:
@@ -1312,7 +1290,7 @@ def preference_lock_purity(
         if preset is None:
             continue
         for step in record.steps:
-            pid = step.inferred_latent_pref or step.inferred_pref
+            pid = _step_latent_pref_id(step) if use_latent_pref else _step_variant_hash(step)
             if pid is not None:
                 by_preset.setdefault(preset, []).append(str(pid))
     total = 0
@@ -1324,6 +1302,76 @@ def preference_lock_purity(
         modal_total += counts.most_common(1)[0][1]
         total += len(pids)
     return float(modal_total / total) if total > 0 else 0.0
+
+
+def preference_cluster_metrics(
+    records: Sequence[LiveEpisodeRecord],
+    preset_of_pair_label: Dict[str, str],
+    *,
+    use_latent_pref: bool = True,
+) -> Dict[str, Any]:
+    true_labels: List[str] = []
+    pred_labels: List[str] = []
+    for record in records:
+        preset = preset_of_pair_label.get(record.pair_label)
+        if preset is None:
+            continue
+        for step in record.steps:
+            pid = _step_latent_pref_id(step) if use_latent_pref else _step_variant_hash(step)
+            if pid is None:
+                continue
+            true_labels.append(str(preset))
+            pred_labels.append(str(pid))
+    n = len(true_labels)
+    if n == 0:
+        return {
+            "preference_cluster_purity": 0.0,
+            "preference_nmi": 0.0,
+            "preference_ari": 0.0,
+            "preference_collapse_rate": 0.0,
+            "latent_preference_entropy": 0.0,
+            "preference_confusion": {},
+            "n_preference_assignments": 0,
+        }
+    true_counts = Counter(true_labels)
+    pred_counts = Counter(pred_labels)
+    joint = Counter(zip(true_labels, pred_labels))
+
+    def comb2(x: int) -> float:
+        return float(x * (x - 1) / 2)
+
+    mi = 0.0
+    for (true_label, pred_label), count in joint.items():
+        if count > 0:
+            mi += (count / n) * math.log((count * n) / max(true_counts[true_label] * pred_counts[pred_label], 1))
+    h_true = -sum((count / n) * math.log(count / n) for count in true_counts.values() if count > 0)
+    h_pred = -sum((count / n) * math.log(count / n) for count in pred_counts.values() if count > 0)
+    nmi = (2.0 * mi / (h_true + h_pred)) if (h_true + h_pred) > 0 else 0.0
+
+    sum_joint = sum(comb2(count) for count in joint.values())
+    sum_true = sum(comb2(count) for count in true_counts.values())
+    sum_pred = sum(comb2(count) for count in pred_counts.values())
+    total_pairs = comb2(n)
+    expected = (sum_true * sum_pred / total_pairs) if total_pairs > 0 else 0.0
+    max_index = 0.5 * (sum_true + sum_pred)
+    ari = ((sum_joint - expected) / (max_index - expected)) if max_index > expected else 0.0
+
+    max_cluster_fraction = max(pred_counts.values()) / n
+    unique_ratio = len(pred_counts) / max(len(true_counts), 1)
+    collapse_rate = max(0.0, 1.0 - unique_ratio) * max_cluster_fraction
+    norm_entropy = (h_pred / math.log(len(pred_counts))) if len(pred_counts) > 1 else 0.0
+    confusion: Dict[str, Dict[str, int]] = {}
+    for (true_label, pred_label), count in joint.items():
+        confusion.setdefault(true_label, {})[pred_label] = int(count)
+    return {
+        "preference_cluster_purity": preference_lock_purity(records, preset_of_pair_label, use_latent_pref=use_latent_pref),
+        "preference_nmi": float(max(0.0, min(1.0, nmi))),
+        "preference_ari": float(ari),
+        "preference_collapse_rate": float(collapse_rate),
+        "latent_preference_entropy": float(norm_entropy),
+        "preference_confusion": confusion,
+        "n_preference_assignments": int(n),
+    }
 
 
 def preference_axis_top1(
@@ -1353,6 +1401,64 @@ def per_recipe_accuracy_matrix(records_by_label: Dict[str, Dict[str, float]], pa
     return {recipe: dict(vals) for recipe, vals in matrix.items()}
 
 
+_POLICY_DIAGNOSTIC_FALLBACK_KEYS: Dict[str, Tuple[str, ...]] = {
+    "would_assist_under_gate": ("assist_used",),
+    "gate_reason": ("assist_reason", "reason"),
+    "gate_source": ("assist_source",),
+    "policy_confidence": ("final_action_confidence", "action_confidence"),
+    "policy_raw_confidence": ("raw_action_confidence",),
+    "policy_gate_score": ("action_gate_score",),
+    "policy_margin": ("final_action_margin", "action_margin"),
+    "policy_entropy": ("final_action_entropy", "action_entropy", "action_marginal_entropy"),
+    "gate_threshold": ("action_gate_threshold",),
+    "policy_final_confidence": ("final_action_confidence",),
+    "policy_final_margin": ("final_action_margin",),
+    "policy_final_entropy": ("final_action_entropy",),
+    "conditioned_policy_confidence": ("conditioned_action_confidence",),
+    "ensemble_policy_confidence": ("ensemble_action_confidence",),
+    "policy_agreement": ("policy_agreement",),
+    "blend_strength": ("blend_strength",),
+}
+
+
+def _row_policy_diagnostics(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    diagnostics = row.get("policy_diagnostics")
+    return diagnostics if isinstance(diagnostics, Mapping) else {}
+
+
+def _row_policy_raw(row: Mapping[str, Any], key: str) -> Any:
+    diagnostics = _row_policy_diagnostics(row)
+    if key in diagnostics:
+        return diagnostics.get(key)
+    for fallback_key in _POLICY_DIAGNOSTIC_FALLBACK_KEYS.get(key, ()):
+        if fallback_key in row:
+            return row.get(fallback_key)
+    return None
+
+
+def _row_policy_value(row: Mapping[str, Any], key: str) -> Optional[float]:
+    value = _row_policy_raw(row, key)
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
+
+
+def _row_policy_bool(row: Mapping[str, Any], key: str) -> Optional[bool]:
+    value = _row_policy_raw(row, key)
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _row_policy_text(row: Mapping[str, Any], key: str, default: str = "unknown") -> str:
+    value = _row_policy_raw(row, key)
+    return str(value if value is not None else default)
+
+
+def _row_robot_wrong(row: Mapping[str, Any]) -> bool:
+    return not bool(row.get("correct_top1", False))
+
+
 def live_step_trace(step_rows: Sequence[Dict[str, Any]]) -> List[Dict[str, float]]:
     rows_for_trace = list(step_rows)
     by_step: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
@@ -1360,12 +1466,34 @@ def live_step_trace(step_rows: Sequence[Dict[str, Any]]) -> List[Dict[str, float
         by_step[int(row.get("step", 0))].append(row)
     out: List[Dict[str, float]] = []
     for step, rows in sorted(by_step.items()):
+        top1_vals = [1.0 if r.get("correct_top1") else 0.0 for r in rows]
+        top1 = _mean(top1_vals)
+        n_steps = max(1, len(rows))
+        binom_ci = 1.96 * math.sqrt(max(0.0, top1 * (1.0 - top1)) / n_steps)
+        continuous: Dict[str, float] = {}
+        direct_keys = ("posterior_confidence", "posterior_entropy")
+        policy_keys = ("policy_confidence", "policy_margin")
+        for key in direct_keys:
+            vals = [float(r.get(key)) for r in rows if r.get(key) is not None]
+            if vals:
+                arr = np.asarray(vals, dtype=float)
+                continuous[key] = float(np.mean(arr))
+                continuous[f"{key}_p10"] = float(np.percentile(arr, 10))
+                continuous[f"{key}_p50"] = float(np.percentile(arr, 50))
+                continuous[f"{key}_p90"] = float(np.percentile(arr, 90))
+        for key in policy_keys:
+            vals = [v for r in rows for v in (_row_policy_value(r, key),) if v is not None]
+            if vals:
+                arr = np.asarray(vals, dtype=float)
+                continuous[key] = float(np.mean(arr))
+                continuous[f"{key}_p10"] = float(np.percentile(arr, 10))
+                continuous[f"{key}_p50"] = float(np.percentile(arr, 50))
+                continuous[f"{key}_p90"] = float(np.percentile(arr, 90))
         out.append({
             "step": float(step),
-            "top1": _mean([1.0 if r.get("correct_top1") else 0.0 for r in rows]),
-            "assist_rate": _mean([1.0 if r.get("assist_used") else 0.0 for r in rows]),
-            "posterior_entropy": _mean([float(r.get("posterior_entropy")) for r in rows if r.get("posterior_entropy") is not None]),
-            "action_confidence": _mean([float(r.get("action_confidence")) for r in rows if r.get("action_confidence") is not None]),
+            "top1": top1,
+            "top1_ci95": float(binom_ci),
+            **continuous,
             "n_episodes": float(len({(r.get("baseline"), r.get("event_idx"), r.get("pair"), r.get("condition"), r.get("repeat"), r.get("arm"), r.get("gap")) for r in rows})),
             "n_steps": float(len(rows)),
         })
@@ -1374,9 +1502,10 @@ def live_step_trace(step_rows: Sequence[Dict[str, Any]]) -> List[Dict[str, float
 
 def calibration_curve_from_steps(step_rows: Sequence[Dict[str, Any]], n_bins: int = 10) -> List[Dict[str, float]]:
     rows = [
-        (float(r.get("action_confidence")), 1.0 if r.get("correct_top1") else 0.0)
+        (float(score), 1.0 if r.get("correct_top1") else 0.0)
         for r in step_rows
-        if r.get("action_confidence") is not None
+        for score in (_row_policy_value(r, "policy_confidence"),)
+        if score is not None
     ]
     if not rows:
         return []
@@ -1384,21 +1513,70 @@ def calibration_curve_from_steps(step_rows: Sequence[Dict[str, Any]], n_bins: in
     labels = np.asarray([r[1] for r in rows], dtype=float)
     if scores.min() < 0.0 or scores.max() > 1.0:
         scores = (scores - float(scores.min())) / max(float(scores.max() - scores.min()), 1e-9)
-    edges = np.linspace(0.0, 1.0, max(1, int(n_bins)) + 1)
+    n_eff_bins = max(1, min(int(n_bins), len(scores)))
+    ordered = np.argsort(scores)
     curve: List[Dict[str, float]] = []
-    for idx in range(len(edges) - 1):
-        lo, hi = float(edges[idx]), float(edges[idx + 1])
-        mask = ((scores >= lo) & (scores <= hi)) if idx == len(edges) - 2 else ((scores >= lo) & (scores < hi))
-        count = int(mask.sum())
+    for idx, bin_idx in enumerate(np.array_split(ordered, n_eff_bins)):
+        count = int(len(bin_idx))
         if count <= 0:
             continue
         curve.append({
             "bin": float(idx),
-            "confidence": float(scores[mask].mean()),
-            "accuracy": float(labels[mask].mean()),
+            "confidence": float(scores[bin_idx].mean()),
+            "accuracy": float(labels[bin_idx].mean()),
             "n_steps": float(count),
+            "score_min": float(scores[bin_idx].min()),
+            "score_max": float(scores[bin_idx].max()),
         })
     return curve
+
+
+def _step_row_confidence(row: Mapping[str, Any]) -> Optional[float]:
+    for key in (
+        "policy_final_confidence",
+        "policy_confidence",
+        "policy_gate_score",
+        "policy_raw_confidence",
+    ):
+        value = _row_policy_value(row, key)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def confidence_threshold_accuracy_curve_from_steps(
+    step_rows: Sequence[Mapping[str, Any]],
+    thresholds: Sequence[float],
+) -> Dict[str, Dict[str, float]]:
+    scored = [
+        (
+            float(score),
+            1.0 if row.get("correct_top1") else 0.0,
+            1.0 if row.get("correct_topk") else 0.0,
+        )
+        for row in step_rows
+        for score in (_step_row_confidence(row),)
+        if score is not None
+    ]
+    n_steps = len(scored)
+    out: Dict[str, Dict[str, float]] = {}
+    for threshold in sorted({float(t) for t in thresholds}):
+        retained = [(top1, topk) for score, top1, topk in scored if score >= threshold]
+        n_retained = len(retained)
+        conditional_top1 = _mean([top1 for top1, _topk in retained]) if retained else float("nan")
+        conditional_topk = _mean([topk for _top1, topk in retained]) if retained else float("nan")
+        out[f"{threshold:.2f}"] = {
+            "confidence_threshold": float(threshold),
+            "retained_robot_turn_fraction": float(n_retained / max(1, n_steps)),
+            "conditional_top1": float(conditional_top1),
+            "conditional_topk": float(conditional_topk),
+            "retained_wrong_rate": float(1.0 - conditional_top1) if math.isfinite(float(conditional_top1)) else float("nan"),
+            "unconditional_top1": _mean([top1 for _score, top1, _topk in scored]),
+            "unconditional_topk": _mean([topk for _score, _top1, topk in scored]),
+            "n_retained_robot_turns": float(n_retained),
+            "n_scored_robot_turns": float(n_steps),
+        }
+    return out
 
 
 def latency_cdf_from_steps(step_rows: Sequence[Dict[str, Any]], max_points: int = 101) -> List[Dict[str, float]]:
@@ -1410,9 +1588,9 @@ def latency_cdf_from_steps(step_rows: Sequence[Dict[str, Any]], max_points: int 
     return [{"latency_s": float(np.quantile(arr, q)), "cdf": float(q)} for q in qs]
 
 
-def assist_gate_reason_summary(step_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    counts = Counter(str(r.get("assist_reason", "unknown")) for r in step_rows)
-    sources = Counter(str(r.get("assist_source", "unknown")) for r in step_rows)
+def policy_gate_reason_summary(step_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    counts = Counter(_row_policy_text(r, "gate_reason") for r in step_rows)
+    sources = Counter(_row_policy_text(r, "gate_source") for r in step_rows)
     total = max(1, sum(counts.values()))
     source_total = max(1, sum(sources.values()))
     return {
@@ -1421,6 +1599,11 @@ def assist_gate_reason_summary(step_rows: Sequence[Dict[str, Any]]) -> Dict[str,
         "source_counts": {k: int(v) for k, v in sorted(sources.items())},
         "source_rates": {k: float(v / source_total) for k, v in sorted(sources.items())},
     }
+
+
+def assist_gate_reason_summary(step_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Backward-compatible alias for historical callers."""
+    return policy_gate_reason_summary(step_rows)
 
 
 def _safe_read_json(path: Path) -> Dict[str, Any]:
@@ -1437,138 +1620,14 @@ def _humanize_identifier(value: str) -> str:
     return stem.replace("_", " ").strip()
 
 
-def _short_metric_value(value: Any) -> str:
-    try:
-        v = float(value)
-    except Exception:
-        return str(value)
-    if abs(v) >= 1000.0:
-        return f"{v:.3g}"
-    if abs(v) >= 10.0:
-        return f"{v:.2f}"
-    return f"{v:.3f}"
 
 
-def _figure_kind(data: Mapping[str, Any], filename: str) -> str:
-    name = filename.lower()
-    if "heatmap" in name or "matrix" in name or "matrix" in data:
-        return "heatmap"
-    if "cdf" in name or "curve" in name:
-        return "line chart"
-    if "series" in data or "curves" in data:
-        return "line chart"
-    if "groups" in data:
-        return "grouped bar chart"
-    if "values" in data:
-        return "bar chart"
-    return "figure"
 
 
-def _infer_axes(filename: str, data: Mapping[str, Any]) -> Tuple[str, str]:
-    x = str(data.get("xlabel") or data.get("x_label") or "")
-    y = str(data.get("ylabel") or data.get("y_label") or "")
-    text = f"{filename} {data.get('title', '')}".lower()
-    if "latency_cdf" in text:
-        x = "prediction latency (milliseconds)"
-        y = "cumulative fraction of predictions"
-    if not x:
-        if "forgetting_curve" in text:
-            x = "number of Phase-B events after initial demonstrations"
-        elif "four_cell" in text:
-            x = "seen/unseen recipe-preference condition and baseline"
-        elif "event_type" in text:
-            x = "deployment event type and baseline"
-        elif "memory_state" in text:
-            x = "ground-truth memory state and event type"
-        elif "assist_gate" in text:
-            x = "gate diagnostic category and baseline"
-        elif "heatmap" in filename.lower() and data.get("x_labels"):
-            x = "columns: " + ", ".join(str(v) for v in data.get("x_labels", [])[:8])
-        elif "per_step" in filename.lower() or "adaptation" in filename.lower():
-            x = "within-episode step"
-        elif "gap" in filename.lower() or "reentry" in filename.lower() or "decay" in filename.lower():
-            x = "gap since last use"
-        elif "threshold" in filename.lower() or "coverage_accuracy" in filename.lower():
-            x = "decision threshold"
-        elif "zipf" in filename.lower():
-            x = "Zipf reuse skew alpha"
-        elif "hamming" in filename.lower():
-            x = "preference-composition distance"
-        elif "demo_count" in filename.lower() or "sample_efficiency" in filename.lower():
-            x = "number of demonstrations"
-        else:
-            x = "system variant or experimental condition"
-    if not y:
-        title = str(data.get("title") or filename).lower()
-        if "four_cell" in text or "forgetting_curve" in text or "per_step_adaptation" in text or "event_type" in text or "memory_state" in text:
-            y = "top-1 accuracy"
-        elif "top-1" in title or "top1" in filename.lower():
-            y = "top-1 accuracy"
-        elif "assist_gate" in text:
-            y = "rate"
-        elif "coverage" in title or "coverage" in filename.lower():
-            y = "assistance coverage"
-        elif "latency" in title or "wall" in title or "fit time" in title:
-            y = "seconds"
-        elif "flop" in title or "flop" in filename.lower():
-            y = "estimated FLOPs"
-        elif "memory" in title or "variant" in title:
-            y = "variant count"
-        elif "rate" in title or "rate" in filename.lower():
-            y = "rate"
-        else:
-            y = "measured outcome"
-    return x, y
 
 
-def _good_direction(filename: str, title: str, y_label: str) -> str:
-    text = f"{filename} {title} {y_label}".lower()
-    if "hrc_assistance_utility" in text or "gate utility" in text or "rate / utility" in text:
-        return "Higher utility is better; coverage and conditional top-1 should rise without increasing wrong-assist rate or hiding many correct predictions."
-    if "latency_cdf" in text or "latency cdf" in text:
-        return "Better curves rise earlier and sit higher at small millisecond thresholds; that means more predictions finish fast enough for interactive assistance."
-    if "net assistance" in text:
-        return "Higher is better: positive values mean useful correct assists outweigh wrong assists."
-    if any(k in text for k in ("latency", "wall time", "fit time", "flop", "steps", "error", "wrong", "duplicate", "entropy")):
-        return "Lower is better, assuming accuracy and coverage are not sacrificed."
-    if any(k in text for k in ("active memory", "active variants", "latest-key", "latest keys", "pruned memory", "pruned variants")):
-        return "Memory is a tradeoff: lower footprint is cheaper, but too low can mean the system is not retaining enough recoverable workflow history."
-    if "coverage" in text:
-        return "Higher coverage is only good when conditional top-1 and net assistance remain high."
-    if any(k in text for k in ("top-1", "top1", "accuracy", "macro-f1", "useful", "net assistance", "retention", "recovery", "purity", "transfer")):
-        return "Higher is better."
-    if "global rate" in text:
-        return "Context dependent: higher decay rate forgets faster; lower decay rate keeps variants longer."
-    return "Interpret relative to the comparison baseline and the companion accuracy/memory plots."
 
 
-def _kitchen_analogy(filename: str, title: str, experiment: str) -> str:
-    text = f"{filename} {title} {experiment}".lower()
-    if "top-1" in text or "top1" in text:
-        return "This is whether the assistant names the exact next kitchen action, such as chop tomato versus retrieve bowl, before the cook does it."
-    if "forgetting" in text:
-        return "This checks whether the assistant still remembers the original recipes after many later orders and preference changes."
-    if "latency_cdf" in text or "prediction latency cdf" in text:
-        return "This is how often the assistant can whisper the next prep step within a few milliseconds, before the cook has already moved on."
-    if any(k in text for k in ("flop", "fit", "wall", "latency")):
-        return "Think of this as the cost of updating the kitchen's prep notebook between customers before the next order arrives."
-    if any(k in text for k in ("memory", "active", "pruned", "latest")):
-        return "This is the stack of recipe cards kept on the counter versus cards archived away after they have not been used."
-    if any(k in text for k in ("reentry", "gap", "decay")):
-        return "This is a customer asking for an old dish again after many intervening meals; the system should recover without relearning from scratch."
-    if any(k in text for k in ("transfer", "four_cell", "seen_unseen", "unseen_seen")):
-        return "This asks whether a learned kitchen habit, such as prep-first or clean-as-you-go, transfers from one recipe to another."
-    if any(k in text for k in ("gate", "coverage", "reliability", "confidence")):
-        return "This is the sous-chef deciding when to speak up with the next action versus staying quiet to avoid giving bad help."
-    if any(k in text for k in ("adaptation", "shift", "per_step")):
-        return "This follows how quickly the assistant adjusts when the cook changes the order of familiar actions in the middle of a recipe."
-    if any(k in text for k in ("disambiguation", "threshold", "confusion", "boundary", "prefix")):
-        return "This is the system watching a partial chopping/prep sequence and deciding whether it is a known dish, a new style, or a new recipe."
-    if any(k in text for k in ("materiality", "duplicate", "kendall", "axis")):
-        return "This checks whether a named workflow preference actually changes the kitchen order rather than producing the same recipe trace."
-    if "zipf" in text:
-        return "This mimics a kitchen where a few house favorites are ordered often while many dishes are rare."
-    return "Read it as a controlled kitchen-workflow comparison: each point or bar is one way the assistant handles recipe and preference demonstrations."
 
 
 GUIDE_EVENT_TYPE_ORDER: Tuple[str, ...] = (
@@ -1582,16 +1641,21 @@ GUIDE_EVENT_TYPE_ORDER: Tuple[str, ...] = (
     "single_shot_first_reuse",
     "preference_shift",
     "known_recipe_new_preference",
-    "gradual_shift",
-    "gradual_shift_followup",
     "user_switch",
     "cross_transfer_probe",
     "offdiagonal_transfer",
+    "axis_value_train",
+    "axis_value_transfer_probe",
+    "axis_family_train",
+    "axis_family_holdout_probe",
     "regular_menu_rotation",
-    "novel_recipe_assist_attempt",
     "rare_reentry",
     "rare_custom_order_reentry",
     "new_recipe_observe",
+    "ladder_initial_observe",
+    "ladder_pref_update_heterogeneous",
+    "ladder_shared_pref_shift",
+    "ladder_settle",
 )
 
 EVENT_TYPE_EXPLANATIONS: Dict[str, str] = {
@@ -1605,16 +1669,22 @@ EVENT_TYPE_EXPLANATIONS: Dict[str, str] = {
     "single_shot_first_reuse": "the first assist attempt immediately after a single demonstration; this tests one-shot reuse.",
     "preference_shift": "a known recipe is requested with a different preference ordering; this tests whether the assistant adapts to a changed human style.",
     "known_recipe_new_preference": "the recipe is familiar but the requested preference has not been seen on that recipe before.",
-    "gradual_shift": "an intermediate or blended preference episode; this tests whether the system tracks drift before the preference fully changes.",
-    "gradual_shift_followup": "the episode after a gradual-shift signal, now using the fully shifted preference; this tests whether adaptation carried over.",
     "user_switch": "the active user context changes; this tests whether user-specific preferences are retained across blocks.",
     "cross_transfer_probe": "a seen preference is applied to a recipe where that exact pairing was not demonstrated; this tests cross-recipe transfer.",
+    "confidence_threshold_probe": "a scheduled robot-turn assist episode used to build confidence-threshold accuracy curves without changing the action policy.",
     "offdiagonal_transfer": "a held-out recipe/preference combination after diagonal training; this tests whether preference structure transfers rather than memorizing pairs.",
+    "axis_value_train": "training support where one non-default preference-axis value is demonstrated on a recipe subset.",
+    "axis_value_transfer_probe": "a held-out recipe subset using the same non-default axis value; this tests whether an axis value transfers across recipes.",
+    "axis_family_train": "training support that excludes non-default values for one preference axis family while other axes may vary.",
+    "axis_family_holdout_probe": "probe episodes using non-default values from an axis family absent from training; this is the cleanest test of cross-axis generalization.",
     "regular_menu_rotation": "a mid-frequency workflow that appears during ordinary menu rotation, neither a house favorite nor a rare custom order.",
-    "novel_recipe_assist_attempt": "an assist attempt on a recipe the system has not directly observed; this is a hard generalization case.",
     "rare_reentry": "an older recipe/preference pair returns after a long gap; this tests recovery from stale or pruned memory.",
     "rare_custom_order_reentry": "a low-frequency customized workflow returns during the Zipf branch; fairness should still count it even if finite sampling barely shows it.",
     "new_recipe_observe": "a deployment-time observation event for a new recipe; this expands the library instead of measuring assistance.",
+    "ladder_initial_observe": "the first ladder rung observes one recipe-preference variant per selected recipe.",
+    "ladder_pref_update_heterogeneous": "all known recipes receive recipe-specific seed-shuffled preference updates in assist mode.",
+    "ladder_shared_pref_shift": "all known recipes receive the same seed-shuffled preference update in assist mode.",
+    "ladder_settle": "assist-only repeats after a ladder update; this measures whether inference stabilizes after the new rung.",
 }
 
 TRANSFER_CELL_EXPLANATIONS: Dict[str, str] = {
@@ -1626,10 +1696,10 @@ TRANSFER_CELL_EXPLANATIONS: Dict[str, str] = {
 }
 
 FOUR_CELL_EXPLANATIONS: Dict[str, str] = {
-    "seen_seen": "both the recipe and the preference style have been seen before, although not necessarily together.",
-    "seen_unseen": "the recipe has been seen before but the preference style is new.",
-    "unseen_seen": "the recipe is new but the preference style has been seen elsewhere.",
-    "unseen_unseen": "both recipe and preference style are new to the system.",
+    "known_recipe_known_preference": "both the recipe and preference style have appeared previously; this is a coarse exposure label, not necessarily exact-pair retrieval.",
+    "seen_recipe_new_preference": "the recipe has appeared before but the preference style is new to the stream.",
+    "unseen_recipe_seen_preference": "the recipe is new but the preference style has appeared elsewhere.",
+    "unseen_unseen": "both recipe and preference style are new to the stream.",
 }
 
 MEMORY_STATE_EXPLANATIONS: Dict[str, str] = {
@@ -1637,22 +1707,6 @@ MEMORY_STATE_EXPLANATIONS: Dict[str, str] = {
     "active_memory": "the requested variant is still active in the bounded memory set.",
     "pruned_memory": "the requested variant was previously learned but has decayed into the pruned/archive set.",
     "same_recipe_new_preference": "the recipe is known, but the current preference variant for that recipe is new.",
-}
-
-BASELINE_EXPLANATIONS: Dict[str, str] = {
-    "full": "the proposed system with bounded memory, adaptive decay, replay weighting, and latest-preference protection.",
-    "adaptive": "adaptive decay without latest-preference protection.",
-    "fixed_decay": "bounded memory with a fixed decay rate rather than reuse-adaptive decay.",
-    "no_decay": "unbounded memory; learned variants are retained instead of decayed out.",
-    "latest_only": "only the most recent preference variant per recipe is retained.",
-    "experience_replay_bc": "a behavior-cloning continual-learning baseline trained with replay.",
-    "ewc": "a continual-learning baseline using elastic weight consolidation.",
-    "online_ewc": "an online EWC variant that updates the consolidation anchor over time.",
-    "l2_anchor": "a quadratic anchor baseline that penalizes drift from the previous fit.",
-    "no_replay": "only the newest committed demonstration survives before retraining.",
-    "bigram": "a weak next-action baseline using local transition statistics.",
-    "frequency_conditioned_bigram": "a bigram baseline conditioned by observed action frequency.",
-    "oracle_ceiling": "an upper-bound baseline with privileged recipe/preference information.",
 }
 
 
@@ -1695,7 +1749,7 @@ def _event_type_glossary_lines(event_types: Iterable[str]) -> List[str]:
     lines = [
         "",
         "### Event Type Glossary",
-        "These labels describe the kitchen situation being evaluated, not just plotting categories.",
+        "These labels describe the kitchen situation being evaluated, not just category names.",
     ]
     for label in labels:
         lines.append(f"- `{label}`: {_event_type_description(label)}")
@@ -1754,231 +1808,24 @@ def _aggregate_seed_results(folder: Path) -> List[Dict[str, Any]]:
     return seed_results
 
 
-def _guide_context_for_folder(folder: Path, result: Mapping[str, Any], aggregate: Mapping[str, Any]) -> Dict[str, Any]:
-    seed_results: List[Mapping[str, Any]]
-    if result:
-        seed_results = [result]
-    elif aggregate:
-        seed_results = _aggregate_seed_results(folder)
-    else:
-        seed_results = []
-    event_counts: Counter[str] = Counter()
-    prior_counts: Counter[str] = Counter()
-    for seed_result in seed_results:
-        event_counts.update(_scenario_event_type_counts(seed_result))
-        prior_counts.update(_scenario_prior_state_counts(seed_result))
-    return {
-        "event_type_counts": dict(event_counts),
-        "prior_state_counts": dict(prior_counts),
-    }
 
 
-def _figure_label_tokens(data: Mapping[str, Any]) -> List[str]:
-    labels: List[str] = []
-    for key in ("groups", "x_labels", "y_labels"):
-        values = data.get(key)
-        if isinstance(values, (list, tuple)):
-            labels.extend(str(v) for v in values)
-    for key in ("values", "series", "curves"):
-        values = data.get(key)
-        if isinstance(values, Mapping):
-            labels.extend(str(v) for v in values.keys())
-    baseline_groups = data.get("baseline_groups")
-    if isinstance(baseline_groups, Mapping):
-        for group_values in baseline_groups.values():
-            if isinstance(group_values, (list, tuple)):
-                labels.extend(str(v) for v in group_values)
-    return labels
 
 
-def _figure_event_type_labels(filename: str, data: Mapping[str, Any], context: Mapping[str, Any]) -> List[str]:
-    title = str(data.get("title", ""))
-    text = f"{filename} {title}".lower()
-    tokens = set(_figure_label_tokens(data))
-    known = tuple(GUIDE_EVENT_TYPE_ORDER) + tuple(k for k in DEPLOYMENT_EVENT_NARRATIVES if k not in GUIDE_EVENT_TYPE_ORDER)
-    labels = [label for label in known if label in tokens or label in text]
-    if not labels and any(k in text for k in ("event_type", "per_event_type", "event_memory_state")):
-        counts = context.get("event_type_counts", {})
-        if isinstance(counts, Mapping):
-            labels = [str(k) for k in counts.keys()]
-            if any(k in text for k in ("live_top1", "memory_state", "assist")):
-                labels = [label for label in labels if label not in {"phase_a_observe", "new_recipe_observe", "diagonal_train", "single_shot_observe", "initial_recipe_observation"}]
-    return _ordered_known_labels(labels, GUIDE_EVENT_TYPE_ORDER)
 
 
-def _figure_transfer_cell_labels(filename: str, data: Mapping[str, Any]) -> List[str]:
-    title = str(data.get("title", ""))
-    text = f"{filename} {title}".lower()
-    tokens = set(_figure_label_tokens(data))
-    labels = [label for label in TRANSFER_CELL_KEYS if label in tokens or label in text]
-    if labels or "transfer_cell" in text or "direct retrieval" in text or "cross-recipe transfer" in text:
-        return _ordered_known_labels(labels or TRANSFER_CELL_KEYS, TRANSFER_CELL_KEYS)
-    return []
 
 
-def _figure_four_cell_labels(filename: str, data: Mapping[str, Any]) -> List[str]:
-    title = str(data.get("title", ""))
-    text = f"{filename} {title}".lower()
-    tokens = set(_figure_label_tokens(data))
-    labels = [label for label in FOUR_CELL_KEYS if label in tokens or label in text]
-    if labels or "four_cell" in text or "seen/unseen" in text:
-        return _ordered_known_labels(labels or FOUR_CELL_KEYS, FOUR_CELL_KEYS)
-    return []
 
 
-def _figure_memory_state_labels(filename: str, data: Mapping[str, Any], context: Mapping[str, Any]) -> List[str]:
-    title = str(data.get("title", ""))
-    text = f"{filename} {title}".lower()
-    tokens = set(_figure_label_tokens(data))
-    labels = [label for label in MEMORY_STATE_LABELS if label in tokens or label in text]
-    if not labels and "memory_state" in text:
-        counts = context.get("prior_state_counts", {})
-        if isinstance(counts, Mapping):
-            labels = [str(k) for k in counts.keys() if str(k) in MEMORY_STATE_LABELS]
-    if labels or "memory_state" in text:
-        return _ordered_known_labels(labels or MEMORY_STATE_LABELS, MEMORY_STATE_LABELS)
-    return []
 
 
-def _figure_baseline_labels(data: Mapping[str, Any]) -> List[str]:
-    labels = []
-    for label in _figure_label_tokens(data):
-        if label in BASELINE_EXPLANATIONS or label in PAPER_BASELINES or label in APPENDIX_BASELINES or label in FACTOR_BASELINES:
-            labels.append(label)
-    return _ordered_baseline_names(labels)
 
 
-def _dependent_variable_detail_lines(filename: str, title: str, y_label: str) -> List[str]:
-    text = f"{filename} {title} {y_label}".lower()
-    details: List[str] = []
-    if "hrc_assistance_utility" in text or "gate utility" in text or "rate / utility" in text:
-        details.append("HRC assistance utility is correct-assist rate minus wrong-assist cost and a smaller penalty for correct predictions that were hidden by abstention.")
-    if "latency_cdf" in text or "latency cdf" in text:
-        details.append("The CDF is the fraction of prediction calls completed at or below each latency on the x-axis; a value of 0.9 at 10 ms means 90% of predictions were that fast or faster.")
-    if "conditional" in text and ("top-1" in text or "top1" in text):
-        details.append("Conditional top-1 accuracy is computed only on steps where the assistant chose to provide help; it asks whether spoken assistance is correct when it happens.")
-    elif "live" in text and ("top-1" in text or "top1" in text):
-        details.append("Live top-1 accuracy is the fraction of online steps where the assistant's single first-choice next action exactly matches the cook's next action before that action is revealed.")
-    elif "top-1" in text or "top1" in text:
-        details.append("Top-1 accuracy is the fraction of action steps where the model's single highest-ranked next-action prediction exactly matches the actual next kitchen action.")
-    if "topk" in text or "top-k" in text:
-        details.append("Top-k accuracy gives credit when the correct next action appears anywhere in the assistant's short ranked list, not necessarily as the first choice.")
-    if "coverage" in text:
-        details.append("Assistance coverage is the fraction of steps where the assistant speaks up instead of abstaining; high coverage is useful only if those assists are usually correct.")
-    if "useful_assistance" in text or "useful assistance" in text:
-        details.append("Useful assistance rate is the fraction of all steps that receive a correct assist, so it combines coverage with correctness.")
-    if "net_assistance" in text or "correct assists - wrong assists" in text or "net assistance" in text:
-        details.append("Net assistance value counts correct assists positively and wrong assists negatively, approximating whether help would actually reduce user burden.")
-    if ("latency" in text or "wall time" in text or "seconds" in text) and "latency_cdf" not in text and "latency cdf" not in text:
-        details.append("Seconds measure wall-clock cost for prediction or retraining; in deployment this is the delay the user or between-session update pipeline would feel.")
-    if "last_estimated_flops" in text:
-        details.append("Latest retrain FLOPs estimate the compute used by the most recent executed retrain, which matches the between-session update cost instead of cumulative experiment compute.")
-    elif "flop" in text:
-        details.append("FLOPs estimate training compute. For current headline plots, prefer latest retrain FLOPs over cumulative FLOPs when skipped retrains exist.")
-    if "active variants" in text or "active_memory" in text or "active memory" in text:
-        details.append("Active variants are recipe/preference workflows still retained for direct use by the bounded-memory system.")
-    if "pruned variants" in text or "pruned_memory" in text or "pruned memory" in text:
-        details.append("Pruned variants are workflows that were learned earlier but moved out of active memory; they should remain recoverable for rare reentry.")
-    if not details and y_label.lower() in {"rate", "measured outcome"}:
-        details.append("This outcome is a diagnostic rate or score; interpret it alongside the companion accuracy, coverage, memory, and compute plots rather than in isolation.")
-    return details
 
 
-def _independent_variable_detail_lines(
-    filename: str,
-    data: Mapping[str, Any],
-    x_label: str,
-    context: Mapping[str, Any],
-) -> List[str]:
-    title = str(data.get("title") or _humanize_identifier(filename))
-    text = f"{filename} {title} {x_label}".lower()
-    details: List[str] = []
-    if "gate_calibration_selection" in text:
-        details.append("This threshold sweep is the held-out calibration set actually used to choose the deployed action gate; the selected marker should be interpreted against wrong-assist and hidden-correct penalties, not coverage alone.")
-    if "posthoc_coverage_accuracy" in text:
-        details.append("This threshold sweep is a post-hoc diagnostic after deployment, not the data used to choose the threshold; it checks whether the selected policy generalizes to the later stream.")
-    if "latency_cdf" in text or "latency cdf" in text:
-        details.append("Prediction latency is the elapsed time for one online next-action query. The plot is zoomed to 0-20 ms because sub-20 ms predictions are effectively instantaneous for kitchen assistance, while a 500 ms axis hides meaningful differences in this run.")
-    event_labels = _figure_event_type_labels(filename, data, context)
-    if event_labels:
-        details.append("Deployment event type is the kind of kitchen situation being tested, such as direct reuse, preference drift, user switching, transfer, or rare reentry.")
-        for label in event_labels[:10]:
-            details.append(f"`{label}` means {_event_type_description(label)}")
-    four_labels = _figure_four_cell_labels(filename, data)
-    if four_labels:
-        details.append("The four-cell condition crosses whether the recipe has been seen before with whether the preference style has been seen before.")
-        for label in four_labels:
-            details.append(f"`{label}` means {FOUR_CELL_EXPLANATIONS.get(label, _prior_state_description(label))}")
-    transfer_labels = _figure_transfer_cell_labels(filename, data)
-    if transfer_labels:
-        details.append("Transfer cell is the prior exposure status before the episode starts; it separates direct retrieval from transfer to new recipe/preference pairings.")
-        for label in transfer_labels:
-            details.append(f"`{label}` means {TRANSFER_CELL_EXPLANATIONS.get(label, _prior_state_description(label))}")
-    memory_labels = _figure_memory_state_labels(filename, data, context)
-    if memory_labels:
-        details.append("Memory state is the ground-truth retention status of the requested workflow at the start of the episode.")
-        for label in memory_labels:
-            details.append(f"`{label}` means {MEMORY_STATE_EXPLANATIONS.get(label, _prior_state_description(label))}")
-    baseline_labels = _figure_baseline_labels(data)
-    if "baseline" in x_label.lower() or baseline_labels:
-        details.append("Baseline means the algorithmic system variant being compared; for example `full` is the proposed bounded-memory system, `no_decay` keeps all learned variants, and `latest_only` keeps only the newest variant per recipe.")
-        if 0 < len(baseline_labels) <= 6:
-            for label in baseline_labels:
-                details.append(f"`{label}` means {BASELINE_EXPLANATIONS.get(label, _baseline_label(label))}")
-    if "within-episode step" in x_label.lower() or "per_step" in text or "adaptation" in text:
-        details.append("Within-episode step is the action position inside a single recipe execution; earlier recovery means the assistant adapts before many wrong kitchen suggestions are made.")
-    if "phase-b events" in x_label.lower() or "forgetting_curve" in text:
-        details.append("Phase-B events are deployment episodes after the initial demonstrations; moving right means more intervening kitchen sessions have occurred since the original training examples.")
-    if "threshold" in x_label.lower() or "coverage_accuracy" in text:
-        details.append("The decision threshold controls how confident the assistant must be before speaking; raising it usually reduces coverage and can improve correctness when it does speak.")
-    if "zipf" in x_label.lower() or "zipf" in text:
-        details.append("Zipf reuse skew controls how concentrated the workload is: low values use recipes more evenly, high values make a few recipes dominate while others become rare.")
-    if "gap" in x_label.lower() or "reentry" in text or "decay" in text:
-        details.append("Gap measures how many intervening sessions occur before an old workflow returns; larger gaps are harder because memory decay has had more time to act.")
-    if not details and "system variant or experimental condition" in x_label.lower():
-        details.append("Each bar or curve is one controlled system setting, so differences should be read as changes caused by the compared algorithm or scenario condition.")
-    return details
 
 
-def _figure_summary_lines(
-    filename: str,
-    data: Mapping[str, Any],
-    experiment: str,
-    context: Optional[Mapping[str, Any]] = None,
-) -> List[str]:
-    title = str(data.get("title") or _humanize_identifier(filename))
-    kind = _figure_kind(data, filename)
-    x_label, y_label = _infer_axes(filename, data)
-    context = context or {}
-    lines = [
-        f"### `{filename}`",
-        f"- **What it is:** {kind}: {title}.",
-        f"- **Kitchen analogy:** {_kitchen_analogy(filename, title, experiment)}",
-        f"- **Independent variable:** {x_label}.",
-    ]
-    for detail in _independent_variable_detail_lines(filename, data, x_label, context):
-        lines.append(f"- **Independent variable detail:** {detail}")
-    lines.append(f"- **Dependent variable:** {y_label}.")
-    for detail in _dependent_variable_detail_lines(filename, title, y_label):
-        lines.append(f"- **Dependent variable detail:** {detail}")
-    lines.extend([
-        f"- **Good vs bad:** {_good_direction(filename, title, y_label)}",
-    ])
-    if "estimated_flops" in filename and "last_estimated_flops" not in filename:
-        lines.append("- **Reporting note:** this is the legacy cumulative fit-FLOP plot. The current headline compute plot is `*_last_estimated_flops.png`, which reflects the latest executed retrain between sessions.")
-    if isinstance(data.get("values"), Mapping):
-        values = dict(data.get("values") or {})
-        if values:
-            best_key = max(values, key=lambda k: float(values[k]))
-            lines.append(f"- **Largest value in this file:** `{best_key}` = {_short_metric_value(values[best_key])}.")
-    elif isinstance(data.get("series"), Mapping):
-        lines.append(f"- **Series shown:** {', '.join(str(k) for k in list(data.get('series', {}).keys())[:12])}.")
-    elif isinstance(data.get("groups"), (list, tuple)):
-        lines.append(f"- **Groups shown:** {', '.join(str(k) for k in list(data.get('groups', []))[:12])}.")
-    elif isinstance(data.get("x_labels"), (list, tuple)) and isinstance(data.get("y_labels"), (list, tuple)):
-        lines.append(f"- **Rows/columns:** rows = {', '.join(str(k) for k in list(data.get('y_labels', []))[:8])}; columns = {', '.join(str(k) for k in list(data.get('x_labels', []))[:8])}.")
-    lines.append("")
-    return lines
 
 
 def _event_brief(row: Mapping[str, Any]) -> str:
@@ -2088,31 +1935,19 @@ def _scenario_lines_for_aggregate(folder: Path, aggregate: Mapping[str, Any]) ->
     return lines
 
 
-def _figure_data_map_for_folder(folder: Path, result: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
-    figures = result.get("figures", {}) if isinstance(result, Mapping) else {}
-    out: Dict[str, Dict[str, Any]] = {}
-    if isinstance(figures, Mapping):
-        for name, row in figures.items():
-            if isinstance(row, Mapping):
-                data = row.get("data", {}) if isinstance(row.get("data", {}), Mapping) else {}
-                out[str(name)] = dict(data)
-    return out
 
 
 def _artifact_guide_text(folder: Path) -> Optional[str]:
-    pngs = sorted(folder.glob("*.png"))
     result_path = folder / "result.json"
     aggregate_path = folder / "aggregate.json"
-    if not pngs and not result_path.exists() and not aggregate_path.exists():
+    if not result_path.exists() and not aggregate_path.exists():
         return None
     result = _safe_read_json(result_path) if result_path.exists() else {}
     aggregate = _safe_read_json(aggregate_path) if aggregate_path.exists() else {}
-    experiment = str((result.get("metadata", {}) or {}).get("experiment") or (aggregate.get("metadata", {}) or {}).get("experiment") or folder.parent.name)
-    context = _guide_context_for_folder(folder, result, aggregate)
     lines = [
         "# Artifact Guide",
         "",
-        "This file is generated from stored result artifacts. It is meant to make the plots auditable without rerunning the experiment or opening the notebook.",
+        "This file is generated from stored result logs.",
         "",
     ]
     if result:
@@ -2121,21 +1956,11 @@ def _artifact_guide_text(folder: Path) -> Optional[str]:
         lines.extend(_scenario_lines_for_aggregate(folder, aggregate))
     else:
         lines.extend(["## Scenario / Workflow", "- No structured result JSON was found in this folder.", ""])
-    if pngs:
-        lines.extend(["## Figure Guide", ""])
-        figure_data = _figure_data_map_for_folder(folder, result)
-        for png in pngs:
-            data = figure_data.get(png.name, {})
-            if not data and aggregate:
-                data = {"title": _humanize_identifier(png.name)}
-            lines.extend(_figure_summary_lines(png.name, data, experiment, context))
-    else:
-        lines.extend(["## Figure Guide", "- No PNG figures were found in this folder.", ""])
     return "\n".join(lines).rstrip() + "\n"
 
 
 def generate_artifact_guides(run_dir: str | Path) -> Dict[str, Any]:
-    """Write per-seed and per-aggregate markdown guides for stored artifacts."""
+    """Write per-seed and per-aggregate markdown guides for stored logs."""
     root = Path(run_dir)
     written: List[str] = []
     for folder in sorted([p for p in root.rglob("*") if p.is_dir()] + [root]):
@@ -2167,361 +1992,8 @@ def _flatten_numeric(prefix: str, obj: Any, out: Optional[Dict[str, float]] = No
     return out
 
 
-def _flat_artifact_path(path: Path) -> Path:
-    path = Path(path)
-    if _ACTIVE_RESULT is not None:
-        try:
-            rel = path.relative_to(_ACTIVE_RESULT.seed_dir)
-            parts = [p for p in rel.parts if p != "figures"]
-            if len(parts) > 1:
-                return _ACTIVE_RESULT.seed_dir / "_".join(parts)
-            return _ACTIVE_RESULT.seed_dir / parts[0]
-        except ValueError:
-            pass
-    if path.parent.name == "figures":
-        return path.parent.parent / path.name
-    return path
 
 
-def _remove_stale_pngs(root: Path, patterns: Sequence[str]) -> None:
-    for pattern in patterns:
-        for path in Path(root).glob(pattern):
-            if path.is_file() and path.suffix.lower() == ".png":
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-
-
-def _plot_bar(
-    path: Path,
-    title: str,
-    values: Dict[str, float],
-    ylabel: str = "value",
-    data: Optional[Dict[str, Any]] = None,
-    colors: Optional[Sequence[str]] = None,
-) -> None:
-    if not values:
-        return
-    path = _flat_artifact_path(path)
-    _ensure(path.parent)
-    labels = list(values.keys())
-    ys = [float(values[k]) for k in labels]
-    fig, ax = plt.subplots(figsize=(max(5.0, 0.55 * len(labels) + 2), 3.6), dpi=140)
-    bar_colors = list(colors) if colors is not None else [_baseline_color(label) for label in labels]
-    ax.bar(np.arange(len(labels)), ys, color=bar_colors)
-    ax.set_xticks(np.arange(len(labels)))
-    ax.set_xticklabels([_baseline_label(label) for label in labels], rotation=25, ha="right")
-    groups = _add_baseline_group_separators(ax, labels)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-    fig_data = data or {"values": values, "title": title, "ylabel": ylabel, "baseline_groups": groups}
-    if _ACTIVE_RESULT is not None:
-        _ACTIVE_RESULT.capture_figure(path, fig_data)
-
-
-def _add_baseline_group_separators(ax: Any, labels: Sequence[str]) -> Dict[str, List[str]]:
-    groups: Dict[str, List[str]] = {}
-    if not labels:
-        return groups
-    group_names = [_baseline_group(label) for label in labels]
-    for label, group in zip(labels, group_names):
-        groups.setdefault(group, []).append(label)
-    for i in range(1, len(labels)):
-        if group_names[i] != group_names[i - 1]:
-            ax.axvline(i - 0.5, color="#9ca3af", linestyle=":", linewidth=1.0, alpha=0.8)
-    return groups
-
-
-def _plot_bar_ci(path: Path, title: str, values: Dict[str, float], ci95: Optional[Dict[str, float]] = None, ylabel: str = "value") -> None:
-    if not values:
-        return
-    path = _flat_artifact_path(path)
-    _ensure(path.parent)
-    labels = list(values.keys())
-    ys = [float(values[k]) for k in labels]
-    yerr = [float((ci95 or {}).get(k, 0.0)) for k in labels]
-    fig, ax = plt.subplots(figsize=(max(5.2, 0.62 * len(labels) + 2), 3.8), dpi=140)
-    ax.bar(np.arange(len(labels)), ys, yerr=yerr, capsize=3, color=[_baseline_color(label) for label in labels])
-    ax.set_xticks(np.arange(len(labels)))
-    ax.set_xticklabels([_baseline_label(label) for label in labels], rotation=25, ha="right")
-    groups = _add_baseline_group_separators(ax, labels)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-    if _ACTIVE_RESULT is not None:
-        _ACTIVE_RESULT.capture_figure(path, {"values": values, "ci95": ci95 or {}, "title": title, "ylabel": ylabel, "baseline_groups": groups})
-
-
-def _plot_lines(
-    path: Path,
-    title: str,
-    series: Dict[str, Tuple[Sequence[float], Sequence[float]]],
-    xlabel: str,
-    ylabel: str,
-    vlines: Optional[Sequence[Tuple[float, str]]] = None,
-    hlines: Optional[Sequence[Tuple[float, str]]] = None,
-    xlim: Optional[Tuple[float, float]] = None,
-) -> None:
-    if not series:
-        return
-    path = _flat_artifact_path(path)
-    _ensure(path.parent)
-    fig, ax = plt.subplots(figsize=(6.5, 3.8), dpi=140)
-    cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["#888888"])
-    for idx, (label, (xs, ys)) in enumerate(series.items()):
-        linestyle = "--" if str(label) == "oracle_ceiling" else "-"
-        color = _baseline_color(label) if str(label) in _BASELINE_COLORS else cycle[idx % len(cycle)]
-        ax.plot(list(xs), list(ys), marker="o", lw=1.4, label=_baseline_label(label), color=color, linestyle=linestyle)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    for x, label in vlines or ():
-        ax.axvline(float(x), color="#991b1b", linestyle="--", linewidth=1.0, alpha=0.85)
-        ax.text(float(x), 0.98, str(label), transform=ax.get_xaxis_transform(), rotation=90, va="top", ha="right", fontsize=7, color="#991b1b")
-    for y, label in hlines or ():
-        ax.axhline(float(y), color="#374151", linestyle=":", linewidth=1.0, alpha=0.85)
-        ax.text(0.99, float(y), str(label), transform=ax.get_yaxis_transform(), va="bottom", ha="right", fontsize=7, color="#374151")
-    if xlim is not None:
-        ax.set_xlim(float(xlim[0]), float(xlim[1]))
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-    fig_data = {"series": series, "title": title, "xlabel": xlabel, "ylabel": ylabel, "vlines": list(vlines or ()), "hlines": list(hlines or ())}
-    if xlim is not None:
-        fig_data["xlim"] = [float(xlim[0]), float(xlim[1])]
-    if _ACTIVE_RESULT is not None:
-        _ACTIVE_RESULT.capture_figure(path, fig_data)
-
-
-def _plot_lines_ci(
-    path: Path,
-    title: str,
-    series: Dict[str, Tuple[Sequence[float], Sequence[float], Sequence[float]]],
-    xlabel: str,
-    ylabel: str,
-    vlines: Optional[Sequence[Tuple[float, str]]] = None,
-    hlines: Optional[Sequence[Tuple[float, str]]] = None,
-) -> None:
-    if not series:
-        return
-    path = _flat_artifact_path(path)
-    _ensure(path.parent)
-    fig, ax = plt.subplots(figsize=(6.8, 4.0), dpi=140)
-    cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["#888888"])
-    for idx, (label, (xs, ys, ci)) in enumerate(series.items()):
-        x_vals = list(xs)
-        y_vals = [float(y) for y in ys]
-        err_vals = [float(e) for e in ci]
-        linestyle = "--" if str(label) == "oracle_ceiling" else "-"
-        color = _baseline_color(label) if str(label) in _BASELINE_COLORS else cycle[idx % len(cycle)]
-        ax.errorbar(x_vals, y_vals, yerr=err_vals, marker="o", lw=1.4, capsize=2, label=_baseline_label(label), color=color, linestyle=linestyle)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    for x, label in vlines or ():
-        ax.axvline(float(x), color="#991b1b", linestyle="--", linewidth=1.0, alpha=0.85)
-        ax.text(float(x), 0.98, str(label), transform=ax.get_xaxis_transform(), rotation=90, va="top", ha="right", fontsize=7, color="#991b1b")
-    for y, label in hlines or ():
-        ax.axhline(float(y), color="#374151", linestyle=":", linewidth=1.0, alpha=0.85)
-        ax.text(0.99, float(y), str(label), transform=ax.get_yaxis_transform(), va="bottom", ha="right", fontsize=7, color="#374151")
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-    if _ACTIVE_RESULT is not None:
-        _ACTIVE_RESULT.capture_figure(path, {"series": series, "title": title, "xlabel": xlabel, "ylabel": ylabel, "vlines": list(vlines or ()), "hlines": list(hlines or ())})
-
-
-def _plot_reliability(
-    path: Path,
-    title: str,
-    curves: Mapping[str, Sequence[Mapping[str, float]]],
-) -> None:
-    curves = {str(k): list(v) for k, v in curves.items() if v}
-    if not curves:
-        return
-    path = _flat_artifact_path(path)
-    _ensure(path.parent)
-    fig, ax = plt.subplots(figsize=(5.2, 4.2), dpi=140)
-    ax.plot([0.0, 1.0], [0.0, 1.0], color="#374151", linestyle=":", linewidth=1.0, label="ideal")
-    for label, rows in curves.items():
-        xs = [float(r.get("confidence", 0.0)) for r in rows]
-        ys = [float(r.get("accuracy", 0.0)) for r in rows]
-        ax.plot(xs, ys, marker="o", lw=1.4, label=_baseline_label(label), color=_baseline_color(label))
-    ax.set_xlim(0.0, 1.0)
-    ax.set_ylim(0.0, 1.0)
-    ax.set_xlabel("predicted confidence")
-    ax.set_ylabel("empirical accuracy")
-    ax.set_title(title)
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-    if _ACTIVE_RESULT is not None:
-        _ACTIVE_RESULT.capture_figure(path, {"curves": _jsonable(curves), "title": title})
-
-
-def _plot_heatmap(path: Path, title: str, matrix: Sequence[Sequence[float]], x_labels: Sequence[str], y_labels: Sequence[str], cmap: str = "Blues") -> None:
-    if not matrix:
-        return
-    path = _flat_artifact_path(path)
-    arr = np.asarray(matrix, dtype=float)
-    if arr.size == 0:
-        return
-    _ensure(path.parent)
-    fig, ax = plt.subplots(figsize=(max(5.0, 0.45 * len(x_labels) + 2), max(4.0, 0.35 * len(y_labels) + 2)), dpi=140)
-    im = ax.imshow(arr, cmap=cmap, aspect="auto")
-    ax.set_xticks(np.arange(len(x_labels)))
-    ax.set_yticks(np.arange(len(y_labels)))
-    ax.set_xticklabels(list(x_labels), rotation=35, ha="right")
-    ax.set_yticklabels(list(y_labels))
-    ax.set_title(title)
-    vmax = float(np.nanmax(arr)) if arr.size else 0.0
-    for i in range(arr.shape[0]):
-        for j in range(arr.shape[1]):
-            val = arr[i, j]
-            ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=7, color="white" if vmax and val > vmax / 2 else "black")
-    fig.colorbar(im, ax=ax, fraction=0.04, pad=0.04)
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-    fig_data = {"matrix": arr.tolist(), "x_labels": list(x_labels), "y_labels": list(y_labels), "title": title}
-    if _ACTIVE_RESULT is not None:
-        _ACTIVE_RESULT.capture_figure(path, fig_data)
-
-
-def _plot_grouped_bar(
-    path: Path,
-    title: str,
-    groups: Sequence[str],
-    series: Mapping[str, Sequence[float]],
-    ylabel: str = "value",
-) -> None:
-    if not groups or not series:
-        return
-    path = _flat_artifact_path(path)
-    _ensure(path.parent)
-    labels = list(series.keys())
-    x = np.arange(len(groups), dtype=float)
-    width = min(0.8 / max(1, len(labels)), 0.18)
-    fig, ax = plt.subplots(figsize=(max(6.5, 0.75 * len(groups) + 2), 3.8), dpi=140)
-    offset0 = -0.5 * width * (len(labels) - 1)
-    for i, label in enumerate(labels):
-        vals = [float(v) for v in series[label]]
-        ax.bar(x + offset0 + i * width, vals, width=width, label=_baseline_label(label), color=_baseline_color(label))
-    ax.set_xticks(x)
-    ax.set_xticklabels(list(groups), rotation=25, ha="right")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-    if _ACTIVE_RESULT is not None:
-        _ACTIVE_RESULT.capture_figure(path, {"groups": list(groups), "series": {k: list(v) for k, v in series.items()}, "title": title, "ylabel": ylabel})
-
-
-def _plot_two_heatmaps(
-    path: Path,
-    title: str,
-    left_title: str,
-    left_matrix: Sequence[Sequence[Optional[float]]],
-    right_title: str,
-    right_matrix: Sequence[Sequence[Optional[float]]],
-    x_labels: Sequence[str],
-    y_labels: Sequence[str],
-    mask_label: str = "train",
-) -> None:
-    if not left_matrix or not right_matrix:
-        return
-    path = _flat_artifact_path(path)
-    _ensure(path.parent)
-    arrays = [
-        np.asarray([[np.nan if v is None else float(v) for v in row] for row in left_matrix], dtype=float),
-        np.asarray([[np.nan if v is None else float(v) for v in row] for row in right_matrix], dtype=float),
-    ]
-    cmap_obj = plt.get_cmap("Blues").copy()
-    cmap_obj.set_bad("#d1d5db")
-    fig, axes = plt.subplots(1, 2, figsize=(max(8.0, 0.8 * len(x_labels) + 4), max(4.0, 0.35 * len(y_labels) + 2)), dpi=140, sharey=True)
-    finite = np.concatenate([arr[np.isfinite(arr)] for arr in arrays if arr.size and np.isfinite(arr).any()])
-    vmax = float(np.nanmax(finite)) if finite.size else 1.0
-    for ax, arr, panel_title in zip(axes, arrays, (left_title, right_title)):
-        masked = np.ma.masked_invalid(arr)
-        im = ax.imshow(masked, cmap=cmap_obj, aspect="auto", vmin=0.0, vmax=max(1e-9, vmax))
-        ax.set_xticks(np.arange(len(x_labels)))
-        ax.set_xticklabels(list(x_labels), rotation=35, ha="right")
-        ax.set_yticks(np.arange(len(y_labels)))
-        ax.set_yticklabels(list(y_labels))
-        ax.set_title(panel_title)
-        for i in range(arr.shape[0]):
-            for j in range(arr.shape[1]):
-                val = arr[i, j]
-                if not np.isfinite(val):
-                    text, color = mask_label, "#374151"
-                else:
-                    text = f"{val:.2f}"
-                    color = "white" if vmax and val > vmax / 2 else "black"
-                ax.text(j, i, text, ha="center", va="center", fontsize=7, color=color)
-    fig.suptitle(title)
-    fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.04, pad=0.04)
-    fig.subplots_adjust(top=0.84, bottom=0.22, wspace=0.12)
-    fig.savefig(path)
-    plt.close(fig)
-    if _ACTIVE_RESULT is not None:
-        _ACTIVE_RESULT.capture_figure(path, {"title": title, "left_title": left_title, "right_title": right_title, "x_labels": list(x_labels), "y_labels": list(y_labels)})
-
-
-def _plot_heatmap_masked(
-    path: Path,
-    title: str,
-    matrix: Sequence[Sequence[Optional[float]]],
-    x_labels: Sequence[str],
-    y_labels: Sequence[str],
-    mask_label: str = "train",
-    cmap: str = "Blues",
-) -> None:
-    if not matrix:
-        return
-    path = _flat_artifact_path(path)
-    arr = np.asarray([[np.nan if v is None else float(v) for v in row] for row in matrix], dtype=float)
-    if arr.size == 0:
-        return
-    _ensure(path.parent)
-    cmap_obj = plt.get_cmap(cmap).copy()
-    cmap_obj.set_bad("#d1d5db")
-    masked = np.ma.masked_invalid(arr)
-    fig, ax = plt.subplots(figsize=(max(5.0, 0.45 * len(x_labels) + 2), max(4.0, 0.35 * len(y_labels) + 2)), dpi=140)
-    im = ax.imshow(masked, cmap=cmap_obj, aspect="auto")
-    ax.set_xticks(np.arange(len(x_labels)))
-    ax.set_yticks(np.arange(len(y_labels)))
-    ax.set_xticklabels(list(x_labels), rotation=35, ha="right")
-    ax.set_yticklabels(list(y_labels))
-    ax.set_title(title)
-    finite = arr[np.isfinite(arr)]
-    vmax = float(np.nanmax(finite)) if finite.size else 0.0
-    for i in range(arr.shape[0]):
-        for j in range(arr.shape[1]):
-            val = arr[i, j]
-            if not np.isfinite(val):
-                text, color = mask_label, "#374151"
-            else:
-                text = f"{val:.2f}"
-                color = "white" if vmax and val > vmax / 2 else "black"
-            ax.text(j, i, text, ha="center", va="center", fontsize=7, color=color)
-    fig.colorbar(im, ax=ax, fraction=0.04, pad=0.04)
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-    if _ACTIVE_RESULT is not None:
-        matrix_json = [[None if not np.isfinite(v) else float(v) for v in row] for row in arr.tolist()]
-        _ACTIVE_RESULT.capture_figure(path, {"matrix": matrix_json, "x_labels": list(x_labels), "y_labels": list(y_labels), "title": title, "mask_label": mask_label})
 
 
 def _nested_get(obj: Mapping[str, Any], path: Sequence[Any], default: Any = None) -> Any:
@@ -2532,1167 +2004,6 @@ def _nested_get(obj: Mapping[str, Any], path: Sequence[Any], default: Any = None
         else:
             return default
     return cur
-
-
-def _completed_seed_results(seed_results: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [r for r in seed_results if r.get("status", {}).get("state") == "completed"]
-
-
-def _baseline_names_from_seed_results(seed_results: Sequence[Dict[str, Any]]) -> List[str]:
-    names = sorted({b for r in _completed_seed_results(seed_results) for b in (r.get("metrics", {}).get("per_baseline", {}) or {})})
-    return _ordered_baseline_names(names)
-
-
-def _aggregate_seed_path_values(seed_results: Sequence[Dict[str, Any]], path: Sequence[Any]) -> Tuple[float, float, List[float]]:
-    vals: List[float] = []
-    for result in _completed_seed_results(seed_results):
-        value = _nested_get(result.get("metrics", {}) or {}, path)
-        if isinstance(value, (int, float)) and math.isfinite(float(value)):
-            vals.append(float(value))
-    return _mean(vals), _stderr95(vals), vals
-
-
-def _aggregate_baseline_metric(seed_results: Sequence[Dict[str, Any]], metric_path: Sequence[Any]) -> Tuple[Dict[str, float], Dict[str, float]]:
-    means: Dict[str, float] = {}
-    ci: Dict[str, float] = {}
-    for baseline in _baseline_names_from_seed_results(seed_results):
-        mean, err, vals = _aggregate_seed_path_values(seed_results, ("per_baseline", baseline, *metric_path))
-        if vals:
-            means[baseline] = mean
-            ci[baseline] = err
-    return means, ci
-
-
-def _curve_series(curve: Mapping[str, Mapping[str, Any]], metric: str) -> Tuple[List[float], List[float]]:
-    points: List[Tuple[float, float]] = []
-    for key, row in curve.items():
-        try:
-            x = float(key)
-            y = float(row.get(metric, 0.0))
-        except (TypeError, ValueError, AttributeError):
-            continue
-        points.append((x, y))
-    points.sort(key=lambda p: p[0])
-    return [p[0] for p in points], [p[1] for p in points]
-
-
-def _curve_line_map(curve: Mapping[str, Mapping[str, Any]], metrics: Sequence[str]) -> Dict[str, Tuple[List[float], List[float]]]:
-    out: Dict[str, Tuple[List[float], List[float]]] = {}
-    for metric in metrics:
-        xs, ys = _curve_series(curve, metric)
-        if xs:
-            out[metric] = (xs, ys)
-    return out
-
-
-def _render_seed_publication_figures(seed_dir: Path, experiment: str, metrics: Mapping[str, Any]) -> None:
-    """Regenerate the F-series seed figures from stored metrics only."""
-    out = Path(seed_dir)
-    if experiment in {"deployment_stream", "cl_regularizer_comparison"}:
-        _remove_stale_pngs(out, ("F1_main_results_*.png", "F2_four_cell_heatmap.png", "F5_coverage_accuracy.png"))
-        per_baseline = dict(metrics.get("per_baseline", {}) or {})
-        _plot_bar(out / "figures/F1a_live_top1.png", "F1a deployment stream live top-1", _label_to_metric_rows(per_baseline, "live_top1"), ylabel="top-1")
-        _plot_bar(out / "figures/F1b_assistance_coverage.png", "F1b assistance coverage", _label_to_metric_rows(per_baseline, "assistance_coverage"), ylabel="coverage")
-        _plot_bar(out / "figures/F1c_conditional_top1.png", "F1c conditional top-1 when assisting", _label_to_metric_rows(per_baseline, "conditional_top1"), ylabel="conditional top-1")
-        _plot_bar(out / "figures/F1d_net_assistance_value.png", "F1d net assistance value", _label_to_metric_rows(per_baseline, "net_assistance_value"), ylabel="correct assists - wrong assists")
-        _plot_bar(out / "figures/F1e_useful_assistance_secondary.png", "F1e useful assistance (coverage x conditional top-1)", _label_to_metric_rows(per_baseline, "useful_assistance_rate"), ylabel="rate")
-        _plot_bar(out / "figures/F1f_recovery_latency.png", "F1f recovery latency after first mismatch", _label_to_metric_rows(per_baseline, "adaptation_latency_steps"), ylabel="steps")
-        _plot_bar(out / "figures/F1g_p95_prediction_latency.png", "F1g p95 prediction latency", _label_to_metric_rows(per_baseline, "p95_prediction_wall_s"), ylabel="seconds")
-        gate_diag_baselines = [b for b in ("full", "no_decay", "experience_replay_bc", "bigram", "latest_only") if b in per_baseline]
-        if gate_diag_baselines:
-            _plot_grouped_bar(
-                out / "figures/S1_assist_gate_diagnostics.png",
-                "S1 assist gate diagnostics",
-                ("correct_prediction_assist_recall", "wrong_prediction_assist_rate", "hidden_correct_rate"),
-                {
-                    b: [
-                        float(per_baseline[b].get("correct_prediction_assist_recall", 0.0)),
-                        float(per_baseline[b].get("wrong_prediction_assist_rate", 0.0)),
-                        float(per_baseline[b].get("hidden_correct_rate", 0.0)),
-                    ]
-                    for b in gate_diag_baselines
-                },
-                ylabel="rate",
-            )
-        event_groups = [event for event in PRIMARY_EVENT_TYPES if any(event in (row.get("per_event_type", {}) or {}) for row in per_baseline.values())]
-        event_baselines = [b for b in ("full", "latest_only", "experience_replay_bc", "bigram") if b in per_baseline]
-        if event_groups and event_baselines:
-            _plot_grouped_bar(
-                out / "figures/F1h_event_type_live_top1.png",
-                "F1h live top-1 by deployment event type",
-                event_groups,
-                {
-                    b: [per_baseline[b].get("per_event_type", {}).get(event, {}).get("live_top1", 0.0) for event in event_groups]
-                    for b in event_baselines
-                },
-                ylabel="top-1",
-            )
-        retention_values = {
-            b: _mean([float(v.get("return_minus_first_live_top1", 0.0)) for v in (row.get("per_user_return_retention", {}) or {}).values()])
-            for b, row in per_baseline.items()
-            if row.get("per_user_return_retention")
-        }
-        if retention_values:
-            _plot_bar(out / "figures/S1_user_return_retention_delta.png", "S1 return-user retention delta", retention_values, ylabel="return - first live top-1")
-        heatmap_baselines = [b for b in ("full", "no_preference_prototype", "no_recipe_prototype", "latest_only", "experience_replay_bc", "bigram", "oracle_ceiling") if b in per_baseline]
-        grouped_bar_baselines = _ordered_baseline_names(per_baseline)
-        if heatmap_baselines:
-            matrix = [
-                [per_baseline[b].get("four_cell", {}).get(cell, {}).get("live_top1", 0.0) for cell in FOUR_CELL_KEYS]
-                for b in heatmap_baselines
-            ]
-            _plot_heatmap(out / "figures/F2_four_cell_heatmap.png", "F2 four-cell accuracy by baseline", matrix, FOUR_CELL_KEYS, heatmap_baselines)
-        if grouped_bar_baselines:
-            _plot_grouped_bar(
-                out / "figures/F2_four_cell_grouped_bar.png",
-                "F2 four-cell accuracy by baseline",
-                FOUR_CELL_KEYS,
-                {b: [per_baseline[b].get("four_cell", {}).get(cell, {}).get("live_top1", 0.0) for cell in FOUR_CELL_KEYS] for b in grouped_bar_baselines},
-                ylabel="top-1",
-            )
-        forgetting_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        for name in ("full", "no_decay", "latest_only", "fixed_decay"):
-            ft = [r for r in metrics.get("derived_views", {}).get("forgetting_curve", []) if r.get("baseline") == name]
-            if ft:
-                forgetting_series[name] = ([r["phase_b_count"] for r in ft], [r["mean_phase_a_top1"] for r in ft])
-        if forgetting_series:
-            _plot_lines(out / "figures/F3_forgetting_curve.png", "F3 retained Phase-A accuracy", forgetting_series, "Phase-B events", "frozen top-1")
-        identity_forgetting_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        for name in ("full", "no_decay", "latest_only", "fixed_decay"):
-            ft = [r for r in metrics.get("derived_views", {}).get("forgetting_curve", []) if r.get("baseline") == name and "mean_phase_a_identity_reference_top1" in r]
-            if ft:
-                identity_forgetting_series[name] = ([r["phase_b_count"] for r in ft], [r["mean_phase_a_identity_reference_top1"] for r in ft])
-        if identity_forgetting_series:
-            _plot_lines(out / "figures/F3_identity_reference_forgetting_curve.png", "F3 identity-reference retained accuracy", identity_forgetting_series, "Phase-B events", "frozen top-1")
-        trace_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        trace_baselines = [b for b in ("full", "experience_replay_bc", "bigram", "latest_only") if b in per_baseline]
-        for baseline in trace_baselines:
-            row = per_baseline[baseline]
-            trace = row.get("live_step_trace", [])
-            if trace:
-                trace_series[baseline] = ([r["step"] for r in trace], [r["top1"] for r in trace])
-        if trace_series:
-            _plot_lines(out / "figures/F4_per_step_adaptation.png", "F4 adaptation within session", trace_series, "step", "top-1")
-        for event_type in ("preference_shift", "cross_transfer_probe", "gradual_shift_followup"):
-            event_trace_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-            for baseline in trace_baselines:
-                trace = (per_baseline[baseline].get("live_step_trace_by_event_type", {}) or {}).get(event_type, [])
-                if trace:
-                    event_trace_series[baseline] = ([r["step"] for r in trace], [r["top1"] for r in trace])
-            if event_trace_series:
-                _plot_lines(out / f"figures/F4_{event_type}_per_step_adaptation.png", f"F4 {event_type} adaptation", event_trace_series, "step", "top-1")
-        full_calibration = (per_baseline.get("full", {}) or {}).get("action_gate_calibration", {}) or {}
-        calibration_curve = full_calibration.get("curve", {}) or {}
-        if calibration_curve:
-            selected = float((full_calibration.get("selection", {}) or {}).get("selected_threshold", metrics.get("selected_action_confidence_threshold", DEFAULT_CONFIG.posterior_action_confidence_threshold)))
-            default_thr = float(full_calibration.get("default_threshold", DEFAULT_CONFIG.posterior_action_confidence_threshold))
-            _plot_lines(
-                out / "figures/F5a_gate_calibration_selection.png",
-                "F5a action-gate calibration selection",
-                _curve_line_map(calibration_curve, ("coverage", "conditional_top1", "wrong_prediction_assist_rate", "hrc_assistance_utility")),
-                "threshold",
-                "rate / utility",
-                vlines=((default_thr, "default"), (selected, "selected")),
-                hlines=((0.0, "zero utility"),),
-            )
-        curve = (metrics.get("derived_views", {}).get("coverage_accuracy_curve", {}) or {}).get("full", {})
-        if curve:
-            _plot_lines(
-                out / "figures/F5b_posthoc_coverage_accuracy.png",
-                "F5b post-hoc coverage/accuracy diagnostic",
-                _curve_line_map(curve, ("coverage", "conditional_top1", "wrong_prediction_assist_rate", "hrc_assistance_utility")),
-                "threshold",
-                "rate / utility",
-                hlines=((0.0, "zero utility"),),
-            )
-        gate_calibrations = {
-            b: row.get("action_gate_calibration", {}) or {}
-            for b, row in per_baseline.items()
-            if (row.get("action_gate_calibration", {}) or {}).get("curve")
-        }
-        if gate_calibrations:
-            _plot_bar(
-                out / "figures/S1_selected_action_gate_threshold.png",
-                "S1 selected action-gate threshold",
-                {b: float((cal.get("selection", {}) or {}).get("selected_threshold", cal.get("default_threshold", DEFAULT_CONFIG.posterior_action_confidence_threshold))) for b, cal in gate_calibrations.items()},
-                ylabel="threshold",
-            )
-            _plot_grouped_bar(
-                out / "figures/S1_fixed_vs_calibrated_gate_utility.png",
-                "S1 fixed vs calibrated gate utility",
-                ("fixed_default", "calibrated"),
-                {
-                    b: [
-                        float((cal.get("fixed_default_row", {}) or {}).get("hrc_assistance_utility", 0.0)),
-                        float((cal.get("calibrated_row", {}) or (cal.get("selection", {}) or {}).get("selected_row", {}) or {}).get("hrc_assistance_utility", 0.0)),
-                    ]
-                    for b, cal in gate_calibrations.items()
-                },
-                ylabel="HRC assistance utility",
-            )
-        _plot_bar(out / "figures/S1_memory_active_variants.png", "S1 active memory footprint", {b: float(row.get("memory", {}).get("active_variants", 0.0)) for b, row in per_baseline.items()}, ylabel="active variants")
-        _plot_bar(out / "figures/S1_compute_wall_time.png", "S1 wall time by baseline", {b: float(row.get("compute", {}).get("wall_s", 0.0)) for b, row in per_baseline.items()}, ylabel="seconds")
-        transfer_groups = [cell for cell in TRANSFER_CELL_KEYS if any(cell in (row.get("per_transfer_cell", {}) or {}) for row in per_baseline.values())]
-        if transfer_groups and event_baselines:
-            _plot_grouped_bar(
-                out / "figures/S1_transfer_cell_live_top1.png",
-                "S1 direct retrieval vs cross-recipe transfer",
-                transfer_groups,
-                {
-                    b: [per_baseline[b].get("per_transfer_cell", {}).get(cell, {}).get("live_top1", 0.0) for cell in transfer_groups]
-                    for b in event_baselines
-                },
-                ylabel="top-1",
-            )
-        full_cross = (per_baseline.get("full", {}) or {}).get("per_event_type_memory_state_gt", {}) or {}
-        if full_cross:
-            events = sorted(full_cross)
-            states = sorted({state for row in full_cross.values() for state in row})
-            matrix = [[float(full_cross.get(event, {}).get(state, {}).get("live_top1", 0.0)) for state in states] for event in events]
-            _plot_heatmap(out / "figures/S1_event_memory_state_live_top1.png", "S1 full-model live top-1 by event and memory state", matrix, states, events)
-        reliability_baselines = [b for b in ("full", "experience_replay_bc", "latest_only", "bigram") if b in per_baseline]
-        _plot_reliability(
-            out / "figures/S1_reliability_diagram.png",
-            "S1 reliability diagram",
-            {b: per_baseline[b].get("calibration_curve", []) for b in reliability_baselines},
-        )
-        latency_series = {
-            b: (
-                [1000.0 * r["latency_s"] for r in per_baseline[b].get("latency_cdf", [])],
-                [r["cdf"] for r in per_baseline[b].get("latency_cdf", [])],
-            )
-            for b in reliability_baselines
-            if per_baseline[b].get("latency_cdf")
-        }
-        if latency_series:
-            _plot_lines(
-                out / "figures/S1_prediction_latency_cdf.png",
-                "S1 prediction latency CDF",
-                latency_series,
-                "milliseconds",
-                "CDF",
-                vlines=((5.0, "5ms"), (10.0, "10ms"), (20.0, "20ms")),
-                xlim=(0.0, 20.0),
-            )
-    elif experiment in {"cross_recipe_transfer", "posterior_ablation_matrix"}:
-        recipes = list(metrics.get("recipes", []) or [])
-        prefs = list(metrics.get("preferences", []) or [])
-        heat = dict(metrics.get("derived_views", {}).get("transfer_heatmap", {}) or {})
-        if recipes and prefs and heat:
-            train_cells = set()
-            for label in metrics.get("diagonal_training_pairs", []) or []:
-                if "/" in str(label):
-                    recipe, pref = str(label).split("/", 1)
-                    train_cells.add((recipe, pref))
-            matrix = [
-                [None if (recipe, pref) in train_cells else float(heat.get(f"{recipe}/{pref}", 0.0)) for pref in prefs]
-                for recipe in recipes
-            ]
-            _plot_heatmap_masked(out / "figures/F6_transfer_heatmap.png", "F6 full transfer heatmap", matrix, prefs, recipes, mask_label="train")
-        heat_by_baseline = dict(metrics.get("derived_views", {}).get("transfer_heatmap_by_baseline", {}) or {})
-        compare_matrices: Dict[str, List[List[Optional[float]]]] = {}
-        for baseline in ("full", "latest_only"):
-            matrix_by_recipe = heat_by_baseline.get(baseline, {})
-            if recipes and prefs and matrix_by_recipe:
-                matrix = [
-                    [matrix_by_recipe.get(recipe, {}).get(pref, None) for pref in prefs]
-                    for recipe in recipes
-                ]
-                compare_matrices[baseline] = matrix
-                _plot_heatmap_masked(out / f"figures/F6_{baseline}_transfer_heatmap.png", f"F6 {baseline} transfer heatmap", matrix, prefs, recipes, mask_label="train")
-        if "full" in compare_matrices and "latest_only" in compare_matrices:
-            _plot_two_heatmaps(
-                out / "figures/F6_full_vs_latest_transfer_heatmap.png",
-                "F6 transfer heatmap: full vs latest-only",
-                "Full",
-                compare_matrices["full"],
-                "Latest only",
-                compare_matrices["latest_only"],
-                prefs,
-                recipes,
-                mask_label="train",
-            )
-        per_baseline = dict(metrics.get("per_baseline", {}) or {})
-        _plot_bar(out / "figures/S2_offdiag_live_top1_by_baseline.png", "S2 off-diagonal live top-1", _label_to_metric_rows(per_baseline, "live_top1"), ylabel="top-1")
-        _plot_bar(out / "figures/S2_primary_seen_seen_transfer_top1.png", "S2 primary seen-seen transfer top-1", _label_to_metric_rows(per_baseline, "primary_transfer_live_top1"), ylabel="top-1")
-        _plot_bar(out / "figures/S2_preference_gate_accuracy.png", "S2 preference gate accuracy", _label_to_metric_rows(per_baseline, "preference_gate_accuracy"), ylabel="rate")
-        _plot_bar(out / "figures/S2_preference_cluster_purity.png", "S2 preference cluster purity", _label_to_metric_rows(per_baseline, "preference_cluster_purity"), ylabel="purity")
-        _plot_bar(out / "figures/S2_offdiag_conditional_top1_by_baseline.png", "S2 off-diagonal conditional top-1", _label_to_metric_rows(per_baseline, "conditional_top1"), ylabel="conditional top-1")
-        axis_labels = sorted({axis for row in per_baseline.values() for axis in (row.get("axis_holdout", {}) or {})})
-        axis_baselines = _ordered_baseline_names([b for b, row in per_baseline.items() if row.get("axis_holdout")])
-        if axis_labels and axis_baselines:
-            matrix = [
-                [float(per_baseline[b].get("axis_holdout", {}).get(axis, {}).get("live_top1", 0.0)) for axis in axis_labels]
-                for b in axis_baselines
-            ]
-            _plot_heatmap(out / "figures/S2_axis_holdout_heatmap.png", "S2 axis-holdout live top-1", matrix, axis_labels, axis_baselines)
-        cycle_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        for baseline, row in per_baseline.items():
-            curve = row.get("diagonal_cycle_curve", {}) or {}
-            if curve:
-                xs = sorted(int(k) for k in curve)
-                cycle_series[baseline] = (xs, [curve[str(x)].get("frozen_diagonal_top1", 0.0) for x in xs])
-        if cycle_series:
-            _plot_lines(out / "figures/S2_single_shot_sufficiency_curve.png", "S2 single-shot sufficiency curve", cycle_series, "diagonal cycles", "frozen diagonal top-1")
-        comp_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        for baseline in ("full", "latest_only", "experience_replay_bc", "bigram", "no_preference_prototype"):
-            comp = (metrics.get("per_baseline", {}).get(baseline, {}) or {}).get("novel_composition", {})
-            if comp:
-                xs = sorted(int(k) for k in comp)
-                comp_series[baseline] = (xs, [comp[str(x)].get("live_top1", 0.0) for x in xs])
-        if comp_series:
-            _plot_lines(out / "figures/F7_composition_curve.png", "F7 novel composition by hamming distance", comp_series, "hamming distance", "live top-1")
-    elif experiment == "decay_reentry":
-        f8_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        f8_useful_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        f8_coverage_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        f8_active_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        f9_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        crossing_vlines: List[Tuple[float, str]] = []
-        for baseline, row in (metrics.get("per_baseline", {}) or {}).items():
-            if baseline not in ("full", "adaptive", "fixed_decay", "no_decay", "experience_replay_bc", "bigram"):
-                continue
-            for arm_name, arm_row in (row.get("arms", {}) or {}).items():
-                per_gap = arm_row.get("per_gap", {}) or {}
-                gap_keys = sorted(per_gap, key=lambda g: int(g))
-                xs = [int(g) for g in gap_keys]
-                if xs:
-                    f8_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)]["live_top1"] for g in xs])
-                    f8_useful_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)].get("useful_assistance_rate", 0.0) for g in xs])
-                    f8_coverage_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)].get("assistance_coverage", 0.0) for g in xs])
-                    f8_active_series[f"{baseline}_{arm_name}_active_before"] = (xs, [per_gap[str(g)].get("active_before_rate", 0.0) for g in xs])
-                    if baseline in ("full", "adaptive"):
-                        f9_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)]["global_rate_after"] for g in xs])
-                    if baseline == "full":
-                        active_vals = [float(per_gap[str(g)].get("active_before_rate", 0.0)) for g in xs]
-                        below = [x for x, y in zip(xs, active_vals) if y <= 0.5]
-                        if below:
-                            crossing_vlines.append((float(below[0]), f"{arm_name} active<=0.5"))
-        if f8_series:
-            _plot_lines(out / "figures/F8_decay_reentry_curve.png", "F8 decay reentry by gap", f8_series, "gap", "live top-1", vlines=crossing_vlines, hlines=((0.5, "0.5"),))
-        if f8_useful_series:
-            _plot_lines(out / "figures/F8_useful_reentry_curve.png", "F8 user-visible reentry value by gap", f8_useful_series, "gap", "useful assistance rate", vlines=crossing_vlines, hlines=((0.5, "0.5"),))
-        if f8_coverage_series:
-            _plot_lines(out / "figures/F8_reentry_coverage_curve.png", "F8 reentry assistance coverage by gap", f8_coverage_series, "gap", "coverage", vlines=crossing_vlines)
-        post_series: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {}
-        for baseline, row in (metrics.get("per_baseline", {}) or {}).items():
-            if baseline not in ("full", "adaptive", "fixed_decay", "no_decay", "experience_replay_bc", "bigram"):
-                continue
-            for arm_name, arm_row in (row.get("arms", {}) or {}).items():
-                per_gap = arm_row.get("per_gap", {}) or {}
-                gap_keys = sorted(per_gap, key=lambda g: int(g))
-                xs = [int(g) for g in gap_keys]
-                if xs:
-                    post_series[f"{baseline}_{arm_name}"] = (xs, [per_gap[str(g)].get("post_reentry_top1", 0.0) for g in xs])
-        if post_series:
-            _plot_lines(out / "figures/F8_post_reentry_recovery_curve.png", "F8 post-reentry recovery by gap", post_series, "gap", "post-reentry frozen top-1", hlines=((0.5, "0.5"),))
-        full_recovery = {}
-        for arm_name in ("neutral", "distractor"):
-            per_gap = ((metrics.get("per_baseline", {}).get("full", {}) or {}).get("arms", {}).get(arm_name, {}) or {}).get("per_gap", {}) or {}
-            if per_gap:
-                xs = sorted(int(g) for g in per_gap)
-                full_recovery[f"live_{arm_name}"] = (xs, [per_gap[str(g)].get("live_top1", 0.0) for g in xs])
-                full_recovery[f"post_{arm_name}"] = (xs, [per_gap[str(g)].get("post_reentry_top1", 0.0) for g in xs])
-        if full_recovery:
-            _plot_lines(out / "figures/F8_full_live_vs_post_reentry.png", "F8 full live vs post-reentry recovery", full_recovery, "gap", "top-1", hlines=((0.5, "0.5"),))
-        if f8_active_series:
-            _plot_lines(out / "figures/F8_active_before_curve.png", "F8 active-before by gap", f8_active_series, "gap", "active-before rate", vlines=crossing_vlines, hlines=((0.5, "pruning midpoint"),))
-        if f9_series:
-            _plot_lines(out / "figures/F9_decay_rate_adaptation.png", "F9 decay rate adaptation", f9_series, "gap", "global rate", hlines=((1.0 / max(1, int(DEFAULT_CONFIG.decay_horizon_init)), "initial horizon rate"),))
-        for arm_name in ("neutral", "distractor"):
-            arm_live = {k.replace(f"_{arm_name}", ""): v for k, v in f8_series.items() if k.endswith(f"_{arm_name}")}
-            arm_useful = {k.replace(f"_{arm_name}", ""): v for k, v in f8_useful_series.items() if k.endswith(f"_{arm_name}")}
-            arm_coverage = {k.replace(f"_{arm_name}", ""): v for k, v in f8_coverage_series.items() if k.endswith(f"_{arm_name}")}
-            arm_active = {k.replace(f"_{arm_name}_active_before", ""): v for k, v in f8_active_series.items() if k.endswith(f"_{arm_name}_active_before")}
-            arm_rate = {k.replace(f"_{arm_name}", ""): v for k, v in f9_series.items() if k.endswith(f"_{arm_name}")}
-            if arm_live:
-                _plot_lines(out / f"figures/F8_{arm_name}_decay_reentry_curve.png", f"F8 {arm_name} decay reentry by gap", arm_live, "gap", "live top-1", hlines=((0.5, "0.5"),))
-            if arm_useful:
-                _plot_lines(out / f"figures/F8_{arm_name}_useful_reentry_curve.png", f"F8 {arm_name} user-visible reentry by gap", arm_useful, "gap", "useful assistance rate", hlines=((0.5, "0.5"),))
-            if arm_coverage:
-                _plot_lines(out / f"figures/F8_{arm_name}_reentry_coverage_curve.png", f"F8 {arm_name} reentry coverage by gap", arm_coverage, "gap", "coverage")
-            if arm_active:
-                _plot_lines(out / f"figures/F8_{arm_name}_active_before_curve.png", f"F8 {arm_name} active-before by gap", arm_active, "gap", "active-before rate", hlines=((0.5, "pruning midpoint"),))
-            if arm_rate:
-                _plot_lines(out / f"figures/F9_{arm_name}_decay_rate_adaptation.png", f"F9 {arm_name} decay rate adaptation", arm_rate, "gap", "global rate", hlines=((1.0 / max(1, int(DEFAULT_CONFIG.decay_horizon_init)), "initial horizon rate"),))
-    elif experiment == "disambiguation_audit":
-        per_threshold = metrics.get("per_threshold", {}) or {}
-        if per_threshold:
-            xs = sorted(float(t) for t in per_threshold)
-            _plot_lines(out / "figures/F10_disambiguation_macro_f1.png", "F10 disambiguation macro-F1", {"macro_f1": (xs, [per_threshold[str(t)]["macro_f1"] for t in xs])}, "jaccard threshold", "macro-F1", vlines=((0.95, "production"),))
-            gate_f1 = [per_threshold[str(t)].get("gate_decision", {}).get("macro_f1", 0.0) for t in xs]
-            _plot_lines(out / "figures/F10_gate_decision_macro_f1.png", "F10 gate decision macro-F1", {"gate_macro_f1": (xs, gate_f1)}, "jaccard threshold", "macro-F1", vlines=((0.95, "production"),))
-            recipe_gate_acc = [per_threshold[str(t)].get("recipe_holdout_gate_decision", {}).get("accuracy", 0.0) for t in xs]
-            _plot_lines(out / "figures/F10_recipe_holdout_gate_accuracy.png", "F10 recipe-heldout gate accuracy", {"recipe_holdout_gate_accuracy": (xs, recipe_gate_acc)}, "jaccard threshold", "accuracy", vlines=((0.95, "production"),))
-            best = str(metrics.get("best_threshold") or xs[0])
-            rows = per_threshold.get(best, {}).get("rows", [])
-            labels = MEMORY_STATE_LABELS
-            if rows:
-                matrix = [[float(sum(1 for r in rows if r.get("gt") == gt and r.get("pred") == pred)) for pred in labels] for gt in labels]
-                _plot_heatmap(out / "figures/S4_confusion_matrix_best_threshold.png", f"S4 confusion matrix at threshold={best}", matrix, labels, labels, cmap="Purples")
-        gate_curve = metrics.get("action_gate_curve", {}) or {}
-        if gate_curve:
-            xs_cov, ys_cov = _curve_series(gate_curve, "coverage")
-            xs_acc, ys_acc = _curve_series(gate_curve, "conditional_top1")
-            _plot_lines(out / "figures/S4_action_gate_coverage_accuracy.png", "S4 action gate coverage/accuracy", {"coverage": (xs_cov, ys_cov), "conditional_top1": (xs_acc, ys_acc)}, "threshold", "rate")
-        boundary = metrics.get("boundary_degradation", {}) or {}
-        if boundary:
-            xs = sorted(float(k) for k in boundary)
-            _plot_lines(out / "figures/S4_boundary_degradation.png", "S4 missing-observation degradation", {"macro_f1": (xs, [boundary[str(x)]["macro_f1"] for x in xs]), "accuracy": (xs, [boundary[str(x)]["accuracy"] for x in xs])}, "drop fraction", "score")
-        prefix = metrics.get("prefix_robustness", {}) or {}
-        if prefix:
-            xs = sorted(float(k) for k in prefix)
-            _plot_lines(out / "figures/S4_prefix_robustness.png", "S4 growing-prefix robustness", {"macro_f1": (xs, [prefix[str(x)]["macro_f1"] for x in xs]), "accuracy": (xs, [prefix[str(x)]["accuracy"] for x in xs])}, "prefix fraction", "score")
-        axis_deg = metrics.get("preference_axis_degradation", {}) or {}
-        if axis_deg:
-            xs = sorted(int(k) for k in axis_deg)
-            _plot_lines(out / "figures/S4_preference_axis_degradation.png", "S4 preference-axis materiality", {"jaccard": (xs, [axis_deg[str(x)]["mean_jaccard_from_identity"] for x in xs]), "kendall": (xs, [axis_deg[str(x)]["mean_kendall_from_identity"] for x in xs])}, "changed axes", "distance")
-    elif experiment == "demo_count_sample_efficiency":
-        _remove_stale_pngs(out, ("*_capacity.png", "n_*_live_top1.png", "n_*_frozen_top1.png"))
-        rows = metrics.get("per_demo_count", {}) or {}
-        baselines = sorted({b for row in rows.values() for b in (row.get("per_baseline", {}) or {})})
-        demo_counts = sorted((int(n) for n in rows), key=int)
-        series = {
-            baseline: (
-                demo_counts,
-                [rows[str(n)].get("per_baseline", {}).get(baseline, {}).get("live_top1", 0.0) for n in demo_counts],
-            )
-            for baseline in baselines
-        }
-        _plot_lines(out / "figures/sample_efficiency_live_top1.png", "sample efficiency by baseline", series, "demo count", "live top-1")
-    elif experiment == "zipf_usage_sweep":
-        per_alpha = metrics.get("per_alpha", {}) or {}
-        alpha_values = sorted(float(alpha) for alpha in per_alpha)
-        baselines = sorted({baseline for row in per_alpha.values() for baseline in row})
-        for metric, ylabel in (
-            ("utility_top1", "utility top-1"),
-            ("fairness_top1", "fairness top-1"),
-            ("head_tail_gap", "head-tail gap"),
-        ):
-            series = {
-                baseline: (
-                    alpha_values,
-                    [per_alpha[str(alpha)].get(baseline, {}).get(metric, 0.0) for alpha in alpha_values],
-                )
-                for baseline in baselines
-            }
-            _plot_lines(out / f"figures/zipf_{metric}.png", f"Zipf sweep {metric}", series, "alpha", ylabel)
-        for metric, ylabel in (
-            ("active_variants", "active variants"),
-            ("pruned_variants", "pruned variants"),
-        ):
-            series = {
-                baseline: (
-                    alpha_values,
-                    [per_alpha[str(alpha)].get(baseline, {}).get("memory", {}).get(metric, 0.0) for alpha in alpha_values],
-                )
-                for baseline in baselines
-            }
-            _plot_lines(out / f"figures/zipf_memory_{metric}.png", f"Zipf sweep memory {metric}", series, "alpha", ylabel)
-
-
-def _line_aggregate_from_traces(
-    seed_results: Sequence[Dict[str, Any]],
-    trace_path: Sequence[Any],
-    x_key: str,
-    y_key: str,
-    label_filter: Optional[Callable[[Dict[str, Any]], str]] = None,
-) -> Dict[str, Tuple[List[float], List[float], List[float]]]:
-    grouped: Dict[str, Dict[float, List[float]]] = defaultdict(lambda: defaultdict(list))
-    for result in _completed_seed_results(seed_results):
-        rows = _nested_get(result.get("metrics", {}) or {}, trace_path, []) or []
-        for row in rows:
-            if not isinstance(row, Mapping) or x_key not in row or y_key not in row:
-                continue
-            label = label_filter(dict(row)) if label_filter else "mean"
-            grouped[str(label)][float(row[x_key])].append(float(row[y_key]))
-    series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-    for label, by_x in grouped.items():
-        xs = sorted(by_x)
-        series[label] = (xs, [_mean(by_x[x]) for x in xs], [_stderr95(by_x[x]) for x in xs])
-    return series
-
-
-def _aggregate_curve_by_threshold(
-    seed_results: Sequence[Dict[str, Any]],
-    curve_path: Sequence[Any],
-    metric: str,
-) -> Tuple[List[float], List[float], List[float]]:
-    by_thr: Dict[float, List[float]] = defaultdict(list)
-    for result in _completed_seed_results(seed_results):
-        curve = _nested_get(result.get("metrics", {}) or {}, curve_path, {}) or {}
-        for key, row in curve.items():
-            if isinstance(row, Mapping) and metric in row:
-                by_thr[float(key)].append(float(row[metric]))
-    xs = sorted(by_thr)
-    return xs, [_mean(by_thr[x]) for x in xs], [_stderr95(by_thr[x]) for x in xs]
-
-
-def _render_deployment_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
-    aggregate_dir = _ensure(exp_dir / "aggregate")
-    _remove_stale_pngs(aggregate_dir, (f"{prefix}_F5_coverage_accuracy.png",))
-    for metric, ylabel, title in (
-        ("live_top1", "top-1", "F1a aggregate live top-1"),
-        ("assistance_coverage", "coverage", "F1b aggregate assistance coverage"),
-        ("conditional_top1", "conditional top-1", "F1c aggregate conditional top-1"),
-        ("net_assistance_value", "correct assists - wrong assists", "F1d aggregate net assistance value"),
-        ("useful_assistance_rate", "rate", "F1e aggregate useful assistance secondary"),
-        ("adaptation_latency_steps", "steps", "F1f aggregate recovery latency"),
-        ("p95_prediction_wall_s", "seconds", "F1g aggregate p95 prediction latency"),
-    ):
-        means, ci = _aggregate_baseline_metric(seed_results, (metric,))
-        _plot_bar_ci(aggregate_dir / f"{prefix}_{metric}.png", title, means, ci, ylabel=ylabel)
-    gate_diag_baselines = [b for b in ("full", "no_decay", "experience_replay_bc", "bigram", "latest_only") if b in _baseline_names_from_seed_results(seed_results)]
-    if gate_diag_baselines:
-        gate_metrics = ("correct_prediction_assist_recall", "wrong_prediction_assist_rate", "hidden_correct_rate")
-        _plot_grouped_bar(
-            aggregate_dir / f"{prefix}_S1_assist_gate_diagnostics.png",
-            "S1 aggregate assist gate diagnostics",
-            gate_metrics,
-            {
-                b: [
-                    _mean([
-                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, metric), 0.0))
-                        for result in _completed_seed_results(seed_results)
-                    ])
-                    for metric in gate_metrics
-                ]
-                for b in gate_diag_baselines
-            },
-            ylabel="rate",
-        )
-    event_groups = [
-        event for event in PRIMARY_EVENT_TYPES
-        if any(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_event_type", event)) for result in _completed_seed_results(seed_results))
-    ]
-    event_baselines = [b for b in ("full", "latest_only", "experience_replay_bc", "bigram") if b in _baseline_names_from_seed_results(seed_results)]
-    if event_groups and event_baselines:
-        _plot_grouped_bar(
-            aggregate_dir / f"{prefix}_F1h_event_type_live_top1.png",
-            "F1h aggregate live top-1 by event type",
-            event_groups,
-            {
-                b: [
-                    _mean([
-                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "per_event_type", event, "live_top1"), 0.0))
-                        for result in _completed_seed_results(seed_results)
-                    ])
-                    for event in event_groups
-                ]
-                for b in event_baselines
-            },
-            ylabel="top-1",
-        )
-    retention_values: Dict[str, float] = {}
-    retention_ci: Dict[str, float] = {}
-    for baseline in _baseline_names_from_seed_results(seed_results):
-        vals: List[float] = []
-        for result in _completed_seed_results(seed_results):
-            ret = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "per_user_return_retention"), {}) or {}
-            per_seed = [float(v.get("return_minus_first_live_top1", 0.0)) for v in ret.values() if isinstance(v, Mapping)]
-            if per_seed:
-                vals.append(_mean(per_seed))
-        if vals:
-            retention_values[baseline] = _mean(vals)
-            retention_ci[baseline] = _stderr95(vals)
-    if retention_values:
-        _plot_bar_ci(aggregate_dir / f"{prefix}_S1_user_return_retention_delta.png", "S1 aggregate return-user retention delta", retention_values, retention_ci, ylabel="return - first live top-1")
-    for metric, ylabel, title in (
-        ("active_variants", "active variants", "Aggregate active memory footprint"),
-        ("pruned_variants", "pruned variants", "Aggregate pruned memory footprint"),
-        ("latest_keys", "latest keys", "Aggregate latest-key memory footprint"),
-    ):
-        means, ci = _aggregate_baseline_metric(seed_results, ("memory", metric))
-        _plot_bar_ci(aggregate_dir / f"{prefix}_memory_{metric}.png", title, means, ci, ylabel=ylabel)
-    for metric, ylabel, title in (
-        ("wall_s", "seconds", "Aggregate wall time"),
-        ("n_fits_executed", "fit count", "Aggregate fit count"),
-        ("last_retrain_fit_wall_s", "seconds", "Aggregate last retrain fit time"),
-        ("mean_retrain_fit_wall_s", "seconds", "Aggregate mean retrain fit time"),
-        ("p95_retrain_fit_wall_s", "seconds", "Aggregate p95 retrain fit time"),
-        ("total_retrain_fit_wall_s", "seconds", "Aggregate total retrain fit time"),
-        ("last_estimated_flops", "latest retrain estimated FLOPs", "Aggregate latest executed retrain FLOPs"),
-    ):
-        means, ci = _aggregate_baseline_metric(seed_results, ("compute", metric))
-        _plot_bar_ci(aggregate_dir / f"{prefix}_compute_{metric}.png", title, means, ci, ylabel=ylabel)
-    # Four-cell deployment report across available baselines.
-    heatmap_baselines = [b for b in ("full", "no_preference_prototype", "no_recipe_prototype", "latest_only", "experience_replay_bc", "bigram", "oracle_ceiling") if b in _baseline_names_from_seed_results(seed_results)]
-    grouped_bar_baselines = _baseline_names_from_seed_results(seed_results)
-    matrix: List[List[float]] = []
-    for baseline in heatmap_baselines:
-        row_vals: List[float] = []
-        for cell in FOUR_CELL_KEYS:
-            vals = [
-                float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "four_cell", cell, "live_top1"), 0.0))
-                for result in _completed_seed_results(seed_results)
-            ]
-            row_vals.append(_mean(vals))
-        matrix.append(row_vals)
-    if matrix:
-        _plot_heatmap(
-            aggregate_dir / f"{prefix}_F2_four_cell_heatmap.png",
-            "F2 aggregate four-cell accuracy by baseline",
-            matrix,
-            FOUR_CELL_KEYS,
-            heatmap_baselines,
-        )
-    grouped_matrix: List[List[float]] = []
-    for baseline in grouped_bar_baselines:
-        grouped_matrix.append([
-            _mean([
-                float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "four_cell", cell, "live_top1"), 0.0))
-                for result in _completed_seed_results(seed_results)
-            ])
-            for cell in FOUR_CELL_KEYS
-        ])
-    if grouped_matrix:
-        _plot_grouped_bar(
-            aggregate_dir / f"{prefix}_F2_four_cell_grouped_bar.png",
-            "F2 aggregate four-cell accuracy by baseline",
-            FOUR_CELL_KEYS,
-            {baseline: row for baseline, row in zip(grouped_bar_baselines, grouped_matrix)},
-            ylabel="top-1",
-        )
-    cell_vals: Dict[str, List[float]] = defaultdict(list)
-    for result in _completed_seed_results(seed_results):
-        full = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "four_cell"), {}) or {}
-        for cell in DEPLOYMENT_REPORT_CELLS:
-            cell_vals[cell].append(float((full.get(cell) or {}).get("live_top1", 0.0)))
-    _plot_bar_ci(
-        aggregate_dir / f"{prefix}_F2_seen_recipe_preference.png",
-        "F2 aggregate seen recipe: same vs new preference",
-        {cell: _mean(vals) for cell, vals in cell_vals.items()},
-        {cell: _stderr95(vals) for cell, vals in cell_vals.items()},
-        ylabel="top-1",
-    )
-    f3 = _line_aggregate_from_traces(
-        seed_results,
-        ("derived_views", "forgetting_curve"),
-        "phase_b_count",
-        "mean_phase_a_top1",
-        label_filter=lambda row: str(row.get("baseline", "unknown")),
-    )
-    if "full" in f3:
-        keep = {k: v for k, v in f3.items() if k in ("full", "no_decay", "latest_only", "fixed_decay")}
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F3_forgetting_curve.png", "F3 aggregate retained Phase-A accuracy", keep, "Phase-B events", "frozen top-1")
-    f3_identity = _line_aggregate_from_traces(
-        seed_results,
-        ("derived_views", "forgetting_curve"),
-        "phase_b_count",
-        "mean_phase_a_identity_reference_top1",
-        label_filter=lambda row: str(row.get("baseline", "unknown")),
-    )
-    if "full" in f3_identity:
-        keep = {k: v for k, v in f3_identity.items() if k in ("full", "no_decay", "latest_only", "fixed_decay")}
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F3_identity_reference_forgetting_curve.png", "F3 aggregate identity-reference retained accuracy", keep, "Phase-B events", "frozen top-1")
-    trace_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-    for baseline in ("full", "experience_replay_bc", "bigram", "latest_only"):
-        by_step: Dict[float, List[float]] = defaultdict(list)
-        for result in _completed_seed_results(seed_results):
-            trace = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "live_step_trace"), []) or []
-            for row in trace:
-                by_step[float(row["step"])].append(float(row["top1"]))
-        if by_step:
-            xs = sorted(by_step)
-            trace_series[baseline] = (xs, [_mean(by_step[x]) for x in xs], [_stderr95(by_step[x]) for x in xs])
-    _plot_lines_ci(aggregate_dir / f"{prefix}_F4_per_step_adaptation.png", "F4 aggregate adaptation within session", trace_series, "step", "top-1")
-    for event_type in ("preference_shift", "cross_transfer_probe", "gradual_shift_followup"):
-        event_trace_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-        for baseline in ("full", "experience_replay_bc", "bigram", "latest_only"):
-            by_step: Dict[float, List[float]] = defaultdict(list)
-            for result in _completed_seed_results(seed_results):
-                trace = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "live_step_trace_by_event_type", event_type), []) or []
-                for row in trace:
-                    by_step[float(row["step"])].append(float(row["top1"]))
-            if by_step:
-                xs = sorted(by_step)
-                event_trace_series[baseline] = (xs, [_mean(by_step[x]) for x in xs], [_stderr95(by_step[x]) for x in xs])
-        if event_trace_series:
-            _plot_lines_ci(aggregate_dir / f"{prefix}_F4_{event_type}_per_step_adaptation.png", f"F4 aggregate {event_type} adaptation", event_trace_series, "step", "top-1")
-    cal_path = ("per_baseline", "full", "action_gate_calibration", "curve")
-    cal_cov = _aggregate_curve_by_threshold(seed_results, cal_path, "coverage")
-    cal_acc = _aggregate_curve_by_threshold(seed_results, cal_path, "conditional_top1")
-    cal_wrong = _aggregate_curve_by_threshold(seed_results, cal_path, "wrong_prediction_assist_rate")
-    cal_utility = _aggregate_curve_by_threshold(seed_results, cal_path, "hrc_assistance_utility")
-    if cal_cov[0] and cal_acc[0]:
-        selected_vals = [
-            float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "action_gate_calibration", "selection", "selected_threshold"), DEFAULT_CONFIG.posterior_action_confidence_threshold))
-            for result in _completed_seed_results(seed_results)
-        ]
-        default_vals = [
-            float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "action_gate_calibration", "default_threshold"), DEFAULT_CONFIG.posterior_action_confidence_threshold))
-            for result in _completed_seed_results(seed_results)
-        ]
-        selected = _mean(selected_vals) if selected_vals else float(DEFAULT_CONFIG.posterior_action_confidence_threshold)
-        default_thr = _mean(default_vals) if default_vals else float(DEFAULT_CONFIG.posterior_action_confidence_threshold)
-        _plot_lines_ci(
-            aggregate_dir / f"{prefix}_F5a_gate_calibration_selection.png",
-            "F5a aggregate action-gate calibration selection",
-            {"coverage": cal_cov, "conditional_top1": cal_acc, "wrong_prediction_assist_rate": cal_wrong, "hrc_assistance_utility": cal_utility},
-            "threshold",
-            "rate / utility",
-            vlines=((default_thr, "default"), (selected, "mean selected")),
-            hlines=((0.0, "zero utility"),),
-        )
-    cov = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "coverage")
-    acc = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "conditional_top1")
-    wrong = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "wrong_prediction_assist_rate")
-    utility = _aggregate_curve_by_threshold(seed_results, ("derived_views", "coverage_accuracy_curve", "full"), "hrc_assistance_utility")
-    if cov[0] and acc[0]:
-        _plot_lines_ci(
-            aggregate_dir / f"{prefix}_F5b_posthoc_coverage_accuracy.png",
-            "F5b aggregate post-hoc coverage/accuracy diagnostic",
-            {"coverage": cov, "conditional_top1": acc, "wrong_prediction_assist_rate": wrong, "hrc_assistance_utility": utility},
-            "threshold",
-            "rate / utility",
-            hlines=((0.0, "zero utility"),),
-        )
-    gate_baselines = [
-        b for b in _baseline_names_from_seed_results(seed_results)
-        if any(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "curve"), {}) for result in _completed_seed_results(seed_results))
-    ]
-    if gate_baselines:
-        threshold_vals = {
-            b: _mean([
-                float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "selection", "selected_threshold"), DEFAULT_CONFIG.posterior_action_confidence_threshold))
-                for result in _completed_seed_results(seed_results)
-            ])
-            for b in gate_baselines
-        }
-        _plot_bar_ci(
-            aggregate_dir / f"{prefix}_S1_selected_action_gate_threshold.png",
-            "S1 aggregate selected action-gate threshold",
-            threshold_vals,
-            {
-                b: _stderr95([
-                    float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "selection", "selected_threshold"), DEFAULT_CONFIG.posterior_action_confidence_threshold))
-                    for result in _completed_seed_results(seed_results)
-                ])
-                for b in gate_baselines
-            },
-            ylabel="threshold",
-        )
-        _plot_grouped_bar(
-            aggregate_dir / f"{prefix}_S1_fixed_vs_calibrated_gate_utility.png",
-            "S1 aggregate fixed vs calibrated gate utility",
-            ("fixed_default", "calibrated"),
-            {
-                b: [
-                    _mean([
-                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "fixed_default_row", "hrc_assistance_utility"), 0.0))
-                        for result in _completed_seed_results(seed_results)
-                    ]),
-                    _mean([
-                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "action_gate_calibration", "selection", "selected_row", "hrc_assistance_utility"), 0.0))
-                        for result in _completed_seed_results(seed_results)
-                    ]),
-                ]
-                for b in gate_baselines
-            },
-            ylabel="HRC assistance utility",
-        )
-    transfer_groups = [
-        cell for cell in TRANSFER_CELL_KEYS
-        if any(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_transfer_cell", cell)) for result in _completed_seed_results(seed_results))
-    ]
-    if transfer_groups and event_baselines:
-        _plot_grouped_bar(
-            aggregate_dir / f"{prefix}_S1_transfer_cell_live_top1.png",
-            "S1 aggregate direct retrieval vs cross-recipe transfer",
-            transfer_groups,
-            {
-                b: [
-                    _mean([
-                        float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "per_transfer_cell", cell, "live_top1"), 0.0))
-                        for result in _completed_seed_results(seed_results)
-                    ])
-                    for cell in transfer_groups
-                ]
-                for b in event_baselines
-            },
-            ylabel="top-1",
-        )
-    full_cross_events = sorted({
-        event
-        for result in _completed_seed_results(seed_results)
-        for event in (_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_event_type_memory_state_gt"), {}) or {})
-    })
-    full_cross_states = sorted({
-        state
-        for result in _completed_seed_results(seed_results)
-        for event_row in (_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_event_type_memory_state_gt"), {}) or {}).values()
-        for state in (event_row or {})
-    })
-    if full_cross_events and full_cross_states:
-        matrix = []
-        for event in full_cross_events:
-            matrix.append([
-                _mean([
-                    float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "per_event_type_memory_state_gt", event, state, "live_top1"), 0.0))
-                    for result in _completed_seed_results(seed_results)
-                ])
-                for state in full_cross_states
-            ])
-        _plot_heatmap(aggregate_dir / f"{prefix}_S1_event_memory_state_live_top1.png", "S1 aggregate full-model live top-1 by event and memory state", matrix, full_cross_states, full_cross_events)
-    reliability_curves: Dict[str, List[Dict[str, float]]] = {}
-    for baseline in event_baselines:
-        by_bin: Dict[float, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
-        for result in _completed_seed_results(seed_results):
-            for row in _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "calibration_curve"), []) or []:
-                b = float(row.get("bin", len(by_bin)))
-                by_bin[b]["confidence"].append(float(row.get("confidence", 0.0)))
-                by_bin[b]["accuracy"].append(float(row.get("accuracy", 0.0)))
-                by_bin[b]["n_steps"].append(float(row.get("n_steps", 0.0)))
-        reliability_curves[baseline] = [
-            {"bin": b, "confidence": _mean(vals["confidence"]), "accuracy": _mean(vals["accuracy"]), "n_steps": _mean(vals["n_steps"])}
-            for b, vals in sorted(by_bin.items())
-        ]
-    _plot_reliability(aggregate_dir / f"{prefix}_S1_reliability_diagram.png", "S1 aggregate reliability diagram", reliability_curves)
-    latency_series: Dict[str, Tuple[List[float], List[float]]] = {}
-    for baseline in event_baselines:
-        by_q: Dict[float, List[float]] = defaultdict(list)
-        for result in _completed_seed_results(seed_results):
-            rows = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "latency_cdf"), []) or []
-            for idx, row in enumerate(rows):
-                by_q[float(row.get("cdf", idx / max(1, len(rows))))].append(float(row.get("latency_s", 0.0)))
-        if by_q:
-            xs = sorted(by_q)
-            latency_series[baseline] = ([1000.0 * _mean(by_q[x]) for x in xs], xs)
-    if latency_series:
-        _plot_lines(
-            aggregate_dir / f"{prefix}_S1_prediction_latency_cdf.png",
-            "S1 aggregate prediction latency CDF",
-            latency_series,
-            "milliseconds",
-            "CDF",
-            vlines=((5.0, "5ms"), (10.0, "10ms"), (20.0, "20ms")),
-            xlim=(0.0, 20.0),
-        )
-    for group_name, path in (
-        ("per_user", ("per_user",)),
-        ("per_event_type", ("per_event_type",)),
-        ("per_memory_state_gt", ("per_memory_state_gt",)),
-    ):
-        labels = sorted({label for result in _completed_seed_results(seed_results) for label in (_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", *path), {}) or {})})
-        values: Dict[str, float] = {}
-        ci: Dict[str, float] = {}
-        for label in labels:
-            vals = [
-                float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", *path, label, "live_top1"), 0.0))
-                for result in _completed_seed_results(seed_results)
-            ]
-            values[label], ci[label] = _mean(vals), _stderr95(vals)
-        _plot_bar_ci(aggregate_dir / f"{prefix}_{group_name}_live_top1.png", f"Aggregate full-model {group_name} live top-1", values, ci, ylabel="top-1")
-
-
-def _render_transfer_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
-    aggregate_dir = _ensure(exp_dir / "aggregate")
-    for metric, ylabel, title in (
-        ("live_top1", "top-1", "S2 aggregate off-diagonal live top-1"),
-        ("primary_transfer_live_top1", "top-1", "S2 aggregate primary seen-seen transfer top-1"),
-        ("zero_shot_preference_live_top1", "top-1", "S2 aggregate zero-shot preference top-1"),
-        ("assistance_coverage", "coverage", "S2 aggregate off-diagonal assistance coverage"),
-        ("conditional_top1", "conditional top-1", "S2 aggregate off-diagonal conditional top-1"),
-        ("preference_gate_accuracy", "rate", "S2 aggregate preference gate accuracy"),
-        ("preference_cluster_purity", "purity", "S2 aggregate preference cluster purity"),
-        ("confidence_ece", "ECE", "S2 aggregate confidence ECE"),
-        ("confidence_brier", "Brier", "S2 aggregate confidence Brier"),
-    ):
-        means, ci = _aggregate_baseline_metric(seed_results, (metric,))
-        _plot_bar_ci(aggregate_dir / f"{prefix}_{metric}.png", title, means, ci, ylabel=ylabel)
-    comp_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-    for baseline in ("full", "latest_only", "experience_replay_bc", "bigram", "no_preference_prototype"):
-        by_h: Dict[float, List[float]] = defaultdict(list)
-        for result in _completed_seed_results(seed_results):
-            comp = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "novel_composition"), {}) or {}
-            for h, row in comp.items():
-                by_h[float(h)].append(float(row.get("live_top1", 0.0)))
-        if by_h:
-            xs = sorted(by_h)
-            comp_series[baseline] = (xs, [_mean(by_h[x]) for x in xs], [_stderr95(by_h[x]) for x in xs])
-    _plot_lines_ci(aggregate_dir / f"{prefix}_F7_composition_curve_by_baseline.png", "F7 aggregate composition by baseline", comp_series, "hamming distance", "live top-1")
-    axis_labels = sorted({
-        axis
-        for result in _completed_seed_results(seed_results)
-        for baseline_row in (_nested_get(result.get("metrics", {}) or {}, ("per_baseline",), {}) or {}).values()
-        for axis in (baseline_row.get("axis_holdout", {}) or {})
-    })
-    axis_baselines = [b for b in _baseline_names_from_seed_results(seed_results) if any(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", b, "axis_holdout")) for result in _completed_seed_results(seed_results))]
-    if axis_labels and axis_baselines:
-        matrix = [
-            [
-                _mean([
-                    float(_nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "axis_holdout", axis, "live_top1"), 0.0))
-                    for result in _completed_seed_results(seed_results)
-                ])
-                for axis in axis_labels
-            ]
-            for baseline in axis_baselines
-        ]
-        _plot_heatmap(aggregate_dir / f"{prefix}_S2_axis_holdout_heatmap.png", "S2 aggregate axis-holdout live top-1", matrix, axis_labels, axis_baselines)
-    cycle_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-    for baseline in _baseline_names_from_seed_results(seed_results):
-        by_cycle: Dict[float, List[float]] = defaultdict(list)
-        for result in _completed_seed_results(seed_results):
-            curve = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "diagonal_cycle_curve"), {}) or {}
-            for cycle, row in curve.items():
-                by_cycle[float(cycle)].append(float(row.get("frozen_diagonal_top1", 0.0)))
-        if by_cycle:
-            xs = sorted(by_cycle)
-            cycle_series[baseline] = (xs, [_mean(by_cycle[x]) for x in xs], [_stderr95(by_cycle[x]) for x in xs])
-    _plot_lines_ci(aggregate_dir / f"{prefix}_S2_single_shot_sufficiency_curve.png", "S2 aggregate single-shot sufficiency curve", cycle_series, "diagonal cycles", "frozen diagonal top-1")
-
-
-def _render_decay_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
-    aggregate_dir = _ensure(exp_dir / "aggregate")
-    for metric, ylabel, title in (
-        ("live_top1", "top-1", "S3 aggregate reentry live top-1"),
-        ("active_before_rate", "rate", "S3 aggregate active-before rate"),
-        ("post_reentry_top1", "top-1", "S3 aggregate post-reentry top-1"),
-        ("assistance_coverage", "coverage", "S3 aggregate reentry assistance coverage"),
-        ("useful_assistance_rate", "rate", "S3 aggregate user-visible reentry value"),
-        ("net_assistance_value", "correct assists - wrong assists", "S3 aggregate net reentry assistance value"),
-    ):
-        means, ci = _aggregate_baseline_metric(seed_results, (metric,))
-        _plot_bar_ci(aggregate_dir / f"{prefix}_{metric}.png", title, means, ci, ylabel=ylabel)
-    for arm in ("neutral", "distractor"):
-        series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-        useful_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-        coverage_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-        active_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-        crossing_vlines: List[Tuple[float, str]] = []
-        for baseline in ("full", "adaptive", "fixed_decay", "no_decay", "experience_replay_bc", "bigram"):
-            by_gap: Dict[float, List[float]] = defaultdict(list)
-            by_useful: Dict[float, List[float]] = defaultdict(list)
-            by_coverage: Dict[float, List[float]] = defaultdict(list)
-            by_active: Dict[float, List[float]] = defaultdict(list)
-            for result in _completed_seed_results(seed_results):
-                per_gap = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "arms", arm, "per_gap"), {}) or {}
-                for gap, row in per_gap.items():
-                    by_gap[float(gap)].append(float(row.get("live_top1", 0.0)))
-                    by_useful[float(gap)].append(float(row.get("useful_assistance_rate", 0.0)))
-                    by_coverage[float(gap)].append(float(row.get("assistance_coverage", 0.0)))
-                    by_active[float(gap)].append(float(row.get("active_before_rate", 0.0)))
-            if by_gap:
-                xs = sorted(by_gap)
-                series[baseline] = (xs, [_mean(by_gap[x]) for x in xs], [_stderr95(by_gap[x]) for x in xs])
-                if baseline == "full":
-                    active_vals = [_mean(by_active[x]) for x in xs]
-                    below = [x for x, y in zip(xs, active_vals) if y <= 0.5]
-                    if below:
-                        crossing_vlines.append((float(below[0]), "active<=0.5"))
-            if by_useful:
-                xs = sorted(by_useful)
-                useful_series[baseline] = (xs, [_mean(by_useful[x]) for x in xs], [_stderr95(by_useful[x]) for x in xs])
-            if by_coverage:
-                xs = sorted(by_coverage)
-                coverage_series[baseline] = (xs, [_mean(by_coverage[x]) for x in xs], [_stderr95(by_coverage[x]) for x in xs])
-            if by_active:
-                xs = sorted(by_active)
-                active_series[baseline] = (xs, [_mean(by_active[x]) for x in xs], [_stderr95(by_active[x]) for x in xs])
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_live_top1_by_gap.png", f"F8 aggregate {arm} reentry by gap", series, "gap", "live top-1", vlines=crossing_vlines, hlines=((0.5, "0.5"),))
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_useful_reentry_by_gap.png", f"F8 aggregate {arm} user-visible reentry by gap", useful_series, "gap", "useful assistance rate", vlines=crossing_vlines, hlines=((0.5, "0.5"),))
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_reentry_coverage_by_gap.png", f"F8 aggregate {arm} reentry coverage by gap", coverage_series, "gap", "coverage", vlines=crossing_vlines)
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_active_before_by_gap.png", f"F8 aggregate {arm} active-before by gap", active_series, "gap", "active-before rate", vlines=crossing_vlines, hlines=((0.5, "pruning midpoint"),))
-        post_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-        for baseline in ("full", "adaptive", "fixed_decay", "no_decay", "experience_replay_bc", "bigram"):
-            by_gap: Dict[float, List[float]] = defaultdict(list)
-            for result in _completed_seed_results(seed_results):
-                per_gap = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "arms", arm, "per_gap"), {}) or {}
-                for gap, row in per_gap.items():
-                    by_gap[float(gap)].append(float(row.get("post_reentry_top1", 0.0)))
-            if by_gap:
-                xs = sorted(by_gap)
-                post_series[baseline] = (xs, [_mean(by_gap[x]) for x in xs], [_stderr95(by_gap[x]) for x in xs])
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_{arm}_post_reentry_by_gap.png", f"F8 aggregate {arm} post-reentry recovery by gap", post_series, "gap", "post-reentry frozen top-1", hlines=((0.5, "0.5"),))
-    rate_series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-    for baseline in ("full", "adaptive"):
-        for arm in ("neutral", "distractor"):
-            by_gap: Dict[float, List[float]] = defaultdict(list)
-            for result in _completed_seed_results(seed_results):
-                per_gap = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", baseline, "arms", arm, "per_gap"), {}) or {}
-                for gap, row in per_gap.items():
-                    by_gap[float(gap)].append(float(row.get("global_rate_after", 0.0)))
-            if by_gap:
-                xs = sorted(by_gap)
-                rate_series[f"{baseline}_{arm}"] = (xs, [_mean(by_gap[x]) for x in xs], [_stderr95(by_gap[x]) for x in xs])
-    _plot_lines_ci(aggregate_dir / f"{prefix}_F9_decay_rate_adaptation.png", "F9 aggregate decay rate adaptation", rate_series, "gap", "global rate", hlines=((1.0 / max(1, int(DEFAULT_CONFIG.decay_horizon_init)), "initial horizon rate"),))
-    for arm in ("neutral", "distractor"):
-        arm_series = {label.replace(f"_{arm}", ""): vals for label, vals in rate_series.items() if label.endswith(f"_{arm}")}
-        if arm_series:
-            _plot_lines_ci(aggregate_dir / f"{prefix}_F9_{arm}_decay_rate_adaptation.png", f"F9 aggregate {arm} decay rate adaptation", arm_series, "gap", "global rate", hlines=((1.0 / max(1, int(DEFAULT_CONFIG.decay_horizon_init)), "initial horizon rate"),))
-    full_recovery: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-    for arm in ("neutral", "distractor"):
-        for metric, label in (("live_top1", f"live_{arm}"), ("post_reentry_top1", f"post_{arm}")):
-            by_gap: Dict[float, List[float]] = defaultdict(list)
-            for result in _completed_seed_results(seed_results):
-                per_gap = _nested_get(result.get("metrics", {}) or {}, ("per_baseline", "full", "arms", arm, "per_gap"), {}) or {}
-                for gap, row in per_gap.items():
-                    by_gap[float(gap)].append(float(row.get(metric, 0.0)))
-            if by_gap:
-                xs = sorted(by_gap)
-                full_recovery[label] = (xs, [_mean(by_gap[x]) for x in xs], [_stderr95(by_gap[x]) for x in xs])
-    if full_recovery:
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F8_full_live_vs_post_reentry.png", "F8 aggregate full live vs post-reentry recovery", full_recovery, "gap", "top-1", hlines=((0.5, "0.5"),))
-
-
-def _render_disambiguation_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
-    aggregate_dir = _ensure(exp_dir / "aggregate")
-    for metric in ("macro_f1", "accuracy"):
-        by_thr: Dict[float, List[float]] = defaultdict(list)
-        for result in _completed_seed_results(seed_results):
-            per_threshold = _nested_get(result.get("metrics", {}) or {}, ("per_threshold",), {}) or {}
-            for thr, row in per_threshold.items():
-                by_thr[float(thr)].append(float(row.get(metric, 0.0)))
-        if by_thr:
-            xs = sorted(by_thr)
-            _plot_lines_ci(aggregate_dir / f"{prefix}_F10_{metric}_by_threshold.png", f"F10 aggregate {metric} by Jaccard threshold", {metric: (xs, [_mean(by_thr[x]) for x in xs], [_stderr95(by_thr[x]) for x in xs])}, "threshold", metric, vlines=((0.95, "production"),))
-    gate_by_thr: Dict[float, List[float]] = defaultdict(list)
-    for result in _completed_seed_results(seed_results):
-        per_threshold = _nested_get(result.get("metrics", {}) or {}, ("per_threshold",), {}) or {}
-        for thr, row in per_threshold.items():
-            gate_by_thr[float(thr)].append(float((row.get("gate_decision") or {}).get("macro_f1", 0.0)))
-    if gate_by_thr:
-        xs = sorted(gate_by_thr)
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F10_gate_decision_macro_f1_by_threshold.png", "F10 aggregate gate decision macro-F1 by threshold", {"gate_macro_f1": (xs, [_mean(gate_by_thr[x]) for x in xs], [_stderr95(gate_by_thr[x]) for x in xs])}, "threshold", "macro-F1", vlines=((0.95, "production"),))
-    recipe_gate_by_thr: Dict[float, List[float]] = defaultdict(list)
-    for result in _completed_seed_results(seed_results):
-        per_threshold = _nested_get(result.get("metrics", {}) or {}, ("per_threshold",), {}) or {}
-        for thr, row in per_threshold.items():
-            recipe_gate_by_thr[float(thr)].append(float((row.get("recipe_holdout_gate_decision") or {}).get("accuracy", 0.0)))
-    if recipe_gate_by_thr:
-        xs = sorted(recipe_gate_by_thr)
-        _plot_lines_ci(aggregate_dir / f"{prefix}_F10_recipe_holdout_gate_accuracy_by_threshold.png", "F10 aggregate recipe-heldout gate accuracy by threshold", {"recipe_holdout_gate_accuracy": (xs, [_mean(recipe_gate_by_thr[x]) for x in xs], [_stderr95(recipe_gate_by_thr[x]) for x in xs])}, "threshold", "accuracy", vlines=((0.95, "production"),))
-    cov = _aggregate_curve_by_threshold(seed_results, ("action_gate_curve",), "coverage")
-    acc = _aggregate_curve_by_threshold(seed_results, ("action_gate_curve",), "conditional_top1")
-    if cov[0] and acc[0]:
-        _plot_lines_ci(aggregate_dir / f"{prefix}_S4_action_gate_coverage_accuracy.png", "S4 aggregate action gate coverage/accuracy", {"coverage": cov, "conditional_top1": acc}, "threshold", "rate")
-    for metric in ("macro_f1", "accuracy"):
-        by_drop: Dict[float, List[float]] = defaultdict(list)
-        for result in _completed_seed_results(seed_results):
-            boundary = _nested_get(result.get("metrics", {}) or {}, ("boundary_degradation",), {}) or {}
-            for drop, row in boundary.items():
-                by_drop[float(drop)].append(float(row.get(metric, 0.0)))
-        if by_drop:
-            xs = sorted(by_drop)
-            _plot_lines_ci(aggregate_dir / f"{prefix}_S4_boundary_{metric}.png", f"S4 aggregate boundary degradation {metric}", {metric: (xs, [_mean(by_drop[x]) for x in xs], [_stderr95(by_drop[x]) for x in xs])}, "drop fraction", metric)
-    for metric in ("macro_f1", "accuracy"):
-        by_prefix: Dict[float, List[float]] = defaultdict(list)
-        for result in _completed_seed_results(seed_results):
-            prefix_rows = _nested_get(result.get("metrics", {}) or {}, ("prefix_robustness",), {}) or {}
-            for frac, row in prefix_rows.items():
-                by_prefix[float(frac)].append(float(row.get(metric, 0.0)))
-        if by_prefix:
-            xs = sorted(by_prefix)
-            _plot_lines_ci(aggregate_dir / f"{prefix}_S4_prefix_{metric}.png", f"S4 aggregate growing-prefix {metric}", {metric: (xs, [_mean(by_prefix[x]) for x in xs], [_stderr95(by_prefix[x]) for x in xs])}, "prefix fraction", metric)
-    labels = MEMORY_STATE_LABELS
-    counts = np.zeros((len(labels), len(labels)), dtype=float)
-    for result in _completed_seed_results(seed_results):
-        metrics = result.get("metrics", {}) or {}
-        best = str(metrics.get("best_threshold") or "")
-        rows = _nested_get(metrics, ("per_threshold", best, "rows"), []) or []
-        for row in rows:
-            if row.get("gt") in labels and row.get("pred") in labels:
-                counts[labels.index(row["gt"]), labels.index(row["pred"])] += 1.0
-    if counts.sum() > 0:
-        _plot_heatmap(aggregate_dir / f"{prefix}_S4_confusion_matrix_best_threshold.png", "S4 aggregate confusion matrix at selected threshold", counts.tolist(), labels, labels, cmap="Purples")
-
-
-def _render_materiality_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
-    aggregate_dir = _ensure(exp_dir / "aggregate")
-    by_recipe_eff: Dict[str, List[float]] = defaultdict(list)
-    by_recipe_dup: Dict[str, List[float]] = defaultdict(list)
-    by_recipe_pairwise: Dict[str, List[float]] = defaultdict(list)
-    for result in _completed_seed_results(seed_results):
-        for row in result.get("metrics", {}).get("summary", []) or []:
-            by_recipe_eff[str(row.get("recipe"))].append(float(row.get("effective_preference_count", 0.0)))
-            by_recipe_dup[str(row.get("recipe"))].append(float(row.get("duplicate_count", 0.0)))
-            if "min_pairwise_kendall_per_recipe" in row:
-                by_recipe_pairwise[str(row.get("recipe"))].append(float(row.get("min_pairwise_kendall_per_recipe", 0.0)))
-    _plot_bar_ci(
-        aggregate_dir / f"{prefix}_materiality_effective_preferences.png",
-        "Materiality preflight effective preferences per recipe",
-        {k: _mean(v) for k, v in sorted(by_recipe_eff.items())},
-        {k: _stderr95(v) for k, v in sorted(by_recipe_eff.items())},
-        ylabel="count",
-    )
-    _plot_bar_ci(
-        aggregate_dir / f"{prefix}_materiality_duplicate_noop_count.png",
-        "Materiality preflight duplicate/no-op count per recipe",
-        {k: _mean(v) for k, v in sorted(by_recipe_dup.items())},
-        {k: _stderr95(v) for k, v in sorted(by_recipe_dup.items())},
-        ylabel="count",
-    )
-    if by_recipe_pairwise:
-        _plot_bar_ci(
-            aggregate_dir / f"{prefix}_materiality_min_pairwise_kendall.png",
-            "Materiality preflight min pairwise Kendall per recipe",
-            {k: _mean(v) for k, v in sorted(by_recipe_pairwise.items())},
-            {k: _stderr95(v) for k, v in sorted(by_recipe_pairwise.items())},
-            ylabel="distance",
-        )
-
-
-def _render_demo_count_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
-    aggregate_dir = _ensure(exp_dir / "aggregate")
-    series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-    baselines = sorted({b for result in _completed_seed_results(seed_results) for row in (result.get("metrics", {}).get("per_demo_count", {}) or {}).values() for b in (row.get("per_baseline", {}) or {})})
-    for baseline in baselines:
-        by_n: Dict[float, List[float]] = defaultdict(list)
-        for result in _completed_seed_results(seed_results):
-            for n, row in (result.get("metrics", {}).get("per_demo_count", {}) or {}).items():
-                value = _nested_get(row, ("per_baseline", baseline, "live_top1"))
-                if isinstance(value, (int, float)):
-                    by_n[float(n)].append(float(value))
-        if by_n:
-            xs = sorted(by_n)
-            series[baseline] = (xs, [_mean(by_n[x]) for x in xs], [_stderr95(by_n[x]) for x in xs])
-    _plot_lines_ci(aggregate_dir / f"{prefix}_sample_efficiency_live_top1.png", "Sample efficiency by baseline", series, "demo count", "live top-1")
-
-
-def _render_zipf_aggregate_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]], prefix: str = "aggregate") -> None:
-    aggregate_dir = _ensure(exp_dir / "aggregate")
-    baselines = sorted({b for result in _completed_seed_results(seed_results) for row in (result.get("metrics", {}).get("per_alpha", {}) or {}).values() for b in row})
-    for metric, ylabel in (
-        ("utility_top1", "utility top-1"),
-        ("fairness_top1", "fairness top-1"),
-        ("head_tail_gap", "head-tail gap"),
-        ("memory_active_variants", "active variants"),
-        ("memory_pruned_variants", "pruned variants"),
-    ):
-        series: Dict[str, Tuple[List[float], List[float], List[float]]] = {}
-        for baseline in baselines:
-            by_alpha: Dict[float, List[float]] = defaultdict(list)
-            for result in _completed_seed_results(seed_results):
-                for alpha, row in (result.get("metrics", {}).get("per_alpha", {}) or {}).items():
-                    if metric.startswith("memory_"):
-                        value = _nested_get(row, (baseline, "memory", metric.replace("memory_", "")))
-                    else:
-                        value = _nested_get(row, (baseline, metric))
-                    if isinstance(value, (int, float)):
-                        by_alpha[float(alpha)].append(float(value))
-            if by_alpha:
-                xs = sorted(by_alpha)
-                series[baseline] = (xs, [_mean(by_alpha[x]) for x in xs], [_stderr95(by_alpha[x]) for x in xs])
-        _plot_lines_ci(aggregate_dir / f"{prefix}_zipf_{metric}.png", f"Zipf sweep {metric}", series, "alpha", ylabel)
-
-
-def _render_aggregate_publication_figures(exp_dir: Path, seed_results: Sequence[Dict[str, Any]]) -> None:
-    name = exp_dir.name
-    if name in {"deployment_stream", "cl_regularizer_comparison"}:
-        _render_deployment_aggregate_figures(exp_dir, seed_results)
-    elif name in {"cross_recipe_transfer", "posterior_ablation_matrix"}:
-        _render_transfer_aggregate_figures(exp_dir, seed_results)
-    elif name == "decay_reentry":
-        _render_decay_aggregate_figures(exp_dir, seed_results)
-    elif name == "disambiguation_audit":
-        _render_disambiguation_aggregate_figures(exp_dir, seed_results)
-    elif name == "materiality_preflight":
-        _render_materiality_aggregate_figures(exp_dir, seed_results)
-    elif name == "demo_count_sample_efficiency":
-        _render_demo_count_aggregate_figures(exp_dir, seed_results)
-    elif name == "zipf_usage_sweep":
-        _render_zipf_aggregate_figures(exp_dir, seed_results)
 
 
 def _rng(seed: int, salt: int = 0) -> np.random.Generator:
@@ -3828,18 +2139,12 @@ def materiality_rows(pairs: Sequence[RecipePrefPair]) -> List[Dict[str, Any]]:
 def _build_gap_preferences() -> List[WorkflowPreference]:
     named = {p.label for p in PRESET_PREFERENCES.values()}
     out: List[WorkflowPreference] = []
-    for ingredient_flow in WORKFLOW_AXIS_VALUES["ingredient_flow"]:
-        for equipment_setup in WORKFLOW_AXIS_VALUES["equipment_setup"]:
-            for serving_setup in WORKFLOW_AXIS_VALUES["serving_setup"]:
-                for cleanup_timing in WORKFLOW_AXIS_VALUES["cleanup_timing"]:
-                    pref = WorkflowPreference(
-                        ingredient_flow=ingredient_flow,
-                        equipment_setup=equipment_setup,
-                        serving_setup=serving_setup,
-                        cleanup_timing=cleanup_timing,
-                    )
-                    if pref.label not in named:
-                        out.append(pref)
+    axes = tuple(WORKFLOW_AXES)
+    values_by_axis = [tuple(WORKFLOW_AXIS_VALUES[axis]) for axis in axes]
+    for values in itertools.product(*values_by_axis):
+        pref = WorkflowPreference(**dict(zip(axes, values)))
+        if pref.label not in named:
+            out.append(pref)
     return out
 
 
@@ -3851,15 +2156,6 @@ def base_config(seed: int, run_config: RunConfig, **overrides: Any) -> Config:
         profile=bool(run_config.profile),
         maxent_valid_action_expansion=bool(run_config.valid_action_expansion),
     )
-    if run_config.quick:
-        cfg = replace(
-            cfg,
-            maxent_mc_rollouts=min(cfg.maxent_mc_rollouts, 30),
-            maxent_iters_cold=min(cfg.maxent_iters_cold, 25),
-            maxent_iters_warm=min(cfg.maxent_iters_warm, 12),
-            bc_epochs_cold=min(cfg.bc_epochs_cold, 30),
-            bc_epochs_warm=min(cfg.bc_epochs_warm, 15),
-        )
     if overrides:
         cfg = replace(cfg, **overrides)
     return cfg
@@ -3869,31 +2165,10 @@ def make_agent(name: str, cfg: Config) -> AdaptiveHRCAgent:
     key = str(name)
     if key == "full":
         return AdaptiveHRCAgent(cfg=cfg)
-    aliases = {
-        "adaptive": "adaptive_decay",
-        "fixed_decay": "FixedDecay",
-        "latest_only": "latest_only",
-        "latest_pref_only": "latest_only",
-        "no_decay": "NoDecay",
-        "no_replay": "NoReplay",
-        "uniform_weight": "UniformWeight",
-        "experience_replay_bc": "ExperienceReplay",
-        "experience_replay": "ExperienceReplay",
-        "bc": "BC",
-        "l2_anchor": "L2Anchor",
-        "ewc": "EWC",
-        "online_ewc": "online_ewc",
-        "bigram": "bigram",
-        "frequency_conditioned_bigram": "frequency_conditioned_bigram",
-        "uniform_valid": "uniform_valid",
-        "most_frequent": "MostFrequentNext",
-        "oracle_ceiling": "oracle_ceiling",
-        "no_weighted_rehearsal": "UniformWeight",
-    }
     ablation_cfg: Optional[Config] = None
-    if key in ("irl_ngram_only", "current_ensemble_only", "no_posterior"):
+    if key == "no_posterior":
         ablation_cfg = replace(cfg, ablation_disable_posterior=True)
-    elif key in ("no_preference_prototype", "no_preference_head"):
+    elif key == "no_preference_prototype":
         ablation_cfg = replace(cfg, ablation_disable_preference_head=True)
     elif key == "no_recipe_prototype":
         ablation_cfg = replace(cfg, ablation_disable_recipe_prototype=True)
@@ -3905,15 +2180,84 @@ def make_agent(name: str, cfg: Config) -> AdaptiveHRCAgent:
         ablation_cfg = replace(cfg, ablation_oracle_recipe_and_preference_label=True)
     if ablation_cfg is not None:
         return AdaptiveHRCAgent(cfg=ablation_cfg)
-    cls_key = aliases.get(key, key)
-    if cls_key not in BASELINE_AGENTS:
+    if key not in BASELINE_AGENTS:
         raise KeyError(f"unknown baseline {name!r}")
-    return BASELINE_AGENTS[cls_key](cfg=cfg)
+    return BASELINE_AGENTS[key](cfg=cfg)
+
+
+TIMING_DETAILS_WARNING = (
+    "Wall-clock HRC timing diagnostics are secondary metrics and are meaningful "
+    "only when HRCTimingConfig is calibrated for the robot, task, and site. "
+    "Use human_action_fraction as the primary HRC utility metric and "
+    "human_effort_fraction when correction burden should be time-weighted."
+)
+
+
+def _hrc_timing_details(
+    *,
+    hrc_total_time: float,
+    human_only_time: float,
+    hrc_time_penalty_vs_human_only: float,
+    observation_mode_extra_time: float,
+    hrc_mean_time_per_recipe_step: float,
+    hrc_mean_time_per_robot_turn: float,
+    hrc_robot_correct_time: float,
+    hrc_robot_wrong_time: float,
+    hrc_human_action_time: float,
+    hrc_human_correction_time: float,
+    hrc_wrong_action_extra_penalty_time: float,
+) -> Dict[str, Any]:
+    """Return secondary wall-clock timing diagnostics.
+
+    Warning: these metrics are interpretable only with a calibrated
+    HRCTimingConfig. For kitchen HRC, the primary assistance outcome is human
+    physical workload, represented by human_action_fraction.
+    """
+    hrc_total_time = float(hrc_total_time)
+    human_only_time = float(human_only_time)
+    return {
+        "warning": TIMING_DETAILS_WARNING,
+        "primary_hrc_metric": "human_action_fraction",
+        "timing_config_seconds": asdict(DEFAULT_HRC_TIMING),
+        "hrc_total_time": hrc_total_time,
+        "human_only_time": human_only_time,
+        "hrc_time_saved_vs_human_only": float(human_only_time - hrc_total_time),
+        "hrc_time_over_human_only": float(hrc_total_time / max(human_only_time, 1e-12)) if human_only_time > 0.0 else 0.0,
+        "normalized_interaction_cost": float(hrc_total_time / max(human_only_time, 1e-12)) if human_only_time > 0.0 else 0.0,
+        "hrc_time_penalty_vs_human_only": float(hrc_time_penalty_vs_human_only),
+        "observation_mode_extra_time": float(observation_mode_extra_time),
+        "hrc_mean_time_per_recipe_step": float(hrc_mean_time_per_recipe_step),
+        "hrc_mean_time_per_robot_turn": float(hrc_mean_time_per_robot_turn),
+        "hrc_robot_correct_time": float(hrc_robot_correct_time),
+        "hrc_robot_wrong_time": float(hrc_robot_wrong_time),
+        "hrc_human_action_time": float(hrc_human_action_time),
+        "hrc_human_correction_time": float(hrc_human_correction_time),
+        "hrc_wrong_action_extra_penalty_time": float(hrc_wrong_action_extra_penalty_time),
+    }
 
 
 def observe_episode(agent: AdaptiveHRCAgent, pair: RecipePrefPair, name_to_rid: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     if isinstance(agent, OracleCeilingAgent):
         agent.set_oracle_target(pair.actions)
+    n_recipe_steps = len(pair.actions)
+    human_only_time = float(n_recipe_steps * DEFAULT_HRC_TIMING.human_action_time)
+    observation_extra_time = float(n_recipe_steps * OBSERVATION_MODE_EXTRA_TIME_PER_STEP)
+    observation_total_time = human_only_time + observation_extra_time
+    human_effort_time = human_only_time
+    human_effort_fraction = human_effort_time / max(human_only_time, 1e-12) if human_only_time > 0.0 else 0.0
+    timing_details = _hrc_timing_details(
+        hrc_total_time=observation_total_time,
+        human_only_time=human_only_time,
+        hrc_time_penalty_vs_human_only=observation_extra_time,
+        observation_mode_extra_time=observation_extra_time,
+        hrc_mean_time_per_recipe_step=observation_total_time / max(1, n_recipe_steps),
+        hrc_mean_time_per_robot_turn=0.0,
+        hrc_robot_correct_time=0.0,
+        hrc_robot_wrong_time=0.0,
+        hrc_human_action_time=human_only_time,
+        hrc_human_correction_time=0.0,
+        hrc_wrong_action_extra_penalty_time=0.0,
+    )
     agent.start_demo()
     for obs in observations_from_actions(pair.actions):
         agent.observe_observation(obs)
@@ -3927,9 +2271,42 @@ def observe_episode(agent: AdaptiveHRCAgent, pair: RecipePrefPair, name_to_rid: 
         "mode": "observe",
         "classification_kind": cls.kind,
         "recipe_id": cls.recipe_id,
-        "pref_hash": cls.pref_hash,
+        "variant_hash": cls.variant_hash,
         "jaccard": cls.jaccard,
         "order_distance": cls.order_distance,
+        "n_steps": 0,
+        "n_recipe_steps": n_recipe_steps,
+        "live_top1": 0.0,
+        "live_topk": 0.0,
+        "total_robot_turn_nll": 0.0,
+        "nll_scored_robot_turns": 0.0,
+        "nll_normalization_recipe_steps": 0.0,
+        "mean_nll_per_robot_turn": 0.0,
+        "mean_nll_per_recipe_step": 0.0,
+        **_adaptation_recovery_metrics([], -1),
+        "robot_wrong_rate": 0.0,
+        "net_robot_action_value": 0.0,
+        "hrc_robot_turn_count": 0,
+        "hrc_human_turn_count": n_recipe_steps,
+        "hrc_human_correction_count": 0,
+        "hrc_human_action_count": n_recipe_steps,
+        "hrc_robot_correct_count": 0,
+        "hrc_robot_wrong_count": 0,
+        "human_correction_rate": 0.0,
+        "human_action_fraction": 1.0,
+        "human_effort_time": human_effort_time,
+        "human_effort_fraction": human_effort_fraction,
+        "primary_hrc_metric": "human_action_fraction",
+        "primary_hrc_metric_value": 1.0,
+        "human_workload_reduction_vs_human_only": 0.0,
+        "hrc_future_valid_wrong_count": 0,
+        "future_valid_wrong_rate": 0.0,
+        "wrong_prediction_future_valid_rate": 0.0,
+        "timing_details": timing_details,
+        "observation_mode_episode": 1.0,
+        "user_observation_required": 1.0,
+        "mode_decision_source": "user",
+        "mode_route_reason": "user_selected_observation",
     }
 
 
@@ -3972,60 +2349,87 @@ def _memory_state_gt(
     return "pruned_memory"
 
 
+def _recipe_has_active_variant(agent: AdaptiveHRCAgent, pair: RecipePrefPair, name_to_rid: Dict[str, str]) -> bool:
+    rid = name_to_rid.get(pair.recipe_name)
+    if rid is None:
+        return False
+    return any(recipe_id == rid for recipe_id, _variant_hash in agent.decay.active.keys())
+
+
+def _user_selected_mode_for_active_memory(
+    requested_mode: str,
+    agent: AdaptiveHRCAgent,
+    pair: RecipePrefPair,
+    name_to_rid: Dict[str, str],
+) -> Tuple[str, Dict[str, Any]]:
+    active_recipe_before = _recipe_has_active_variant(agent, pair, name_to_rid)
+    if requested_mode == "observe":
+        mode = "observe"
+        reason = "user_selected_observation"
+    elif active_recipe_before:
+        mode = "assist"
+        reason = "user_selected_assist_active_recipe"
+    else:
+        mode = "observe"
+        reason = "user_selected_observation_recipe_absent_from_active_memory"
+    return mode, {
+        "requested_mode": requested_mode,
+        "executed_mode": mode,
+        "mode_decision_source": "user",
+        "mode_route_reason": reason,
+        "active_recipe_before": bool(active_recipe_before),
+        "recipe_active_before": bool(active_recipe_before),
+    }
+
+
+def _policy_diagnostics_from_gate(gate: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "would_assist_under_gate": bool(gate.get("assist_used", False)),
+        "gate_reason": gate.get("reason"),
+        "gate_source": gate.get("assist_source"),
+        "policy_confidence": gate.get("final_action_confidence", gate.get("action_confidence")),
+        "policy_raw_confidence": gate.get("raw_action_confidence"),
+        "policy_gate_score": gate.get("action_gate_score"),
+        "policy_margin": gate.get("final_action_margin", gate.get("action_margin")),
+        "policy_entropy": gate.get("final_action_entropy", gate.get("action_entropy")),
+        "gate_threshold": gate.get("action_gate_threshold"),
+        "policy_final_confidence": gate.get("final_action_confidence"),
+        "policy_final_margin": gate.get("final_action_margin"),
+        "policy_final_entropy": gate.get("final_action_entropy"),
+        "conditioned_policy_confidence": gate.get("conditioned_action_confidence"),
+        "ensemble_policy_confidence": gate.get("ensemble_action_confidence"),
+        "policy_agreement": gate.get("policy_agreement"),
+        "blend_strength": gate.get("blend_strength"),
+    }
+
+
 def _posterior_stats(agent: AdaptiveHRCAgent) -> Dict[str, Any]:
     joint = agent.posterior.joint()
     gate = agent.assist_gate_stats()
+    policy_diagnostics = _policy_diagnostics_from_gate(gate)
     if not joint:
         return {
             "posterior_entropy": None,
+            "posterior_confidence": None,
             "posterior_raw_entropy": None,
             "posterior_max_prob": None,
             "posterior_n_hypotheses": 0,
             "posterior_recipe": agent.inferred_recipe,
             "posterior_preference": None,
-            "assist_used": bool(gate.get("assist_used", False)),
-            "assist_reason": gate.get("reason"),
-            "action_confidence": gate.get("action_confidence"),
-            "raw_action_confidence": gate.get("raw_action_confidence"),
-            "action_gate_score": gate.get("action_gate_score"),
-            "action_margin": gate.get("action_margin"),
-            "action_gate_threshold": gate.get("action_gate_threshold"),
-            "action_entropy": gate.get("action_entropy"),
-            "assist_source": gate.get("assist_source"),
-            "final_action_confidence": gate.get("final_action_confidence"),
-            "final_action_margin": gate.get("final_action_margin"),
-            "final_action_entropy": gate.get("final_action_entropy"),
-            "conditioned_action_confidence": gate.get("conditioned_action_confidence"),
-            "ensemble_action_confidence": gate.get("ensemble_action_confidence"),
-            "policy_agreement": gate.get("policy_agreement"),
-            "blend_strength": gate.get("blend_strength"),
+            "policy_diagnostics": policy_diagnostics,
         }
     probs = [float(p) for p in joint.values()]
     raw_h = -sum(p * math.log(max(p, 1e-12)) for p in probs)
     norm_h = raw_h / math.log(len(probs)) if len(probs) > 1 else None
     return {
         "posterior_entropy": norm_h,
+        "posterior_confidence": max(probs),
         "posterior_raw_entropy": raw_h,
         "posterior_max_prob": max(probs),
         "posterior_n_hypotheses": len(probs),
         "posterior_recipe": agent.posterior.argmax_recipe(),
         "posterior_preference": agent.posterior.argmax_preference(),
-        "assist_used": bool(gate.get("assist_used", False)),
-        "assist_reason": gate.get("reason"),
-        "action_confidence": gate.get("action_confidence"),
-        "raw_action_confidence": gate.get("raw_action_confidence"),
-        "action_gate_score": gate.get("action_gate_score"),
-        "action_margin": gate.get("action_margin"),
-        "action_gate_threshold": gate.get("action_gate_threshold"),
-        "action_entropy": gate.get("action_entropy"),
-        "assist_source": gate.get("assist_source"),
-        "final_action_confidence": gate.get("final_action_confidence"),
-        "final_action_margin": gate.get("final_action_margin"),
-        "final_action_entropy": gate.get("final_action_entropy"),
-        "conditioned_action_confidence": gate.get("conditioned_action_confidence"),
-        "ensemble_action_confidence": gate.get("ensemble_action_confidence"),
-        "policy_agreement": gate.get("policy_agreement"),
-        "blend_strength": gate.get("blend_strength"),
+        "policy_diagnostics": policy_diagnostics,
     }
 
 
@@ -4042,8 +2446,7 @@ def assist_episode(
     simulator_observed_labels: Optional[set] = None,
     simulator_observed_recipes: Optional[set] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    if isinstance(agent, OracleCeilingAgent):
-        agent.set_oracle_target(pair.actions)
+    probe_snapshot = agent.snapshot() if not commit else None
     rid = (name_to_rid or {}).get(pair.recipe_name)
     if simulator_observed_labels is not None or simulator_observed_recipes is not None:
         memory_state = _memory_state_gt(agent, pair, name_to_rid or {}, simulator_observed_labels, simulator_observed_recipes)
@@ -4051,46 +2454,86 @@ def assist_episode(
         memory_state = _memory_state(agent, pair, name_to_rid or {})
     observations = observations_from_actions(pair.actions)
     actual_tokens = agent._tokens_from_action_labels(pair.actions)
+    if isinstance(agent, OracleCeilingAgent):
+        agent.set_oracle_target(actual_tokens)
+    floor = max(float(agent.cfg.prob_floor), 1e-12)
+
+    uses_oracle_label_prediction = oracle_recipe_id is not None or oracle_preference_id is not None
+
+    def predict_for_prefix(prefix: Sequence[str]) -> Mapping[str, float]:
+        if uses_oracle_label_prediction:
+            return agent.predict_with_oracle(list(prefix), oracle_recipe_id or rid, oracle_preference_id)
+        return agent.predict_next_tokens(list(prefix))
+
+    def observe_ground_truth(obs: Any, distribution: Optional[Mapping[str, float]] = None) -> None:
+        precomputed_distribution = None if uses_oracle_label_prediction else distribution
+        agent.observe_observation(
+            obs,
+            ground_truth_recipe=rid,
+            precomputed_distribution=precomputed_distribution,
+        )
+
+    def capture_robot_metadata(context: HRCDecisionContext) -> Dict[str, Any]:
+        post = _posterior_stats(agent)
+        policy_diagnostics = dict(post.get("policy_diagnostics") or {})
+        policy_diagnostics.update(
+            policy_distribution_diagnostics(context.distribution, context.ranked, context.predicted)
+        )
+        post["policy_diagnostics"] = policy_diagnostics
+        return post
+
+    trace = run_alternating_hrc_episode(
+        observations=observations,
+        actual_tokens=actual_tokens,
+        actual_actions=pair.actions,
+        current_prefix=lambda: list(agent.current_prefix),
+        predict_distribution=predict_for_prefix,
+        observe_ground_truth=observe_ground_truth,
+        topk=max(1, int(run_config.topk)),
+        prob_floor=floor,
+        capture_robot_metadata=capture_robot_metadata,
+    )
     steps: List[Dict[str, Any]] = []
     live_steps: List[LiveStepRecord] = []
-    hits1 = hits3 = 0
-    nll = 0.0
-    first_mismatch = -1
-    floor = max(float(agent.cfg.prob_floor), 1e-12)
-    for idx, (obs, actual) in enumerate(zip(observations, actual_tokens)):
-        prefix = list(agent.current_prefix)
-        if oracle_recipe_id is not None or oracle_preference_id is not None:
-            t_pred = time.perf_counter()
-            dist = agent.predict_with_oracle(prefix, oracle_recipe_id or rid, oracle_preference_id)
-            prediction_wall_s = time.perf_counter() - t_pred
-        else:
-            t_pred = time.perf_counter()
-            dist = agent.predict_next_tokens(prefix)
-            prediction_wall_s = time.perf_counter() - t_pred
-        ranked = top_k(dist, k=max(1, run_config.topk)) if dist else []
-        correct1 = bool(ranked and ranked[0] == actual)
-        correct3 = bool(actual in ranked)
-        hits1 += int(correct1)
-        hits3 += int(correct3)
-        if first_mismatch < 0 and not correct1:
-            first_mismatch = idx
-        nll -= math.log(max(float(dist.get(actual, floor)), floor))
-        post = _posterior_stats(agent)
+    for turn in trace.robot_turns:
+        ranked = list(turn.ranked)
+        dist = dict(turn.distribution)
+        post = dict(turn.metadata)
+        policy = dict(post.get("policy_diagnostics") or {})
         row = {
-            "step": idx,
+            "step": turn.recipe_step,
+            "recipe_step": turn.recipe_step,
+            "robot_turn_idx": turn.robot_turn_idx,
             "pair": pair.label,
             "recipe": pair.recipe_name,
             "preference": pair.preference_name,
             "memory_state": memory_state,
             "memory_state_gt": memory_state,
-            "actual": actual,
-            "actual_action": pair.actions[idx],
-            "predicted": ranked[0] if ranked else None,
-            "correct_top1": correct1,
-            "correct_topk": correct3,
+            "actual": turn.actual,
+            "actual_action": turn.actual_action,
+            "predicted": turn.predicted,
+            "correct_top1": turn.correct_top1,
+            "correct_topk": turn.correct_topk,
             "topk": ranked,
             "topk_probs": {k: float(dist.get(k, 0.0)) for k in ranked},
-            "prediction_wall_s": float(prediction_wall_s),
+            "valid_next_action_count": int(max(1, len(dist))),
+            "prediction_wall_s": float(turn.prediction_wall_s),
+            "scheduled_actor": turn.scheduled_actor,
+            "executed_by": turn.executed_by,
+            "human_corrected": turn.human_corrected,
+            "future_valid_wrong": turn.future_valid_wrong,
+            "predicted_future_offset": turn.predicted_future_offset,
+            "hrc_step_time": float(turn.hrc_step_time),
+            "hrc_total_time_so_far": float(turn.hrc_total_time_so_far),
+            "human_actions_so_far": int(turn.human_actions_so_far),
+            "human_effort_time_so_far": float(turn.human_effort_time_so_far),
+            "inferred_recipe": post.get("posterior_recipe"),
+            "inferred_variant_hash": getattr(agent, "inferred_variant_hash", None),
+            "inferred_latent_pref_id": getattr(agent, "inferred_latent_pref_id", None),
+            "locked_variant_key": (
+                list(getattr(agent, "locked_variant_key"))
+                if getattr(agent, "locked_variant_key", None) is not None else None
+            ),
             **post,
         }
         if event_tag:
@@ -4099,37 +2542,38 @@ def assist_episode(
             row["distribution"] = {k: float(v) for k, v in sorted(dist.items(), key=lambda kv: -kv[1])}
         steps.append(row)
         live_steps.append(LiveStepRecord(
-            step=idx,
-            predicted=ranked[0] if ranked else None,
-            actual=actual,
-            correct_top1=correct1,
-            correct_topk=correct3,
+            step=turn.robot_turn_idx,
+            predicted=turn.predicted,
+            actual=turn.actual,
+            correct_top1=turn.correct_top1,
+            correct_topk=turn.correct_topk,
             topk=tuple(ranked),
             inferred_recipe=post.get("posterior_recipe"),
-            inferred_pref=getattr(agent, "inferred_pref", None),
-            inferred_latent_pref=post.get("posterior_preference"),
+            inferred_variant_hash=getattr(agent, "inferred_variant_hash", None),
+            inferred_latent_pref_id=post.get("posterior_preference"),
             posterior_entropy=post.get("posterior_entropy"),
-            posterior_confidence=post.get("action_confidence"),
+            posterior_confidence=post.get("posterior_confidence"),
             posterior_raw_entropy=post.get("posterior_raw_entropy"),
             posterior_max_prob=post.get("posterior_max_prob"),
             posterior_n_hypotheses=post.get("posterior_n_hypotheses"),
-            assist_used=bool(post.get("assist_used", False)),
-            raw_action_confidence=post.get("raw_action_confidence"),
-            action_gate_score=post.get("action_gate_score"),
-            action_margin=post.get("action_margin"),
-            action_gate_threshold=post.get("action_gate_threshold"),
-            action_marginal_entropy=post.get("action_entropy"),
-            assist_source=post.get("assist_source"),
-            final_action_confidence=post.get("final_action_confidence"),
-            final_action_margin=post.get("final_action_margin"),
-            final_action_entropy=post.get("final_action_entropy"),
-            conditioned_action_confidence=post.get("conditioned_action_confidence"),
-            ensemble_action_confidence=post.get("ensemble_action_confidence"),
-            policy_agreement=post.get("policy_agreement"),
-            blend_strength=post.get("blend_strength"),
-            prediction_wall_s=float(prediction_wall_s),
+            would_assist_under_gate=bool(policy.get("would_assist_under_gate", False)),
+            policy_confidence=policy.get("policy_confidence"),
+            policy_raw_confidence=policy.get("policy_raw_confidence"),
+            policy_gate_score=policy.get("policy_gate_score"),
+            policy_margin=policy.get("policy_margin"),
+            gate_threshold=policy.get("gate_threshold"),
+            policy_entropy=policy.get("policy_entropy"),
+            gate_source=policy.get("gate_source"),
+            gate_reason=policy.get("gate_reason"),
+            policy_final_confidence=policy.get("policy_final_confidence"),
+            policy_final_margin=policy.get("policy_final_margin"),
+            policy_final_entropy=policy.get("policy_final_entropy"),
+            conditioned_policy_confidence=policy.get("conditioned_policy_confidence"),
+            ensemble_policy_confidence=policy.get("ensemble_policy_confidence"),
+            policy_agreement=policy.get("policy_agreement"),
+            blend_strength=policy.get("blend_strength"),
+            prediction_wall_s=float(turn.prediction_wall_s),
         ))
-        agent.observe_observation(obs, ground_truth_recipe=rid)
     cls = None
     if commit:
         cls = agent.end_demo()
@@ -4138,7 +2582,9 @@ def assist_episode(
     else:
         agent.current_prefix = []
         agent.inferred_recipe = None
-        agent.inferred_pref = None
+        agent.inferred_variant_hash = None
+        if hasattr(agent, "inferred_latent_pref_id"):
+            agent.inferred_latent_pref_id = None
         if hasattr(agent, "_needs_observation"):
             agent._needs_observation = False
         if hasattr(agent, "_pending_argmax"):
@@ -4150,15 +2596,21 @@ def assist_episode(
         if hasattr(agent, "locked_pref_id"):
             agent.locked_pref_id = None
         agent.posterior.reset()
-    n = max(1, len(actual_tokens))
-    assist_steps = [s for s in steps if s.get("assist_used")]
-    closed_wrong = [s for s in steps if not s.get("assist_used") and not s.get("correct_top1")]
-    post_div = [s for s in steps[first_mismatch + 1:]] if first_mismatch >= 0 else steps
+    summary = trace.summary
+    n_robot_turns = summary.n_robot_turns
+    n = max(1, n_robot_turns)
+    n_recipe_steps = max(1, int(summary.n_recipe_steps))
+    total_robot_turn_nll = float(summary.nll)
+    mean_nll_per_robot_turn = float(total_robot_turn_nll / max(1, n_robot_turns))
+    mean_nll_per_recipe_step = float(total_robot_turn_nll / n_recipe_steps)
+    first_mismatch = summary.first_mismatch_robot_turn
+    first_mismatch_recipe_step = summary.first_mismatch_recipe_step
     recipe_hits = [s for s in steps if rid is not None and s.get("posterior_recipe") == rid]
-    confidence_vals = [float(s["action_confidence"]) for s in steps if s.get("action_confidence") is not None]
-    raw_confidence_vals = [float(s["raw_action_confidence"]) for s in steps if s.get("raw_action_confidence") is not None]
-    gate_score_vals = [float(s["action_gate_score"]) for s in steps if s.get("action_gate_score") is not None]
-    margin_vals = [float(s["action_margin"]) for s in steps if s.get("action_margin") is not None]
+    confidence_vals = [v for s in steps for v in (_row_policy_value(s, "policy_confidence"),) if v is not None]
+    raw_confidence_vals = [v for s in steps for v in (_row_policy_value(s, "policy_raw_confidence"),) if v is not None]
+    gate_score_vals = [v for s in steps for v in (_row_policy_value(s, "policy_gate_score"),) if v is not None]
+    margin_vals = [v for s in steps for v in (_row_policy_value(s, "policy_margin"),) if v is not None]
+    policy_entropy_vals = [v for s in steps for v in (_row_policy_value(s, "policy_entropy"),) if v is not None]
     entropy_vals = [float(s["posterior_entropy"]) for s in steps if s.get("posterior_entropy") is not None]
     degenerate = [s for s in steps if int(s.get("posterior_n_hypotheses") or 0) <= 1]
     live_record = LiveEpisodeRecord(
@@ -4169,12 +2621,32 @@ def assist_episode(
         memory_state=memory_state,
         mode="assist",
         steps=tuple(live_steps),
-        live_top1=hits1 / n,
-        live_topk=hits3 / n,
-        n=len(actual_tokens),
-        first_mismatch_step=None if first_mismatch < 0 else first_mismatch,
+        live_top1=summary.hits1 / n,
+        live_topk=summary.hitsk / n,
+        n=n_robot_turns,
+        first_mismatch_robot_turn=None if first_mismatch < 0 else first_mismatch,
     )
     rich_metrics = live_episode_metrics(live_record, true_rid=rid)
+    human_only_time = float(summary.human_only_time)
+    hrc_time_penalty = float(summary.hrc_total_time - human_only_time)
+    human_action_count = int(summary.human_turn_count + summary.human_correction_count)
+    human_correction_rate = float(summary.human_correction_count / max(1, n_robot_turns))
+    human_action_fraction = float(summary.human_action_fraction)
+    human_effort_time = float(summary.human_effort_time)
+    human_effort_fraction = float(summary.human_effort_fraction)
+    timing_details = _hrc_timing_details(
+        hrc_total_time=float(summary.hrc_total_time),
+        human_only_time=human_only_time,
+        hrc_time_penalty_vs_human_only=hrc_time_penalty,
+        observation_mode_extra_time=0.0,
+        hrc_mean_time_per_recipe_step=float(summary.hrc_total_time / max(1, len(actual_tokens))),
+        hrc_mean_time_per_robot_turn=float(summary.hrc_total_time / max(1, n_robot_turns)),
+        hrc_robot_correct_time=float(summary.hrc_robot_correct_time),
+        hrc_robot_wrong_time=float(summary.hrc_robot_wrong_time),
+        hrc_human_action_time=float(summary.hrc_human_action_time),
+        hrc_human_correction_time=float(summary.hrc_human_correction_time),
+        hrc_wrong_action_extra_penalty_time=float(summary.hrc_wrong_action_extra_penalty_time),
+    )
     metrics = {
         "pair": pair.label,
         "recipe": pair.recipe_name,
@@ -4182,252 +2654,620 @@ def assist_episode(
         "mode": "assist",
         "memory_state": memory_state,
         "memory_state_gt": memory_state,
-        "n_steps": len(actual_tokens),
-        "live_top1": hits1 / n,
-        "live_topk": hits3 / n,
-        "cross_entropy": nll / n,
-        "first_mismatch_step": first_mismatch,
-        "post_divergence_top1": _mean([1.0 if s["correct_top1"] else 0.0 for s in post_div]),
-        "assistance_coverage": len(assist_steps) / n,
-        "conditional_top1": _mean([1.0 if s["correct_top1"] else 0.0 for s in assist_steps]),
-        "useful_assistance_rate": (len(assist_steps) / n) * _mean([1.0 if s["correct_top1"] else 0.0 for s in assist_steps]),
-        "abstention_error_rate": len(closed_wrong) / max(1, n - len(assist_steps)),
+        "n_steps": n_robot_turns,
+        "n_recipe_steps": len(actual_tokens),
+        "live_top1": summary.hits1 / n,
+        "live_topk": summary.hitsk / n,
+        "total_robot_turn_nll": total_robot_turn_nll,
+        "nll_scored_robot_turns": float(n_robot_turns),
+        "nll_normalization_recipe_steps": float(summary.n_recipe_steps),
+        "mean_nll_per_robot_turn": mean_nll_per_robot_turn,
+        "mean_nll_per_recipe_step": mean_nll_per_recipe_step,
+        "first_mismatch_robot_turn": first_mismatch,
+        "first_mismatch_recipe_step": first_mismatch_recipe_step,
         "posterior_correct_recipe": len(recipe_hits) / n if rid is not None else 0.0,
-        "mean_action_confidence": _mean(confidence_vals),
-        "mean_raw_action_confidence": _mean(raw_confidence_vals),
-        "mean_action_gate_score": _mean(gate_score_vals),
-        "mean_action_margin": _mean(margin_vals),
+        "mean_policy_confidence": _mean(confidence_vals),
+        "mean_policy_raw_confidence": _mean(raw_confidence_vals),
+        "mean_policy_gate_score": _mean(gate_score_vals),
+        "mean_policy_margin": _mean(margin_vals),
         "mean_posterior_entropy": _mean(entropy_vals),
+        "mean_policy_entropy": _mean(policy_entropy_vals),
         "posterior_degenerate_rate": len(degenerate) / n,
         "classification_kind": getattr(cls, "kind", None),
         "classification_recipe_id": getattr(cls, "recipe_id", None),
-        "classification_pref_hash": getattr(cls, "pref_hash", None),
+        "classification_variant_hash": getattr(cls, "variant_hash", None),
         "needs_observation": getattr(agent, "_needs_observation", False) or getattr(cls, "kind", None) == "needs_observation",
         "live_record": live_record,
         **rich_metrics,
+        "hrc_robot_turn_count": n_robot_turns,
+        "hrc_human_turn_count": summary.human_turn_count,
+        "hrc_human_correction_count": summary.human_correction_count,
+        "hrc_human_action_count": human_action_count,
+        "hrc_robot_correct_count": summary.robot_correct_count,
+        "hrc_robot_wrong_count": summary.robot_wrong_count,
+        "human_correction_rate": human_correction_rate,
+        "human_action_fraction": human_action_fraction,
+        "human_effort_time": human_effort_time,
+        "human_effort_fraction": human_effort_fraction,
+        "primary_hrc_metric": "human_action_fraction",
+        "primary_hrc_metric_value": human_action_fraction,
+        "human_workload_reduction_vs_human_only": float(1.0 - human_action_fraction),
+        "hrc_future_valid_wrong_count": summary.future_valid_wrong_count,
+        # future_valid_wrong_rate omitted from primary metrics: a wrong
+        # prediction is wrong regardless of whether it matches a future action.
+        # future_valid_wrong_count is kept for per-turn diagnostic inspection.
+        "wrong_prediction_future_valid_rate": (
+            float(summary.future_valid_wrong_count / summary.robot_wrong_count)
+            if summary.robot_wrong_count > 0 else float("nan")
+            # NaN when no wrong predictions: the rate is undefined, not zero.
+            # _mean() already filters NaN before aggregating across episodes.
+        ),
+        "timing_details": timing_details,
+        "observation_mode_episode": 0.0,
+        "user_observation_required": 0.0,
+        "mode_decision_source": "user",
+        "mode_route_reason": "user_selected_assist_active_recipe",
         **(event_tag or {}),
     }
+    if probe_snapshot is not None:
+        agent.restore_from(probe_snapshot)
     return metrics, steps
 
 
-def frozen_eval(agent: AdaptiveHRCAgent, pairs: Sequence[RecipePrefPair], name_to_rid: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, float]]:
+def frozen_eval(agent: AdaptiveHRCAgent, pairs: Sequence[RecipePrefPair], name_to_rid: Optional[Dict[str, str]] = None, run_config: Optional[RunConfig] = None) -> Dict[str, Dict[str, float]]:
+    """Evaluate the agent using the HRC protocol without updating any state.
+
+    Accuracy is measured only on the steps the robot is scheduled to carry out —
+    matching the live deployment metric exactly. Human turns and corrections are
+    accounted for in timing but not counted toward accuracy.
+
+    This intentionally uses snapshot/restore rather than ``agent.frozen()``.
+    Frozen mode blocks ``observe_observation`` from advancing the online prefix,
+    which would make later robot turns condition on the wrong interaction history.
+    """
+    if getattr(agent, "_frozen", False):
+        raise RuntimeError("frozen_eval must not be called inside agent.frozen(); it manages its own snapshot/restore")
+    _run_config = run_config if run_config is not None else RunConfig()
     out: Dict[str, Dict[str, float]] = {}
-    with agent.frozen():
-        for pair in pairs:
-            if isinstance(agent, OracleCeilingAgent):
-                agent.set_oracle_target(pair.actions)
-            rid = (name_to_rid or {}).get(pair.recipe_name)
-            out[pair.label] = agent.evaluate_autonomous_tokens(pair.actions, topn=3, ground_truth_recipe=rid)
+    for pair in pairs:
+        checkpoint = agent.snapshot()
+        try:
+            row, _ = assist_episode(
+                agent, pair, dict(name_to_rid or {}),
+                run_config=_run_config,
+                commit=False,
+            )
+        finally:
+            agent.restore_from(checkpoint)
+        topk_value = max(1, int(_run_config.topk))
+        row_out = {
+            "top1": float(row.get("live_top1", 0.0)),
+            "topk": float(row.get("live_topk", 0.0)),
+            "n": float(row.get("n_steps", 0)),
+            "live_top1": float(row.get("live_top1", 0.0)),
+            "live_topk": float(row.get("live_topk", 0.0)),
+        }
+        row_out[f"top{topk_value}"] = float(row.get("live_topk", 0.0))
+        out[pair.label] = row_out
     return out
 
 
-def coverage_vs_accuracy_curve(
-    agent: AdaptiveHRCAgent,
-    pairs: Sequence[RecipePrefPair],
-    name_to_rid: Optional[Dict[str, str]],
+def _hrc_net_action_value(row: Mapping[str, Any], *, wrong_assist_penalty: float = ASSIST_WRONG_PENALTY) -> float:
+    if isinstance(row.get("net_robot_action_value"), (int, float)):
+        return float(row.get("net_robot_action_value", 0.0))
+    if isinstance(row.get("net_assistance_value"), (int, float)):
+        return float(row.get("net_assistance_value", 0.0))
+    live_top1 = float(row.get("live_top1", 0.0))
+    wrong_rate = float(row.get("robot_wrong_rate", row.get("assist_wrong_rate", row.get("wrong_assistance_rate", 0.0))))
+    return float(live_top1 - float(wrong_assist_penalty) * wrong_rate)
+
+
+def _oracle_reference_metrics(
+    seed: int,
     run_config: RunConfig,
-    thresholds: Sequence[float],
-) -> Dict[str, Dict[str, float]]:
-    snap = agent.snapshot()
-    original_cfg = agent.cfg
-    out: Dict[str, Dict[str, float]] = {}
-    for threshold in thresholds:
-        agent.restore_from(snap)
-        agent.cfg = replace(agent.cfg, posterior_action_confidence_threshold=float(threshold))
+    train_pairs: Sequence[RecipePrefPair],
+    eval_pairs: Sequence[RecipePrefPair],
+    *,
+    max_eval_pairs: Optional[int] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Evaluate non-deployable oracle references on a fixed train/eval split.
+
+    These are reported as reference lines, not deployable baselines. The recipe
+    and preference oracles only reveal labels that can be mapped through the
+    training checkpoint; the next-action oracle reads the simulator target.
+    """
+    eval_list = list(eval_pairs)
+    if max_eval_pairs is not None:
+        eval_list = eval_list[: max(0, int(max_eval_pairs))]
+    if not eval_list:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for oracle_name in ORACLE_REFERENCE_BASELINES:
+        agent_name = "oracle_ceiling" if oracle_name == "oracle_ceiling" else "full"
+        agent = make_agent(agent_name, base_config(seed, run_config))
+        name_to_rid: Dict[str, str] = {}
+        pref_to_pid: Dict[str, Optional[str]] = {}
+        for pair in train_pairs:
+            observe_episode(agent, pair, name_to_rid)
+            if pair.preference_name not in pref_to_pid:
+                pref_to_pid[pair.preference_name] = getattr(agent, "last_pref_id", None)
         rows: List[Dict[str, Any]] = []
-        for pair in pairs:
-            row, _steps = assist_episode(agent, pair, dict(name_to_rid or {}), run_config=run_config, commit=False, event_tag={"threshold": threshold})
+        for pair in eval_list:
+            kwargs: Dict[str, Any] = {}
+            if oracle_name in {"oracle_recipe_label", "oracle_recipe_and_preference_label"}:
+                kwargs["oracle_recipe_id"] = name_to_rid.get(pair.recipe_name)
+            if oracle_name in {"oracle_preference_label", "oracle_recipe_and_preference_label"}:
+                kwargs["oracle_preference_id"] = pref_to_pid.get(pair.preference_name)
+            row, _steps = assist_episode(
+                agent,
+                pair,
+                dict(name_to_rid),
+                run_config=run_config,
+                commit=False,
+                event_tag={"oracle_reference": oracle_name},
+                **kwargs,
+            )
             rows.append(row)
         agg = _aggregate_episode_metrics(rows)
-        wrong_all_steps = max(0.0, float(agg.get("assistance_coverage", 0.0)) - float(agg.get("useful_assistance_rate", 0.0)))
-        out[str(threshold)] = {
-            "live_top1": float(agg.get("live_top1", 0.0)),
-            "live_topk": float(agg.get("live_topk", 0.0)),
-            "coverage": float(agg.get("assistance_coverage", 0.0)),
-            "conditional_top1": float(agg.get("conditional_top1", 0.0)),
-            "useful_assistance_rate": float(agg.get("useful_assistance_rate", 0.0)),
-            "wrong_assistance_rate": float(wrong_all_steps),
-            "net_assistance_value": float(agg.get("net_assistance_value", 0.0)),
-            "correct_prediction_assist_recall": float(agg.get("correct_prediction_assist_recall", 0.0)),
-            "wrong_prediction_assist_rate": float(agg.get("wrong_prediction_assist_rate", 0.0)),
-            "hidden_correct_rate": float(agg.get("hidden_correct_rate", 0.0)),
-            "n": float(agg.get("n_steps", 0.0)),
+        ci95 = {
+            metric: _stderr95([
+                float(r.get(metric, 0.0))
+                for r in rows
+                if isinstance(r.get(metric, None), (int, float))
+            ])
+            for metric in (
+                "live_top1",
+                "live_topk",
+                "adaptation_recovery_top1_w3",
+                "robot_wrong_rate",
+                "net_robot_action_value",
+            )
         }
-    agent.restore_from(snap)
-    agent.cfg = original_cfg
+        out[oracle_name] = {
+            **agg,
+            "oracle_type": oracle_name,
+            "mean": {
+                metric: float(agg.get(metric, 0.0))
+                for metric in ci95
+            },
+            "ci95": ci95,
+            "n": float(agg.get("n_steps", 0.0)),
+            "n_eval_pairs": len(eval_list),
+            "reported_as": "dashed_reference_not_deployable",
+        }
     return out
 
 
-def hrc_assistance_utility(
-    row: Mapping[str, float],
-    *,
-    wrong_assist_penalty: float = ASSIST_WRONG_PENALTY,
-    hidden_correct_penalty: float = ASSIST_HIDDEN_CORRECT_PENALTY,
-) -> float:
-    """Reviewer-facing assistance utility: correct assists minus harmful and missed assists."""
-    useful = float(row.get("useful_assistance_rate", 0.0))
-    wrong_all_steps = float(row.get("wrong_assistance_rate", max(0.0, float(row.get("coverage", 0.0)) - useful)))
-    hidden_correct = float(row.get("hidden_correct_rate", 0.0))
-    return float(useful - float(wrong_assist_penalty) * wrong_all_steps - float(hidden_correct_penalty) * hidden_correct)
-
-
-def _annotate_gate_curve_utility(
-    curve: Mapping[str, Mapping[str, float]],
-    *,
-    wrong_assist_penalty: float = ASSIST_WRONG_PENALTY,
-    hidden_correct_penalty: float = ASSIST_HIDDEN_CORRECT_PENALTY,
-) -> Dict[str, Dict[str, float]]:
-    out: Dict[str, Dict[str, float]] = {}
-    for key, row in curve.items():
-        numeric = {str(k): float(v) for k, v in (row or {}).items() if isinstance(v, (int, float))}
-        numeric["hrc_assistance_utility"] = hrc_assistance_utility(
-            numeric,
-            wrong_assist_penalty=wrong_assist_penalty,
-            hidden_correct_penalty=hidden_correct_penalty,
-        )
-        out[str(key)] = numeric
-    return out
-
-
-def select_action_gate_threshold(
-    curve: Mapping[str, Mapping[str, float]],
-    *,
-    min_conditional_top1: float = 0.55,
-    max_wrong_assist_rate: float = 0.45,
-    wrong_assist_penalty: float = ASSIST_WRONG_PENALTY,
-    hidden_correct_penalty: float = ASSIST_HIDDEN_CORRECT_PENALTY,
-) -> Tuple[float, Dict[str, Any]]:
-    rows: List[Tuple[float, Dict[str, float]]] = []
-    for key, row in curve.items():
-        try:
-            threshold = float(key)
-        except Exception:
-            continue
-        if not isinstance(row, Mapping):
-            continue
-        numeric = {str(k): float(v) for k, v in row.items() if isinstance(v, (int, float))}
-        numeric["hrc_assistance_utility"] = hrc_assistance_utility(
-            numeric,
-            wrong_assist_penalty=wrong_assist_penalty,
-            hidden_correct_penalty=hidden_correct_penalty,
-        )
-        rows.append((threshold, numeric))
-    if not rows:
-        default = float(DEFAULT_CONFIG.posterior_action_confidence_threshold)
-        return default, {"selected_threshold": default, "selection_reason": "empty_curve"}
-    eligible = [
-        (thr, row)
-        for thr, row in rows
-        if float(row.get("coverage", 0.0)) > 0.0
-        and float(row.get("conditional_top1", 0.0)) >= float(min_conditional_top1)
-        and float(row.get("wrong_prediction_assist_rate", 0.0)) <= float(max_wrong_assist_rate)
-    ]
-    pool = eligible or rows
-    reason = "max_hrc_assistance_utility_under_constraints" if eligible else "max_hrc_assistance_utility_unconstrained"
-    best_thr, best_row = max(
-        pool,
-        key=lambda item: (
-            float(item[1].get("hrc_assistance_utility", 0.0)),
-            float(item[1].get("useful_assistance_rate", 0.0)),
-            float(item[1].get("coverage", 0.0)),
-            -float(item[1].get("wrong_prediction_assist_rate", 0.0)),
-        ),
-    )
-    return float(best_thr), {
-        "selected_threshold": float(best_thr),
-        "selected_row": dict(best_row),
-        "selection_reason": reason,
-        "min_conditional_top1": float(min_conditional_top1),
-        "max_wrong_assist_rate": float(max_wrong_assist_rate),
-        "wrong_assist_penalty": float(wrong_assist_penalty),
-        "hidden_correct_penalty": float(hidden_correct_penalty),
-        "n_thresholds": len(rows),
-        "n_eligible_thresholds": len(eligible),
+def _event_distribution(events: Sequence[ScenarioEvent]) -> Dict[str, Any]:
+    actual = Counter(str(e.tags.get("event_type", "unknown")) for e in events if e.phase != "phase_a")
+    requested = Counter(str(e.tags.get("requested_event_type", e.tags.get("event_type", "unknown"))) for e in events if e.phase != "phase_a")
+    assist_events = [e for e in events if e.mode == "assist" and e.phase != "phase_a"]
+    substituted = [e for e in assist_events if bool(e.tags.get("event_substituted", False))]
+    total = max(1, len(assist_events))
+    return {
+        "requested_counts": dict(requested),
+        "actual_counts": dict(actual),
+        "requested_distribution": {k: v / max(1, sum(requested.values())) for k, v in requested.items()},
+        "actual_distribution": {k: v / max(1, sum(actual.values())) for k, v in actual.items()},
+        "event_substituted_rate": len(substituted) / total,
+        "n_assist_events": len(assist_events),
     }
 
 
-def deployment_gate_calibration_pairs(
+def _scaled_event_mix(base_mix: Mapping[str, float], routine_frac: float) -> Dict[str, float]:
+    routine = max(0.0, min(1.0, float(routine_frac)))
+    others = {k: max(0.0, float(v)) for k, v in base_mix.items() if k != "routine_reuse"}
+    total_other = sum(others.values())
+    if total_other <= 0.0:
+        return {"routine_reuse": 1.0}
+    scaled = {"routine_reuse": routine}
+    for key, value in others.items():
+        scaled[key] = (1.0 - routine) * value / total_other
+    return scaled
+
+
+def _event_mix_sensitivity(
     seed: int,
-    phase_a_pairs: Sequence[RecipePrefPair],
+    run_config: RunConfig,
     cfg_obj: DeploymentStreamConfig,
-) -> List[RecipePrefPair]:
-    """Offline deployment-style calibration probes drawn from known recipes.
-
-    This is separate from the Phase-B test stream. It mixes direct reuse,
-    same-recipe preference shifts, and cross-recipe seen-preference probes so
-    the operating threshold is tuned for the deployment distribution instead of
-    the pessimistic identity-only S4 calibration.
-    """
-    max_pairs = max(1, int(cfg_obj.calibration_n_probe_pairs))
-    rng = _rng(seed, 8607)
-    library = gen.recipe_library()
-    phase_by_recipe = {p.recipe_name: p for p in phase_a_pairs}
-    seen_prefs = sorted({p.preference_name for p in phase_a_pairs})
-    candidates: List[RecipePrefPair] = []
-
-    def add_pair(recipe: str, preference: str) -> None:
-        if recipe not in library:
-            return
-        try:
-            candidates.append(materialize_pair(recipe, preference, library[recipe]))
-        except Exception:
-            return
-
-    for pair in phase_a_pairs:
-        candidates.append(pair)
-    for pair in phase_a_pairs:
-        prefs = [p for p in PREFERENCE_NAMES if p != pair.preference_name]
-        rng.shuffle(prefs)
-        for pref in prefs[:3]:
-            add_pair(pair.recipe_name, pref)
-    for recipe, base_pair in phase_by_recipe.items():
-        prefs = [p for p in seen_prefs if p != base_pair.preference_name]
-        rng.shuffle(prefs)
-        for pref in prefs[:2]:
-            add_pair(recipe, pref)
-
-    unique = list({p.label: p for p in candidates}.values())
-    rng.shuffle(unique)
-    return unique[: min(max_pairs, len(unique))]
-
-
-def _calibratable_action_gate_baselines(baselines: Sequence[str], cfg_obj: DeploymentStreamConfig) -> Tuple[str, ...]:
-    if not bool(getattr(cfg_obj, "calibrate_full_action_gate", True)):
-        return ()
-    explicit = tuple(str(b) for b in getattr(cfg_obj, "calibration_baselines", ()) if b)
-    candidates = explicit or tuple(str(b) for b in baselines)
-    non_deployable = {"oracle_ceiling", "oracle_preference_label", "oracle_recipe_and_preference_label"}
-    return tuple(dict.fromkeys(b for b in candidates if b in baselines and b not in non_deployable))
-
-
-def _gate_curve_row_at_threshold(curve: Mapping[str, Mapping[str, float]], threshold: float) -> Dict[str, float]:
-    if not curve:
+) -> Dict[str, Any]:
+    fractions = tuple(float(x) for x in getattr(cfg_obj, "event_mix_sweep_routine_fracs", ()) or ())
+    if not fractions:
         return {}
-    target = float(threshold)
-    best_key = min(curve.keys(), key=lambda key: abs(float(key) - target))
-    row = curve.get(best_key, {}) or {}
-    out = {str(k): float(v) for k, v in row.items() if isinstance(v, (int, float))}
-    out["threshold"] = float(best_key)
+    baselines = tuple(b for b in PAPER_BASELINES if b in set(run_config.baselines)) or ("full",)
+    max_events = min(60, int(cfg_obj.n_phase_b_events))
+    out: Dict[str, Any] = {}
+    for frac in fractions:
+        sub_cfg = replace(
+            cfg_obj,
+            event_mix=_scaled_event_mix(cfg_obj.event_mix, frac),
+            n_phase_b_events=max_events,
+            event_mix_sweep_routine_fracs=(),
+        )
+        _recipes, _users, events, _phase_a_pairs, _new_recipe_rejections = _deployment_stream_events(seed + int(round(frac * 1000)), sub_cfg, run_config)
+        per_baseline: Dict[str, Any] = {}
+        for baseline in baselines:
+            row, _episode_rows, _step_rows, _memory_rows = _run_baseline_stream(
+                baseline,
+                base_config(seed, run_config),
+                events,
+                replace(run_config, baselines=(baseline,)),
+            )
+            per_baseline[baseline] = row
+        full_top1 = float(per_baseline.get("full", {}).get("live_top1", 0.0))
+        out[str(frac)] = {
+            "routine_reuse_frac": frac,
+            "event_distribution": _event_distribution(events),
+            "per_baseline": per_baseline,
+            "full_minus_baseline_live_top1": {
+                b: full_top1 - float(row.get("live_top1", 0.0))
+                for b, row in per_baseline.items()
+                if b != "full"
+            },
+        }
+    return out
+
+
+def _memory_key_for_pair(agent: AdaptiveHRCAgent, pair: RecipePrefPair, name_to_rid: Mapping[str, str]) -> Optional[VariantKey]:
+    rid = name_to_rid.get(pair.recipe_name)
+    if rid is None:
+        return None
+    return (rid, variant_hash(agent._tokens_from_action_labels(pair.actions)))
+
+
+def _online_best_so_far_forgetting_rows(
+    agent: AdaptiveHRCAgent,
+    pairs: Sequence[RecipePrefPair],
+    name_to_rid: Mapping[str, str],
+    evals: Mapping[str, Mapping[str, float]],
+    best_top1_by_pair: Dict[str, float],
+    *,
+    baseline: str,
+    event_idx: int,
+    phase_b_count: int,
+    phase: str,
+    mode: str,
+    event_type: str,
+    displaced_at: Mapping[VariantKey, int],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for pair in pairs:
+        eval_row = evals.get(pair.label, {}) or {}
+        current_top1 = float(eval_row.get("top1", 0.0))
+        current_topk = float(eval_row.get("topk", 0.0))
+        prior_best = float(best_top1_by_pair.get(pair.label, current_top1))
+        forgetting = max(0.0, prior_best - current_top1)
+        best_top1_by_pair[pair.label] = max(prior_best, current_top1)
+        key = _memory_key_for_pair(agent, pair, name_to_rid)
+        rid = key[0] if key is not None else None
+        h = key[1] if key is not None else None
+        active_entry = agent.decay.active.get(key) if key is not None else None
+        pruned_entry = agent.decay.pruned.get(key) if key is not None else None
+        latest_hash = agent.decay.latest_by_recipe.get(rid) if rid is not None else None
+        is_latest = bool(h is not None and latest_hash == h)
+        if key is None:
+            subgroup = "unmapped"
+        elif is_latest:
+            subgroup = "latest_pin"
+        elif active_entry is not None:
+            subgroup = "displaced_active"
+        elif pruned_entry is not None:
+            subgroup = "pruned"
+        else:
+            subgroup = "known_in_registry"
+        rows.append({
+            "baseline": baseline,
+            "event_idx": int(event_idx),
+            "phase_b_count": int(phase_b_count),
+            "phase": phase,
+            "mode": mode,
+            "event_type": event_type,
+            "pair": pair.label,
+            "recipe": pair.recipe_name,
+            "preference": pair.preference_name,
+            "subgroup": subgroup,
+            "top1": current_top1,
+            "topk": current_topk,
+            "best_top1_before": prior_best,
+            "best_top1_ever": float(best_top1_by_pair[pair.label]),
+            "best_so_far_forgetting_top1": forgetting,
+            "weight": float(active_entry.weight) if active_entry is not None else 0.0,
+            "sessions_since_displaced": 0 if is_latest or key is None else max(0, int(phase_b_count) - int(displaced_at.get(key, 0))),
+            "sessions_since_pruned": (
+                max(0, int(agent.session_counter) - int(pruned_entry.removed_step))
+                if pruned_entry is not None else 0
+            ),
+            "variant_is_latest_pin": bool(is_latest),
+            "variant_is_active": bool(active_entry is not None),
+            "variant_is_pruned": bool(pruned_entry is not None),
+        })
+    return rows
+
+
+def _summarize_online_forgetting_rows(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    vals = [float(r.get("best_so_far_forgetting_top1", 0.0)) for r in rows]
+    worst_by_pair: Dict[str, float] = {}
+    final_by_pair: Dict[str, float] = {}
+    for row in rows:
+        pair = str(row.get("pair", ""))
+        val = float(row.get("best_so_far_forgetting_top1", 0.0))
+        worst_by_pair[pair] = max(float(worst_by_pair.get(pair, 0.0)), val)
+        final_by_pair[pair] = val
+    by_subgroup: Dict[str, Any] = {}
+    for subgroup in sorted({str(r.get("subgroup", "unknown")) for r in rows}):
+        subgroup_vals = [
+            float(r.get("best_so_far_forgetting_top1", 0.0))
+            for r in rows
+            if str(r.get("subgroup", "unknown")) == subgroup
+        ]
+        by_subgroup[subgroup] = {
+            "n_rows": float(len(subgroup_vals)),
+            "mean_forgetting_top1": _mean(subgroup_vals),
+            "p95_forgetting_top1": _p95(subgroup_vals),
+            "max_forgetting_top1": max(subgroup_vals, default=0.0),
+            "forgetting_event_rate": _mean([1.0 if v > 1e-12 else 0.0 for v in subgroup_vals]),
+            "histogram": _histogram(subgroup_vals),
+        }
+    return {
+        "metric_definition": "max(0, best_top1_ever_seen_for_pair_before_event - top1_after_learning_event)",
+        "sampling": "after_every_learning_event_after_initial_onboarding",
+        "n_rows": float(len(rows)),
+        "n_pairs": float(len(worst_by_pair)),
+        "n_events": float(len({int(r.get("event_idx", -1)) for r in rows})),
+        "mean_forgetting_top1": _mean(vals),
+        "p95_forgetting_top1": _p95(vals),
+        "max_forgetting_top1": max(vals, default=0.0),
+        "forgetting_event_rate": _mean([1.0 if v > 1e-12 else 0.0 for v in vals]),
+        "all_row_histogram": _histogram(vals),
+        "worst_per_pair_mean": _mean(list(worst_by_pair.values())),
+        "worst_per_pair_p95": _p95(list(worst_by_pair.values())),
+        "worst_per_pair_max": max(worst_by_pair.values(), default=0.0),
+        "worst_per_pair_histogram": _histogram(list(worst_by_pair.values())),
+        "final_per_pair_mean": _mean(list(final_by_pair.values())),
+        "final_per_pair_histogram": _histogram(list(final_by_pair.values())),
+        "by_subgroup": by_subgroup,
+    }
+
+
+def _summarize_preference_reentry_rows(rows: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    return {
+        "n_reentries": float(len(rows)),
+        "pre_reentry_top1": _mean([float(r.get("pre_reentry_top1", 0.0)) for r in rows]),
+        "during_reentry_step_top1": _mean([float(r.get("during_reentry_step_top1", 0.0)) for r in rows]),
+        "post_reentry_top1": _mean([float(r.get("post_reentry_top1", 0.0)) for r in rows]),
+        "steps_to_recover": _mean([float(r.get("steps_to_recover", -1.0)) for r in rows if float(r.get("steps_to_recover", -1.0)) >= 0.0]),
+        "recovery_failure_rate": _mean([0.0 if r.get("recovered") else 1.0 for r in rows]),
+        "robot_wrong_rate_before_recovery": _mean([float(r.get("robot_wrong_rate_before_recovery", r.get("wrong_assist_rate_before_recovery", 0.0))) for r in rows]),
+    }
+
+
+def _variant_state_for_pair(agent: AdaptiveHRCAgent, pair: RecipePrefPair, name_to_rid: Mapping[str, str]) -> str:
+    key = _memory_key_for_pair(agent, pair, name_to_rid)
+    if key is None:
+        return "unseen"
+    rid, h = key
+    if agent.decay.latest_by_recipe.get(rid) == h:
+        return "latest_pin"
+    if key in agent.decay.active:
+        return "displaced_active"
+    if key in agent.decay.pruned:
+        return "pruned"
+    return "known_in_registry"
+
+
+def _preference_decay_profile(seed: int, run_config: RunConfig, cfg_obj: DeploymentStreamConfig) -> Dict[str, Any]:
+    builders = select_recipe_builders(seed + 7919, max(3, int(cfg_obj.n_recipes)))
+    target_recipe = ""
+    target_fn: Optional[Callable[[], List[str]]] = None
+    target_pairs: List[RecipePrefPair] = []
+    for recipe, fn in builders:
+        pairs: List[RecipePrefPair] = []
+        seen_orderings: set = set()
+        for pref in PREFERENCE_NAMES:
+            try:
+                pair = materialize_pair(recipe, pref, fn)
+            except Exception:
+                continue
+            if pair.actions in seen_orderings:
+                continue
+            seen_orderings.add(pair.actions)
+            pairs.append(pair)
+            if len(pairs) >= 3:
+                break
+        if len(pairs) >= 3:
+            target_recipe = recipe
+            target_fn = fn
+            target_pairs = pairs[:3]
+            break
+    if target_fn is None or len(target_pairs) < 3:
+        return {
+            "status": "insufficient_material_preferences",
+            "rows": [],
+            "displacements": [],
+        }
+    distractors: List[RecipePrefPair] = []
+    for recipe, fn in builders:
+        if recipe == target_recipe:
+            continue
+        for pref in ("identity", target_pairs[0].preference_name, target_pairs[1].preference_name):
+            try:
+                distractors.append(materialize_pair(recipe, pref, fn))
+            except Exception:
+                continue
+            if len(distractors) >= 12:
+                break
+        if len(distractors) >= 12:
+            break
+    if not distractors:
+        for pref in PREFERENCE_NAMES:
+            if pref not in {p.preference_name for p in target_pairs}:
+                try:
+                    distractors.append(materialize_pair(target_recipe, pref, target_fn))
+                except Exception:
+                    continue
+            if distractors:
+                break
+    agent = make_agent("full", base_config(seed, run_config))
+    name_to_rid: Dict[str, str] = {}
+    rows: List[Dict[str, Any]] = []
+    displacements: List[Dict[str, Any]] = []
+
+    def record(elapsed: int, checkpoint: str) -> None:
+        evals = frozen_eval(agent, target_pairs, name_to_rid)
+        for idx, pair in enumerate(target_pairs, start=1):
+            rows.append({
+                "elapsed_sessions": int(elapsed),
+                "checkpoint": checkpoint,
+                "recipe": pair.recipe_name,
+                "pair": pair.label,
+                "preference_index": idx,
+                "preference": pair.preference_name,
+                "top1": float((evals.get(pair.label, {}) or {}).get("top1", 0.0)),
+                "topk": float((evals.get(pair.label, {}) or {}).get("topk", 0.0)),
+                "state": _variant_state_for_pair(agent, pair, name_to_rid),
+            })
+
+    observe_episode(agent, target_pairs[0], name_to_rid)
+    record(0, "after_p1")
+    observe_episode(agent, target_pairs[1], name_to_rid)
+    displacements.append({
+        "elapsed_sessions": 1,
+        "label": "p1 displaced by p2",
+        "displaced_pair": target_pairs[0].label,
+        "displaced_preference": target_pairs[0].preference_name,
+        "incoming_pair": target_pairs[1].label,
+        "incoming_preference": target_pairs[1].preference_name,
+    })
+    record(1, "after_p2")
+    observe_episode(agent, target_pairs[2], name_to_rid)
+    displacements.append({
+        "elapsed_sessions": 2,
+        "label": "p2 displaced by p3",
+        "displaced_pair": target_pairs[1].label,
+        "displaced_preference": target_pairs[1].preference_name,
+        "incoming_pair": target_pairs[2].label,
+        "incoming_preference": target_pairs[2].preference_name,
+    })
+    record(2, "after_p3")
+    max_tail = min(max(8, int(cfg_obj.n_phase_b_events)), 30)
+    checkpoints = sorted({3, 5, 10, max_tail})
+    elapsed = 2
+    for target_elapsed in checkpoints:
+        while elapsed < target_elapsed:
+            if distractors:
+                observe_episode(agent, distractors[elapsed % len(distractors)], name_to_rid)
+            else:
+                agent.decay._recompute_effective(agent.session_counter + 1)
+            elapsed += 1
+        record(elapsed, "distractor_gap")
+    return {
+        "status": "ok",
+        "baseline": "full",
+        "recipe": target_recipe,
+        "tracked_pairs": [p.label for p in target_pairs],
+        "distractor_pairs": [p.label for p in distractors],
+        "rows": rows,
+        "displacements": displacements,
+        "caption_note": "Single-recipe p1->p2->p3 profile with unrelated distractor sessions; evaluation is frozen top-1 on the three tracked variants.",
+    }
+
+
+def _step_trace_from_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, float]]:
+    out: List[Dict[str, float]] = []
+    for step in sorted({int(r.get("step", 0)) for r in rows}):
+        vals = [r for r in rows if int(r.get("step", 0)) == step]
+        out.append({
+            "step_idx": float(step),
+            "top1": _mean([1.0 if r.get("correct_top1") else 0.0 for r in vals]),
+            "topk": _mean([1.0 if r.get("correct_topk") else 0.0 for r in vals]),
+            "robot_wrong_rate": _mean([1.0 if _row_robot_wrong(r) else 0.0 for r in vals]),
+            "posterior_confidence": _mean([float(r.get("posterior_confidence", 0.0) or 0.0) for r in vals]),
+            "n": float(len(vals)),
+        })
     return out
 
 
 def memory_snapshot(agent: AdaptiveHRCAgent) -> Dict[str, Any]:
     weights = agent.decay.weights()
-    return {
+    active_action_steps = sum(len(entry.ordering) for entry in agent.decay.active.values())
+    prototype_events = list(getattr(agent, "prototype_events", []))
+    latest_proto_event = prototype_events[-1] if prototype_events else {}
+    latest_new = latest_proto_event.get("prototype_new", []) if isinstance(latest_proto_event, Mapping) else []
+    latest_retired = latest_proto_event.get("prototype_retired", []) if isinstance(latest_proto_event, Mapping) else []
+    latest_persisted = latest_proto_event.get("prototype_persisted", []) if isinstance(latest_proto_event, Mapping) else []
+    latest_split_count = int(latest_proto_event.get("prototype_split_count", 0) or 0) if isinstance(latest_proto_event, Mapping) else 0
+    latest_merge_count = int(latest_proto_event.get("prototype_merge_count", 0) or 0) if isinstance(latest_proto_event, Mapping) else 0
+    latest_total = len(latest_new or []) + len(latest_retired or []) + len(latest_persisted or [])
+    latest_churn = len(latest_new or []) + len(latest_retired or []) + latest_split_count + latest_merge_count
+    replay_meta = {}
+    if hasattr(agent, "replay_buffer_metadata"):
+        try:
+            replay_meta = dict(agent.replay_buffer_metadata())  # type: ignore[attr-defined]
+        except Exception:
+            replay_meta = dict(getattr(agent, "_last_replay_metadata", {}) or {})
+    out = {
         "active_variants": len(agent.decay.active),
+        "active_action_steps": int(active_action_steps),
+        "active_examples": int(active_action_steps),
         "pruned_variants": len(agent.decay.pruned),
         "latest_keys": len(agent.decay.latest_keys),
         "base_rate": float(agent.decay.base_rate),
         "global_rate": float(agent.decay.global_rate),
         "reuse_gaps": list(agent.decay.reuse_gaps),
         "reuse_gap_window": list(agent.decay.window_snapshot()),
-        "active_count_window": list(agent.decay.active_count_window_snapshot()),
+        "active_recipe_count_window": list(agent.decay.active_recipe_count_window_snapshot()),
         "mean_active_weight": _mean(list(weights.values())),
         "min_active_weight": min(weights.values()) if weights else 0.0,
         "max_active_weight": max(weights.values()) if weights else 0.0,
         "retrain_cycle": int(agent.retrain_cycle),
         "retrain_skipped_count": int(getattr(agent, "retrain_skipped_count", 0)),
         "observation_mode_entries": int(getattr(agent, "observation_mode_entries", 0)),
+        "prototype_rebuild_count": len(prototype_events),
+        "prototype_churn_rate": latest_churn / max(1, latest_total),
+        "prototype_new_count": len(latest_new or []),
+        "prototype_retired_count": len(latest_retired or []),
+        "prototype_split_count": latest_split_count,
+        "prototype_merge_count": latest_merge_count,
+        "prototype_stability_ari": latest_proto_event.get("prototype_stability_ari") if isinstance(latest_proto_event, Mapping) else None,
+        "prototype_active_intersection": latest_proto_event.get("prototype_active_intersection") if isinstance(latest_proto_event, Mapping) else 0,
+    }
+    if replay_meta:
+        out["replay_buffer"] = replay_meta
+        out["replay_policy"] = replay_meta.get("policy")
+        out["er_buffer_size"] = int(replay_meta.get("er_buffer_size", agent.cfg.er_buffer_size))
+        out["er_batch_size"] = int(replay_meta.get("er_batch_size", agent.cfg.er_batch_size))
+        out["replay_memory_footprint"] = int(replay_meta.get("replay_memory_footprint", 0))
+    return out
+
+
+def variant_weight_for_pair(agent: AdaptiveHRCAgent, pair: RecipePrefPair, name_to_rid: Mapping[str, str]) -> Optional[float]:
+    rid = name_to_rid.get(pair.recipe_name)
+    if rid is None:
+        return None
+    h = variant_hash(agent._tokens_from_action_labels(pair.actions))
+    entry = agent.decay.active.get((rid, h))
+    return float(entry.weight) if entry is not None else None
+
+
+def _learner_hyperparameter_metadata(agent: AdaptiveHRCAgent) -> Dict[str, Any]:
+    cfg = agent.cfg
+    return {
+        "bc_learning_rate": float(cfg.bc_learning_rate),
+        "bc_l2": float(cfg.bc_l2),
+        "bc_history_len": int(cfg.bc_history_len),
+        "bc_history_bins": int(cfg.bc_history_bins),
+        "bc_epochs_cold": int(cfg.bc_epochs_cold),
+        "bc_epochs_warm": int(cfg.bc_epochs_warm),
+        "er_buffer_size": int(cfg.er_buffer_size),
+        "er_batch_size": int(cfg.er_batch_size),
+        "er_recency_alpha": float(cfg.er_recency_alpha),
+        "er_uniform_mix": float(cfg.er_uniform_mix),
+        "ewc_lambda": float(cfg.ewc_lambda),
+        "ewc_fisher_clip": float(cfg.ewc_fisher_clip),
+        "maxent_learning_rate": float(cfg.maxent_learning_rate),
+        "maxent_l2": float(cfg.maxent_l2),
+        "maxent_iters_cold": int(cfg.maxent_iters_cold),
+        "maxent_iters_warm": int(cfg.maxent_iters_warm),
     }
 
 
@@ -4437,7 +3277,8 @@ def compute_snapshot(agent: AdaptiveHRCAgent, wall_s: float) -> Dict[str, Any]:
     total_times = [float(v) for v in getattr(agent, "retrain_total_wall_times", [])]
     build_times = [float(v) for v in getattr(agent, "retrain_build_wall_times", [])]
     flop_estimates = [float(v) for v in getattr(agent, "retrain_flop_estimates", [])]
-    return {
+    replay_meta = dict(getattr(agent, "_last_replay_metadata", {}) or {})
+    out = {
         "wall_s": float(wall_s),
         "retrain_cycle": int(agent.retrain_cycle),
         "retrain_skipped_count": int(getattr(agent, "retrain_skipped_count", 0)),
@@ -4453,22 +3294,28 @@ def compute_snapshot(agent: AdaptiveHRCAgent, wall_s: float) -> Dict[str, Any]:
         "total_retrain_build_wall_s": float(sum(build_times)),
         "estimated_flops": float(sum(flop_estimates)),
         "last_estimated_flops": flop_estimates[-1] if flop_estimates else 0.0,
+        "mean_estimated_flops": _mean(flop_estimates),
+        "p95_estimated_flops": _p95(flop_estimates),
         "retrain_fit_wall_times": fit_times,
         "retrain_total_wall_times": total_times,
         "retrain_build_wall_times": build_times,
         "retrain_flop_estimates": flop_estimates,
         "retrain_events": _jsonable(getattr(agent, "retrain_events", [])),
         "profile": profile,
+        "learner_hyperparameters": _learner_hyperparameter_metadata(agent),
     }
+    if replay_meta:
+        out["replay_buffer"] = _jsonable(replay_meta)
+    return out
 
 
 def _four_cell(seen_recipe: bool, seen_preference: bool) -> str:
     if seen_recipe and seen_preference:
-        return "seen_seen"
+        return "known_recipe_known_preference"
     if seen_recipe and not seen_preference:
-        return "seen_unseen"
+        return "seen_recipe_new_preference"
     if (not seen_recipe) and seen_preference:
-        return "unseen_seen"
+        return "unseen_recipe_seen_preference"
     return "unseen_unseen"
 
 
@@ -4491,64 +3338,287 @@ def _transfer_cell(
     return "unseen_unseen"
 
 
-def _aggregate_episode_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, float]:
+def _transfer_cell_for_pair(
+    pair: RecipePrefPair,
+    *,
+    seen_recipes: set,
+    seen_pairs: set,
+    seen_preferences: set,
+    seen_preferences_by_recipe: Mapping[str, set],
+) -> str:
+    same_recipe_prefs = seen_preferences_by_recipe.get(pair.recipe_name, set())
+    return _transfer_cell(
+        seen_recipe=pair.recipe_name in seen_recipes,
+        seen_pair=pair.label in seen_pairs,
+        seen_preference_global=pair.preference_name in seen_preferences,
+        seen_preference_same_recipe=pair.preference_name in same_recipe_prefs,
+        seen_preference_other_recipe=any(
+            pair.preference_name in vals
+            for recipe, vals in seen_preferences_by_recipe.items()
+            if recipe != pair.recipe_name
+        ),
+    )
+
+
+def _episode_timing_value(row: Mapping[str, Any], key: str, default: float = 0.0) -> float:
+    timing_details = row.get("timing_details")
+    if isinstance(timing_details, Mapping) and key in timing_details:
+        return float(timing_details.get(key, default) or 0.0)
+    return float(row.get(key, default) or 0.0)
+
+
+_EPISODE_METRIC_FALLBACK_KEYS: Dict[str, Tuple[str, ...]] = {
+    "robot_wrong_rate": ("assist_wrong_rate", "wrong_assistance_rate", "wrong_assists_per_step"),
+    "net_robot_action_value": ("net_assistance_value",),
+    "mean_policy_confidence": ("mean_action_confidence", "mean_final_action_confidence"),
+    "mean_policy_raw_confidence": ("mean_raw_action_confidence",),
+    "mean_policy_gate_score": ("mean_action_gate_score",),
+    "mean_policy_margin": ("mean_action_margin",),
+    "mean_policy_entropy": ("mean_action_marginal_entropy",),
+    "mean_policy_final_confidence": ("mean_final_action_confidence",),
+    "mean_conditioned_policy_confidence": ("mean_conditioned_action_confidence",),
+    "mean_ensemble_policy_confidence": ("mean_ensemble_action_confidence",),
+}
+
+
+def _episode_metric_value(row: Mapping[str, Any], key: str, default: float = 0.0) -> float:
+    value = row.get(key)
+    if isinstance(value, (int, float)):
+        return float(value)
+    for fallback_key in _EPISODE_METRIC_FALLBACK_KEYS.get(key, ()):
+        value = row.get(fallback_key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return float(default)
+
+
+def _episode_robot_turn_count(row: Mapping[str, Any]) -> float:
+    for key in ("nll_scored_robot_turns", "hrc_robot_turn_count", "n_steps"):
+        value = row.get(key)
+        if isinstance(value, (int, float)):
+            return max(0.0, float(value))
+    return 0.0
+
+
+def _episode_nll_recipe_steps(row: Mapping[str, Any]) -> float:
+    value = row.get("nll_normalization_recipe_steps")
+    if isinstance(value, (int, float)) and float(value) > 0.0:
+        return float(value)
+    if _episode_robot_turn_count(row) <= 0.0:
+        return 0.0
+    value = row.get("n_recipe_steps")
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    return 0.0
+
+
+def _episode_total_robot_turn_nll(row: Mapping[str, Any]) -> float:
+    value = row.get("total_robot_turn_nll")
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    robot_turns = _episode_robot_turn_count(row)
+    recipe_steps = _episode_nll_recipe_steps(row)
+    for key, denom in (
+        ("mean_nll_per_robot_turn", robot_turns),
+        ("cross_entropy", robot_turns),
+        ("mean_nll_per_recipe_step", recipe_steps),
+    ):
+        value = row.get(key)
+        if isinstance(value, (int, float)) and denom > 0.0:
+            return max(0.0, float(value) * float(denom))
+    return 0.0
+
+
+def _aggregate_episode_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {
             "live_top1": 0.0,
             "live_topk": 0.0,
-            "post_divergence_top1": 0.0,
-            "assistance_coverage": 0.0,
-            "conditional_top1": 0.0,
-            "useful_assistance_rate": 0.0,
-            "assist_correct_rate": 0.0,
-            "assist_wrong_rate": 0.0,
-            "net_assistance_value": 0.0,
+            "total_robot_turn_nll": 0.0,
+            "nll_scored_robot_turns": 0.0,
+            "nll_normalization_recipe_steps": 0.0,
+            "mean_nll_per_robot_turn": 0.0,
+            "mean_nll_per_recipe_step": 0.0,
+            **_adaptation_recovery_metrics([], -1),
+            "mean_first_mismatch_robot_turn": -1.0,
+            "mean_first_mismatch_robot_turn_normalized_position": -1.0,
+            "adaptation_recovery_window_curve": _adaptation_recovery_window_curve([]),
+            "first_mismatch_position_curve": _first_mismatch_position_curve([]),
+            **{f"adaptation_recovery_eligible_rate_w{w}": 0.0 for w in ADAPTATION_RECOVERY_WINDOWS},
+            **{f"adaptation_recovery_censored_rate_w{w}": 0.0 for w in ADAPTATION_RECOVERY_WINDOWS},
+            **{f"n_adaptation_recovery_eligible_w{w}": 0.0 for w in ADAPTATION_RECOVERY_WINDOWS},
+            "robot_wrong_rate": 0.0,
+            "net_robot_action_value": 0.0,
             "n_episodes": 0.0,
+            "n_steps": 0.0,
+            "n_recipe_steps": 0.0,
+            "hrc_robot_turn_count": 0.0,
+            "hrc_human_turn_count": 0.0,
+            "hrc_human_correction_count": 0.0,
+            "hrc_human_action_count": 0.0,
+            "hrc_robot_correct_count": 0.0,
+            "hrc_robot_wrong_count": 0.0,
+            "human_correction_rate": 0.0,
+            "human_action_fraction": 0.0,
+            "human_effort_time": 0.0,
+            "human_effort_fraction": 0.0,
+            "primary_hrc_metric": "human_action_fraction",
+            "primary_hrc_metric_value": 0.0,
+            "human_workload_reduction_vs_human_only": 0.0,
+            "hrc_future_valid_wrong_count": 0.0,
+            "future_valid_wrong_rate": 0.0,
+            "wrong_prediction_future_valid_rate": 0.0,
+            "behavioral_steps_to_lock": -1.0,
+            "posterior_steps_to_lock": -1.0,
+            "n_episodes_behavioral_lock_eligible": 0.0,
+            "lock_success_rate": 0.0,
+            "mean_behavioral_steps_to_lock_conditional": -1.0,
+            "timing_details": _hrc_timing_details(
+                hrc_total_time=0.0,
+                human_only_time=0.0,
+                hrc_time_penalty_vs_human_only=0.0,
+                observation_mode_extra_time=0.0,
+                hrc_mean_time_per_recipe_step=0.0,
+                hrc_mean_time_per_robot_turn=0.0,
+                hrc_robot_correct_time=0.0,
+                hrc_robot_wrong_time=0.0,
+                hrc_human_action_time=0.0,
+                hrc_human_correction_time=0.0,
+                hrc_wrong_action_extra_penalty_time=0.0,
+            ),
+            "observation_mode_episode": 0.0,
+            "observation_mode_rate": 0.0,
+            "user_observation_required_rate": 0.0,
         }
-    weights = [max(1, int(r.get("n_steps", 1))) for r in rows]
+    step_support = [max(0, int(r.get("n_steps", 0))) for r in rows]
+    weights = [max(1, n) for n in step_support]
     total = max(1, sum(weights))
-    out: Dict[str, float] = {"n_episodes": float(len(rows)), "n_steps": float(total)}
+    out: Dict[str, Any] = {"n_episodes": float(len(rows)), "n_steps": float(sum(step_support))}
     for key in (
-        "live_top1", "live_topk", "post_divergence_top1", "assistance_coverage",
-        "coverage", "conditional_top1", "useful_assistance_rate",
-        "assist_correct_rate", "assist_wrong_rate", "net_assistance_value",
-        "correct_prediction_assist_recall", "wrong_prediction_assist_rate",
-        "hidden_correct_rate", "abstention_error_rate", "abstention_recall",
+        "live_top1", "live_topk",
+        "robot_wrong_rate", "net_robot_action_value",
         "posterior_correct_recipe", "recipe_vocab_top1",
-        "recipe_vocab_conditional_top1",
-        "mean_action_confidence", "mean_raw_action_confidence",
-        "mean_action_gate_score", "mean_action_margin",
-        "mean_posterior_entropy", "mean_action_marginal_entropy",
-        "posterior_degenerate_rate", "cross_entropy",
+        "mean_policy_confidence", "mean_policy_raw_confidence",
+        "mean_posterior_confidence",
+        "mean_policy_gate_score", "mean_policy_margin",
+        "mean_posterior_entropy", "mean_policy_entropy",
+        "mean_policy_final_confidence", "mean_conditioned_policy_confidence",
+        "mean_ensemble_policy_confidence",
+        "posterior_degenerate_rate",
         "posterior_steps_to_lock",
         "adaptation_latency_steps", "confidence_ece", "confidence_brier",
         "pooled_ece", "pooled_brier", "p95_prediction_wall_s",
         "mean_prediction_wall_s",
+        "observation_mode_episode",
+        "user_observation_required",
     ):
-        out[key] = sum(float(r.get(key, 0.0)) * w for r, w in zip(rows, weights)) / total
+        out[key] = sum(_episode_metric_value(r, key, 0.0) * w for r, w in zip(rows, weights)) / total
+    for key in (
+        "n_recipe_steps",
+        "hrc_robot_turn_count",
+        "hrc_human_turn_count",
+        "hrc_human_correction_count",
+        "hrc_human_action_count",
+        "hrc_robot_correct_count",
+        "hrc_robot_wrong_count",
+        "hrc_future_valid_wrong_count",
+        "human_effort_time",
+    ):
+        out[key] = sum(float(r.get(key, 0.0)) for r in rows)
+    total_robot_turn_nll = sum(_episode_total_robot_turn_nll(r) for r in rows)
+    nll_scored_robot_turns = sum(_episode_robot_turn_count(r) for r in rows)
+    nll_normalization_recipe_steps = sum(_episode_nll_recipe_steps(r) for r in rows)
+    out["total_robot_turn_nll"] = float(total_robot_turn_nll)
+    out["nll_scored_robot_turns"] = float(nll_scored_robot_turns)
+    out["nll_normalization_recipe_steps"] = float(nll_normalization_recipe_steps)
+    out["mean_nll_per_robot_turn"] = float(total_robot_turn_nll / max(1.0, nll_scored_robot_turns))
+    out["mean_nll_per_recipe_step"] = float(total_robot_turn_nll / max(1.0, nll_normalization_recipe_steps))
+    timing_totals = {
+        key: sum(_episode_timing_value(r, key) for r in rows)
+        for key in (
+            "hrc_total_time",
+            "human_only_time",
+            "observation_mode_extra_time",
+            "hrc_robot_correct_time",
+            "hrc_robot_wrong_time",
+            "hrc_human_action_time",
+            "hrc_human_correction_time",
+            "hrc_wrong_action_extra_penalty_time",
+        )
+    }
+    out["observation_mode_rate"] = sum(1.0 for r in rows if r.get("mode") == "observe") / max(1.0, len(rows))
+    out["user_observation_required_rate"] = sum(float(r.get("user_observation_required", 0.0)) for r in rows) / max(1.0, len(rows))
+    out["human_correction_rate"] = out["hrc_human_correction_count"] / max(1.0, out["hrc_robot_turn_count"])
+    out["human_action_fraction"] = out["hrc_human_action_count"] / max(1.0, out["n_recipe_steps"])
+    if out["human_effort_time"] <= 0.0 and out["n_recipe_steps"] > 0.0:
+        out["human_effort_time"] = (
+            out["hrc_human_turn_count"] * float(DEFAULT_HRC_TIMING.human_action_time)
+            + out["hrc_human_correction_count"] * float(DEFAULT_HRC_TIMING.human_correction_time)
+        )
+    out["human_effort_fraction"] = out["human_effort_time"] / max(1.0e-12, timing_totals["human_only_time"]) if timing_totals["human_only_time"] > 0.0 else 0.0
+    out["primary_hrc_metric"] = "human_action_fraction"
+    out["primary_hrc_metric_value"] = out["human_action_fraction"]
+    out["human_workload_reduction_vs_human_only"] = 1.0 - out["human_action_fraction"]
+    out["future_valid_wrong_rate"] = out["hrc_future_valid_wrong_count"] / max(1.0, out["hrc_robot_turn_count"])
+    out["wrong_prediction_future_valid_rate"] = out["hrc_future_valid_wrong_count"] / max(1.0, out["hrc_robot_wrong_count"])
+    out["timing_details"] = _hrc_timing_details(
+        hrc_total_time=timing_totals["hrc_total_time"],
+        human_only_time=timing_totals["human_only_time"],
+        hrc_time_penalty_vs_human_only=timing_totals["hrc_total_time"] - timing_totals["human_only_time"],
+        observation_mode_extra_time=timing_totals["observation_mode_extra_time"],
+        hrc_mean_time_per_recipe_step=timing_totals["hrc_total_time"] / max(1.0, out["n_recipe_steps"]),
+        hrc_mean_time_per_robot_turn=timing_totals["hrc_total_time"] / max(1.0, out["hrc_robot_turn_count"]),
+        hrc_robot_correct_time=timing_totals["hrc_robot_correct_time"],
+        hrc_robot_wrong_time=timing_totals["hrc_robot_wrong_time"],
+        hrc_human_action_time=timing_totals["hrc_human_action_time"],
+        hrc_human_correction_time=timing_totals["hrc_human_correction_time"],
+        hrc_wrong_action_extra_penalty_time=timing_totals["hrc_wrong_action_extra_penalty_time"],
+    )
     lock_rows = [r for r in rows if int(r.get("n_steps", 0)) >= 5]
     lock_weights = [max(1, int(r.get("n_steps", 1))) for r in lock_rows]
     lock_total = max(1, sum(lock_weights))
     out["n_episodes_behavioral_lock_eligible"] = float(len(lock_rows))
     out["lock_success_rate"] = _mean([1.0 if float(r.get("behavioral_steps_to_lock", -1.0)) >= 0.0 else 0.0 for r in lock_rows]) if lock_rows else 0.0
     successful_lock_rows = [r for r in lock_rows if float(r.get("behavioral_steps_to_lock", -1.0)) >= 0.0]
-    out["mean_steps_to_lock_conditional"] = _mean([float(r.get("behavioral_steps_to_lock", 0.0)) for r in successful_lock_rows]) if successful_lock_rows else -1.0
-    for key in ("steps_to_lock", "behavioral_steps_to_lock"):
-        out[key] = (
-            sum(float(r.get(key, -1.0)) * w for r, w in zip(lock_rows, lock_weights)) / lock_total
-            if lock_rows else -1.0
+    out["mean_behavioral_steps_to_lock_conditional"] = _mean([float(r.get("behavioral_steps_to_lock", 0.0)) for r in successful_lock_rows]) if successful_lock_rows else -1.0
+    out["behavioral_steps_to_lock"] = (
+        sum(float(r.get("behavioral_steps_to_lock", -1.0)) * w for r, w in zip(lock_rows, lock_weights)) / lock_total
+        if lock_rows else -1.0
+    )
+    robot_turn_rows = [r for r in rows if int(r.get("n_steps", 0)) > 0]
+    mismatch_rows = [r for r in robot_turn_rows if float(r.get("first_mismatch_rate", 0.0)) > 0.0]
+    out["first_mismatch_rate"] = _mean([float(r.get("first_mismatch_rate", 0.0)) for r in robot_turn_rows])
+    out["no_mismatch_rate"] = _mean([float(r.get("no_mismatch_rate", 0.0)) for r in robot_turn_rows])
+    out["n_first_mismatch_episodes"] = float(len(mismatch_rows))
+    out["mean_first_mismatch_robot_turn"] = (
+        _mean([_row_first_mismatch_robot_turn(r) for r in mismatch_rows])
+        if mismatch_rows else -1.0
+    )
+    out["mean_first_mismatch_robot_turn_normalized_position"] = (
+        _mean([_row_first_mismatch_robot_turn_position(r) for r in mismatch_rows])
+        if mismatch_rows else -1.0
+    )
+    out["mean_robot_turns_after_first_mismatch"] = _mean([
+        float(r.get("robot_turns_after_first_mismatch", 0.0)) for r in mismatch_rows
+    ])
+    for window in ADAPTATION_RECOVERY_WINDOWS:
+        eligible_key = f"adaptation_recovery_eligible_w{window}"
+        censored_key = f"adaptation_recovery_censored_w{window}"
+        top1_key = f"adaptation_recovery_top1_w{window}"
+        support_key = f"adaptation_recovery_support_w{window}"
+        eligible_rows = [r for r in mismatch_rows if float(r.get(eligible_key, 0.0)) > 0.0]
+        support = [max(1.0, float(r.get(support_key, window))) for r in eligible_rows]
+        out[f"adaptation_recovery_top1_w{window}"] = (
+            sum(float(r.get(top1_key, 0.0)) * w for r, w in zip(eligible_rows, support)) / max(1.0, sum(support))
+            if eligible_rows else 0.0
         )
-    for bucket, predicate in (
-        ("early", lambda fm: 0 <= fm < 5),
-        ("middle", lambda fm: 5 <= fm <= 15),
-        ("late", lambda fm: fm > 15),
-    ):
-        bucket_rows = [r for r in rows if predicate(int(r.get("first_mismatch_step", -1)))]
-        if bucket_rows:
-            bw = [max(1, int(r.get("n_steps", 1))) for r in bucket_rows]
-            bt = max(1, sum(bw))
-            out[f"post_divergence_top1_first_mismatch_{bucket}"] = sum(float(r.get("post_divergence_top1", 0.0)) * w for r, w in zip(bucket_rows, bw)) / bt
-            out[f"n_episodes_first_mismatch_{bucket}"] = float(len(bucket_rows))
+        out[f"adaptation_recovery_eligible_rate_w{window}"] = float(len(eligible_rows) / max(1, len(mismatch_rows)))
+        out[f"adaptation_recovery_censored_rate_w{window}"] = float(
+            sum(float(r.get(censored_key, 0.0)) for r in mismatch_rows) / max(1, len(mismatch_rows))
+        )
+        out[f"n_adaptation_recovery_eligible_w{window}"] = float(len(eligible_rows))
+    out["adaptation_recovery_window_curve"] = _adaptation_recovery_window_curve(robot_turn_rows)
+    out["first_mismatch_position_curve"] = _first_mismatch_position_curve(robot_turn_rows)
     pooled_scores: List[float] = []
     pooled_labels: List[int] = []
     for row in rows:
@@ -4556,8 +3626,9 @@ def _aggregate_episode_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, floa
         if not isinstance(record, LiveEpisodeRecord):
             continue
         for step in record.steps:
-            if step.posterior_confidence is not None:
-                pooled_scores.append(float(step.posterior_confidence))
+            score = _step_action_calibration_score(step)
+            if score is not None:
+                pooled_scores.append(float(score))
                 pooled_labels.append(1 if step.correct_top1 else 0)
     if pooled_scores:
         pooled = binary_decision_metrics(pooled_scores, pooled_labels, n_bins=10)
@@ -4604,6 +3675,7 @@ def _support_counts(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if preference:
             seen_preferences.add(preference)
     return {
+        "exposure_cell": {k: int(cells.get(k, 0)) for k in FOUR_CELL_KEYS},
         "four_cell": {k: int(cells.get(k, 0)) for k in FOUR_CELL_KEYS},
         "transfer_cell": {k: int(transfer_cells.get(k, 0)) for k in TRANSFER_CELL_KEYS},
         "modes": dict(modes),
@@ -4614,12 +3686,14 @@ def _support_counts(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 def _scenario_warnings(scenario: Dict[str, Any]) -> List[str]:
     warnings: List[str] = []
     support = scenario.get("support_counts", {})
-    cells = support.get("four_cell", {}) if isinstance(support, dict) else {}
+    cells = support.get("exposure_cell", support.get("four_cell", {})) if isinstance(support, dict) else {}
+    event_type_counts = scenario.get("event_type_counts", {}) or {}
+    is_ladder_stream = any(str(k).startswith("ladder_") for k in event_type_counts)
     if scenario.get("n_events", 0) == 0:
         warnings.append("scenario_has_no_recorded_events")
     if cells and sum(int(v) for v in cells.values()) > 0:
-        if int(cells.get("seen_unseen", 0)) == 0:
-            warnings.append("scenario_has_no_seen_recipe_unseen_preference_events")
+        if not is_ladder_stream and int(cells.get("seen_recipe_new_preference", 0)) == 0:
+            warnings.append("scenario_has_no_seen_recipe_new_preference_events")
         if int(cells.get("unseen_unseen", 0)) == 0 and int(support.get("modes", {}).get("observe", 0)) == 0:
             warnings.append("scenario_has_no_explicit_new_recipe_or_unseen_unseen_events")
     return warnings
@@ -4639,19 +3713,20 @@ def _baseline_health(metrics: Dict[str, Any], records: Dict[str, List[Dict[str, 
             flat = _flatten_numeric("", row)
             n_steps = int(flat.get("n_steps", 0.0))
             live_top1 = float(flat.get("live_top1", 0.0))
-            empty_rate = 1.0 if n_steps > 0 and live_top1 == 0.0 and float(flat.get("cross_entropy", 0.0)) > 10.0 else 0.0
+            prediction_nll = float(flat.get("mean_nll_per_robot_turn", flat.get("cross_entropy", 0.0)))
+            empty_rate = 1.0 if n_steps > 0 and live_top1 == 0.0 and prediction_nll > 10.0 else 0.0
             out[baseline] = {
                 "n_train_demos": 0,
                 "n_assist_episodes": int(flat.get("n_episodes", 0.0)),
                 "n_steps": n_steps,
                 "n_policy_actions": 0,
                 "empty_prediction_rate": empty_rate,
-                "assist_gate_reason_counts": {},
+                "policy_gate_reason_counts": {},
                 "model_fitted": empty_rate < 1.0,
             }
             continue
         empty_steps = [s for s in b_steps if not s.get("topk") and s.get("predicted") is None]
-        reason_counts = Counter(str(s.get("assist_reason", "unknown")) for s in b_steps)
+        reason_counts = Counter(_row_policy_text(s, "gate_reason") for s in b_steps)
         actions = {str(s.get("actual")) for s in b_steps if s.get("actual") is not None}
         out[baseline] = {
             "n_train_demos": sum(1 for r in b_eps if r.get("mode") == "observe"),
@@ -4659,7 +3734,7 @@ def _baseline_health(metrics: Dict[str, Any], records: Dict[str, List[Dict[str, 
             "n_steps": len(b_steps),
             "n_policy_actions": len(actions),
             "empty_prediction_rate": len(empty_steps) / max(1, len(b_steps)),
-            "assist_gate_reason_counts": dict(reason_counts),
+            "policy_gate_reason_counts": dict(reason_counts),
             "model_fitted": bool(len(actions) > 0 and len(empty_steps) < len(b_steps)),
         }
     return out
@@ -4682,17 +3757,26 @@ def _comparison_summary(metrics: Dict[str, Any]) -> Dict[str, Any]:
     full = _flatten_numeric("", per_baseline.get("full", {}))
     comparisons: Dict[str, Any] = {}
     preferred = (
-        "live_top1", "live_topk", "post_divergence_top1", "assistance_coverage",
-        "conditional_top1", "useful_assistance_rate", "frozen_top1",
-        "post_adapt_top1", "safe_fail_rate", "preference_transfer_rate",
+        "live_top1", "live_topk", "adaptation_recovery_top1_w3",
+        "adaptation_recovery_eligible_rate_w3", "adaptation_recovery_censored_rate_w3",
+        "first_mismatch_rate", "no_mismatch_rate", "mean_first_mismatch_robot_turn_normalized_position",
+        "robot_wrong_rate", "net_robot_action_value", "frozen_top1",
+        "frozen_transfer_top1", "live_online_transfer_top1",
+        "frozen_to_live_transfer_gain", "inference_time_adaptation_gain",
+        "prototype_level_transfer_top1",
+        "post_adapt_top1", "known_recipe_assist_continuation_rate",
+        "known_recipe_assistance_suppression_rate", "preference_transfer_rate",
         "preference_gate_accuracy",
-        "known_shift_live_top1", "novel_recipe_live_top1",
+        "known_shift_live_top1",
         "primary_transfer_live_top1", "adaptation_latency_steps",
+        "human_correction_rate", "human_action_fraction", "human_effort_fraction", "primary_hrc_metric_value",
+        "human_workload_reduction_vs_human_only",
+        "observation_mode_rate", "user_observation_required_rate",
         "p95_prediction_wall_s", "behavioral_steps_to_lock",
-        "lock_success_rate", "mean_steps_to_lock_conditional",
-        "correct_prediction_assist_recall", "wrong_prediction_assist_rate",
-        "hidden_correct_rate",
+        "lock_success_rate", "mean_behavioral_steps_to_lock_conditional",
         "pooled_ece", "preference_cluster_purity",
+        "preference_nmi", "preference_ari", "preference_collapse_rate",
+        "latent_preference_entropy",
     )
     for baseline, row in per_baseline.items():
         if baseline == "full":
@@ -4705,10 +3789,6 @@ def _comparison_summary(metrics: Dict[str, Any]) -> Dict[str, Any]:
         if diffs:
             comparisons[f"full_minus_{baseline}"] = diffs
     return comparisons
-
-
-def _label_to_metric_rows(per_baseline: Dict[str, Dict[str, Any]], metric: str) -> Dict[str, float]:
-    return {b: float(per_baseline[b].get(metric, 0.0)) for b in _ordered_baseline_names(per_baseline)}
 
 
 def _record_common_artifacts(seed_dir: Path, seed: int, config: Any, selected_recipes: Sequence[str], selected_preferences: Sequence[str]) -> None:
@@ -4734,6 +3814,9 @@ def _run_baseline_stream(
             mode, pair, tags = event.mode, event.pair, {"phase": event.phase, "user_id": event.user_id, **dict(event.tags)}
         else:
             mode, pair, tags = event
+        requested_mode = str(mode)
+        mode, route_tags = _user_selected_mode_for_active_memory(requested_mode, agent, pair, name_to_rid)
+        tags = {**tags, **route_tags}
         if mode == "observe":
             row = observe_episode(agent, pair, name_to_rid)
             row.update(tags)
@@ -4746,10 +3829,11 @@ def _run_baseline_stream(
         memory_rows.append({"event_idx": idx, "baseline": baseline, **memory_snapshot(agent)})
     wall_s = time.perf_counter() - t0
     metrics = {
-        **_aggregate_episode_metrics([r for r in episode_rows if r.get("mode") == "assist"]),
+        **_aggregate_episode_metrics(episode_rows),
+        "assist_only": _aggregate_episode_metrics([r for r in episode_rows if r.get("mode") == "assist"]),
         "compute": compute_snapshot(agent, wall_s),
         "memory": memory_snapshot(agent),
-        "assist_gate": assist_gate_reason_summary(step_rows),
+        "policy_gate": policy_gate_reason_summary(step_rows),
     }
     return metrics, episode_rows, step_rows, memory_rows
 
@@ -4763,53 +3847,12 @@ def _zipf_probs(n: int, alpha: float) -> np.ndarray:
     return w / w.sum()
 
 
-def run_materiality_audit(seed: int, out: Path, run_config: RunConfig, cfg_obj: MaterialityAuditConfig) -> Dict[str, Any]:
-    recipes, pairs = build_pairs(seed, cfg_obj.n_recipes, cfg_obj.n_preferences, require_material=False)
-    prefs = select_preference_names(cfg_obj.n_preferences)
-    _record_common_artifacts(out, seed, cfg_obj, recipes, prefs)
-    rows = materiality_rows(pairs)
-    _append_jsonl(out / "materiality_rows.jsonl", rows)
-    _write_csv(out / "materiality_rows.csv", rows)
-    by_recipe: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        by_recipe[row["recipe"]].append(row)
-    summary_rows: List[Dict[str, Any]] = []
-    for recipe, vals in sorted(by_recipe.items()):
-        hashes = {r["preference"]: _order_hash(next(p for p in pairs if p.label == r["label"])) for r in vals}
-        summary_rows.append({
-            "recipe": recipe,
-            "n_preferences": len(vals),
-            "effective_preference_count": len(set(hashes.values())),
-            "duplicate_count": sum(1 for r in vals if r["is_duplicate"]),
-            "mean_edit_from_identity": _mean([r["edit_from_identity"] for r in vals]),
-            "mean_kendall_from_identity": _mean([r["kendall_from_identity"] for r in vals]),
-        })
-    _write_csv(out / "recipe_materiality_summary.csv", summary_rows)
-    metrics = {
-        "seed": seed,
-        "n_recipes": len(recipes),
-        "n_pairs": len(pairs),
-        "n_duplicate_pairs": sum(int(r["is_duplicate"]) for r in rows),
-        "mean_effective_preference_count": _mean([r["effective_preference_count"] for r in summary_rows]),
-        "mean_kendall_from_identity": _mean([r["mean_kendall_from_identity"] for r in summary_rows]),
-        "rows": summary_rows,
-    }
-    _write_json(out / "metrics.json", metrics)
-    _plot_bar(out / "figures/effective_preference_count.png", "effective preferences per recipe", {r["recipe"]: r["effective_preference_count"] for r in summary_rows}, ylabel="count")
-    _plot_bar(out / "figures/duplicate_count.png", "duplicate/no-op preferences per recipe", {r["recipe"]: r["duplicate_count"] for r in summary_rows}, ylabel="count")
-    return metrics
-
-
 def run_single_shot_reuse(seed: int, out: Path, run_config: RunConfig, cfg_obj: SingleShotReuseConfig) -> Dict[str, Any]:
     observe_pref = cfg_obj.observe_preference if cfg_obj.observe_preference in PRESET_PREFERENCES else "identity"
     test_prefs = tuple(p for p in cfg_obj.test_preferences if p in PRESET_PREFERENCES) or (observe_pref,)
     builders = select_recipe_builders(seed, cfg_obj.n_recipes)
     recipes = [r for r, _ in builders]
     pairs = [materialize_pair(recipe, observe_pref, fn) for recipe, fn in builders]
-    if run_config.quick:
-        pairs = pairs[: max(1, min(len(pairs), 4))]
-        builders = builders[:len(pairs)]
-        recipes = recipes[:len(pairs)]
     _record_common_artifacts(out, seed, cfg_obj, recipes, (observe_pref,) + tuple(p for p in test_prefs if p != observe_pref))
     _append_jsonl(
         out / "scenario_events.jsonl",
@@ -4840,8 +3883,7 @@ def run_single_shot_reuse(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
                     heldout_pair = materialize_pair(recipe_name, test_pref, fn)
                 except Exception:
                     continue
-                with agent.frozen():
-                    result = frozen_eval(agent, [heldout_pair], name_to_rid).get(heldout_pair.label, {})
+                result = frozen_eval(agent, [heldout_pair], name_to_rid).get(heldout_pair.label, {})
                 heldout_evals.append(float(result.get("top1", 0.0)))
             heldout_by_pref[f"heldout_top1_{test_pref}"] = _mean(heldout_evals)
         episodes: List[Dict[str, Any]] = []
@@ -4854,11 +3896,11 @@ def run_single_shot_reuse(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
             all_step_rows.extend({"baseline": baseline, **s} for s in steps)
         wall_s = time.perf_counter() - t0
         frozen_top1 = _mean([v.get("top1", 0.0) for v in frozen.values()])
-        frozen_top3 = _mean([v.get("top3", 0.0) for v in frozen.values()])
+        frozen_topk = _mean([v.get("topk", 0.0) for v in frozen.values()])
         per_baseline[baseline] = {
             **_aggregate_episode_metrics(episodes),
             "frozen_top1": frozen_top1,
-            "frozen_top3": frozen_top3,
+            "frozen_topk": frozen_topk,
             **heldout_by_pref,
             "compute": compute_snapshot(agent, wall_s),
             "memory": memory_snapshot(agent),
@@ -4867,17 +3909,12 @@ def run_single_shot_reuse(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
     _append_jsonl(out / "episode_steps.jsonl", all_step_rows)
     metrics = {"seed": seed, "n_pairs": len(pairs), "per_baseline": per_baseline}
     _write_json(out / "metrics.json", metrics)
-    _plot_bar(out / "figures/frozen_top1.png", "single-shot frozen top-1", _label_to_metric_rows(per_baseline, "frozen_top1"), ylabel="top-1")
-    _plot_bar(out / "figures/live_top1.png", "single-shot online first-reuse top-1", _label_to_metric_rows(per_baseline, "live_top1"), ylabel="top-1")
-    for test_pref in test_prefs:
-        _plot_bar(out / f"figures/heldout_top1_{test_pref}.png", f"single-shot held-out {test_pref} top-1", _label_to_metric_rows(per_baseline, f"heldout_top1_{test_pref}"), ylabel="top-1")
     return metrics
 
 
 def run_deployment_gate_preference_shift(seed: int, out: Path, run_config: RunConfig, cfg_obj: DeploymentGateConfig) -> Dict[str, Any]:
     n_train = max(1, int(cfg_obj.n_train_recipes))
     train_builders = select_recipe_builders(seed, n_train)
-    novel_builders = select_recipe_builders(seed, n_train, offset=n_train)
     train_pairs = [materialize_pair(r, cfg_obj.train_preference, fn) for r, fn in train_builders]
     shift_prefs = tuple(p for p in cfg_obj.shift_preferences if p in PRESET_PREFERENCES)
     shift_pairs: List[RecipePrefPair] = []
@@ -4890,14 +3927,10 @@ def run_deployment_gate_preference_shift(seed: int, out: Path, run_config: RunCo
             if shifted.actions != materialize_pair(r, cfg_obj.train_preference, fn).actions:
                 shift_pairs.append(shifted)
                 break
-    novel_pairs = [materialize_pair(r, cfg_obj.train_preference, fn) for r, fn in novel_builders[:len(shift_pairs) or n_train]]
     _record_common_artifacts(out, seed, cfg_obj, [p.recipe_name for p in train_pairs], (cfg_obj.train_preference,) + shift_prefs)
     events_log = [
         {"mode": "assist", "phase": "probe", "event_type": "known_recipe_new_preference", "condition": "known_shift", "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
         for p in shift_pairs
-    ] + [
-        {"mode": "assist", "phase": "probe", "event_type": "novel_recipe_assist_attempt", "condition": "novel_recipe", "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
-        for p in novel_pairs
     ]
     _append_jsonl(out / "scenario_events.jsonl", events_log)
     per_baseline: Dict[str, Dict[str, Any]] = {}
@@ -4910,7 +3943,6 @@ def run_deployment_gate_preference_shift(seed: int, out: Path, run_config: RunCo
             observe_episode(agent, pair, name_to_rid)
         checkpoint = agent.snapshot()
         known_rows: List[Dict[str, Any]] = []
-        novel_rows: List[Dict[str, Any]] = []
         for pair in shift_pairs:
             agent.restore_from(checkpoint)
             local_map = dict(name_to_rid)
@@ -4921,242 +3953,17 @@ def run_deployment_gate_preference_shift(seed: int, out: Path, run_config: RunCo
             known_rows.append(row)
             all_episode_rows.append(row)
             all_step_rows.extend({"baseline": baseline, "condition": "known_recipe_new_preference", **s} for s in steps)
-        for pair in novel_pairs:
-            agent.restore_from(checkpoint)
-            local_map = dict(name_to_rid)
-            row, steps = assist_episode(agent, pair, local_map, run_config=run_config, event_tag={"condition": "novel_recipe_assist_attempt"})
-            safe_fail = bool(row.get("needs_observation")) or float(row.get("assistance_coverage", 0.0)) < 0.25
-            row["safe_fail"] = safe_fail
-            row["baseline"] = baseline
-            novel_rows.append(row)
-            all_episode_rows.append(row)
-            all_step_rows.extend({"baseline": baseline, "condition": "novel_recipe_assist_attempt", **s} for s in steps)
-            observe_episode(agent, pair, local_map)
+        known_suppression = _mean([1.0 if r.get("needs_observation") else 0.0 for r in known_rows])
         per_baseline[baseline] = {
             "known_shift": _aggregate_episode_metrics(known_rows),
-            "novel_recipe": _aggregate_episode_metrics(novel_rows),
             "post_commit_top1": _mean([r.get("post_commit_top1", 0.0) for r in known_rows]),
-            "safe_fail_rate": _mean([1.0 if r.get("safe_fail") else 0.0 for r in novel_rows]),
-            "false_new_recipe_rate": _mean([1.0 if r.get("needs_observation") else 0.0 for r in known_rows]),
-            "false_known_recipe_rate": _mean([0.0 if r.get("needs_observation") else 1.0 for r in novel_rows]),
+            "known_recipe_assistance_suppression_rate": known_suppression,
+            "known_recipe_assist_continuation_rate": 1.0 - known_suppression,
         }
     _append_jsonl(out / "episode_metrics.jsonl", all_episode_rows)
     _append_jsonl(out / "episode_steps.jsonl", all_step_rows)
-    metrics = {"seed": seed, "n_known_shift": len(shift_pairs), "n_novel": len(novel_pairs), "per_baseline": per_baseline}
+    metrics = {"seed": seed, "n_known_shift": len(shift_pairs), "per_baseline": per_baseline}
     _write_json(out / "metrics.json", metrics)
-    _plot_bar(out / "figures/known_shift_live_top1.png", "known recipe, new preference: live top-1", {b: r["known_shift"]["live_top1"] for b, r in per_baseline.items()}, ylabel="top-1")
-    _plot_bar(out / "figures/novel_safe_fail.png", "novel recipe safe-fail rate", {b: r["safe_fail_rate"] for b, r in per_baseline.items()}, ylabel="rate")
-    return metrics
-
-
-def _preference_pid_map(agent: AdaptiveHRCAgent, pairs: Sequence[RecipePrefPair]) -> Dict[str, Optional[str]]:
-    # The agent's preference ids are latent; after diagonal training we map
-    # simulator preference names to the most recent learned id for oracle probes.
-    out: Dict[str, Optional[str]] = {}
-    for pair in pairs:
-        out[pair.preference_name] = agent.last_pref_id
-    return out
-
-
-def run_cross_recipe_preference_transfer(seed: int, out: Path, run_config: RunConfig, cfg_obj: CrossRecipeTransferConfig) -> Dict[str, Any]:
-    prefs = select_preference_names(cfg_obj.n_preferences)
-    recipes, all_pairs = build_pairs(seed, cfg_obj.n_recipes, preferences=prefs)
-    by_recipe_pref = {(p.recipe_name, p.preference_name): p for p in all_pairs}
-    diagonal: List[RecipePrefPair] = []
-    for i, recipe in enumerate(recipes):
-        pref = prefs[i % len(prefs)]
-        pair = by_recipe_pref.get((recipe, pref))
-        if pair is not None:
-            diagonal.append(pair)
-    diagonal_pref_by_recipe = {p.recipe_name: p.preference_name for p in diagonal}
-    offdiag = [p for p in all_pairs if p.recipe_name in diagonal_pref_by_recipe and p.preference_name != diagonal_pref_by_recipe[p.recipe_name]]
-    if run_config.quick:
-        offdiag = offdiag[: max(1, min(12, len(offdiag)))]
-    _record_common_artifacts(out, seed, cfg_obj, recipes, prefs)
-    _append_jsonl(
-        out / "scenario_events.jsonl",
-        [
-            {"mode": "observe", "phase": "diagonal_train", "event_type": "diagonal_train", "condition": "diagonal_train", "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
-            for p in diagonal
-        ] + [
-            {"mode": "assist", "phase": "offdiagonal_probe", "event_type": "offdiagonal_transfer", "condition": "offdiagonal_transfer", "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
-            for p in offdiag
-        ],
-    )
-    baselines = cfg_obj.baselines
-    per_baseline: Dict[str, Dict[str, Any]] = {}
-    all_episode_rows: List[Dict[str, Any]] = []
-    all_step_rows: List[Dict[str, Any]] = []
-    matrix_rows: Dict[str, Dict[Tuple[str, str], float]] = {}
-    for baseline in baselines:
-        agent = make_agent(baseline, base_config(seed, run_config))
-        name_to_rid: Dict[str, str] = {}
-        pref_to_pid: Dict[str, Optional[str]] = {}
-        t0 = time.perf_counter()
-        for _ in range(max(1, int(cfg_obj.diagonal_cycles))):
-            for pair in diagonal:
-                observe_episode(agent, pair, name_to_rid)
-                pref_to_pid[pair.preference_name] = agent.last_pref_id
-        checkpoint = agent.snapshot()
-        frozen_diag = frozen_eval(agent, diagonal, name_to_rid)
-        frozen_off = frozen_eval(agent, offdiag, name_to_rid)
-        rows: List[Dict[str, Any]] = []
-        matrix_rows[baseline] = {}
-        for pair in offdiag:
-            for rep in range(max(1, int(cfg_obj.repeats))):
-                agent.restore_from(checkpoint)
-                local_map = dict(name_to_rid)
-                oracle_pid = pref_to_pid.get(pair.preference_name)
-                oracle_rid = local_map.get(pair.recipe_name)
-                if baseline == "oracle_preference_label":
-                    row, steps = assist_episode(agent, pair, local_map, run_config=run_config, oracle_preference_id=oracle_pid, event_tag={"condition": "offdiagonal_transfer", "repeat": rep})
-                elif baseline == "oracle_recipe_and_preference_label":
-                    row, steps = assist_episode(agent, pair, local_map, run_config=run_config, oracle_preference_id=oracle_pid, oracle_recipe_id=oracle_rid, event_tag={"condition": "offdiagonal_transfer", "repeat": rep})
-                else:
-                    row, steps = assist_episode(agent, pair, local_map, run_config=run_config, event_tag={"condition": "offdiagonal_transfer", "repeat": rep})
-                row["baseline"] = baseline
-                row["seen_recipe"] = pair.recipe_name in name_to_rid
-                row["seen_preference_global"] = pair.preference_name in {p.preference_name for p in diagonal}
-                row["seen_preference_for_recipe"] = pair.preference_name == diagonal_pref_by_recipe.get(pair.recipe_name)
-                row["four_cell_global"] = _four_cell(row["seen_recipe"], row["seen_preference_global"])
-                row["preference_transfer_correct"] = row.get("classification_kind") in ("known", "preference_shift", "reentry_from_pruned")
-                rows.append(row)
-                all_episode_rows.append(row)
-                all_step_rows.extend({"baseline": baseline, **s} for s in steps)
-            matrix_rows[baseline][(pair.recipe_name, pair.preference_name)] = _mean([r["live_top1"] for r in rows if r["pair"] == pair.label])
-        wall_s = time.perf_counter() - t0
-        per_baseline[baseline] = {
-            **_aggregate_episode_metrics(rows),
-            "frozen_diagonal_top1": _mean([v.get("top1", 0.0) for v in frozen_diag.values()]),
-            "frozen_offdiagonal_top1": _mean([v.get("top1", 0.0) for v in frozen_off.values()]),
-            "preference_transfer_rate": _mean([1.0 if r.get("preference_transfer_correct") else 0.0 for r in rows]),
-            "compute": compute_snapshot(agent, wall_s),
-            "memory": memory_snapshot(agent),
-        }
-    _append_jsonl(out / "episode_metrics.jsonl", all_episode_rows)
-    _append_jsonl(out / "episode_steps.jsonl", all_step_rows)
-    metrics = {"seed": seed, "recipes": recipes, "preferences": list(prefs), "diagonal_training_pairs": [p.label for p in diagonal], "n_offdiag": len(offdiag), "per_baseline": per_baseline}
-    _write_json(out / "metrics.json", metrics)
-    _plot_bar(out / "figures/live_top1.png", "cross-recipe off-diagonal live top-1", _label_to_metric_rows(per_baseline, "live_top1"), ylabel="top-1")
-    _plot_bar(out / "figures/preference_transfer_rate.png", "cross-recipe preference transfer rate", _label_to_metric_rows(per_baseline, "preference_transfer_rate"), ylabel="rate")
-    if "full" in matrix_rows:
-        mat = [[matrix_rows["full"].get((recipe, pref), 0.0) for pref in prefs] for recipe in recipes]
-        _plot_heatmap(out / "figures/full_transfer_heatmap.png", "full model off-diagonal live top-1", mat, prefs, recipes)
-    if "full" in per_baseline and "irl_ngram_only" in per_baseline:
-        gain = float(per_baseline["full"]["live_top1"] - per_baseline["irl_ngram_only"]["live_top1"])
-        metrics["full_minus_ensemble_live_top1"] = gain
-        _write_json(out / "metrics.json", metrics)
-    return metrics
-
-
-def _axis_holdout_split(axis: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    identity = WorkflowPreference().as_dict()[axis]
-    train = tuple(n for n, pref in PRESET_PREFERENCES.items() if pref.as_dict()[axis] == identity)
-    holdout = tuple(n for n, pref in PRESET_PREFERENCES.items() if pref.as_dict()[axis] != identity)
-    return train, holdout
-
-
-def run_preference_axis_holdout(seed: int, out: Path, run_config: RunConfig, cfg_obj: PreferenceAxisHoldoutConfig) -> Dict[str, Any]:
-    builders = select_recipe_builders(seed, cfg_obj.n_recipes)
-    _record_common_artifacts(out, seed, cfg_obj, [r for r, _ in builders], PREFERENCE_NAMES)
-    per_axis: Dict[str, Any] = {}
-    for axis in WORKFLOW_AXES:
-        train_prefs, holdout_prefs = _axis_holdout_split(axis)
-        train_pairs = [materialize_pair(r, p, fn) for r, fn in builders for p in train_prefs]
-        raw_holdout = [materialize_pair(r, p, fn) for r, fn in builders for p in holdout_prefs]
-        train_hashes = {_order_hash(p) for p in train_pairs}
-        holdout_pairs = [p for p in raw_holdout if _order_hash(p) not in train_hashes]
-        axis_row: Dict[str, Any] = {"n_train_pairs": len(train_pairs), "n_holdout_pairs": len(holdout_pairs), "n_filtered_duplicates": len(raw_holdout) - len(holdout_pairs)}
-        for baseline in run_config.baselines:
-            agent = make_agent(baseline, base_config(seed, run_config))
-            name_to_rid: Dict[str, str] = {}
-            for _ in range(max(1, int(cfg_obj.settle_cycles))):
-                for pair in train_pairs:
-                    observe_episode(agent, pair, name_to_rid)
-            checkpoint = agent.snapshot()
-            frozen = frozen_eval(agent, holdout_pairs, name_to_rid)
-            rows: List[Dict[str, Any]] = []
-            for pair in holdout_pairs:
-                agent.restore_from(checkpoint)
-                local_map = dict(name_to_rid)
-                row, steps = assist_episode(agent, pair, local_map, run_config=run_config, event_tag={"axis": axis})
-                post = frozen_eval(agent, [pair], local_map)
-                row["post_adapt_top1"] = _mean([v.get("top1", 0.0) for v in post.values()])
-                row["baseline"] = baseline
-                rows.append(row)
-                _append_jsonl(out / "episode_steps.jsonl", ({"baseline": baseline, **s} for s in steps))
-            agg = _aggregate_episode_metrics(rows)
-            axis_row[baseline] = {
-                **agg,
-                "frozen_top1": _mean([v.get("top1", 0.0) for v in frozen.values()]),
-                "post_adapt_top1": _mean([r.get("post_adapt_top1", 0.0) for r in rows]),
-            }
-        per_axis[axis] = axis_row
-    metrics = {"seed": seed, "per_axis": per_axis}
-    for baseline in run_config.baselines:
-        metrics[f"{baseline}_live_top1"] = _mean([per_axis[a].get(baseline, {}).get("live_top1", 0.0) for a in WORKFLOW_AXES])
-        metrics[f"{baseline}_post_adapt_top1"] = _mean([per_axis[a].get(baseline, {}).get("post_adapt_top1", 0.0) for a in WORKFLOW_AXES])
-        metrics[f"{baseline}_frozen_top1"] = _mean([per_axis[a].get(baseline, {}).get("frozen_top1", 0.0) for a in WORKFLOW_AXES])
-    _write_json(out / "metrics.json", metrics)
-    matrix = [[per_axis[axis].get(b, {}).get("live_top1", 0.0) for axis in WORKFLOW_AXES] for b in run_config.baselines]
-    _plot_heatmap(out / "figures/live_top1_by_axis.png", "axis holdout live top-1", matrix, WORKFLOW_AXES, run_config.baselines)
-    return metrics
-
-
-def run_novel_preference_composition(seed: int, out: Path, run_config: RunConfig, cfg_obj: NovelPreferenceCompositionConfig) -> Dict[str, Any]:
-    builders = select_recipe_builders(seed, cfg_obj.n_recipes)
-    gap_prefs = _build_gap_preferences()
-    train_pairs = [materialize_pair(r, p, fn) for r, fn in builders for p in PREFERENCE_NAMES]
-    train_hashes = {_order_hash(p) for p in train_pairs}
-    gap_pairs: List[Tuple[RecipePrefPair, int]] = []
-    identity = WorkflowPreference().as_dict()
-    for r, fn in builders:
-        for pref in gap_prefs:
-            try:
-                pair = materialize_custom_pair(r, pref, fn)
-            except Exception:
-                continue
-            if _order_hash(pair) in train_hashes:
-                continue
-            hamming = sum(1 for axis in WORKFLOW_AXES if pref.as_dict()[axis] != identity[axis])
-            gap_pairs.append((pair, hamming))
-    if run_config.quick:
-        gap_pairs = gap_pairs[: max(1, min(20, len(gap_pairs)))]
-    _record_common_artifacts(out, seed, cfg_obj, [r for r, _ in builders], tuple(PREFERENCE_NAMES) + tuple(p.label for p in gap_prefs))
-    per_baseline: Dict[str, Dict[str, Any]] = {}
-    for baseline in run_config.baselines:
-        agent = make_agent(baseline, base_config(seed, run_config))
-        name_to_rid: Dict[str, str] = {}
-        for _ in range(max(1, int(cfg_obj.settle_cycles))):
-            for pair in train_pairs:
-                observe_episode(agent, pair, name_to_rid)
-        checkpoint = agent.snapshot()
-        frozen = frozen_eval(agent, [p for p, _h in gap_pairs], name_to_rid)
-        rows: List[Dict[str, Any]] = []
-        for pair, hamming in gap_pairs:
-            agent.restore_from(checkpoint)
-            local_map = dict(name_to_rid)
-            row, steps = assist_episode(agent, pair, local_map, run_config=run_config, event_tag={"hamming": hamming})
-            row["hamming"] = hamming
-            post = frozen_eval(agent, [pair], local_map)
-            row["post_adapt_top1"] = _mean([v.get("top1", 0.0) for v in post.values()])
-            rows.append(row)
-            _append_jsonl(out / "episode_steps.jsonl", ({"baseline": baseline, **s} for s in steps))
-        per_h: Dict[str, Any] = {}
-        for h in sorted({h for _p, h in gap_pairs}):
-            h_rows = [r for r in rows if r["hamming"] == h]
-            h_pairs = [p for p, hh in gap_pairs if hh == h]
-            per_h[str(h)] = {
-                **_aggregate_episode_metrics(h_rows),
-                "frozen_top1": _mean([frozen.get(p.label, {}).get("top1", 0.0) for p in h_pairs]),
-                "post_adapt_top1": _mean([r.get("post_adapt_top1", 0.0) for r in h_rows]),
-            }
-        per_baseline[baseline] = {**_aggregate_episode_metrics(rows), "per_hamming": per_h, "frozen_top1": _mean([v.get("top1", 0.0) for v in frozen.values()]), "post_adapt_top1": _mean([r.get("post_adapt_top1", 0.0) for r in rows])}
-    metrics = {"seed": seed, "n_gap_pairs": len(gap_pairs), "per_baseline": per_baseline}
-    _write_json(out / "metrics.json", metrics)
-    h_vals = sorted({str(h) for _p, h in gap_pairs})
-    matrix = [[per_baseline[b]["per_hamming"].get(h, {}).get("live_top1", 0.0) for h in h_vals] for b in run_config.baselines]
-    _plot_heatmap(out / "figures/live_top1_by_hamming.png", "novel preference composition live top-1", matrix, h_vals, run_config.baselines)
     return metrics
 
 
@@ -5212,54 +4019,33 @@ def _advance_gap(agent: AdaptiveHRCAgent, gap: int, distractors: Sequence[Recipe
             agent.session_counter += 1
             agent.decay.step(agent.session_counter, agent.retrain_cycle)
             agent.decay._recompute_effective(agent.session_counter)
+        if int(gap) > 0:
+            if hasattr(agent, "refresh_model_from_memory"):
+                agent.refresh_model_from_memory()
+            elif hasattr(agent, "_retrain"):
+                agent._retrain()
     else:
         for i in range(max(0, int(gap))):
             observe_episode(agent, distractors[i % len(distractors)], name_to_rid)
             agent.decay._recompute_effective(agent.session_counter)
 
 
-def run_adaptive_decay_reentry(seed: int, out: Path, run_config: RunConfig, cfg_obj: AdaptiveDecayReentryConfig) -> Dict[str, Any]:
-    target, variant, distractors = _target_and_variant(seed, cfg_obj.n_recipes)
-    _record_common_artifacts(out, seed, cfg_obj, sorted({target.recipe_name, variant.recipe_name} | {p.recipe_name for p in distractors}), PREFERENCE_NAMES)
-    per_baseline: Dict[str, Dict[str, Any]] = {}
-    for baseline in run_config.baselines:
-        gap_rows: Dict[str, Any] = {}
-        for gap in cfg_obj.gap_sweep:
-            agent = make_agent(baseline, base_config(seed, run_config))
-            name_to_rid: Dict[str, str] = {}
-            observe_episode(agent, target, name_to_rid)
-            observe_episode(agent, variant, name_to_rid)
-            rid = name_to_rid.get(target.recipe_name)
-            target_hash = variant_hash(agent._tokens_from_action_labels(target.actions))
-            _advance_gap(agent, int(gap), distractors, name_to_rid, bool(cfg_obj.neutral_filler))
-            active_before = bool(rid is not None and (rid, target_hash) in agent.decay.active)
-            pruned_before = bool(rid is not None and ((rid, target_hash) in agent.decay.pruned or target_hash in agent.memory.variants.get(rid, {})) and not active_before)
-            row, steps = assist_episode(agent, target, name_to_rid, run_config=run_config, event_tag={"gap": gap})
-            post = frozen_eval(agent, [target], name_to_rid)
-            row.update({
-                "target_active_before": active_before,
-                "target_pruned_before": pruned_before,
-                "post_reentry_top1": _mean([v.get("top1", 0.0) for v in post.values()]),
-                "base_rate_after": float(agent.decay.base_rate),
-                "global_rate_after": float(agent.decay.global_rate),
-                "active_variants_end": len(agent.decay.active),
-                "pruned_variants_end": len(agent.decay.pruned),
-            })
-            gap_rows[str(gap)] = row
-            _append_jsonl(out / "episode_steps.jsonl", ({"baseline": baseline, **s} for s in steps))
-        per_baseline[baseline] = {
-            "per_gap": gap_rows,
-            "live_top1": _mean([r["live_top1"] for r in gap_rows.values()]),
-            "post_reentry_top1": _mean([r["post_reentry_top1"] for r in gap_rows.values()]),
-            "active_before_rate": _mean([1.0 if r["target_active_before"] else 0.0 for r in gap_rows.values()]),
-            "pruned_before_rate": _mean([1.0 if r["target_pruned_before"] else 0.0 for r in gap_rows.values()]),
-        }
-    metrics = {"seed": seed, "target": target.label, "same_recipe_variant": variant.label, "neutral_filler": bool(cfg_obj.neutral_filler), "per_baseline": per_baseline}
-    _write_json(out / "metrics.json", metrics)
-    _plot_bar(out / "figures/reentry_live_top1.png", "reentry live top-1", _label_to_metric_rows(per_baseline, "live_top1"), ylabel="top-1")
-    for baseline, row in per_baseline.items():
-        _plot_lines(out / f"figures/{baseline}_gap_curve.png", f"{baseline}: reentry by gap", {baseline: ([int(g) for g in row["per_gap"]], [v["live_top1"] for v in row["per_gap"].values()])}, "gap", "live top-1")
-    return metrics
+def _advance_mixed_gap(
+    agent: AdaptiveHRCAgent,
+    gap_sessions: int,
+    n_distractors: int,
+    distractors: Sequence[RecipePrefPair],
+    name_to_rid: Dict[str, str],
+) -> None:
+    gap = max(0, int(gap_sessions))
+    n_dist = max(0, min(int(n_distractors), gap))
+    for i in range(n_dist):
+        if distractors:
+            observe_episode(agent, distractors[i % len(distractors)], name_to_rid)
+            agent.decay._recompute_effective(agent.session_counter)
+    neutral_ticks = gap - n_dist
+    if neutral_ticks > 0:
+        _advance_gap(agent, neutral_ticks, (), name_to_rid, neutral=True)
 
 
 def _user_preferences(seed: int, n_users: int) -> Dict[str, str]:
@@ -5379,44 +4165,7 @@ def _stream_events(seed: int, cfg_obj: MultiUserStreamConfig, *, observe_new: bo
     return [r for r, _ in builders], list(users), events
 
 
-def run_multi_user_continual_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: MultiUserStreamConfig) -> Dict[str, Any]:
-    recipes, users, events = _stream_events(seed, cfg_obj, observe_new=cfg_obj.observe_first_recipe)
-    _record_common_artifacts(out, seed, cfg_obj, recipes, [f"{u}:{_user_preferences(seed, cfg_obj.n_users)[u]}" for u in users])
-    _append_jsonl(out / "scenario_events.jsonl", (_scenario_event_row(e) for e in events))
-    per_baseline: Dict[str, Dict[str, Any]] = {}
-    for baseline in run_config.baselines:
-        metrics, episode_rows, step_rows, memory_rows = _run_baseline_stream(baseline, base_config(seed, run_config), events, run_config)
-        per_user: Dict[str, Any] = {}
-        for user in users:
-            rows = [r for r in episode_rows if r.get("user_id") == user and r.get("mode") == "assist"]
-            per_user[user] = _aggregate_episode_metrics(rows)
-        metrics["per_user"] = per_user
-        metrics["switch_count"] = sum(1 for i in range(1, len(events)) if events[i].user_id != events[i - 1].user_id)
-        per_baseline[baseline] = metrics
-        _append_jsonl(out / "episode_metrics.jsonl", ({"baseline": baseline, **r} for r in episode_rows))
-        _append_jsonl(out / "episode_steps.jsonl", step_rows)
-        _append_jsonl(out / "memory_trace.jsonl", memory_rows)
-    metrics = {"seed": seed, "n_users": len(users), "n_recipes": len(recipes), "n_events": len(events), "per_baseline": per_baseline}
-    _write_json(out / "metrics.json", metrics)
-    _plot_bar(out / "figures/live_top1.png", "multi-user stream live top-1", _label_to_metric_rows(per_baseline, "live_top1"), ylabel="top-1")
-    _plot_bar(out / "figures/useful_assistance.png", "multi-user useful assistance", _label_to_metric_rows(per_baseline, "useful_assistance_rate"), ylabel="rate")
-    return metrics
-
-
-def run_bounded_memory_tradeoff(seed: int, out: Path, run_config: RunConfig, cfg_obj: MemoryTradeoffConfig) -> Dict[str, Any]:
-    stream_cfg = MultiUserStreamConfig(n_users=4, n_recipes=cfg_obj.n_recipes, n_events=cfg_obj.n_events, zipf_alpha=cfg_obj.zipf_alpha)
-    metrics = run_multi_user_continual_stream(seed, out, run_config, stream_cfg)
-    values = {}
-    for b, row in metrics["per_baseline"].items():
-        mem = row.get("memory", {})
-        values[b] = float(row.get("useful_assistance_rate", 0.0)) / max(1.0, math.log1p(float(mem.get("active_variants", 0.0))))
-    metrics["memory_efficiency"] = values
-    _write_json(out / "metrics.json", metrics)
-    _plot_bar(out / "figures/memory_efficiency.png", "useful assistance per log active memory", values, ylabel="efficiency")
-    return metrics
-
-
-def run_compute_tradeoff(seed: int, out: Path, run_config: RunConfig, cfg_obj: ComputeTradeoffConfig) -> Dict[str, Any]:
+def _run_compute_tradeoff(seed: int, out: Path, run_config: RunConfig, cfg_obj: ComputeTradeoffConfig) -> Dict[str, Any]:
     stream_cfg = MultiUserStreamConfig(n_users=3, n_recipes=cfg_obj.n_recipes, n_events=cfg_obj.n_events, zipf_alpha=0.8)
     recipes, users, events = _stream_events(seed, stream_cfg)
     _record_common_artifacts(out, seed, cfg_obj, recipes, users)
@@ -5429,8 +4178,6 @@ def run_compute_tradeoff(seed: int, out: Path, run_config: RunConfig, cfg_obj: C
         _append_jsonl(out / "memory_trace.jsonl", memory_rows)
     metrics = {"seed": seed, "per_baseline": per_baseline}
     _write_json(out / "metrics.json", metrics)
-    _plot_bar(out / "figures/wall_s.png", "compute tradeoff: wall time", {b: r["compute"]["wall_s"] for b, r in per_baseline.items()}, ylabel="seconds")
-    _plot_bar(out / "figures/useful_assistance.png", "compute tradeoff: useful assistance", _label_to_metric_rows(per_baseline, "useful_assistance_rate"), ylabel="rate")
     return metrics
 
 
@@ -5440,48 +4187,276 @@ def run_short_term_capacity_sweep(seed: int, out: Path, run_config: RunConfig, c
         sub = SingleShotReuseConfig(n_recipes=int(n), n_preferences=cfg_obj.n_preferences)
         sub_out = _ensure(out / f"n_{n}")
         rows[str(n)] = run_single_shot_reuse(seed, sub_out, run_config, sub)
-        for png in out.glob(f"n_{n}_*.png"):
-            try:
-                png.unlink()
-            except OSError:
-                pass
-        if _ACTIVE_RESULT is not None:
-            for key in list(_ACTIVE_RESULT.figures):
-                if key.startswith(f"n_{n}_"):
-                    _ACTIVE_RESULT.figures.pop(key, None)
     metrics = {"seed": seed, "per_demo_count": rows}
     _write_json(out / "metrics.json", metrics)
-    series = {
-        baseline: (list(cfg_obj.demo_counts), [rows[str(n)]["per_baseline"].get(baseline, {}).get("live_top1", 0.0) for n in cfg_obj.demo_counts])
-        for baseline in run_config.baselines
-    }
-    _plot_lines(out / "figures/sample_efficiency_live_top1.png", "sample efficiency by baseline", series, "demo count", "live top-1")
     return metrics
 
 
+def _unique_material_preference_pairs(
+    recipe_name: str,
+    generator_fn: Callable[[], List[str]],
+    *,
+    include_identity: bool = True,
+) -> List[RecipePrefPair]:
+    pairs: List[RecipePrefPair] = []
+    seen_orderings: set = set()
+    for pref_name in PREFERENCE_NAMES:
+        if pref_name == "identity" and not include_identity:
+            continue
+        try:
+            pair = materialize_pair(recipe_name, pref_name, generator_fn)
+        except Exception:
+            continue
+        order = _order_hash(pair)
+        if order in seen_orderings:
+            continue
+        seen_orderings.add(order)
+        pairs.append(pair)
+    return pairs
+
+
+def _recipe_onboarding_sample_efficiency(
+    seed: int,
+    run_config: RunConfig,
+    cfg_obj: CapacitySweepConfig,
+) -> Dict[str, Any]:
+    builders = select_recipe_builders(seed + 43, 1)
+    if not builders:
+        return {}
+    recipe_name, fn = builders[0]
+    pair = materialize_pair(recipe_name, "identity", fn)
+    rows: Dict[str, Any] = {}
+    for k_raw in cfg_obj.demo_counts:
+        k = max(1, int(k_raw))
+        train_pairs = [pair for _ in range(k)]
+        per_baseline: Dict[str, Any] = {}
+        for baseline in run_config.baselines:
+            agent = make_agent(baseline, base_config(seed, run_config))
+            name_to_rid: Dict[str, str] = {}
+            for train_pair in train_pairs:
+                observe_episode(agent, train_pair, name_to_rid)
+            frozen = frozen_eval(agent, [pair], name_to_rid)
+            row, _steps = assist_episode(
+                agent,
+                pair,
+                dict(name_to_rid),
+                run_config=run_config,
+                commit=False,
+                event_tag={"condition": "recipe_onboarding_sample_efficiency", "demo_count": k},
+            )
+            row.update({
+                "frozen_top1": float((frozen.get(pair.label, {}) or {}).get("top1", 0.0)),
+                "frozen_topk": float((frozen.get(pair.label, {}) or {}).get("topk", 0.0)),
+                "n_train_demos": k,
+            })
+            per_baseline[baseline] = row
+        rows[str(k)] = {
+            "curve_type": "recipe_onboarding",
+            "train_pair": pair.label,
+            "test_pair": pair.label,
+            "recipe": pair.recipe_name,
+            "preference": pair.preference_name,
+            "n_train_demos": k,
+            "per_baseline": per_baseline,
+            "oracle_references": _oracle_reference_metrics(
+                seed,
+                run_config,
+                train_pairs,
+                [pair],
+                max_eval_pairs=1,
+            ),
+        }
+    return rows
+
+
+def _preference_transfer_sample_efficiency(
+    seed: int,
+    run_config: RunConfig,
+    cfg_obj: CapacitySweepConfig,
+) -> Dict[str, Any]:
+    max_k = max(int(k) for k in cfg_obj.demo_counts) if cfg_obj.demo_counts else 1
+    builders = select_recipe_builders(seed + 71, max_k + 1)
+    rows: Dict[str, Any] = {}
+    for k_raw in cfg_obj.demo_counts:
+        k = max(1, int(k_raw))
+        if len(builders) <= k:
+            continue
+        candidate_prefs = [p for p in PREFERENCE_NAMES if p != "identity"]
+        train_pairs: List[RecipePrefPair] = []
+        test_pair: Optional[RecipePrefPair] = None
+        selected_pref: Optional[str] = None
+        for pref in candidate_prefs:
+            try:
+                trial_train = [materialize_pair(recipe, pref, fn) for recipe, fn in builders[:k]]
+                trial_test = materialize_pair(builders[k][0], pref, builders[k][1])
+            except Exception:
+                continue
+            if len({p.actions for p in trial_train + [trial_test]}) >= 2:
+                train_pairs = trial_train
+                test_pair = trial_test
+                selected_pref = pref
+                break
+        if test_pair is None:
+            continue
+        per_baseline: Dict[str, Any] = {}
+        for baseline in run_config.baselines:
+            agent = make_agent(baseline, base_config(seed, run_config))
+            name_to_rid: Dict[str, str] = {}
+            for pair in train_pairs:
+                observe_episode(agent, pair, name_to_rid)
+            row, _steps = assist_episode(
+                agent,
+                test_pair,
+                name_to_rid,
+                run_config=run_config,
+                commit=False,
+                event_tag={"condition": "preference_transfer_sample_efficiency", "preference_demo_count": k},
+            )
+            per_baseline[baseline] = row
+        rows[str(k)] = {
+            "preference": selected_pref,
+            "train_pairs": [p.label for p in train_pairs],
+            "test_pair": test_pair.label,
+            "per_baseline": per_baseline,
+            "oracle_references": _oracle_reference_metrics(
+                seed,
+                run_config,
+                train_pairs,
+                [test_pair],
+                max_eval_pairs=1,
+            ),
+        }
+    return rows
+
+
+def _preference_variant_sample_efficiency(
+    seed: int,
+    run_config: RunConfig,
+    cfg_obj: CapacitySweepConfig,
+) -> Dict[str, Any]:
+    max_k = max(int(k) for k in cfg_obj.demo_counts) if cfg_obj.demo_counts else 1
+    builders = select_recipe_builders(seed + 109, max(4, min(len(gen.recipe_library()), max_k + 2)))
+    selected_pairs: List[RecipePrefPair] = []
+    for recipe_name, fn in builders:
+        variants = _unique_material_preference_pairs(recipe_name, fn)
+        if len(variants) > len(selected_pairs):
+            selected_pairs = variants
+    if len(selected_pairs) < 2:
+        return {}
+    rows: Dict[str, Any] = {}
+    for k_raw in cfg_obj.demo_counts:
+        k = max(1, int(k_raw))
+        if k >= len(selected_pairs):
+            continue
+        train_pairs = selected_pairs[:k]
+        test_pair = selected_pairs[k]
+        per_baseline: Dict[str, Any] = {}
+        for baseline in run_config.baselines:
+            agent = make_agent(baseline, base_config(seed, run_config))
+            name_to_rid: Dict[str, str] = {}
+            for pair in train_pairs:
+                observe_episode(agent, pair, name_to_rid)
+            row, _steps = assist_episode(
+                agent,
+                test_pair,
+                dict(name_to_rid),
+                run_config=run_config,
+                commit=False,
+                event_tag={"condition": "preference_variant_sample_efficiency", "preference_variant_count": k},
+            )
+            per_baseline[baseline] = row
+        rows[str(k)] = {
+            "curve_type": "preference_variant",
+            "recipe": test_pair.recipe_name,
+            "train_pairs": [p.label for p in train_pairs],
+            "test_pair": test_pair.label,
+            "n_train_variants": k,
+            "per_baseline": per_baseline,
+            "oracle_references": _oracle_reference_metrics(
+                seed,
+                run_config,
+                train_pairs,
+                [test_pair],
+                max_eval_pairs=1,
+            ),
+        }
+    return rows
+
+
 def run_demo_count_sample_efficiency(seed: int, out: Path, run_config: RunConfig, cfg_obj: CapacitySweepConfig) -> Dict[str, Any]:
-    metrics = run_short_term_capacity_sweep(seed, out, run_config, cfg_obj)
+    onboarding_rows = _recipe_onboarding_sample_efficiency(seed, run_config, cfg_obj)
+    metrics: Dict[str, Any] = {
+        "seed": seed,
+        "per_demo_count": onboarding_rows,
+    }
     efficiency: Dict[str, Dict[str, float]] = {}
     for n, row in metrics["per_demo_count"].items():
         efficiency[n] = {b: row["per_baseline"].get(b, {}).get("live_top1", 0.0) / max(1, int(n)) for b in run_config.baselines}
     metrics["sample_efficiency"] = efficiency
+    transfer_rows = _preference_transfer_sample_efficiency(seed, run_config, cfg_obj)
+    variant_rows = _preference_variant_sample_efficiency(seed, run_config, cfg_obj)
+    metrics["recipe_onboarding_sample_efficiency"] = metrics.get("per_demo_count", {})
+    metrics["preference_transfer_sample_efficiency"] = transfer_rows
+    metrics["preference_variant_sample_efficiency"] = variant_rows
+    metrics["sample_efficiency_curves"] = {
+        "recipe_onboarding": {
+            baseline: {
+                str(n): (metrics.get("per_demo_count", {}).get(str(n), {}).get("per_baseline", {}).get(baseline, {}) or {}).get("live_top1", 0.0)
+                for n in cfg_obj.demo_counts
+            }
+            for baseline in run_config.baselines
+        },
+        "preference_transfer": {
+            baseline: {
+                str(n): (transfer_rows.get(str(n), {}).get("per_baseline", {}).get(baseline, {}) or {}).get("live_top1", 0.0)
+                for n in cfg_obj.demo_counts
+                if str(n) in transfer_rows
+            }
+            for baseline in run_config.baselines
+        },
+        "preference_variant": {
+            baseline: {
+                str(n): (variant_rows.get(str(n), {}).get("per_baseline", {}).get(baseline, {}) or {}).get("live_top1", 0.0)
+                for n in cfg_obj.demo_counts
+                if str(n) in variant_rows
+            }
+            for baseline in run_config.baselines
+        },
+    }
+    metrics["sample_efficiency_metric_curves"] = {}
+    for curve_name, source_rows in (
+        ("recipe_onboarding", metrics.get("per_demo_count", {}) or {}),
+        ("preference_transfer", transfer_rows),
+        ("preference_variant", variant_rows),
+    ):
+        metrics["sample_efficiency_metric_curves"][curve_name] = {}
+        for metric_name in ("live_top1", "robot_wrong_rate", "net_robot_action_value"):
+            metric_curves = {
+                baseline: {
+                    str(n): (source_rows.get(str(n), {}).get("per_baseline", {}).get(baseline, {}) or {}).get(metric_name, 0.0)
+                    for n in cfg_obj.demo_counts
+                    if str(n) in source_rows
+                }
+                for baseline in run_config.baselines
+            }
+            if curve_name == "recipe_onboarding":
+                metric_curves["oracle_ceiling"] = {
+                    str(n): (0.0 if metric_name == "robot_wrong_rate" else 1.0)
+                    for n in cfg_obj.demo_counts
+                    if str(n) in source_rows
+                }
+            else:
+                for oracle_name in ORACLE_REFERENCE_BASELINES:
+                    vals = {
+                        str(n): (source_rows.get(str(n), {}).get("oracle_references", {}).get(oracle_name, {}) or {}).get(metric_name, 0.0)
+                        for n in cfg_obj.demo_counts
+                        if str(n) in source_rows
+                    }
+                    if vals:
+                        metric_curves[oracle_name] = vals
+            metrics["sample_efficiency_metric_curves"][curve_name][metric_name] = metric_curves
     _write_json(out / "metrics.json", metrics)
     return metrics
-
-
-def _classify_pair(agent: AdaptiveHRCAgent, pair: RecipePrefPair, name_to_rid: Dict[str, str], threshold: Optional[float] = None, actions: Optional[Sequence[str]] = None) -> str:
-    seq = agent._tokens_from_action_labels(actions or pair.actions)
-    lib = agent.memory.library()
-    cls = agent.disambig.classify(seq, lib, threshold=threshold)
-    if cls.kind == "new_recipe":
-        return "new_recipe"
-    rid = name_to_rid.get(pair.recipe_name)
-    if rid is None:
-        return "new_recipe"
-    h = variant_hash(seq)
-    if rid in agent.memory.variants and h in agent.memory.variants[rid]:
-        return "known"
-    return "same_recipe_new_preference"
 
 
 def _classify_memory_state_pair(agent: AdaptiveHRCAgent, pair: RecipePrefPair, name_to_rid: Dict[str, str], threshold: Optional[float] = None, actions: Optional[Sequence[str]] = None) -> str:
@@ -5501,71 +4476,11 @@ def _classify_memory_state_pair(agent: AdaptiveHRCAgent, pair: RecipePrefPair, n
     return "same_recipe_new_preference"
 
 
-def _gate_report(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def _route_report(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     labels = ("assist", "observe")
     matrix = confusion_labels([str(r.get("pred")) for r in rows], [str(r.get("gt")) for r in rows], labels=labels)
     report = classifier_report(matrix, labels)
     return {**report, "confusion_matrix": matrix.tolist(), "rows": list(rows)}
-
-
-def run_disambiguation_threshold_calibration(seed: int, out: Path, run_config: RunConfig, cfg_obj: ThresholdCalibrationConfig) -> Dict[str, Any]:
-    recipes, pairs = build_pairs(seed, cfg_obj.n_recipes, n_preferences=7)
-    rng = _rng(seed, 911)
-    order = list(range(len(pairs)))
-    rng.shuffle(order)
-    cut = max(1, int((1.0 - cfg_obj.validation_fraction) * len(order)))
-    train_pairs = [pairs[i] for i in order[:cut]]
-    val_pairs = [pairs[i] for i in order[cut:]]
-    _record_common_artifacts(out, seed, cfg_obj, recipes, PREFERENCE_NAMES)
-    per_thr: Dict[str, Any] = {}
-    for thr in cfg_obj.thresholds:
-        agent = make_agent("full", base_config(seed, run_config, jaccard_threshold=float(thr)))
-        name_to_rid: Dict[str, str] = {}
-        for pair in train_pairs:
-            observe_episode(agent, pair, name_to_rid)
-        observed_labels = {p.label for p in train_pairs}
-        observed_recipes = {p.recipe_name for p in train_pairs}
-        rows: List[Dict[str, Any]] = []
-        for pair in val_pairs:
-            gt = _memory_state_gt(agent, pair, name_to_rid, observed_labels, observed_recipes)
-            pred = _classify_memory_state_pair(agent, pair, name_to_rid, threshold=float(thr))
-            rows.append({"threshold": thr, "pair": pair.label, "ground_truth": gt, "predicted": pred, "gt": gt, "pred": pred, "correct": gt == pred})
-        matrix = confusion_labels([r["predicted"] for r in rows], [r["ground_truth"] for r in rows])
-        report = classifier_report(matrix, MEMORY_STATE_LABELS)
-        per_thr[str(thr)] = {**report, "confusion_matrix": matrix.tolist(), "rows": rows}
-        _append_jsonl(out / "classification_rows.jsonl", rows)
-    metrics = {"seed": seed, "per_threshold": per_thr}
-    _write_json(out / "metrics.json", metrics)
-    _plot_lines(out / "figures/threshold_accuracy.png", "disambiguation threshold validation", {"accuracy": (list(cfg_obj.thresholds), [per_thr[str(t)]["accuracy"] for t in cfg_obj.thresholds])}, "threshold", "accuracy", vlines=((0.95, "production"),))
-    return metrics
-
-
-def run_action_gate_threshold_calibration(seed: int, out: Path, run_config: RunConfig, cfg_obj: ThresholdCalibrationConfig) -> Dict[str, Any]:
-    recipes, pairs = build_pairs(seed, cfg_obj.n_recipes, n_preferences=3)
-    train = [p for p in pairs if p.preference_name == "identity"]
-    probes = [p for p in pairs if p.preference_name != "identity"]
-    per_thr: Dict[str, Any] = {}
-    for thr in cfg_obj.thresholds:
-        cfg = base_config(seed, run_config, posterior_action_confidence_threshold=float(thr))
-        agent = make_agent("full", cfg)
-        name_to_rid: Dict[str, str] = {}
-        for pair in train:
-            observe_episode(agent, pair, name_to_rid)
-        checkpoint = agent.snapshot()
-        rows: List[Dict[str, Any]] = []
-        for pair in probes:
-            agent.restore_from(checkpoint)
-            row, steps = assist_episode(agent, pair, dict(name_to_rid), run_config=run_config, event_tag={"threshold": thr})
-            rows.append(row)
-            _append_jsonl(out / "episode_steps.jsonl", ({"threshold": thr, **s} for s in steps))
-        per_thr[str(thr)] = _aggregate_episode_metrics(rows)
-    metrics = {"seed": seed, "per_threshold": per_thr}
-    _write_json(out / "metrics.json", metrics)
-    _plot_lines(out / "figures/coverage_accuracy.png", "action gate calibration", {
-        "coverage": (list(cfg_obj.thresholds), [per_thr[str(t)]["assistance_coverage"] for t in cfg_obj.thresholds]),
-        "conditional_top1": (list(cfg_obj.thresholds), [per_thr[str(t)]["conditional_top1"] for t in cfg_obj.thresholds]),
-    }, "threshold", "rate")
-    return metrics
 
 
 def _drop_interior(actions: Sequence[str], frac: float, seed: int) -> List[str]:
@@ -5576,30 +4491,6 @@ def _drop_interior(actions: Sequence[str], frac: float, seed: int) -> List[str]:
     rng.shuffle(idxs)
     drop = set(idxs[: max(1, int(round(frac * len(actions))))])
     return [a for i, a in enumerate(actions) if i not in drop]
-
-
-def run_boundary_degradation_disambiguation(seed: int, out: Path, run_config: RunConfig, cfg_obj: ThresholdCalibrationConfig) -> Dict[str, Any]:
-    recipes, pairs = build_pairs(seed, cfg_obj.n_recipes, n_preferences=3)
-    train = [p for p in pairs if p.preference_name == "identity"]
-    probes = [p for p in pairs if p.preference_name != "identity"]
-    agent = make_agent("full", base_config(seed, run_config))
-    name_to_rid: Dict[str, str] = {}
-    for pair in train:
-        observe_episode(agent, pair, name_to_rid)
-    per_drop: Dict[str, Any] = {}
-    for frac in cfg_obj.drop_fractions:
-        rows = []
-        for pair in probes:
-            dropped = _drop_interior(pair.actions, float(frac), seed)
-            pred = _classify_pair(agent, pair, name_to_rid, actions=dropped)
-            gt = "same_recipe_new_preference" if pair.recipe_name in name_to_rid else "new_recipe"
-            rows.append({"drop_fraction": frac, "pair": pair.label, "pred": pred, "gt": gt, "correct": pred == gt})
-        per_drop[str(frac)] = {"accuracy": _mean([1.0 if r["correct"] else 0.0 for r in rows]), "rows": rows}
-        _append_jsonl(out / "boundary_rows.jsonl", rows)
-    metrics = {"seed": seed, "per_drop_fraction": per_drop}
-    _write_json(out / "metrics.json", metrics)
-    _plot_lines(out / "figures/boundary_degradation.png", "classification under dropped actions", {"accuracy": (list(cfg_obj.drop_fractions), [per_drop[str(f)]["accuracy"] for f in cfg_obj.drop_fractions])}, "dropped fraction", "accuracy")
-    return metrics
 
 
 def run_frequency_gap_decay_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: GapSweepConfig) -> Dict[str, Any]:
@@ -5621,8 +4512,6 @@ def run_frequency_gap_decay_sweep(seed: int, out: Path, run_config: RunConfig, c
         per_baseline[baseline] = {"per_gap": per_gap, "mean_global_rate": _mean([v["mean_global_rate"] for v in per_gap.values()])}
     metrics = {"seed": seed, "per_baseline": per_baseline}
     _write_json(out / "metrics.json", metrics)
-    for baseline, row in per_baseline.items():
-        _plot_lines(out / f"figures/{baseline}_global_rate.png", f"{baseline}: gap decay rate", {baseline: (list(cfg_obj.gaps), [row["per_gap"][str(g)]["mean_global_rate"] for g in cfg_obj.gaps])}, "gap", "global rate")
     return metrics
 
 
@@ -5643,21 +4532,6 @@ def run_mwr_window_sensitivity(seed: int, out: Path, run_config: RunConfig, cfg_
             rows[baseline] = row
         per_window[str(window)] = rows
     metrics = {"seed": seed, "per_window": per_window}
-    _write_json(out / "metrics.json", metrics)
-    return metrics
-
-
-def run_reentry_gap_neutral_vs_distractor(seed: int, out: Path, run_config: RunConfig, cfg_obj: GapSweepConfig) -> Dict[str, Any]:
-    neutral = run_adaptive_decay_reentry(seed, _ensure(out / "neutral"), run_config, AdaptiveDecayReentryConfig(cfg_obj.n_recipes, cfg_obj.gaps, True))
-    distractor = run_adaptive_decay_reentry(seed, _ensure(out / "distractor"), run_config, AdaptiveDecayReentryConfig(cfg_obj.n_recipes, cfg_obj.gaps, False))
-    metrics = {"seed": seed, "neutral": neutral, "distractor": distractor}
-    _write_json(out / "metrics.json", metrics)
-    return metrics
-
-
-def run_active_pruned_decay_probe(seed: int, out: Path, run_config: RunConfig, cfg_obj: GapSweepConfig) -> Dict[str, Any]:
-    metrics = run_adaptive_decay_reentry(seed, out, run_config, AdaptiveDecayReentryConfig(cfg_obj.n_recipes, cfg_obj.gaps, True))
-    metrics["probe_family"] = "active_pruned_decay_probe"
     _write_json(out / "metrics.json", metrics)
     return metrics
 
@@ -5695,8 +4569,8 @@ def run_sparse_first_exposure_pool_sweep(seed: int, out: Path, run_config: RunCo
             row[baseline] = {
                 "all_top1": _mean([v.get("top1", 0.0) for v in evals.values()]),
                 "active_variants": len(agent.decay.active),
-                "pool_coverage": len(seen_labels) / max(1, len(pool)),
-                **{f"{metric}_{cell}": vals.get(metric, 0.0) for cell, rows in cell_rows.items() for vals in [_aggregate_episode_metrics(rows)] for metric in ("live_top1", "assistance_coverage", "conditional_top1", "n_episodes")},
+                "pool_seen_fraction": len(seen_labels) / max(1, len(pool)),
+                **{f"{metric}_{cell}": vals.get(metric, 0.0) for cell, rows in cell_rows.items() for vals in [_aggregate_episode_metrics(rows)] for metric in ("live_top1", "robot_wrong_rate", "n_episodes")},
             }
         per_pool[str(pool_size)] = row
     metrics = {"seed": seed, "per_pool": per_pool}
@@ -5705,7 +4579,7 @@ def run_sparse_first_exposure_pool_sweep(seed: int, out: Path, run_config: RunCo
 
 
 def run_zipf_usage_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: ZipfUsageConfig) -> Dict[str, Any]:
-    builders = select_recipe_builders(seed, min(cfg_obj.n_recipes, 4) if run_config.quick else cfg_obj.n_recipes)
+    builders = select_recipe_builders(seed, cfg_obj.n_recipes)
     prefs = select_preference_names(max(1, int(cfg_obj.n_preferences)))
     by_recipe: Dict[str, List[RecipePrefPair]] = {}
     for recipe_name, fn in builders:
@@ -5723,15 +4597,17 @@ def run_zipf_usage_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: Z
         if rows:
             by_recipe[recipe_name] = rows
     ranked_pairs: List[RecipePrefPair] = []
-    max_rows = max((len(v) for v in by_recipe.values()), default=0)
-    for pref_idx in range(max_rows):
-        for recipe_name, _fn in builders:
-            rows = by_recipe.get(recipe_name, [])
-            if pref_idx < len(rows):
-                ranked_pairs.append(rows[pref_idx])
+    recipe_rank_by_name = {recipe_name: idx for idx, (recipe_name, _fn) in enumerate(builders)}
+    preference_rank_by_label: Dict[str, int] = {}
+    for recipe_name, _fn in builders:
+        rows = _sorted_preference_choices(by_recipe.get(recipe_name, []))
+        by_recipe[recipe_name] = rows
+        for pref_idx, pair in enumerate(rows):
+            preference_rank_by_label[pair.label] = pref_idx
+            ranked_pairs.append(pair)
     if not ranked_pairs:
         raise RuntimeError("zipf_usage_sweep requires at least one materialized recipe/preference workflow")
-    n_events = min(int(cfg_obj.n_events), 24) if run_config.quick else int(cfg_obj.n_events)
+    n_events = int(cfg_obj.n_events)
     phase_a_pairs: List[RecipePrefPair] = []
     for _cycle in range(max(1, int(cfg_obj.phase_a_cycles))):
         phase_a_pairs.extend(ranked_pairs)
@@ -5770,19 +4646,30 @@ def run_zipf_usage_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: Z
         phase_a_snapshots[baseline] = agent.snapshot()
         phase_a_name_to_rid[baseline] = dict(name_to_rid)
     for alpha in cfg_obj.alphas:
-        probs = _zipf_probs(len(ranked_pairs), float(alpha))
+        recipe_probs = _zipf_probs(len(builders), float(alpha))
+        raw_probs: List[float] = []
+        for pair in ranked_pairs:
+            r_idx = recipe_rank_by_name.get(pair.recipe_name, 0)
+            pref_probs = _zipf_probs(len(by_recipe.get(pair.recipe_name, [])), float(alpha))
+            p_idx = preference_rank_by_label.get(pair.label, 0)
+            raw_probs.append(float(recipe_probs[r_idx]) * float(pref_probs[min(p_idx, len(pref_probs) - 1)]))
+        probs = np.asarray(raw_probs, dtype=float)
+        probs = probs / max(float(probs.sum()), 1e-9)
         rng = _rng(seed, int(alpha * 1000) + 707)
         counts = Counter()
         alpha_events: List[ScenarioEvent] = []
+        probability_order = list(np.argsort(-probs))
+        rank_by_idx = {int(idx): rank for rank, idx in enumerate(probability_order)}
         head_cut = max(1, len(ranked_pairs) // 4)
-        tail_start = max(0, len(ranked_pairs) - head_cut)
+        tail_rank_start = max(0, len(ranked_pairs) - head_cut)
         for i in range(max(1, n_events)):
             idx = int(rng.choice(len(ranked_pairs), p=probs))
             pair = ranked_pairs[idx]
             counts[pair.label] += 1
-            if idx < head_cut:
+            prob_rank = int(rank_by_idx.get(idx, idx))
+            if prob_rank < head_cut:
                 event_type = "rush_hour_repeat_order"
-            elif idx >= tail_start:
+            elif prob_rank >= tail_rank_start:
                 event_type = "rare_custom_order_reentry"
             else:
                 event_type = "regular_menu_rotation"
@@ -5795,16 +4682,18 @@ def run_zipf_usage_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: Z
                     "event_idx": i,
                     "event_type": event_type,
                     "zipf_alpha": float(alpha),
-                    "workflow_rank": idx,
+                    "workflow_rank": prob_rank,
+                    "recipe_rank": int(recipe_rank_by_name.get(pair.recipe_name, 0)),
+                    "preference_rank": int(preference_rank_by_label.get(pair.label, 0)),
                     "intended_probability": float(probs[idx]),
-                    "head_tail_bin": "head" if idx < head_cut else ("tail" if idx >= tail_start else "middle"),
+                    "head_tail_bin": "head" if prob_rank < head_cut else ("tail" if prob_rank >= tail_rank_start else "middle"),
                 },
             ))
         scenario_rows.extend(_scenario_event_row(e) for e in alpha_events)
         alpha_row: Dict[str, Any] = {}
         total = max(1, sum(counts.values()))
-        head_labels = {p.label for p in ranked_pairs[:head_cut]}
-        tail_labels = {p.label for p in ranked_pairs[tail_start:]}
+        head_labels = {ranked_pairs[idx].label for idx in probability_order[:head_cut]}
+        tail_labels = {ranked_pairs[idx].label for idx in probability_order[tail_rank_start:]}
         prob_by_label = {p.label: float(probs[idx]) for idx, p in enumerate(ranked_pairs)}
         for baseline in run_config.baselines:
             agent = make_agent(baseline, base_config(seed, run_config))
@@ -5832,6 +4721,8 @@ def run_zipf_usage_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: Z
             utility = sum(label_acc.get(lbl, 0.0) * prob_by_label.get(lbl, 0.0) for lbl in label_acc)
             realized_utility = sum(label_acc.get(lbl, 0.0) * (cnt / total) for lbl, cnt in counts.items())
             fairness = _mean([label_acc.get(p.label, 0.0) for p in ranked_pairs])
+            observed_labels = set(counts)
+            zero_count_labels = {p.label for p in ranked_pairs if p.label not in observed_labels}
             live_row = _aggregate_episode_metrics(assist_rows)
             row = {
                 **live_row,
@@ -5840,6 +4731,9 @@ def run_zipf_usage_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: Z
                 "utility_top1": utility,
                 "realized_utility_top1": realized_utility,
                 "fairness_top1": fairness,
+                "fairness_top1_all_onboarded": fairness,
+                "fairness_top1_observed_phase_b": _mean([label_acc.get(lbl, 0.0) for lbl in observed_labels]),
+                "fairness_top1_unsampled_phase_b": _mean([label_acc.get(lbl, 0.0) for lbl in zero_count_labels]),
                 "head_top1": _mean([label_acc.get(lbl, 0.0) for lbl in head_labels]),
                 "tail_top1": _mean([label_acc.get(lbl, 0.0) for lbl in tail_labels]),
                 "head_tail_gap": _mean([label_acc.get(lbl, 0.0) for lbl in head_labels]) - _mean([label_acc.get(lbl, 0.0) for lbl in tail_labels]),
@@ -5850,6 +4744,9 @@ def run_zipf_usage_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: Z
                 "tail_realised_n": int(sum(counts.get(lbl, 0) for lbl in tail_labels)),
                 "n_eval_pairs": len(ranked_pairs),
                 "n_unique_phase_b_pairs": len(counts),
+                "n_zero_count_fairness_pairs": len(zero_count_labels),
+                "fairness_denominator": "all_onboarded_recipe_preference_workflows",
+                "zipf_distribution": "joint_recipe_zipf_times_preference_zipf",
                 "phase_a_wall_s": phase_a_wall_s.get(baseline, 0.0),
                 "phase_b_wall_s": phase_b_wall,
             }
@@ -5877,32 +4774,6 @@ def run_zipf_usage_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: Z
         "per_alpha": per_alpha,
     }
     _write_json(out / "metrics.json", metrics)
-    baselines = sorted({baseline for row in per_alpha.values() for baseline in row})
-    for metric, ylabel in (
-        ("utility_top1", "utility top-1"),
-        ("fairness_top1", "fairness top-1"),
-        ("head_tail_gap", "head-tail gap"),
-    ):
-        series = {
-            baseline: (
-                list(cfg_obj.alphas),
-                [per_alpha[str(alpha)].get(baseline, {}).get(metric, 0.0) for alpha in cfg_obj.alphas],
-            )
-            for baseline in baselines
-        }
-        _plot_lines(out / f"figures/zipf_{metric}.png", f"Zipf sweep {metric}", series, "alpha", ylabel)
-    for metric, ylabel in (
-        ("active_variants", "active variants"),
-        ("pruned_variants", "pruned variants"),
-    ):
-        series = {
-            baseline: (
-                list(cfg_obj.alphas),
-                [per_alpha[str(alpha)].get(baseline, {}).get("memory", {}).get(metric, 0.0) for alpha in cfg_obj.alphas],
-            )
-            for baseline in baselines
-        }
-        _plot_lines(out / f"figures/zipf_memory_{metric}.png", f"Zipf sweep memory {metric}", series, "alpha", ylabel)
     return metrics
 
 
@@ -5928,13 +4799,13 @@ def run_cycle_width_sparsity_sweep(seed: int, out: Path, run_config: RunConfig, 
 
 
 def run_baseline_anchor_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: ComputeTradeoffConfig) -> Dict[str, Any]:
-    anchor_run = replace(run_config, baselines=("full", "adaptive", "l2_anchor", "ewc", "online_ewc", "experience_replay_bc", "no_replay"))
+    anchor_run = replace(run_config, baselines=PAPER_BASELINES)
     stream_cfg = DeploymentStreamConfig(n_recipes=cfg_obj.n_recipes, n_phase_b_events=cfg_obj.n_events)
     return run_deployment_stream(seed, out, anchor_run, stream_cfg)
 
 
 def run_continual_learning_regularizer_sweep(seed: int, out: Path, run_config: RunConfig, cfg_obj: ComputeTradeoffConfig) -> Dict[str, Any]:
-    cl_run = replace(run_config, baselines=("bc", "l2_anchor", "ewc", "online_ewc", "experience_replay_bc", "no_decay", "full"))
+    cl_run = replace(run_config, baselines=PAPER_BASELINES)
     stream_cfg = DeploymentStreamConfig(n_recipes=cfg_obj.n_recipes, n_phase_b_events=cfg_obj.n_events)
     return run_deployment_stream(seed, out, cl_run, stream_cfg)
 
@@ -5945,7 +4816,7 @@ def run_posterior_ablation_matrix(seed: int, out: Path, run_config: RunConfig, c
         n_preferences=cfg_obj.n_preferences,
         diagonal_cycles=cfg_obj.diagonal_cycles,
         offdiag_repeats=cfg_obj.repeats,
-        baselines=("full", "irl_ngram_only", "no_posterior", "no_pruned_memory_prior", "oracle_preference_label"),
+        baselines=PAPER_BASELINES,
     )
     return run_cross_recipe_transfer_suite(seed, out, run_config, ab_cfg)
 
@@ -5956,61 +4827,222 @@ def run_recipe_preference_factor_ablation(seed: int, out: Path, run_config: RunC
         n_preferences=cfg_obj.n_preferences,
         diagonal_cycles=cfg_obj.diagonal_cycles,
         offdiag_repeats=cfg_obj.repeats,
-        baselines=("full", "no_preference_prototype", "no_recipe_prototype", "no_weighted_rehearsal", "bigram"),
+        baselines=PAPER_BASELINES,
     )
     return run_cross_recipe_transfer_suite(seed, out, run_config, ab_cfg)
 
 
-def run_coverage_accuracy_curve(seed: int, out: Path, run_config: RunConfig, cfg_obj: ComputeTradeoffConfig) -> Dict[str, Any]:
-    thresholds = (0.0, 0.1, 0.2, 0.35, 0.5, 0.7)
-    per_thr: Dict[str, Any] = {}
-    for thr in thresholds:
-        thr_run = replace(run_config, baselines=("full",))
-        stream_cfg = MultiUserStreamConfig(n_users=3, n_recipes=cfg_obj.n_recipes, n_events=cfg_obj.n_events, zipf_alpha=0.8)
-        recipes, users, events = _stream_events(seed, stream_cfg)
-        cfg = base_config(seed, thr_run, posterior_action_confidence_threshold=float(thr))
-        metrics, episode_rows, step_rows, memory_rows = _run_baseline_stream("full", cfg, events, thr_run)
-        per_thr[str(thr)] = metrics
-        _append_jsonl(out / "episode_steps.jsonl", ({"threshold": thr, **s} for s in step_rows))
-    metrics = {"seed": seed, "per_threshold": per_thr}
-    _write_json(out / "metrics.json", metrics)
-    _plot_lines(out / "figures/coverage_accuracy_curve.png", "coverage-accuracy curve", {
-        "coverage": (list(thresholds), [per_thr[str(t)]["assistance_coverage"] for t in thresholds]),
-        "conditional_top1": (list(thresholds), [per_thr[str(t)]["conditional_top1"] for t in thresholds]),
-    }, "threshold", "rate")
-    return metrics
+def _baseline_tuning_grid_ranges(cfg_obj: BaselineHyperparameterTuningConfig) -> Dict[str, Any]:
+    return {
+        "bc_learning_rate": list(cfg_obj.bc_learning_rates),
+        "bc_l2": list(cfg_obj.bc_l2_values),
+        "bc_history_len": list(cfg_obj.bc_history_lens),
+        "bc_history_bins": list(cfg_obj.bc_history_bins_values),
+        "bc_epochs_cold_warm": [list(v) for v in cfg_obj.bc_epoch_pairs],
+        "er_buffer_size": list(cfg_obj.er_buffer_sizes),
+        "er_batch_size": list(cfg_obj.er_batch_sizes),
+        "er_recency_alpha": list(cfg_obj.er_recency_alphas),
+        "er_uniform_mix": list(cfg_obj.er_uniform_mixes),
+        "ewc_lambda": list(cfg_obj.ewc_lambdas),
+        "maxent_learning_rate": list(cfg_obj.maxent_learning_rates),
+        "maxent_l2": list(cfg_obj.maxent_l2_values),
+        "maxent_iters_cold_warm": [list(v) for v in cfg_obj.maxent_iter_pairs],
+    }
 
 
-def _calibration_bins(step_rows: Sequence[Dict[str, Any]], n_bins: int = 10) -> Dict[str, Any]:
-    pairs = [(float(r["action_confidence"]), 1.0 if r.get("correct_top1") else 0.0) for r in step_rows if r.get("action_confidence") is not None]
-    if not pairs:
-        return {"ece": 0.0, "brier": 0.0, "bins": []}
-    bins = []
-    ece = 0.0
-    brier = _mean([(s - y) ** 2 for s, y in pairs])
-    for i in range(n_bins):
-        lo, hi = i / n_bins, (i + 1) / n_bins
-        vals = [(s, y) for s, y in pairs if (s >= lo and (s < hi or i == n_bins - 1))]
-        if not vals:
+def _dedupe_override_candidates(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for row in candidates:
+        key = tuple(sorted(row.items()))
+        if key in seen:
             continue
-        conf = _mean([s for s, _y in vals])
-        acc = _mean([y for _s, y in vals])
-        ece += (len(vals) / len(pairs)) * abs(conf - acc)
-        bins.append({"lo": lo, "hi": hi, "mean_confidence": conf, "accuracy": acc, "n": len(vals)})
-    return {"ece": ece, "brier": brier, "bins": bins}
+        seen.add(key)
+        out.append(dict(row))
+    return out
 
 
-def run_confidence_calibration_reliability(seed: int, out: Path, run_config: RunConfig, cfg_obj: ComputeTradeoffConfig) -> Dict[str, Any]:
-    stream_cfg = MultiUserStreamConfig(n_users=3, n_recipes=cfg_obj.n_recipes, n_events=cfg_obj.n_events)
-    recipes, users, events = _stream_events(seed, stream_cfg)
+def _cap_tuning_candidates(candidates: Sequence[Dict[str, Any]], max_points: int) -> List[Dict[str, Any]]:
+    defaults = _learner_hyperparameter_metadata(AdaptiveHRCAgent(cfg=DEFAULT_CONFIG))
+    deduped = _dedupe_override_candidates(candidates)
+    if len(deduped) <= max(1, int(max_points)):
+        return deduped
+    ranked = sorted(
+        deduped,
+        key=lambda row: (
+            sum(abs(float(v) - float(defaults.get(k, v))) for k, v in row.items() if isinstance(v, (int, float))),
+            tuple(sorted((str(k), str(v)) for k, v in row.items())),
+        ),
+    )
+    stride = max(1, len(deduped) // max(1, int(max_points)))
+    spread = deduped[::stride]
+    return _dedupe_override_candidates(ranked[: max(1, int(max_points)) // 2] + spread)[: max(1, int(max_points))]
+
+
+def _baseline_hyperparameter_candidates(
+    baseline: str,
+    cfg_obj: BaselineHyperparameterTuningConfig,
+) -> List[Dict[str, Any]]:
+    bc_epoch_pairs = tuple((int(c), int(w)) for c, w in cfg_obj.bc_epoch_pairs)
+    maxent_iter_pairs = tuple((int(c), int(w)) for c, w in cfg_obj.maxent_iter_pairs)
+    max_points = int(cfg_obj.max_grid_points_per_baseline)
+    candidates: List[Dict[str, Any]] = []
+    if baseline in {"bc", "experience_replay_bc", "recency_prioritized_replay"}:
+        for lr in cfg_obj.bc_learning_rates:
+            for l2 in cfg_obj.bc_l2_values:
+                for hist_len in cfg_obj.bc_history_lens:
+                    for hist_bins in cfg_obj.bc_history_bins_values:
+                        for cold, warm in bc_epoch_pairs:
+                            base = {
+                                "bc_learning_rate": float(lr),
+                                "bc_l2": float(l2),
+                                "bc_history_len": int(hist_len),
+                                "bc_history_bins": int(hist_bins),
+                                "bc_epochs_cold": int(cold),
+                                "bc_epochs_warm": int(warm),
+                            }
+                            if baseline in {"experience_replay_bc", "recency_prioritized_replay"}:
+                                for buffer_size in cfg_obj.er_buffer_sizes:
+                                    for batch_size in cfg_obj.er_batch_sizes:
+                                        row = {
+                                            **base,
+                                            "er_buffer_size": int(buffer_size),
+                                            "er_batch_size": int(batch_size),
+                                        }
+                                        if baseline == "recency_prioritized_replay":
+                                            for alpha in cfg_obj.er_recency_alphas:
+                                                for mix in cfg_obj.er_uniform_mixes:
+                                                    candidates.append({
+                                                        **row,
+                                                        "er_recency_alpha": float(alpha),
+                                                        "er_uniform_mix": float(mix),
+                                                    })
+                                        else:
+                                            candidates.append(row)
+                            else:
+                                candidates.append(base)
+    elif baseline in {"ewc", "online_ewc"}:
+        for lam in cfg_obj.ewc_lambdas:
+            for lr in cfg_obj.maxent_learning_rates:
+                for l2 in cfg_obj.maxent_l2_values:
+                    for cold, warm in maxent_iter_pairs:
+                        candidates.append({
+                            "ewc_lambda": float(lam),
+                            "maxent_learning_rate": float(lr),
+                            "maxent_l2": float(l2),
+                            "maxent_iters_cold": int(cold),
+                            "maxent_iters_warm": int(warm),
+                        })
+    else:
+        candidates.append({})
+    return _cap_tuning_candidates(candidates or [{}], max_points)
+
+
+def run_baseline_hyperparameter_tuning(
+    seed: int,
+    out: Path,
+    run_config: RunConfig,
+    cfg_obj: BaselineHyperparameterTuningConfig,
+) -> Dict[str, Any]:
+    recipes, pairs = build_pairs(seed, cfg_obj.n_recipes, n_preferences=cfg_obj.n_preferences)
+    rng = _rng(seed, 2701)
+    usable = [p for p in pairs if p.preference_name in PRESET_PREFERENCES]
+    rng.shuffle(usable)
+    cut = max(1, int(round((1.0 - float(cfg_obj.validation_fraction)) * len(usable))))
+    train_pairs = usable[:cut]
+    calibration_pairs = usable[cut:] or usable[: max(1, min(4, len(usable)))]
+    calibration_pairs = calibration_pairs[: max(1, int(cfg_obj.max_eval_pairs))]
+    selected_prefs = sorted({p.preference_name for p in train_pairs + calibration_pairs})
+    _record_common_artifacts(out, seed, cfg_obj, recipes, selected_prefs)
+    rows: List[Dict[str, Any]] = []
     per_baseline: Dict[str, Any] = {}
-    for baseline in run_config.baselines:
-        metrics, episode_rows, step_rows, memory_rows = _run_baseline_stream(baseline, base_config(seed, run_config), events, run_config)
-        calib = _calibration_bins(step_rows)
-        metrics["calibration"] = calib
-        per_baseline[baseline] = metrics
-        _append_jsonl(out / "episode_steps.jsonl", step_rows)
-    metrics = {"seed": seed, "per_baseline": per_baseline}
+    objective = "hrc_net_action_value_shared_heldout_calibration"
+    for baseline in cfg_obj.baselines:
+        if baseline != "full":
+            try:
+                make_agent(baseline, base_config(seed, run_config))
+            except Exception:
+                continue
+        baseline_rows: List[Dict[str, Any]] = []
+        candidates = _baseline_hyperparameter_candidates(baseline, cfg_obj)
+        for idx, overrides in enumerate(candidates):
+            cfg = base_config(seed, run_config, **overrides)
+            agent = make_agent(baseline, cfg)
+            name_to_rid: Dict[str, str] = {}
+            for pair in train_pairs:
+                observe_episode(agent, pair, name_to_rid)
+            eval_rows: List[Dict[str, Any]] = []
+            for pair in calibration_pairs:
+                row, _steps = assist_episode(
+                    agent,
+                    pair,
+                    dict(name_to_rid),
+                    run_config=run_config,
+                    commit=False,
+                    event_tag={"condition": "baseline_hyperparameter_calibration", "candidate_idx": idx},
+                )
+                eval_rows.append(row)
+            agg = _aggregate_episode_metrics(eval_rows)
+            net_value = _hrc_net_action_value(agg)
+            metadata = _learner_hyperparameter_metadata(agent)
+            replay_meta = {}
+            if hasattr(agent, "replay_buffer_metadata"):
+                replay_meta = dict(agent.replay_buffer_metadata())  # type: ignore[attr-defined]
+            candidate_row = {
+                "baseline": baseline,
+                "candidate_idx": int(idx),
+                "overrides": dict(overrides),
+                "selected_values": {k: metadata.get(k) for k in overrides},
+                "hrc_net_action_value": float(net_value),
+                "live_top1": float(agg.get("live_top1", 0.0)),
+                "robot_wrong_rate": float(agg.get("robot_wrong_rate", 0.0)),
+                "net_robot_action_value": float(agg.get("net_robot_action_value", 0.0)),
+                "n_calibration_pairs": len(calibration_pairs),
+                "n_train_pairs": len(train_pairs),
+                "replay_buffer": replay_meta,
+            }
+            baseline_rows.append(candidate_row)
+            rows.append(candidate_row)
+        eligible = baseline_rows or [{
+            "baseline": baseline,
+            "candidate_idx": -1,
+            "overrides": {},
+            "hrc_net_action_value": 0.0,
+            "live_top1": 0.0,
+            "robot_wrong_rate": 1.0,
+        }]
+        best = max(
+            eligible,
+            key=lambda r: (
+                float(r.get("hrc_net_action_value", 0.0)),
+                float(r.get("live_top1", 0.0)),
+                -float(r.get("robot_wrong_rate", 0.0)),
+            ),
+        )
+        per_baseline[baseline] = {
+            "recommendation": dict(best),
+            "n_candidates": len(baseline_rows),
+            "grid_points_evaluated": len(baseline_rows),
+            "grid_capped": False,
+            "reported_only_does_not_mutate_default_config": True,
+        }
+    _append_jsonl(out / "baseline_hyperparameter_candidates.jsonl", rows)
+    metrics = {
+        "seed": seed,
+        "objective": objective,
+        "shared_calibration_protocol": {
+            "train_pairs": [p.label for p in train_pairs],
+            "calibration_pairs": [p.label for p in calibration_pairs],
+            "validation_fraction": float(cfg_obj.validation_fraction),
+            "same_split_for_all_systems": True,
+            "not_used_to_tune_final_test_stream": True,
+        },
+        "grid_ranges": _baseline_tuning_grid_ranges(cfg_obj),
+        "per_baseline": per_baseline,
+        "candidate_rows": rows,
+        "reported_only_does_not_mutate_default_config": True,
+        "default_values": _learner_hyperparameter_metadata(AdaptiveHRCAgent(cfg=DEFAULT_CONFIG)),
+    }
     _write_json(out / "metrics.json", metrics)
     return metrics
 
@@ -6035,8 +5067,19 @@ def _stress_prefix_collision(seed: int, baseline: str, run_config: RunConfig, cf
     name_to_rid: Dict[str, str] = {}
     observe_episode(agent, a, name_to_rid)
     observe_episode(agent, b, name_to_rid)
-    row, _steps = assist_episode(agent, b, name_to_rid, run_config=run_config, event_tag={"stress": "prefix_collision"})
-    return {"score": row["live_top1"], "live_top1": row["live_top1"], "shared_prefix": shared}
+    row, steps = assist_episode(agent, b, name_to_rid, run_config=run_config, event_tag={"stress": "prefix_collision"})
+    before_div = [s for s in steps if int(s.get("step", 0)) < int(shared)]
+    after_div = [s for s in steps if int(s.get("step", 0)) >= int(shared)]
+    return {
+        "score": row["live_top1"],
+        "live_top1": row["live_top1"],
+        "shared_prefix": shared,
+        "wrong_recipe_commit_rate": 1.0 if row.get("classification_recipe_id") not in (None, name_to_rid.get(b.recipe_name)) else 0.0,
+        "observation_suppression_rate": 0.0 if row.get("needs_observation") else 1.0,
+        "posterior_switch_latency": float(row.get("posterior_steps_to_lock", -1.0)),
+        "top1_before_diverging_step": _mean([1.0 if s.get("correct_top1") else 0.0 for s in before_div]),
+        "top1_after_diverging_step": _mean([1.0 if s.get("correct_top1") else 0.0 for s in after_div]),
+    }
 
 
 def _stress_preference_thrash(seed: int, baseline: str, run_config: RunConfig, cfg_obj: StressConfig) -> Dict[str, Any]:
@@ -6044,15 +5087,34 @@ def _stress_preference_thrash(seed: int, baseline: str, run_config: RunConfig, c
     agent = make_agent(baseline, base_config(seed, run_config))
     name_to_rid: Dict[str, str] = {}
     rows = []
+    step_rows: List[Dict[str, Any]] = []
+    latest_flips = 0
+    last_latest = None
     for i in range(max(1, cfg_obj.reps)):
         pair = pairs[i % len(pairs)]
         if i == 0:
             observe_episode(agent, pair, name_to_rid)
         else:
-            row, _steps = assist_episode(agent, pair, name_to_rid, run_config=run_config, event_tag={"stress": "preference_thrash"})
+            before_latest = dict(agent.decay.latest_by_recipe)
+            row, steps = assist_episode(agent, pair, name_to_rid, run_config=run_config, event_tag={"stress": "preference_thrash", "switch_index": i})
+            after_latest = tuple(sorted(agent.decay.latest_by_recipe.items()))
+            if last_latest is not None and after_latest != last_latest:
+                latest_flips += 1
+            if before_latest != agent.decay.latest_by_recipe:
+                latest_flips += 1
+            last_latest = after_latest
             rows.append(row)
+            step_rows.extend(steps)
     agg = _aggregate_episode_metrics(rows)
-    return {"score": agg["live_top1"], **agg, "active_variants": len(agent.decay.active)}
+    return {
+        "score": agg["live_top1"],
+        **agg,
+        "mean_steps_to_stable_inference": float(agg.get("posterior_steps_to_lock", -1.0)),
+        "latest_pin_flip_count": float(latest_flips),
+        "robot_wrong_rate_after_switch": _mean([1.0 if _row_robot_wrong(s) else 0.0 for s in step_rows]),
+        "top1_by_switch_index": agg["live_top1"],
+        "active_variants": len(agent.decay.active),
+    }
 
 
 def _stress_reentry(seed: int, baseline: str, run_config: RunConfig, cfg_obj: StressConfig, distractor: bool = False) -> Dict[str, Any]:
@@ -6062,8 +5124,57 @@ def _stress_reentry(seed: int, baseline: str, run_config: RunConfig, cfg_obj: St
     observe_episode(agent, target, name_to_rid)
     observe_episode(agent, variant, name_to_rid)
     _advance_gap(agent, cfg_obj.gap, distractors, name_to_rid, neutral=not distractor)
-    row, _steps = assist_episode(agent, target, name_to_rid, run_config=run_config, event_tag={"stress": "rare_reentry"})
-    return {"score": row["live_top1"], **row, "active_variants": len(agent.decay.active), "pruned_variants": len(agent.decay.pruned)}
+    target_rid = name_to_rid.get(target.recipe_name)
+    target_hash = variant_hash(agent._tokens_from_action_labels(target.actions))
+    pruned_before = bool(target_rid is not None and (target_rid, target_hash) in agent.decay.pruned)
+    episode_pair = target
+    distractor_midpoint = -1
+    if distractor and distractors:
+        distractor_midpoint = max(1, len(target.actions) // 2)
+        distractor_action = distractors[0].actions[0]
+        late_actions = tuple(target.actions[:distractor_midpoint]) + (distractor_action,) + tuple(target.actions[distractor_midpoint:])
+        episode_pair = RecipePrefPair(
+            target.recipe_name,
+            f"{target.preference_name}_late_distractor",
+            f"{target.label}/late_distractor",
+            late_actions,
+            target.preference,
+            target.base_pref,
+            target.applied_axes,
+            target.failed_axes,
+            target.unchanged_axes,
+        )
+    row, steps = assist_episode(
+        agent,
+        episode_pair,
+        name_to_rid,
+        run_config=run_config,
+        event_tag={"stress": "late_distractor" if distractor else "rare_reentry", "distractor_midpoint": distractor_midpoint},
+    )
+    post = frozen_eval(agent, [target], name_to_rid)
+    recovery = next((int(s.get("step", 0)) for s in steps if s.get("correct_top1")), -1)
+    before_distractor = [s for s in steps if distractor_midpoint < 0 or int(s.get("step", 0)) < distractor_midpoint]
+    after_distractor = [s for s in steps if distractor_midpoint >= 0 and int(s.get("step", 0)) > distractor_midpoint]
+    recovery_after_distractor = next((int(s.get("step", 0)) - distractor_midpoint for s in after_distractor if s.get("correct_top1")), -1)
+    return {
+        "score": row["live_top1"],
+        **row,
+        "reentry_live_top1": row["live_top1"],
+        "pruned_step_top1": _mean([1.0 if s.get("correct_top1") else 0.0 for s in steps]) if pruned_before else 0.0,
+        "post_reentry_top1": _mean([v.get("top1", 0.0) for v in post.values()]),
+        "reentry_recovery_steps": recovery,
+        "target_live_top1_before_distractor": _mean([1.0 if s.get("correct_top1") else 0.0 for s in before_distractor]),
+        "target_live_top1_after_distractor": _mean([1.0 if s.get("correct_top1") else 0.0 for s in after_distractor]),
+        "recovery_steps_after_distractor": recovery_after_distractor if distractor else -1,
+        "posterior_recipe_flip_rate": _mean([
+            1.0 if target_rid is not None and s.get("posterior_recipe") not in (None, target_rid) else 0.0
+            for s in steps
+        ]),
+        "robot_wrong_rate": _mean([1.0 if _row_robot_wrong(s) else 0.0 for s in steps]),
+        "robot_wrong_rate_after_distractor": _mean([1.0 if _row_robot_wrong(s) else 0.0 for s in after_distractor]),
+        "active_variants": len(agent.decay.active),
+        "pruned_variants": len(agent.decay.pruned),
+    }
 
 
 def _stress_memory_exhaustion(seed: int, baseline: str, run_config: RunConfig, cfg_obj: StressConfig) -> Dict[str, Any]:
@@ -6074,7 +5185,43 @@ def _stress_memory_exhaustion(seed: int, baseline: str, run_config: RunConfig, c
         observe_episode(agent, pair, name_to_rid)
     evals = frozen_eval(agent, pairs, name_to_rid)
     top1 = _mean([v.get("top1", 0.0) for v in evals.values()])
-    return {"score": top1, "frozen_top1": top1, "active_variants": len(agent.decay.active), "pruned_variants": len(agent.decay.pruned)}
+    pin_violations = sum(
+        1 for rid, latest in agent.decay.latest_by_recipe.items()
+        if (rid, latest) not in agent.decay.active
+    )
+    capacity_sweep: List[Dict[str, Any]] = []
+    capacity = max(1, int(agent.cfg.max_variants_per_recipe))
+    for ratio in (0.8, 0.9, 1.0, 1.2):
+        probe = make_agent(baseline, base_config(seed, run_config))
+        probe_map: Dict[str, str] = {}
+        n_train = max(1, min(len(pairs), int(math.ceil(capacity * ratio))))
+        train_pairs = pairs[:n_train]
+        for pair in train_pairs:
+            observe_episode(probe, pair, probe_map)
+        probe_eval = frozen_eval(probe, train_pairs, probe_map)
+        probe_pin_violations = sum(
+            1 for rid, latest in probe.decay.latest_by_recipe.items()
+            if (rid, latest) not in probe.decay.active
+        )
+        capacity_sweep.append({
+            "capacity_ratio_target": float(ratio),
+            "n_train_pairs": n_train,
+            "live_top1": _mean([v.get("top1", 0.0) for v in probe_eval.values()]),
+            "frozen_top1": _mean([v.get("top1", 0.0) for v in probe_eval.values()]),
+            "active_variants": len(probe.decay.active),
+            "pruned_variants": len(probe.decay.pruned),
+            "latest_pin_violation_count": float(probe_pin_violations),
+        })
+    return {
+        "score": top1,
+        "live_top1": top1,
+        "frozen_top1": top1,
+        "capacity_ratio": len(agent.decay.active) / max(1.0, float(agent.cfg.max_variants_per_recipe)),
+        "active_variants": len(agent.decay.active),
+        "pruned_variants": len(agent.decay.pruned),
+        "latest_pin_violation_count": float(pin_violations),
+        "capacity_sweep": capacity_sweep,
+    }
 
 
 def _run_stress(seed: int, out: Path, run_config: RunConfig, cfg_obj: StressConfig, kind: str) -> Dict[str, Any]:
@@ -6088,12 +5235,11 @@ def _run_stress(seed: int, out: Path, run_config: RunConfig, cfg_obj: StressConf
     per_baseline: Dict[str, Any] = {}
     baselines = tuple(b for b in run_config.baselines if b != "oracle_ceiling") or ("full",)
     for baseline in baselines:
-        rows = [fns[kind](seed + i * 37, baseline, run_config, cfg_obj) for i in range(max(1, int(cfg_obj.reps if run_config.quick else min(cfg_obj.reps, 10))))]
+        rows = [fns[kind](seed + i * 37, baseline, run_config, cfg_obj) for i in range(max(1, int(cfg_obj.reps)))]
         per_baseline[baseline] = {key: _mean([r.get(key, 0.0) for r in rows]) for key in sorted({k for r in rows for k in r if isinstance(r.get(k), (int, float, bool))})}
         per_baseline[baseline]["rep_rows"] = rows
     metrics = {"seed": seed, "stress_kind": kind, "per_baseline": per_baseline}
     _write_json(out / "metrics.json", metrics)
-    _plot_bar(out / "figures/stress_score.png", f"{kind} score", {b: r.get("score", 0.0) for b, r in per_baseline.items()}, ylabel="score")
     return metrics
 
 
@@ -6115,6 +5261,50 @@ def run_rare_reentry_stress(seed: int, out: Path, run_config: RunConfig, cfg_obj
 
 def run_late_distractor_stress(seed: int, out: Path, run_config: RunConfig, cfg_obj: StressConfig) -> Dict[str, Any]:
     return _run_stress(seed, out, run_config, cfg_obj, "late_distractor_stress")
+
+
+def run_adversarial_stress_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj: StressConfig) -> Dict[str, Any]:
+    per_stress: Dict[str, Any] = {}
+    for kind in (
+        "memory_exhaustion_stress",
+        "prefix_collision_stress",
+        "preference_thrash_stress",
+        "rare_reentry_stress",
+        "late_distractor_stress",
+    ):
+        per_stress[kind] = _run_stress(seed, _ensure(out / kind), run_config, cfg_obj, kind)
+    per_baseline: Dict[str, Any] = {}
+    baselines = sorted({
+        baseline
+        for stress_row in per_stress.values()
+        for baseline in (stress_row.get("per_baseline", {}) or {})
+    })
+    for baseline in baselines:
+        rows = [
+            stress_row.get("per_baseline", {}).get(baseline, {})
+            for stress_row in per_stress.values()
+            if baseline in (stress_row.get("per_baseline", {}) or {})
+        ]
+        per_baseline[baseline] = {
+            "stress_macro_score": _mean([float(r.get("score", 0.0)) for r in rows]),
+            "stress_macro_live_top1": _mean([float(r.get("live_top1", r.get("score", 0.0))) for r in rows]),
+            "stress_macro_robot_wrong_rate": _mean([float(r.get("robot_wrong_rate", r.get("robot_wrong_rate_after_switch", 0.0))) for r in rows]),
+            "n_stresses": len(rows),
+        }
+    metrics = {
+        "seed": seed,
+        "per_stress": per_stress,
+        "per_baseline": per_baseline,
+        "standardized_metrics": {
+            "memory_exhaustion": ("live_top1", "frozen_top1", "active_variants", "pruned_variants", "latest_pin_violation_count"),
+            "prefix_collision": ("wrong_recipe_commit_rate", "observation_suppression_rate", "posterior_switch_latency", "top1_before_diverging_step", "top1_after_diverging_step"),
+            "preference_thrash": ("mean_steps_to_stable_inference", "latest_pin_flip_count", "robot_wrong_rate_after_switch", "top1_by_switch_index"),
+            "rare_reentry": ("reentry_live_top1", "pruned_step_top1", "post_reentry_top1", "reentry_recovery_steps"),
+            "late_distractor": ("reentry_live_top1", "posterior_recipe_flip_rate", "recovery_steps_after_distractor", "robot_wrong_rate"),
+        },
+    }
+    _write_json(out / "metrics.json", metrics)
+    return metrics
 
 
 def run_seed_recipe_selection_audit(seed: int, out: Path, run_config: RunConfig, cfg_obj: MaterialityAuditConfig) -> Dict[str, Any]:
@@ -6139,7 +5329,7 @@ def run_runtime_scaling_sweep(seed: int, out: Path, run_config: RunConfig, cfg_o
     per_n: Dict[str, Any] = {}
     small_run = replace(run_config, baselines=("full", "bigram"))
     for n in cfg_obj.recipe_counts:
-        metrics = run_compute_tradeoff(seed, _ensure(out / f"n_{n}"), small_run, ComputeTradeoffConfig(n_recipes=int(n), n_events=cfg_obj.n_events))
+        metrics = _run_compute_tradeoff(seed, _ensure(out / f"n_{n}"), small_run, ComputeTradeoffConfig(n_recipes=int(n), n_events=cfg_obj.n_events))
         per_n[str(n)] = metrics
     result = {"seed": seed, "per_recipe_count": per_n}
     _write_json(out / "metrics.json", result)
@@ -6148,38 +5338,34 @@ def run_runtime_scaling_sweep(seed: int, out: Path, run_config: RunConfig, cfg_o
 
 def _material_pair_candidates(recipe_name: str, fn: Callable[[], List[str]], prefs: Sequence[str]) -> List[RecipePrefPair]:
     pairs: List[RecipePrefPair] = []
+    seen_orders: set = set()
     for pref in prefs:
         try:
             pair = materialize_pair(recipe_name, pref, fn)
         except Exception:
             continue
+        if pair.actions in seen_orders:
+            continue
+        seen_orders.add(pair.actions)
         if pair.base_pref or pair.applied_axes:
             pairs.append(pair)
     return pairs
 
 
-def _blend_preference_pair(base: RecipePrefPair, target: RecipePrefPair, alpha: float, rng: np.random.Generator) -> RecipePrefPair:
-    base_order = {action: i for i, action in enumerate(base.actions)}
-    target_order = {action: i for i, action in enumerate(target.actions)}
-    actions = sorted(
-        set(base.actions) | set(target.actions),
-        key=lambda action: (
-            (1.0 - float(alpha)) * base_order.get(action, len(base_order))
-            + float(alpha) * target_order.get(action, len(target_order))
-            + float(rng.random()) * 1e-6
-        ),
+def _sorted_preference_choices(pairs: Sequence[RecipePrefPair]) -> List[RecipePrefPair]:
+    pref_rank = {pref: idx for idx, pref in enumerate(PREFERENCE_NAMES)}
+    return sorted(
+        list(pairs),
+        key=lambda p: (pref_rank.get(p.preference_name, len(pref_rank)), p.preference_name, p.label),
     )
-    return RecipePrefPair(
-        recipe_name=target.recipe_name,
-        preference_name=target.preference_name,
-        label=f"{target.recipe_name}/gradual_{base.preference_name}_to_{target.preference_name}_{int(alpha * 100)}",
-        actions=tuple(actions),
-        preference=target.preference,
-        base_pref=False,
-        applied_axes=target.applied_axes,
-        failed_axes=target.failed_axes,
-        unchanged_axes=target.unchanged_axes,
-    )
+
+
+def _choose_preference_zipf(pairs: Sequence[RecipePrefPair], alpha: float, rng: np.random.Generator) -> Optional[RecipePrefPair]:
+    choices = _sorted_preference_choices(pairs)
+    if not choices:
+        return None
+    probs = _zipf_probs(len(choices), float(alpha))
+    return choices[int(rng.choice(len(choices), p=probs))]
 
 
 def _blocked_user_for_event(user_ids: Sequence[str], phase_b_idx: int, block_size: int) -> Tuple[str, int, bool]:
@@ -6194,9 +5380,463 @@ def _blocked_user_for_event(user_ids: Sequence[str], phase_b_idx: int, block_siz
     return user_ids[other_idx], block, False
 
 
-def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_config: RunConfig) -> Tuple[List[str], List[str], List[ScenarioEvent], List[RecipePrefPair]]:
-    n_recipes = min(cfg_obj.n_recipes, 4) if run_config.quick else cfg_obj.n_recipes
-    n_events = min(cfg_obj.n_phase_b_events, 24) if run_config.quick else cfg_obj.n_phase_b_events
+def _valid_ladder_pairs_for_recipe(
+    recipe_name: str,
+    generator_fn: Callable[[], List[str]],
+    preferences: Sequence[str],
+    rng: np.random.Generator,
+) -> List[RecipePrefPair]:
+    pref_names = [p for p in preferences if p in PRESET_PREFERENCES]
+    rng.shuffle(pref_names)
+    pairs: List[RecipePrefPair] = []
+    seen_orderings: set = set()
+    for pref_name in pref_names:
+        try:
+            pair = materialize_pair(recipe_name, pref_name, generator_fn)
+        except Exception:
+            continue
+        if not pair.base_pref and not pair.applied_axes:
+            continue
+        ordering = _order_hash(pair)
+        if ordering in seen_orderings:
+            continue
+        seen_orderings.add(ordering)
+        pairs.append(pair)
+    return pairs
+
+
+def _resolve_ladder_rung_count(cfg_obj: DeploymentLadderConfig, available: int) -> int:
+    requested = cfg_obj.n_rungs if cfg_obj.n_rungs is not None else cfg_obj.max_rungs
+    n_rungs = min(max(1, int(requested)), max(0, int(available)))
+    if n_rungs < 2:
+        raise RuntimeError(
+            "Deployment ladder requires at least two effective preference rungs "
+            "so the stream contains an update after initial observation."
+        )
+    return n_rungs
+
+
+def _deployment_ladder_plan(
+    seed: int,
+    cfg_obj: DeploymentLadderConfig,
+    scenario_kind: Literal["heterogeneous", "shared"],
+) -> Tuple[List[str], List[List[RecipePrefPair]], Dict[str, Any]]:
+    builders = select_recipe_builders(seed, cfg_obj.n_recipes)
+    if not builders:
+        raise RuntimeError("deployment ladder requires at least one selected recipe")
+    recipes = [recipe for recipe, _fn in builders]
+    prefs = tuple(cfg_obj.preferences or PREFERENCE_NAMES)
+    rng = _rng(seed, 8729 if scenario_kind == "heterogeneous" else 8731)
+    if scenario_kind == "heterogeneous":
+        by_recipe: Dict[str, List[RecipePrefPair]] = {}
+        for idx, (recipe_name, fn) in enumerate(builders):
+            by_recipe[recipe_name] = _valid_ladder_pairs_for_recipe(
+                recipe_name,
+                fn,
+                prefs,
+                _rng(seed, 8800 + idx),
+            )
+        available = min((len(v) for v in by_recipe.values()), default=0)
+        n_rungs = _resolve_ladder_rung_count(cfg_obj, available)
+        rungs = [
+            [by_recipe[recipe_name][rung_idx] for recipe_name in recipes]
+            for rung_idx in range(n_rungs)
+        ]
+        selection = {
+            "scenario_kind": scenario_kind,
+            "selection_policy": "per_recipe_seed_shuffled_unique_effective_preferences",
+            "available_preferences_by_recipe": {
+                recipe: [p.preference_name for p in pairs]
+                for recipe, pairs in by_recipe.items()
+            },
+        }
+    else:
+        pref_names = [p for p in prefs if p in PRESET_PREFERENCES]
+        rng.shuffle(pref_names)
+        seen_by_recipe: Dict[str, set] = {recipe: set() for recipe in recipes}
+        rungs = []
+        selected_preferences: List[str] = []
+        rejected_preferences: List[Dict[str, Any]] = []
+        desired = int(cfg_obj.n_rungs if cfg_obj.n_rungs is not None else cfg_obj.max_rungs)
+        for pref_name in pref_names:
+            rung_pairs: List[RecipePrefPair] = []
+            rejection_reason = ""
+            for recipe_name, fn in builders:
+                try:
+                    pair = materialize_pair(recipe_name, pref_name, fn)
+                except Exception as exc:
+                    rejection_reason = f"{recipe_name}:materialization_failed:{type(exc).__name__}"
+                    break
+                if not pair.base_pref and not pair.applied_axes:
+                    rejection_reason = f"{recipe_name}:no_effective_axis"
+                    break
+                ordering = _order_hash(pair)
+                if ordering in seen_by_recipe[recipe_name]:
+                    rejection_reason = f"{recipe_name}:duplicate_ordering_for_recipe"
+                    break
+                rung_pairs.append(pair)
+            if rejection_reason:
+                rejected_preferences.append({"preference": pref_name, "reason": rejection_reason})
+                continue
+            rungs.append(rung_pairs)
+            selected_preferences.append(pref_name)
+            for pair in rung_pairs:
+                seen_by_recipe[pair.recipe_name].add(_order_hash(pair))
+            if len(rungs) >= max(1, desired):
+                break
+        n_rungs = _resolve_ladder_rung_count(cfg_obj, len(rungs))
+        rungs = rungs[:n_rungs]
+        selection = {
+            "scenario_kind": scenario_kind,
+            "selection_policy": "seed_shuffled_shared_preference_valid_for_all_recipes",
+            "selected_shared_preferences": selected_preferences[:n_rungs],
+            "rejected_shared_preferences": rejected_preferences,
+        }
+    rung_plan = [
+        {
+            "rung_idx": rung_idx,
+            "rung_number": rung_idx + 1,
+            "shared_preference": (
+                rungs[rung_idx][0].preference_name
+                if scenario_kind == "shared" and rungs[rung_idx]
+                else None
+            ),
+            "pairs": [
+                {
+                    "recipe": pair.recipe_name,
+                    "preference": pair.preference_name,
+                    "pair": pair.label,
+                    "applied_axes": list(pair.applied_axes),
+                }
+                for pair in rungs[rung_idx]
+            ],
+        }
+        for rung_idx in range(len(rungs))
+    ]
+    selection["rung_plan"] = rung_plan
+    return recipes, rungs, selection
+
+
+def _ladder_seen_tags(
+    pair: RecipePrefPair,
+    seen_recipes: set,
+    seen_preferences: set,
+    seen_pairs: set,
+    seen_preferences_by_recipe: Mapping[str, set],
+) -> Dict[str, Any]:
+    seen_recipe = pair.recipe_name in seen_recipes
+    seen_preference = pair.preference_name in seen_preferences
+    seen_pair = pair.label in seen_pairs
+    same_recipe_seen = pair.preference_name in seen_preferences_by_recipe.get(pair.recipe_name, set())
+    other_recipe_seen = any(
+        pair.preference_name in vals
+        for recipe, vals in seen_preferences_by_recipe.items()
+        if recipe != pair.recipe_name
+    )
+    return {
+        "seen_recipe_before": seen_recipe,
+        "seen_preference_before": seen_preference,
+        "seen_preference_same_recipe_before": same_recipe_seen,
+        "seen_preference_other_recipe_before": other_recipe_seen,
+        "seen_pair_before": seen_pair,
+        "four_cell_before": _four_cell(seen_recipe, seen_preference),
+        "exposure_cell_before": _four_cell(seen_recipe, seen_preference),
+        "transfer_cell_before": _transfer_cell(
+            seen_recipe=seen_recipe,
+            seen_pair=seen_pair,
+            seen_preference_global=seen_preference,
+            seen_preference_same_recipe=same_recipe_seen,
+            seen_preference_other_recipe=other_recipe_seen,
+        ),
+    }
+
+
+def _mark_ladder_seen(
+    pair: RecipePrefPair,
+    seen_recipes: set,
+    seen_preferences: set,
+    seen_pairs: set,
+    seen_preferences_by_recipe: Dict[str, set],
+) -> None:
+    seen_recipes.add(pair.recipe_name)
+    seen_preferences.add(pair.preference_name)
+    seen_pairs.add(pair.label)
+    seen_preferences_by_recipe[pair.recipe_name].add(pair.preference_name)
+
+
+def _deployment_ladder_events(
+    rungs: Sequence[Sequence[RecipePrefPair]],
+    cfg_obj: DeploymentLadderConfig,
+    scenario_kind: Literal["heterogeneous", "shared"],
+) -> List[ScenarioEvent]:
+    seen_recipes: set = set()
+    seen_preferences: set = set()
+    seen_pairs: set = set()
+    seen_preferences_by_recipe: Dict[str, set] = defaultdict(set)
+    settle_repeats = max(1, int(cfg_obj.settle_repeats_per_recipe))
+    events: List[ScenarioEvent] = []
+    update_event_type = (
+        "ladder_pref_update_heterogeneous"
+        if scenario_kind == "heterogeneous"
+        else "ladder_shared_pref_shift"
+    )
+    for rung_idx, rung_pairs_raw in enumerate(rungs):
+        rung_pairs = list(rung_pairs_raw)
+        rung_signature = tuple(pair.preference_name for pair in rung_pairs)
+        shared_pref = rung_pairs[0].preference_name if scenario_kind == "shared" and rung_pairs else ""
+        for recipe_pos, pair in enumerate(rung_pairs):
+            event_type = "ladder_initial_observe" if rung_idx == 0 else update_event_type
+            mode: Literal["observe", "assist"] = "observe" if rung_idx == 0 else "assist"
+            tags = {
+                "event_idx": len(events),
+                "event_type": event_type,
+                "requested_event_type": event_type,
+                "event_substituted": False,
+                "ladder_scenario": scenario_kind,
+                "ladder_stage": "add",
+                "rung_idx": int(rung_idx),
+                "rung_number": int(rung_idx + 1),
+                "recipe_position": int(recipe_pos),
+                "settle_cycle": -1,
+                "rung_preference_signature": list(rung_signature),
+                "shared_preference": shared_pref,
+                **_ladder_seen_tags(pair, seen_recipes, seen_preferences, seen_pairs, seen_preferences_by_recipe),
+            }
+            events.append(ScenarioEvent(
+                pair=pair,
+                mode=mode,
+                phase="phase_a" if rung_idx == 0 else "ladder_update",
+                user_id="ladder_user",
+                tags=tags,
+            ))
+            _mark_ladder_seen(pair, seen_recipes, seen_preferences, seen_pairs, seen_preferences_by_recipe)
+        for settle_cycle in range(settle_repeats):
+            for recipe_pos, pair in enumerate(rung_pairs):
+                tags = {
+                    "event_idx": len(events),
+                    "event_type": "ladder_settle",
+                    "requested_event_type": "ladder_settle",
+                    "event_substituted": False,
+                    "ladder_scenario": scenario_kind,
+                    "ladder_stage": "settle",
+                    "rung_idx": int(rung_idx),
+                    "rung_number": int(rung_idx + 1),
+                    "recipe_position": int(recipe_pos),
+                    "settle_cycle": int(settle_cycle),
+                    "rung_preference_signature": list(rung_signature),
+                    "shared_preference": shared_pref,
+                    **_ladder_seen_tags(pair, seen_recipes, seen_preferences, seen_pairs, seen_preferences_by_recipe),
+                }
+                events.append(ScenarioEvent(
+                    pair=pair,
+                    mode="assist",
+                    phase="ladder_settle",
+                    user_id="ladder_user",
+                    tags=tags,
+                ))
+                _mark_ladder_seen(pair, seen_recipes, seen_preferences, seen_pairs, seen_preferences_by_recipe)
+    return events
+
+
+def _ladder_rung_memory_trace(memory_rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for rung in sorted({int(r.get("rung_idx", -1)) for r in memory_rows if r.get("rung_idx") is not None}):
+        rows = [r for r in memory_rows if int(r.get("rung_idx", -1)) == rung]
+        if not rows:
+            continue
+        last = rows[-1]
+        out.append({
+            "rung_idx": int(rung),
+            "rung_number": int(rung + 1),
+            "active_variants": float(last.get("active_variants", 0.0)),
+            "pruned_variants": float(last.get("pruned_variants", 0.0)),
+            "latest_keys": float(last.get("latest_keys", 0.0)),
+            "global_rate": float(last.get("global_rate", 0.0)),
+            "mean_active_weight": float(last.get("mean_active_weight", 0.0)),
+        })
+    return out
+
+
+def _run_deployment_ladder(
+    seed: int,
+    out: Path,
+    run_config: RunConfig,
+    cfg_obj: DeploymentLadderConfig,
+    scenario_kind: Literal["heterogeneous", "shared"],
+) -> Dict[str, Any]:
+    recipes, rungs, selection = _deployment_ladder_plan(seed, cfg_obj, scenario_kind)
+    events = _deployment_ladder_events(rungs, cfg_obj, scenario_kind)
+    selected_preferences = sorted({pair.preference_name for rung in rungs for pair in rung})
+    _record_common_artifacts(out, seed, cfg_obj, recipes, selected_preferences)
+    _append_jsonl(out / "scenario_events.jsonl", (_scenario_event_row(e) for e in events))
+    per_baseline: Dict[str, Any] = {}
+    all_episode_rows: List[Dict[str, Any]] = []
+    all_step_rows: List[Dict[str, Any]] = []
+    all_memory_rows: List[Dict[str, Any]] = []
+    for baseline in run_config.baselines:
+        agent = make_agent(baseline, base_config(seed, run_config))
+        name_to_rid: Dict[str, str] = {}
+        simulator_observed_labels: set = set()
+        simulator_observed_recipes: set = set()
+        episode_rows: List[Dict[str, Any]] = []
+        step_rows: List[Dict[str, Any]] = []
+        memory_rows: List[Dict[str, Any]] = []
+        t0 = time.perf_counter()
+        for idx, event in enumerate(events):
+            tags = {"phase": event.phase, "user_id": event.user_id, **dict(event.tags)}
+            if event.mode == "observe":
+                row = observe_episode(agent, event.pair, name_to_rid)
+                row.update(tags)
+                episode_rows.append(row)
+            else:
+                row, steps = assist_episode(
+                    agent,
+                    event.pair,
+                    name_to_rid,
+                    run_config=run_config,
+                    event_tag=tags,
+                    simulator_observed_labels=simulator_observed_labels,
+                    simulator_observed_recipes=simulator_observed_recipes,
+                )
+                row.update(tags)
+                episode_rows.append(row)
+                step_rows.extend({"event_idx": idx, "baseline": baseline, **s} for s in steps)
+            simulator_observed_labels.add(event.pair.label)
+            simulator_observed_recipes.add(event.pair.recipe_name)
+            memory_rows.append({
+                "event_idx": idx,
+                "baseline": baseline,
+                "rung_idx": int(tags.get("rung_idx", -1)),
+                "rung_number": int(tags.get("rung_number", 0)),
+                "ladder_stage": str(tags.get("ladder_stage", "")),
+                "event_type": str(tags.get("event_type", "")),
+                **memory_snapshot(agent),
+            })
+        wall_s = time.perf_counter() - t0
+        assist_rows = [r for r in episode_rows if r.get("mode") == "assist"]
+        metrics = _aggregate_episode_metrics(assist_rows)
+        metrics["compute"] = compute_snapshot(agent, wall_s)
+        metrics["memory"] = memory_snapshot(agent)
+        metrics["per_stage"] = {
+            stage: _aggregate_episode_metrics([r for r in assist_rows if r.get("ladder_stage") == stage])
+            for stage in ("add", "settle")
+        }
+        metrics["per_rung"] = {
+            str(rung_idx): _aggregate_episode_metrics([
+                r for r in assist_rows
+                if int(r.get("rung_idx", -1)) == int(rung_idx)
+            ])
+            for rung_idx in range(len(rungs))
+        }
+        metrics["per_rung_stage"] = {
+            str(rung_idx): {
+                stage: _aggregate_episode_metrics([
+                    r for r in assist_rows
+                    if int(r.get("rung_idx", -1)) == int(rung_idx)
+                    and r.get("ladder_stage") == stage
+                ])
+                for stage in ("add", "settle")
+            }
+            for rung_idx in range(len(rungs))
+        }
+        metrics["per_rung_update_to_settle_gain"] = {}
+        for rung_idx in range(len(rungs)):
+            add_row = metrics["per_rung_stage"][str(rung_idx)]["add"]
+            settle_row = metrics["per_rung_stage"][str(rung_idx)]["settle"]
+            has_add = float(add_row.get("n_episodes", 0.0)) > 0.0
+            metrics["per_rung_update_to_settle_gain"][str(rung_idx)] = {
+                "has_add_assist": has_add,
+                "add_live_top1": float(add_row.get("live_top1", 0.0)) if has_add else None,
+                "settle_live_top1": float(settle_row.get("live_top1", 0.0)),
+                "settle_minus_add_live_top1": (
+                    float(settle_row.get("live_top1", 0.0)) - float(add_row.get("live_top1", 0.0))
+                    if has_add else None
+                ),
+                "add_robot_wrong_rate": float(add_row.get("robot_wrong_rate", 0.0)) if has_add else None,
+                "settle_robot_wrong_rate": float(settle_row.get("robot_wrong_rate", 0.0)),
+            }
+        metrics["per_event_type"] = {
+            event_type: _aggregate_episode_metrics([
+                r for r in assist_rows
+                if str(r.get("event_type")) == event_type
+            ])
+            for event_type in sorted({str(r.get("event_type")) for r in assist_rows})
+        }
+        metrics["per_transfer_cell"] = {
+            cell: _aggregate_episode_metrics([
+                r for r in assist_rows
+                if r.get("transfer_cell_before") == cell
+            ])
+            for cell in TRANSFER_CELL_KEYS
+        }
+        metrics["coarse_exposure_cell"] = {
+            cell: _aggregate_episode_metrics([
+                r for r in assist_rows
+                if r.get("exposure_cell_before", r.get("four_cell_before")) == cell
+            ])
+            for cell in FOUR_CELL_KEYS
+        }
+        metrics["four_cell"] = metrics["coarse_exposure_cell"]
+        metrics["rung_memory_trace"] = _ladder_rung_memory_trace(memory_rows)
+        metrics["valid_random_floor"] = _mean([
+            1.0 / max(1, int(s.get("valid_next_action_count", 1)))
+            for s in step_rows
+        ])
+        metrics["live_step_trace"] = live_step_trace(step_rows)
+        metrics["calibration_curve"] = calibration_curve_from_steps(step_rows)
+        metrics["latency_cdf"] = latency_cdf_from_steps(step_rows)
+        metrics["policy_gate"] = policy_gate_reason_summary(step_rows)
+        prediction_walls = [float(s.get("prediction_wall_s")) for s in step_rows if s.get("prediction_wall_s") is not None]
+        metrics["mean_prediction_wall_s"] = _mean(prediction_walls)
+        metrics["p95_prediction_wall_s"] = _p95(prediction_walls)
+        per_baseline[baseline] = metrics
+        all_episode_rows.extend({"baseline": baseline, **r} for r in episode_rows)
+        all_step_rows.extend(step_rows)
+        all_memory_rows.extend(memory_rows)
+    _append_jsonl(out / "episode_metrics.jsonl", all_episode_rows)
+    _append_jsonl(out / "episode_steps.jsonl", all_step_rows)
+    _append_jsonl(out / "memory_trace.jsonl", all_memory_rows)
+    metrics = {
+        "seed": seed,
+        "scenario_kind": scenario_kind,
+        "n_recipes": len(recipes),
+        "n_rungs": len(rungs),
+        "settle_repeats_per_recipe": int(max(1, cfg_obj.settle_repeats_per_recipe)),
+        "settle_events_per_rung": int(len(recipes) * max(1, cfg_obj.settle_repeats_per_recipe)),
+        "n_events": len(events),
+        "n_assist_events": sum(1 for e in events if e.mode == "assist"),
+        "n_observe_events": sum(1 for e in events if e.mode == "observe"),
+        "event_distribution": _event_distribution(events),
+        "ladder_selection": selection,
+        "rung_plan": selection.get("rung_plan", []),
+        "valid_random_floor": float((per_baseline.get("full", {}) or {}).get("valid_random_floor", 0.0)),
+        "per_baseline": per_baseline,
+    }
+    _write_json(out / "metrics.json", metrics)
+    return metrics
+
+
+def run_deployment_ladder_heterogeneous_prefs(
+    seed: int,
+    out: Path,
+    run_config: RunConfig,
+    cfg_obj: DeploymentLadderConfig,
+) -> Dict[str, Any]:
+    return _run_deployment_ladder(seed, out, run_config, cfg_obj, "heterogeneous")
+
+
+def run_deployment_ladder_shared_pref(
+    seed: int,
+    out: Path,
+    run_config: RunConfig,
+    cfg_obj: DeploymentLadderConfig,
+) -> Dict[str, Any]:
+    return _run_deployment_ladder(seed, out, run_config, cfg_obj, "shared")
+
+
+def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_config: RunConfig) -> Tuple[List[str], List[str], List[ScenarioEvent], List[RecipePrefPair], List[Dict[str, Any]]]:
+    n_recipes = cfg_obj.n_recipes
+    n_events = cfg_obj.n_phase_b_events
     builders = select_recipe_builders(seed, n_recipes)
     n_new_candidates = max(1, int(math.ceil(max(0.0, float(cfg_obj.new_recipe_obs_rate)) * max(1, n_events))))
     new_builders = select_recipe_builders(seed, n_new_candidates, offset=n_recipes)
@@ -6207,13 +5847,14 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
         r: _material_pair_candidates(r, fn, PREFERENCE_NAMES)
         for r, fn in list(builders) + list(new_builders)
     }
+    new_recipe_rejections: List[Dict[str, Any]] = []
     phase_a_pairs: List[RecipePrefPair] = []
     for recipe_name, fn in builders:
         candidates = by_recipe.get(recipe_name) or [materialize_pair(recipe_name, "identity", fn)]
         identity = next((p for p in candidates if p.preference_name == "identity"), candidates[0])
         non_identity = [p for p in candidates if p.preference_name != "identity"]
         if non_identity and rng.random() < float(cfg_obj.phase_a_non_identity_prob):
-            phase_a_pairs.append(non_identity[int(rng.integers(0, len(non_identity)))])
+            phase_a_pairs.append(_choose_preference_zipf(non_identity, cfg_obj.zipf_alpha, rng) or non_identity[0])
         else:
             phase_a_pairs.append(identity)
     events: List[ScenarioEvent] = []
@@ -6262,117 +5903,82 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
     user_ids = list(users)
     history: List[RecipePrefPair] = list(phase_a_pairs)
     unused_new = list(new_builders)
-    pending_gradual_followups: List[Tuple[RecipePrefPair, int, str]] = []
     for i in range(max(0, int(n_events))):
         current_user, user_block, is_return_block = _blocked_user_for_event(user_ids, i, cfg_obj.user_block_size)
         block_start = i > 0 and (i % max(1, int(cfg_obj.user_block_size)) == 0)
         if unused_new and rng.random() < float(cfg_obj.new_recipe_obs_rate):
-            recipe_name, fn = unused_new.pop(0)
-            candidates = by_recipe.get(recipe_name) or [materialize_pair(recipe_name, "identity", fn)]
-            pref = users.get(current_user, "identity")
-            pair = next((p for p in candidates if p.preference_name == pref), candidates[0])
-            seen_preference_before = pair.preference_name in seen_preferences
-            seen_preference_same_recipe_before = pair.preference_name in seen_preferences_by_recipe.get(pair.recipe_name, set())
-            seen_preference_other_recipe_before = any(
-                pair.preference_name in vals
-                for recipe, vals in seen_preferences_by_recipe.items()
-                if recipe != pair.recipe_name
-            )
-            events.append(ScenarioEvent(pair, "observe", "phase_b_observe", current_user, {
-                "event_idx": len(events),
-                "phase_b_idx": i,
-                "event_type": "new_recipe_observe",
-                "recipe_rank": n_recipes + len(new_builders) - len(unused_new) - 1,
-                "user_preference": users[current_user],
-                "user_block": user_block,
-                "is_return_user_block": is_return_block,
-                "seen_recipe_before": False,
-                "seen_preference_before": seen_preference_before,
-                "seen_preference_same_recipe_before": seen_preference_same_recipe_before,
-                "seen_preference_other_recipe_before": seen_preference_other_recipe_before,
-                "seen_pair_before": False,
-                "four_cell_before": _four_cell(False, seen_preference_before),
-                "transfer_cell_before": _transfer_cell(
-                    seen_recipe=False,
-                    seen_pair=False,
-                    seen_preference_global=seen_preference_before,
-                    seen_preference_same_recipe=seen_preference_same_recipe_before,
-                    seen_preference_other_recipe=seen_preference_other_recipe_before,
-                ),
-            }))
-            seen_recipes.add(pair.recipe_name)
-            seen_preferences.add(pair.preference_name)
-            seen_pairs.add(pair.label)
-            seen_preferences_by_recipe[pair.recipe_name].add(pair.preference_name)
-            last_by_recipe[pair.recipe_name] = pair
-            last_by_user_recipe[(current_user, pair.recipe_name)] = pair
-            history.append(pair)
-            continue
-        if pending_gradual_followups:
-            pair, recipe_idx, requested_event_type = pending_gradual_followups.pop(0)
-            seen_recipe_before = pair.recipe_name in seen_recipes
-            seen_preference_before = pair.preference_name in seen_preferences
-            seen_pair_before = pair.label in seen_pairs
-            seen_preference_same_recipe_before = pair.preference_name in seen_preferences_by_recipe.get(pair.recipe_name, set())
-            seen_preference_other_recipe_before = any(
-                pair.preference_name in vals
-                for recipe, vals in seen_preferences_by_recipe.items()
-                if recipe != pair.recipe_name
-            )
-            events.append(ScenarioEvent(pair, "assist", "phase_b", current_user, {
-                "event_idx": len(events),
-                "phase_b_idx": i,
-                "event_type": "gradual_shift_followup",
-                "requested_event_type": requested_event_type,
-                "event_substituted": False,
-                "recipe_rank": recipe_idx,
-                "user_preference": users[current_user],
-                "user_block": user_block,
-                "is_return_user_block": is_return_block,
-                "block_start": block_start,
-                "eventual_preference": pair.preference_name,
-                "seen_recipe_before": seen_recipe_before,
-                "seen_preference_before": seen_preference_before,
-                "seen_preference_same_recipe_before": seen_preference_same_recipe_before,
-                "seen_preference_other_recipe_before": seen_preference_other_recipe_before,
-                "seen_pair_before": seen_pair_before,
-                "four_cell_before": _four_cell(seen_recipe_before, seen_preference_before),
-                "transfer_cell_before": _transfer_cell(
-                    seen_recipe=seen_recipe_before,
-                    seen_pair=seen_pair_before,
-                    seen_preference_global=seen_preference_before,
-                    seen_preference_same_recipe=seen_preference_same_recipe_before,
-                    seen_preference_other_recipe=seen_preference_other_recipe_before,
-                ),
-                "followup_for": "gradual_shift",
-            }))
-            seen_recipes.add(pair.recipe_name)
-            seen_preferences.add(pair.preference_name)
-            seen_pairs.add(pair.label)
-            seen_preferences_by_recipe[pair.recipe_name].add(pair.preference_name)
-            last_by_recipe[pair.recipe_name] = pair
-            last_by_user_recipe[(current_user, pair.recipe_name)] = pair
-            history.append(pair)
-            continue
+            accepted_new = False
+            while unused_new:
+                recipe_name, fn = unused_new.pop(0)
+                candidates = by_recipe.get(recipe_name, [])
+                material_variant_count = len({p.actions for p in candidates})
+                if material_variant_count < 2:
+                    new_recipe_rejections.append({
+                        "phase_b_idx": i,
+                        "recipe": recipe_name,
+                        "reason": "fewer_than_two_material_preference_variants",
+                        "material_variant_count": material_variant_count,
+                    })
+                    continue
+                pref = users.get(current_user, "identity")
+                pair = next((p for p in candidates if p.preference_name == pref), None)
+                if pair is None:
+                    pair = _choose_preference_zipf(candidates, cfg_obj.zipf_alpha, rng) or candidates[0]
+                seen_preference_before = pair.preference_name in seen_preferences
+                seen_preference_same_recipe_before = pair.preference_name in seen_preferences_by_recipe.get(pair.recipe_name, set())
+                seen_preference_other_recipe_before = any(
+                    pair.preference_name in vals
+                    for recipe, vals in seen_preferences_by_recipe.items()
+                    if recipe != pair.recipe_name
+                )
+                events.append(ScenarioEvent(pair, "observe", "phase_b_observe", current_user, {
+                    "event_idx": len(events),
+                    "phase_b_idx": i,
+                    "event_type": "new_recipe_observe",
+                    "recipe_rank": n_recipes + len(new_builders) - len(unused_new) - 1,
+                    "user_preference": users[current_user],
+                    "user_block": user_block,
+                    "is_return_user_block": is_return_block,
+                    "seen_recipe_before": False,
+                    "seen_preference_before": seen_preference_before,
+                    "seen_preference_same_recipe_before": seen_preference_same_recipe_before,
+                    "seen_preference_other_recipe_before": seen_preference_other_recipe_before,
+                    "seen_pair_before": False,
+                    "four_cell_before": _four_cell(False, seen_preference_before),
+                    "transfer_cell_before": _transfer_cell(
+                        seen_recipe=False,
+                        seen_pair=False,
+                        seen_preference_global=seen_preference_before,
+                        seen_preference_same_recipe=seen_preference_same_recipe_before,
+                        seen_preference_other_recipe=seen_preference_other_recipe_before,
+                    ),
+                    "new_recipe_material_variant_count": material_variant_count,
+                }))
+                seen_recipes.add(pair.recipe_name)
+                seen_preferences.add(pair.preference_name)
+                seen_pairs.add(pair.label)
+                seen_preferences_by_recipe[pair.recipe_name].add(pair.preference_name)
+                last_by_recipe[pair.recipe_name] = pair
+                last_by_user_recipe[(current_user, pair.recipe_name)] = pair
+                history.append(pair)
+                accepted_new = True
+                break
+            if accepted_new:
+                continue
         recipe_idx = int(rng.choice(len(builders), p=probs))
         recipe_name, fn = builders[recipe_idx]
         candidates = by_recipe.get(recipe_name) or [materialize_pair(recipe_name, "identity", fn)]
         requested_event_type = str(rng.choice(event_types, p=weights))
         event_type = "user_switch" if block_start else requested_event_type
         base = last_by_user_recipe.get((current_user, recipe_name)) or last_by_recipe.get(recipe_name) or candidates[0]
-        target_after_event: Optional[RecipePrefPair] = None
         if event_type == "routine_reuse":
             pair = base
         elif event_type == "preference_shift":
             choices = [p for p in candidates if p.preference_name != base.preference_name]
-            pair = choices[int(rng.integers(0, len(choices)))] if choices else base
-        elif event_type == "gradual_shift":
-            choices = [p for p in candidates if p.preference_name != base.preference_name]
-            target = choices[int(rng.integers(0, len(choices)))] if choices else base
-            pair = _blend_preference_pair(base, target, alpha=0.30, rng=rng) if target is not base else base
-            target_after_event = target
-            if target is not base:
-                pending_gradual_followups.append((target, recipe_idx, "gradual_shift"))
+            pair = _choose_preference_zipf(choices, cfg_obj.zipf_alpha, rng) if choices else None
+            if pair is None:
+                pair = base
+                event_type = "routine_reuse"
         elif event_type == "user_switch":
             pref = users[current_user]
             pair = next((p for p in candidates if p.preference_name == pref), base)
@@ -6394,11 +6000,15 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
                 and p.label not in seen_pairs
             ]
             if i >= int(cfg_obj.transfer_warmup_events) and choices:
-                pair = choices[int(rng.integers(0, len(choices)))]
+                pair = _choose_preference_zipf(choices, cfg_obj.zipf_alpha, rng) or choices[0]
             else:
                 choices = [p for p in candidates if p.preference_name != base.preference_name]
-                pair = choices[int(rng.integers(0, len(choices)))] if choices else base
-                event_type = "preference_shift"
+                pair = _choose_preference_zipf(choices, cfg_obj.zipf_alpha, rng) if choices else None
+                if pair is None:
+                    pair = base
+                    event_type = "routine_reuse"
+                else:
+                    event_type = "preference_shift"
         elif event_type == "rare_reentry":
             horizon = int(getattr(DEFAULT_CONFIG, "decay_horizon_init", 10))
             old = history[:-horizon] if len(history) > horizon else []
@@ -6425,7 +6035,6 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
             "user_block": user_block,
             "is_return_user_block": is_return_block,
             "block_start": block_start,
-            "eventual_preference": target_after_event.preference_name if target_after_event is not None else pair.preference_name,
             "seen_recipe_before": seen_recipe_before,
             "seen_preference_before": seen_preference_before,
             "seen_preference_same_recipe_before": seen_preference_same_recipe_before,
@@ -6444,90 +6053,123 @@ def _deployment_stream_events(seed: int, cfg_obj: DeploymentStreamConfig, run_co
         seen_preferences.add(pair.preference_name)
         seen_pairs.add(pair.label)
         seen_preferences_by_recipe[pair.recipe_name].add(pair.preference_name)
-        last_pair = target_after_event or pair
-        last_by_recipe[pair.recipe_name] = last_pair
-        last_by_user_recipe[(current_user, pair.recipe_name)] = last_pair
+        last_by_recipe[pair.recipe_name] = pair
+        last_by_user_recipe[(current_user, pair.recipe_name)] = pair
         history.append(pair)
-    return [r for r, _ in builders], user_ids, events, phase_a_pairs
+    for event in events:
+        if "four_cell_before" in event.tags and "exposure_cell_before" not in event.tags:
+            event.tags["exposure_cell_before"] = event.tags["four_cell_before"]
+    return [r for r, _ in builders], user_ids, events, phase_a_pairs, new_recipe_rejections
 
 
 def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: DeploymentStreamConfig) -> Dict[str, Any]:
-    recipes, users, events, phase_a_pairs = _deployment_stream_events(seed, cfg_obj, run_config)
+    recipes, users, events, phase_a_pairs, new_recipe_rejections = _deployment_stream_events(seed, cfg_obj, run_config)
     _record_common_artifacts(out, seed, cfg_obj, recipes, [f"{u}:{_user_preferences(seed, cfg_obj.n_users)[u]}" for u in users])
     _append_jsonl(out / "scenario_events.jsonl", (_scenario_event_row(e) for e in events))
+    if new_recipe_rejections:
+        _append_jsonl(out / "new_recipe_rejections.jsonl", new_recipe_rejections)
     per_baseline: Dict[str, Dict[str, Any]] = {}
-    coverage_curves: Dict[str, Any] = {}
     all_episode_rows: List[Dict[str, Any]] = []
     all_step_rows: List[Dict[str, Any]] = []
     all_memory_rows: List[Dict[str, Any]] = []
-    forgetting_rows: List[Dict[str, Any]] = []
-    interval = max(1, int(cfg_obj.forgetting_checkpoint_interval))
-    phase_b_pairs = [e.pair for e in events if e.mode == "assist"]
+    online_forgetting_rows: List[Dict[str, Any]] = []
+    user_switch_recovery_rows: List[Dict[str, Any]] = []
+    preference_reentry_recovery_rows: List[Dict[str, Any]] = []
     eval_pool = list({event.pair.label: event.pair for event in events}.values())
-    library = gen.recipe_library()
-    phase_a_identity_pairs = [
-        materialize_pair(pair.recipe_name, "identity", library[pair.recipe_name])
-        for pair in phase_a_pairs
-        if pair.recipe_name in library
-    ]
-    gate_calibration_pairs = deployment_gate_calibration_pairs(seed, phase_a_pairs, cfg_obj)
-    if run_config.quick:
-        gate_calibration_pairs = gate_calibration_pairs[: max(1, min(8, len(gate_calibration_pairs)))]
-    gate_calibration_baselines = set(_calibratable_action_gate_baselines(run_config.baselines, cfg_obj))
-    calibration_thresholds = tuple(float(t) for t in cfg_obj.calibration_thresholds)
-    if run_config.quick and len(calibration_thresholds) > 6:
-        calibration_thresholds = (0.0, 0.25, 0.50, 0.75, 1.01)
     for baseline in run_config.baselines:
         cfg = base_config(seed, run_config)
-        default_action_threshold = float(cfg.posterior_action_confidence_threshold)
         agent = make_agent(baseline, cfg)
         name_to_rid: Dict[str, str] = {}
         simulator_observed_labels: set = set()
         simulator_observed_recipes: set = set()
         phase_a_eval_at_start: Optional[Dict[str, Dict[str, float]]] = None
-        gate_calibration: Dict[str, Any] = {}
         episode_rows: List[Dict[str, Any]] = []
         step_rows: List[Dict[str, Any]] = []
         memory_rows: List[Dict[str, Any]] = []
+        baseline_online_forgetting_rows: List[Dict[str, Any]] = []
+        best_top1_by_pair: Dict[str, float] = {}
+        online_eval_pairs_by_label: Dict[str, RecipePrefPair] = {}
+        # Compute isolated single-task performance for each Phase A pair.
+        # Each pair is trained in isolation (fresh agent, one observe episode) and
+        # evaluated immediately.  This provides the correct BWT baseline: the peak
+        # performance the agent architecture can achieve on a task when trained only
+        # on that task, free of multi-task interference.
+        isolated_eval: Dict[str, Dict[str, float]] = {}
+        for _iso_pair in phase_a_pairs:
+            _iso_agent = make_agent(baseline, base_config(seed, run_config))
+            _iso_rid: Dict[str, str] = {}
+            observe_episode(_iso_agent, _iso_pair, _iso_rid)
+            isolated_eval.update(frozen_eval(_iso_agent, [_iso_pair], _iso_rid, run_config))
+        baseline_user_switch_recovery: List[Dict[str, Any]] = []
+        baseline_preference_reentry_recovery: List[Dict[str, Any]] = []
+        label_by_key: Dict[VariantKey, str] = {}
+        displaced_at: Dict[VariantKey, int] = {}
         phase_b_count = 0
         t0 = time.perf_counter()
         for idx, event in enumerate(events):
             tags = {"phase": event.phase, "user_id": event.user_id, **dict(event.tags)}
+            requested_mode = str(event.mode)
+            mode, route_tags = _user_selected_mode_for_active_memory(requested_mode, agent, event.pair, name_to_rid)
+            tags = {**tags, **route_tags}
+            before_latest_by_recipe = dict(agent.decay.latest_by_recipe)
             if phase_a_eval_at_start is None and event.phase != "phase_a":
                 phase_a_eval_at_start = frozen_eval(agent, eval_pool, name_to_rid)
-                if baseline in gate_calibration_baselines and gate_calibration_pairs:
-                    calibration_curve = _annotate_gate_curve_utility(
-                        coverage_vs_accuracy_curve(agent, gate_calibration_pairs, name_to_rid, run_config, calibration_thresholds),
-                        wrong_assist_penalty=cfg_obj.calibration_wrong_assist_penalty,
-                        hidden_correct_penalty=cfg_obj.calibration_hidden_correct_penalty,
-                    )
-                    selected_threshold, selection = select_action_gate_threshold(
-                        calibration_curve,
-                        min_conditional_top1=cfg_obj.calibration_min_conditional_top1,
-                        max_wrong_assist_rate=cfg_obj.calibration_max_wrong_assist_rate,
-                        wrong_assist_penalty=cfg_obj.calibration_wrong_assist_penalty,
-                        hidden_correct_penalty=cfg_obj.calibration_hidden_correct_penalty,
-                    )
-                    agent.cfg = replace(agent.cfg, posterior_action_confidence_threshold=float(selected_threshold))
-                    fixed_row = _gate_curve_row_at_threshold(calibration_curve, default_action_threshold)
-                    selected_row = dict(selection.get("selected_row", {}) or {})
-                    gate_calibration = {
-                        "curve": calibration_curve,
-                        "selection": selection,
-                        "default_threshold": default_action_threshold,
-                        "fixed_default_row": fixed_row,
-                        "calibrated_row": selected_row,
-                        "calibrated": True,
-                        "n_probe_pairs": len(gate_calibration_pairs),
-                        "probe_pair_labels": [p.label for p in gate_calibration_pairs],
-                    }
-            if event.mode == "observe":
+            if mode == "observe":
                 row = observe_episode(agent, event.pair, name_to_rid)
                 row.update(tags)
                 episode_rows.append(row)
                 simulator_observed_labels.add(event.pair.label)
                 simulator_observed_recipes.add(event.pair.recipe_name)
+                if event.phase != "phase_a":
+                    phase_b_count += 1
             else:
+                user_switch_probe: Optional[Dict[str, Any]] = None
+                reentry_probe: Optional[Dict[str, Any]] = None
+                target_key_before = _memory_key_for_pair(agent, event.pair, name_to_rid)
+                if target_key_before is not None and target_key_before in displaced_at:
+                    target_rid, target_hash = target_key_before
+                    pinned_hash = agent.decay.latest_by_recipe.get(target_rid)
+                    if pinned_hash is not None and pinned_hash != target_hash:
+                        pre_eval = frozen_eval(agent, [event.pair], name_to_rid).get(event.pair.label, {})
+                        reentry_probe = {
+                            "baseline": baseline,
+                            "event_idx": idx,
+                            "phase_b_count": int(phase_b_count),
+                            "pair": event.pair.label,
+                            "recipe": event.pair.recipe_name,
+                            "preference": event.pair.preference_name,
+                            "true_preference_name": event.pair.preference_name,
+                            "true_variant_hash": target_hash,
+                            "pinned_variant_hash_before": pinned_hash,
+                            "subgroup_before": (
+                                "displaced_active" if target_key_before in agent.decay.active
+                                else "pruned" if target_key_before in agent.decay.pruned
+                                else "known_in_registry"
+                            ),
+                            "sessions_since_displaced": max(0, int(phase_b_count) - int(displaced_at.get(target_key_before, phase_b_count))),
+                            "pre_reentry_top1": float(pre_eval.get("top1", 0.0)),
+                            "pre_reentry_topk": float(pre_eval.get("topk", 0.0)),
+                        }
+                if str(tags.get("event_type")) == "user_switch":
+                    rid = name_to_rid.get(event.pair.recipe_name)
+                    true_hash = variant_hash(agent._tokens_from_action_labels(event.pair.actions))
+                    pinned_hash = agent.decay.latest_by_recipe.get(rid) if rid is not None else None
+                    pinned_mismatch = bool(pinned_hash is not None and pinned_hash != true_hash)
+                    tags["user_switch_pinned_variant_mismatch"] = pinned_mismatch
+                    tags["user_switch_true_variant_hash"] = true_hash
+                    tags["user_switch_pinned_variant_hash"] = pinned_hash
+                    if pinned_mismatch:
+                        user_switch_probe = {
+                            "baseline": baseline,
+                            "event_idx": idx,
+                            "user_id": event.user_id,
+                            "pair": event.pair.label,
+                            "recipe": event.pair.recipe_name,
+                            "preference": event.pair.preference_name,
+                            "true_preference_name": event.pair.preference_name,
+                            "true_variant_hash": true_hash,
+                            "pinned_variant_hash": pinned_hash,
+                        }
                 row, steps = assist_episode(
                     agent,
                     event.pair,
@@ -6541,35 +6183,133 @@ def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
                 episode_rows.append(row)
                 step_rows.extend({"event_idx": idx, "baseline": baseline, **s} for s in steps)
                 phase_b_count += 1
-                if phase_b_count % interval == 0:
-                    evals = frozen_eval(agent, phase_a_pairs, name_to_rid)
-                    identity_evals = frozen_eval(agent, phase_a_identity_pairs, name_to_rid) if phase_a_identity_pairs else {}
-                    forgetting_rows.append({
-                        "baseline": baseline,
-                        "phase_b_count": phase_b_count,
-                        "mean_phase_a_top1": _mean([v.get("top1", 0.0) for v in evals.values()]),
-                        "mean_phase_a_top3": _mean([v.get("top3", 0.0) for v in evals.values()]),
-                        "mean_phase_a_identity_reference_top1": _mean([v.get("top1", 0.0) for v in identity_evals.values()]),
-                        "mean_phase_a_identity_reference_top3": _mean([v.get("top3", 0.0) for v in identity_evals.values()]),
+                if user_switch_probe is not None:
+                    recovery_step = -1
+                    for step_row in steps:
+                        step_idx = int(step_row.get("step", 0))
+                        if step_row.get("inferred_variant_hash") == user_switch_probe.get("true_variant_hash"):
+                            recovery_step = step_idx
+                            break
+                    before_recovery = [
+                        s for s in steps
+                        if recovery_step < 0 or int(s.get("step", 0)) < recovery_step
+                    ]
+                    user_switch_probe.update({
+                        "recovery_step": recovery_step,
+                        "recovered": bool(recovery_step >= 0),
+                        "robot_wrong_rate_before_recovery": _mean([
+                            1.0 if _row_robot_wrong(s) else 0.0
+                            for s in before_recovery
+                        ]),
+                        "live_top1": float(row.get("live_top1", 0.0)),
+                        "classification_variant_hash": row.get("classification_variant_hash"),
+                        "step_top1_trace": [
+                            {
+                                "step": int(s.get("step", 0)),
+                                "top1_correct": bool(s.get("correct_top1")),
+                                "correct_top1": bool(s.get("correct_top1")),
+                                "correct_topk": bool(s.get("correct_topk")),
+                                "would_assist_under_gate": bool(_row_policy_bool(s, "would_assist_under_gate")),
+                                "robot_wrong": bool(_row_robot_wrong(s)),
+                                "posterior_confidence": float(s.get("posterior_confidence", 0.0) or 0.0),
+                                "posterior_entropy": float(s.get("posterior_entropy", 0.0) or 0.0),
+                                "policy_confidence": float(_row_policy_value(s, "policy_confidence") or 0.0),
+                                "policy_margin": float(_row_policy_value(s, "policy_margin") or 0.0),
+                                "inferred_variant_hash": s.get("inferred_variant_hash"),
+                                "inferred_latent_pref_id": s.get("inferred_latent_pref_id"),
+                            }
+                            for s in steps
+                        ],
                     })
+                    baseline_user_switch_recovery.append(user_switch_probe)
+                    user_switch_recovery_rows.append(user_switch_probe)
+                if reentry_probe is not None:
+                    post_eval = frozen_eval(agent, [event.pair], name_to_rid).get(event.pair.label, {})
+                    recovery_step = -1
+                    for step_row in steps:
+                        step_idx = int(step_row.get("step", 0))
+                        if step_row.get("inferred_variant_hash") == reentry_probe.get("true_variant_hash"):
+                            recovery_step = step_idx
+                            break
+                    before_recovery = [
+                        s for s in steps
+                        if recovery_step < 0 or int(s.get("step", 0)) < recovery_step
+                    ]
+                    reentry_probe.update({
+                        "post_reentry_top1": float(post_eval.get("top1", 0.0)),
+                        "post_reentry_topk": float(post_eval.get("topk", 0.0)),
+                        "during_reentry_step_top1": _mean([1.0 if s.get("correct_top1") else 0.0 for s in steps]),
+                        "during_reentry_step_topk": _mean([1.0 if s.get("correct_topk") else 0.0 for s in steps]),
+                        "steps_to_recover": recovery_step,
+                        "reentry_recovery_steps": recovery_step,
+                        "recovered": bool(recovery_step >= 0),
+                        "robot_wrong_rate_before_recovery": _mean([
+                            1.0 if _row_robot_wrong(s) else 0.0
+                            for s in before_recovery
+                        ]),
+                        "step_top1_trace": [
+                            {
+                                "step": int(s.get("step", 0)),
+                                "top1_correct": bool(s.get("correct_top1")),
+                                "would_assist_under_gate": bool(_row_policy_bool(s, "would_assist_under_gate")),
+                                "robot_wrong": bool(_row_robot_wrong(s)),
+                                "inferred_variant_hash": s.get("inferred_variant_hash"),
+                                "inferred_latent_pref_id": s.get("inferred_latent_pref_id"),
+                            }
+                            for s in steps
+                        ],
+                    })
+                    baseline_preference_reentry_recovery.append(reentry_probe)
+                    preference_reentry_recovery_rows.append(reentry_probe)
+            key = _memory_key_for_pair(agent, event.pair, name_to_rid)
+            if key is not None:
+                label_by_key[key] = event.pair.label
+            for rid, old_hash in before_latest_by_recipe.items():
+                new_hash = agent.decay.latest_by_recipe.get(rid)
+                if old_hash is not None and old_hash != new_hash:
+                    old_key = (rid, old_hash)
+                    if old_key in label_by_key:
+                        displaced_at.setdefault(old_key, int(phase_b_count))
+            online_eval_pairs_by_label[event.pair.label] = event.pair
+            online_pairs = list(online_eval_pairs_by_label.values())
+            online_evals = frozen_eval(agent, online_pairs, name_to_rid, run_config) if online_pairs else {}
+            online_rows = _online_best_so_far_forgetting_rows(
+                agent,
+                online_pairs,
+                name_to_rid,
+                online_evals,
+                best_top1_by_pair,
+                baseline=baseline,
+                event_idx=idx,
+                phase_b_count=phase_b_count,
+                phase=str(event.phase),
+                mode=str(mode),
+                event_type=str(tags.get("event_type", "")),
+                displaced_at=displaced_at,
+            )
+            if event.phase != "phase_a":
+                baseline_online_forgetting_rows.extend(online_rows)
+                online_forgetting_rows.extend(online_rows)
             memory_rows.append({"event_idx": idx, "baseline": baseline, **memory_snapshot(agent)})
         wall_s = time.perf_counter() - t0
         assist_rows = [r for r in episode_rows if r.get("mode") == "assist"]
-        metrics = _aggregate_episode_metrics(assist_rows)
+        deployment_rows = list(episode_rows)
+        metrics = _aggregate_episode_metrics(deployment_rows)
+        metrics["assist_only"] = _aggregate_episode_metrics(assist_rows)
         if phase_a_eval_at_start is None:
             phase_a_eval_at_start = frozen_eval(agent, eval_pool, name_to_rid)
         final_frozen = frozen_eval(agent, eval_pool, name_to_rid)
-        bwt_fwt = bwt_fwt_checkpoints(phase_a_eval_at_start, final_frozen, [p.label for p in phase_a_pairs])
+        bwt_zero_shot = bwt_zero_shot_checkpoints(phase_a_eval_at_start, final_frozen, [p.label for p in phase_a_pairs], isolated_eval=isolated_eval)
         metrics["compute"] = compute_snapshot(agent, wall_s)
         metrics["memory"] = memory_snapshot(agent)
-        metrics["per_user"] = {u: _aggregate_episode_metrics([r for r in assist_rows if r.get("user_id") == u]) for u in users}
+        metrics["per_user"] = {u: _aggregate_episode_metrics([r for r in deployment_rows if r.get("user_id") == u]) for u in users}
         metrics["per_user_block"] = {
             f"{u}_block_{block}": _aggregate_episode_metrics([
-                r for r in assist_rows
+                r for r in deployment_rows
                 if r.get("user_id") == u and int(r.get("user_block", -1)) == block
             ])
             for u in users
-            for block in sorted({int(r.get("user_block", -1)) for r in assist_rows if r.get("user_id") == u and r.get("user_block") is not None})
+            for block in sorted({int(r.get("user_block", -1)) for r in deployment_rows if r.get("user_id") == u and r.get("user_block") is not None})
         }
         user_block_retention: Dict[str, Any] = {}
         for u in users:
@@ -6577,71 +6317,126 @@ def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
             return_blocks = [b for b in blocks if b > min(blocks or [0])]
             if blocks and return_blocks:
                 first_key = f"{u}_block_{blocks[0]}"
-                return_key = f"{u}_block_{return_blocks[-1]}"
+                first_return_key = f"{u}_block_{return_blocks[0]}"
+                last_return_key = f"{u}_block_{return_blocks[-1]}"
                 first_top1 = float(metrics["per_user_block"].get(first_key, {}).get("live_top1", 0.0))
-                return_top1 = float(metrics["per_user_block"].get(return_key, {}).get("live_top1", 0.0))
+                first_return_top1 = float(metrics["per_user_block"].get(first_return_key, {}).get("live_top1", 0.0))
+                last_return_top1 = float(metrics["per_user_block"].get(last_return_key, {}).get("live_top1", 0.0))
                 user_block_retention[u] = {
                     "first_block": blocks[0],
+                    "first_return_block": return_blocks[0],
+                    "last_return_block": return_blocks[-1],
                     "return_block": return_blocks[-1],
                     "first_block_live_top1": first_top1,
-                    "return_block_live_top1": return_top1,
-                    "return_minus_first_live_top1": return_top1 - first_top1,
+                    "first_return_live_top1": first_return_top1,
+                    "last_return_live_top1": last_return_top1,
+                    "return_block_live_top1": last_return_top1,
+                    "first_return_minus_first_live_top1": first_return_top1 - first_top1,
+                    "last_return_minus_first_live_top1": last_return_top1 - first_top1,
+                    "return_minus_first_live_top1": last_return_top1 - first_top1,
                 }
         metrics["per_user_return_retention"] = user_block_retention
-        metrics["per_event_type"] = {k: _aggregate_episode_metrics([r for r in assist_rows if r.get("event_type") == k]) for k in sorted({str(r.get("event_type")) for r in assist_rows})}
+        metrics["per_event_type"] = {k: _aggregate_episode_metrics([r for r in deployment_rows if r.get("event_type") == k]) for k in sorted({str(r.get("event_type")) for r in deployment_rows})}
         metrics["per_event_type_support"] = {k: float(v.get("n_episodes", 0.0)) for k, v in metrics["per_event_type"].items()}
+        metrics["macro_event_top1"] = _mean([
+            float(row.get("live_top1", 0.0))
+            for event_type, row in metrics["per_event_type"].items()
+            if event_type in PRIMARY_EVENT_TYPES and float(row.get("n_episodes", 0.0)) > 0.0
+        ])
+        metrics["calibration_curve"] = calibration_curve_from_steps(step_rows)
+        # Calibration by event type surfaces whether the confidence signal is
+        # trustworthy specifically on hard events (preference_shift, rare_reentry),
+        # which is the operationally important range for the action gate.
+        metrics["calibration_curve_by_event_type"] = {
+            et: calibration_curve_from_steps([s for s in step_rows if s.get("event_type") == et])
+            for et in PRIMARY_EVENT_TYPES
+            if any(s.get("event_type") == et for s in step_rows)
+        }
+        hard_cases = {"preference_shift", "user_switch", "rare_reentry", "cross_transfer_probe"}
+        metrics["hard_case_top1"] = _mean([
+            float(r.get("live_top1", 0.0))
+            for r in deployment_rows
+            if str(r.get("event_type")) in hard_cases
+        ])
+        metrics["hard_case_net_robot_action_value"] = _mean([
+            float(r.get("net_robot_action_value", r.get("net_assistance_value", 0.0)))
+            for r in deployment_rows
+            if str(r.get("event_type")) in hard_cases
+        ])
         metrics["per_memory_state_gt"] = {
             k: _aggregate_episode_metrics([
-                r for r in assist_rows
+                r for r in deployment_rows
                 if str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) == k
             ])
-            for k in sorted({str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) for r in assist_rows})
+            for k in sorted({str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) for r in deployment_rows})
         }
         metrics["per_event_type_memory_state_gt"] = {
             event_type: {
                 state: _aggregate_episode_metrics([
-                    r for r in assist_rows
+                    r for r in deployment_rows
                     if str(r.get("event_type")) == event_type
                     and str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) == state
                 ])
-                for state in sorted({str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) for r in assist_rows if str(r.get("event_type")) == event_type})
+                for state in sorted({str(r.get("memory_state_gt", r.get("memory_state", "unknown"))) for r in deployment_rows if str(r.get("event_type")) == event_type})
             }
-            for event_type in sorted({str(r.get("event_type")) for r in assist_rows})
+            for event_type in sorted({str(r.get("event_type")) for r in deployment_rows})
         }
         metrics["per_transfer_cell"] = {
-            cell: _aggregate_episode_metrics([r for r in assist_rows if r.get("transfer_cell_before") == cell])
+            cell: _aggregate_episode_metrics([r for r in deployment_rows if r.get("transfer_cell_before") == cell])
             for cell in TRANSFER_CELL_KEYS
         }
-        metrics["four_cell"] = {cell: _aggregate_episode_metrics([r for r in assist_rows if r.get("four_cell_before") == cell]) for cell in FOUR_CELL_KEYS}
-        for cell, vals in metrics["four_cell"].items():
+        exposure_cell_metrics = {
+            cell: _aggregate_episode_metrics([
+                r for r in deployment_rows
+                if r.get("exposure_cell_before", r.get("four_cell_before")) == cell
+            ])
+            for cell in FOUR_CELL_KEYS
+        }
+        metrics["coarse_exposure_cell"] = exposure_cell_metrics
+        metrics["four_cell"] = exposure_cell_metrics
+        for cell, vals in exposure_cell_metrics.items():
             for metric_name, metric_val in vals.items():
                 if isinstance(metric_val, (int, float)):
                     metrics[f"{metric_name}_{cell}"] = float(metric_val)
-        metrics["memory_efficiency"] = float(metrics.get("useful_assistance_rate", 0.0)) / max(1.0, math.log1p(float(metrics["memory"].get("active_variants", 0.0))))
+        metrics["valid_random_floor"] = _mean([
+            1.0 / max(1, int(s.get("valid_next_action_count", 1)))
+            for s in step_rows
+        ])
         metrics["live_step_trace"] = live_step_trace(step_rows)
+        event_trace_types = tuple(dict.fromkeys((*PRIMARY_EVENT_TYPES, "user_switch")))
         metrics["live_step_trace_by_event_type"] = {
             event_type: live_step_trace([s for s in step_rows if str(s.get("event_type")) == event_type])
-            for event_type in PRIMARY_EVENT_TYPES
+            for event_type in event_trace_types
         }
         prediction_walls = [float(s.get("prediction_wall_s")) for s in step_rows if s.get("prediction_wall_s") is not None]
         metrics["mean_prediction_wall_s"] = _mean(prediction_walls)
         metrics["p95_prediction_wall_s"] = _p95(prediction_walls)
         metrics["calibration_curve"] = calibration_curve_from_steps(step_rows)
         metrics["latency_cdf"] = latency_cdf_from_steps(step_rows)
-        metrics["assist_gate"] = assist_gate_reason_summary(step_rows)
-        metrics["action_gate_calibration"] = gate_calibration
-        metrics["selected_action_confidence_threshold"] = float(agent.cfg.posterior_action_confidence_threshold)
-        metrics["bwt"] = bwt_fwt["bwt"]
-        metrics["fwt"] = bwt_fwt["fwt"]
-        metrics["bwt_fwt_detail"] = bwt_fwt
-        if baseline in gate_calibration_baselines and phase_b_pairs:
-            probe_pairs = list({p.label: p for p in phase_b_pairs}.values())[: max(1, min(20, len(phase_b_pairs)))]
-            coverage_curves[baseline] = _annotate_gate_curve_utility(
-                coverage_vs_accuracy_curve(agent, probe_pairs, name_to_rid, run_config, cfg_obj.coverage_curve_thresholds),
-                wrong_assist_penalty=cfg_obj.calibration_wrong_assist_penalty,
-                hidden_correct_penalty=cfg_obj.calibration_hidden_correct_penalty,
-            )
-            metrics["coverage_accuracy_curve"] = coverage_curves[baseline]
+        metrics["policy_gate"] = policy_gate_reason_summary(step_rows)
+        metrics["selected_policy_confidence_threshold"] = float(agent.cfg.posterior_action_confidence_threshold)
+        metrics["bwt"] = bwt_zero_shot["bwt"]
+        metrics["zero_shot_transfer"] = bwt_zero_shot["zero_shot_transfer"]
+        metrics["bwt_zero_shot_detail"] = bwt_zero_shot
+        metrics["primary_forgetting_metric"] = "online_best_so_far_forgetting"
+        metrics["online_best_so_far_forgetting"] = _summarize_online_forgetting_rows(baseline_online_forgetting_rows)
+        metrics["preference_reentry_recovery"] = {
+            "rows": baseline_preference_reentry_recovery,
+            "summary": _summarize_preference_reentry_rows(baseline_preference_reentry_recovery),
+        }
+        metrics["user_switch_recovery"] = {
+            "rows": baseline_user_switch_recovery,
+            "n_qualifying_episodes": len(baseline_user_switch_recovery),
+            "user_mismatch_recovery_steps": _mean([float(r.get("recovery_step", -1)) for r in baseline_user_switch_recovery if int(r.get("recovery_step", -1)) >= 0]),
+            "recovery_failure_rate": _mean([0.0 if r.get("recovered") else 1.0 for r in baseline_user_switch_recovery]),
+            "robot_wrong_rate_before_recovery": _mean([float(r.get("robot_wrong_rate_before_recovery", r.get("wrong_assist_rate_before_recovery", 0.0))) for r in baseline_user_switch_recovery]),
+            "step_trace": _step_trace_from_rows([
+                step
+                for row in baseline_user_switch_recovery
+                for step in (row.get("step_top1_trace", []) or [])
+                if isinstance(step, Mapping)
+            ]),
+        }
         per_baseline[baseline] = metrics
         all_episode_rows.extend({"baseline": baseline, **r} for r in episode_rows)
         all_step_rows.extend(step_rows)
@@ -6649,55 +6444,216 @@ def run_deployment_stream(seed: int, out: Path, run_config: RunConfig, cfg_obj: 
     _append_jsonl(out / "episode_metrics.jsonl", all_episode_rows)
     _append_jsonl(out / "episode_steps.jsonl", all_step_rows)
     _append_jsonl(out / "memory_trace.jsonl", all_memory_rows)
-    _append_jsonl(out / "forgetting_trace.jsonl", forgetting_rows)
+    _append_jsonl(out / "online_forgetting_trace.jsonl", online_forgetting_rows)
+    _append_jsonl(out / "user_switch_recovery.jsonl", user_switch_recovery_rows)
+    _append_jsonl(out / "preference_reentry_recovery.jsonl", preference_reentry_recovery_rows)
+    oracle_eval_pairs = [e.pair for e in events if e.mode == "assist" and e.phase != "phase_a"]
+    oracle_references = _oracle_reference_metrics(
+        seed,
+        run_config,
+        phase_a_pairs,
+        oracle_eval_pairs,
+        max_eval_pairs=None,
+    )
+    preference_decay_profile = _preference_decay_profile(seed, run_config, cfg_obj)
+    valid_random_floor = float((per_baseline.get("full", {}) or {}).get("valid_random_floor", 0.0))
+    transfer_taxonomy_policy = {
+        "transfer_claim_cells": list(TRANSFER_CELL_KEYS),
+        "forgetting_and_reentry_memory_states": ["latest_pin", "displaced_active", "pruned", "known_in_registry"],
+        "exposure_cells": list(FOUR_CELL_KEYS),
+        "four_cell_is_secondary_taxonomy": True,
+    }
     metrics = {
         "seed": seed,
+        "mode_policy": "user selects observation when the recipe is absent from the baseline's active memory; otherwise the user selects assist",
         "n_recipes": len(recipes),
         "n_users": len(users),
         "n_events": len(events),
         "n_phase_b_events": sum(1 for e in events if e.mode == "assist"),
-        "selected_action_confidence_threshold": float((per_baseline.get("full", {}) or {}).get("selected_action_confidence_threshold", base_config(seed, run_config).posterior_action_confidence_threshold)),
-        "selected_action_confidence_thresholds": {b: row.get("selected_action_confidence_threshold", base_config(seed, run_config).posterior_action_confidence_threshold) for b, row in per_baseline.items()},
-        "per_baseline": per_baseline,
-        "derived_views": {
-            "memory_efficiency": {b: row.get("memory_efficiency", 0.0) for b, row in per_baseline.items()},
-            "compute_tradeoff": {b: row.get("compute", {}) for b, row in per_baseline.items()},
-            "forgetting_curve": forgetting_rows,
-            "per_user_accuracy": {b: row.get("per_user", {}) for b, row in per_baseline.items()},
-            "per_memory_state_gt": {b: row.get("per_memory_state_gt", {}) for b, row in per_baseline.items()},
-            "per_transfer_cell": {b: row.get("per_transfer_cell", {}) for b, row in per_baseline.items()},
-            "per_event_type_memory_state_gt": {b: row.get("per_event_type_memory_state_gt", {}) for b, row in per_baseline.items()},
-            "coverage_accuracy_curve": coverage_curves,
-            "action_gate_calibration": {b: row.get("action_gate_calibration", {}) for b, row in per_baseline.items()},
-            "assist_gate": {b: row.get("assist_gate", {}) for b, row in per_baseline.items()},
-            "event_type_narratives": DEPLOYMENT_EVENT_NARRATIVES,
+        "n_new_recipe_rejections": len(new_recipe_rejections),
+        "new_recipe_rejections": new_recipe_rejections,
+        "event_distribution": _event_distribution(events),
+        "event_mix_sensitivity": _event_mix_sensitivity(seed, run_config, cfg_obj),
+        "oracle_references": oracle_references,
+        "valid_random_floor": valid_random_floor,
+        "preference_decay_profile": preference_decay_profile,
+        "primary_forgetting_metric": "online_best_so_far_forgetting",
+        "online_best_so_far_forgetting_summary": {
+            baseline: row.get("online_best_so_far_forgetting", {})
+            for baseline, row in per_baseline.items()
         },
+        "transfer_taxonomy_policy": transfer_taxonomy_policy,
+        "selected_policy_confidence_threshold": float((per_baseline.get("full", {}) or {}).get("selected_policy_confidence_threshold", per_baseline.get("full", {}).get("selected_action_confidence_threshold", base_config(seed, run_config).posterior_action_confidence_threshold))),
+        "selected_policy_confidence_thresholds": {b: row.get("selected_policy_confidence_threshold", row.get("selected_action_confidence_threshold", base_config(seed, run_config).posterior_action_confidence_threshold)) for b, row in per_baseline.items()},
+        "per_baseline": per_baseline,
     }
     _write_json(out / "metrics.json", metrics)
-    _render_seed_publication_figures(out, "deployment_stream", metrics)
     return metrics
 
 
-def _axis_probe_pairs(builders: Sequence[Tuple[str, Callable[[], List[str]]]]) -> Dict[str, List[RecipePrefPair]]:
-    out: Dict[str, List[RecipePrefPair]] = {}
+def _default_axis_values() -> Dict[str, str]:
+    return WorkflowPreference().as_dict()
+
+
+def _single_axis_preference(axis: str, value: str) -> WorkflowPreference:
+    axes = _default_axis_values()
+    axes[axis] = value
+    return WorkflowPreference(**axes)
+
+
+def _non_default_axis_values(axis: str) -> Tuple[str, ...]:
+    default = _default_axis_values()[axis]
+    return tuple(v for v in WORKFLOW_AXIS_VALUES.get(axis, ()) if v != default)
+
+
+def _material_single_axis_pair(
+    recipe: str,
+    fn: Callable[[], List[str]],
+    axis: str,
+    value: str,
+) -> Optional[RecipePrefPair]:
+    try:
+        pair = materialize_custom_pair(recipe, _single_axis_preference(axis, value), fn)
+    except Exception:
+        return None
+    if axis in pair.failed_axes:
+        return None
+    if axis not in pair.applied_axes:
+        return None
+    return pair
+
+
+def _axis_materiality_report(builders: Sequence[Tuple[str, Callable[[], List[str]]]]) -> Dict[str, Dict[str, int]]:
+    report: Dict[str, Dict[str, int]] = {}
     for axis in WORKFLOW_AXES:
-        _train, holdout = _axis_holdout_split(axis)
-        rows: List[RecipePrefPair] = []
+        attempted = valid = failed = noop = 0
         for recipe, fn in builders:
-            for pref in holdout:
+            for value in _non_default_axis_values(axis):
+                attempted += 1
                 try:
-                    pair = materialize_pair(recipe, pref, fn)
+                    pair = materialize_custom_pair(recipe, _single_axis_preference(axis, value), fn)
                 except Exception:
+                    failed += 1
                     continue
-                if pair.applied_axes:
-                    rows.append(pair)
-        out[axis] = rows
-    return out
+                if axis in pair.failed_axes:
+                    failed += 1
+                elif axis not in pair.applied_axes:
+                    noop += 1
+                else:
+                    valid += 1
+        report[axis] = {
+            "pairs_attempted": attempted,
+            "valid_material_pairs": valid,
+            "excluded_target_axis_failed": failed,
+            "excluded_target_axis_noop": noop,
+        }
+    return report
+
+
+def _cross_axis_value_transfer_specs(
+    builders: Sequence[Tuple[str, Callable[[], List[str]]]],
+) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    if len(builders) < 2:
+        return specs
+    split = max(1, len(builders) // 2)
+    train_builders = list(builders[:split])
+    test_builders = list(builders[split:]) or list(builders[:split])
+    for axis in WORKFLOW_AXES:
+        for value in _non_default_axis_values(axis):
+            train_pairs = [
+                pair
+                for recipe, fn in train_builders
+                for pair in [_material_single_axis_pair(recipe, fn, axis, value)]
+                if pair is not None
+            ]
+            test_pairs = [
+                pair
+                for recipe, fn in test_builders
+                for pair in [_material_single_axis_pair(recipe, fn, axis, value)]
+                if pair is not None
+            ]
+            if train_pairs and test_pairs:
+                specs.append({
+                    "condition": "cross_axis_value_transfer",
+                    "axis": axis,
+                    "axis_value": value,
+                    "train_pairs": train_pairs,
+                    "test_pairs": test_pairs,
+                })
+    return specs
+
+
+def _preset_excludes_axis(pref: WorkflowPreference, axis: str) -> bool:
+    return pref.as_dict()[axis] == _default_axis_values()[axis]
+
+
+def _preset_varies_other_axis(pref: WorkflowPreference, heldout_axis: str) -> bool:
+    defaults = _default_axis_values()
+    return any(
+        axis != heldout_axis and pref.as_dict()[axis] != defaults[axis]
+        for axis in WORKFLOW_AXES
+    )
+
+
+def _axis_family_holdout_specs(
+    builders: Sequence[Tuple[str, Callable[[], List[str]]]],
+) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    if not builders:
+        return specs
+    split = max(1, int(math.ceil(len(builders) * 0.67)))
+    train_builders = list(builders[:split])
+    test_builders = list(builders[split:]) or list(builders)
+    for axis in WORKFLOW_AXES:
+        train_pref_names = [
+            name
+            for name, pref in PRESET_PREFERENCES.items()
+            if _preset_excludes_axis(pref, axis) and (name == "identity" or _preset_varies_other_axis(pref, axis))
+        ]
+        if not train_pref_names:
+            train_pref_names = ["identity"]
+        train_pairs: List[RecipePrefPair] = []
+        for i, (recipe, fn) in enumerate(train_builders):
+            pref_name = train_pref_names[i % len(train_pref_names)]
+            try:
+                pair = materialize_pair(recipe, pref_name, fn)
+            except Exception:
+                continue
+            train_pairs.append(pair)
+        by_value: Dict[str, List[RecipePrefPair]] = {}
+        test_pairs: List[RecipePrefPair] = []
+        for value in _non_default_axis_values(axis):
+            value_pairs = [
+                pair
+                for recipe, fn in test_builders
+                for pair in [_material_single_axis_pair(recipe, fn, axis, value)]
+                if pair is not None
+            ]
+            if value_pairs:
+                by_value[value] = value_pairs
+                test_pairs.extend(value_pairs)
+        if train_pairs and test_pairs:
+            specs.append({
+                "condition": "axis_family_holdout",
+                "axis": axis,
+                "train_preference_names": tuple(train_pref_names),
+                "heldout_axis_values": tuple(by_value.keys()),
+                "train_pairs": train_pairs,
+                "test_pairs": test_pairs,
+                "test_pairs_by_value": by_value,
+            })
+    return specs
+
+
+def _preference_axis_difference_count(pref: WorkflowPreference, reference: Optional[WorkflowPreference] = None) -> int:
+    reference_axes = (reference or WorkflowPreference()).as_dict()
+    pref_axes = pref.as_dict()
+    return sum(1 for axis in WORKFLOW_AXES if pref_axes.get(axis) != reference_axes.get(axis))
 
 
 def _novel_composition_pairs(builders: Sequence[Tuple[str, Callable[[], List[str]]]], named_pairs: Sequence[RecipePrefPair]) -> List[Tuple[RecipePrefPair, int]]:
     train_hashes = {_order_hash(p) for p in named_pairs}
-    identity = WorkflowPreference().as_dict()
     rows: List[Tuple[RecipePrefPair, int]] = []
     for recipe, fn in builders:
         for pref in _build_gap_preferences():
@@ -6707,8 +6663,8 @@ def _novel_composition_pairs(builders: Sequence[Tuple[str, Callable[[], List[str
                 continue
             if _order_hash(pair) in train_hashes:
                 continue
-            hamming = sum(1 for axis in WORKFLOW_AXES if pref.as_dict()[axis] != identity[axis])
-            rows.append((pair, hamming))
+            axis_diff_count = _preference_axis_difference_count(pref)
+            rows.append((pair, axis_diff_count))
     return rows
 
 
@@ -6733,6 +6689,33 @@ def _build_exclusive_diagonal(
         hashes = {_order_hash(pair) for pair in by_pref.values()}
         if len(hashes) < len(pref_list):
             continue
+        pair_vals = list(by_pref.values())
+        effective_pairs, duplicate_pairs = _deduplicate_preference_pairs(
+            pair_vals,
+            tau_threshold=float(MaterialityPreflightConfig().near_duplicate_tau_threshold),
+        )
+        if len(effective_pairs) < len(pref_list) or duplicate_pairs:
+            continue
+        divergences = [
+            earliest_divergence_step(a.actions, b.actions)
+            for i, a in enumerate(pair_vals)
+            for b in pair_vals[i + 1:]
+            if a.actions != b.actions
+        ]
+        min_divergence = min(divergences, default=0)
+        min_len = min((len(p.actions) for p in pair_vals), default=1)
+        if min_divergence > max(1, min_len // 3):
+            continue
+        identity_pair = by_pref.get("identity")
+        if identity_pair is not None:
+            too_close_to_selected = False
+            for _sel_name, _sel_fn, sel_by_pref in selected:
+                sel_identity = sel_by_pref.get("identity")
+                if sel_identity is not None and jaccard(identity_pair.actions, sel_identity.actions) >= float(DEFAULT_CONFIG.jaccard_threshold):
+                    too_close_to_selected = True
+                    break
+            if too_close_to_selected:
+                continue
         selected.append((recipe_name, fn, by_pref))
         if len(selected) >= n:
             break
@@ -6756,6 +6739,63 @@ def _build_exclusive_diagonal(
     }
 
 
+def _run_transfer_condition_probe(
+    baseline: str,
+    seed: int,
+    run_config: RunConfig,
+    condition: str,
+    train_pairs: Sequence[RecipePrefPair],
+    test_pairs: Sequence[RecipePrefPair],
+    event_tag: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    agent = make_agent(baseline, base_config(seed, run_config))
+    name_to_rid: Dict[str, str] = {}
+    pref_to_pid: Dict[str, Optional[str]] = {}
+    for pair in train_pairs:
+        observe_episode(agent, pair, name_to_rid)
+        pref_to_pid[pair.preference_name] = agent.last_pref_id
+    checkpoint = agent.snapshot()
+    frozen = frozen_eval(agent, test_pairs, name_to_rid) if test_pairs else {}
+    rows: List[Dict[str, Any]] = []
+    step_rows: List[Dict[str, Any]] = []
+    tag = {"condition": condition, **(event_tag or {})}
+    for pair in test_pairs:
+        agent.restore_from(checkpoint)
+        try:
+            local_map = dict(name_to_rid)
+            oracle_pid = pref_to_pid.get(pair.preference_name)
+            oracle_rid = local_map.get(pair.recipe_name)
+            kwargs = {"oracle_preference_id": oracle_pid} if baseline == "oracle_preference_label" else {}
+            if baseline == "oracle_recipe_and_preference_label":
+                kwargs = {"oracle_preference_id": oracle_pid, "oracle_recipe_id": oracle_rid}
+            row, steps = assist_episode(
+                agent,
+                pair,
+                local_map,
+                run_config=run_config,
+                commit=False,
+                event_tag=tag,
+                **kwargs,
+            )
+        finally:
+            agent.restore_from(checkpoint)
+        row.update({"baseline": baseline, **tag})
+        rows.append(row)
+        step_rows.extend({"baseline": baseline, **tag, **s} for s in steps)
+    live = _aggregate_episode_metrics(rows)
+    frozen_top1 = _mean([v.get("top1", 0.0) for v in frozen.values()])
+    return {
+        **live,
+        "condition": condition,
+        "n_train_pairs": float(len(train_pairs)),
+        "n_test_pairs": float(len(test_pairs)),
+        "train_pairs": [p.label for p in train_pairs],
+        "test_pairs": [p.label for p in test_pairs],
+        "frozen_top1": frozen_top1,
+        "frozen_to_live_transfer_gain": float(live.get("live_top1", 0.0)) - frozen_top1,
+    }, rows, step_rows
+
+
 def run_cross_recipe_transfer_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj: TransferSuiteConfig) -> Dict[str, Any]:
     prefs = select_preference_names(cfg_obj.n_preferences)
     n_diag = min(int(cfg_obj.n_recipes), len(prefs))
@@ -6772,21 +6812,44 @@ def run_cross_recipe_transfer_suite(seed: int, out: Path, run_config: RunConfig,
     diagonal = list(diagonal_spec["diagonal"])
     diag_pref_by_recipe = {p.recipe_name: p.preference_name for p in diagonal}
     offdiag = list(diagonal_spec["offdiag"])
-    repeats = 1 if run_config.quick else max(1, int(cfg_obj.offdiag_repeats))
-    if run_config.quick:
-        offdiag = offdiag[: min(8, len(offdiag))]
-    axis_probes = _axis_probe_pairs(builders) if cfg_obj.include_axis_holdout else {}
+    effective_preferences_by_recipe: Dict[str, int] = {}
+    duplicate_orderings_by_recipe: Dict[str, List[Dict[str, Any]]] = {}
+    for recipe in recipes:
+        recipe_pairs = [p for p in all_pairs if p.recipe_name == recipe]
+        deduped, dropped = _deduplicate_preference_pairs(
+            recipe_pairs,
+            tau_threshold=float(MaterialityPreflightConfig().near_duplicate_tau_threshold),
+        )
+        effective_preferences_by_recipe[recipe] = len(deduped)
+        duplicate_orderings_by_recipe[recipe] = dropped
+    repeats = max(1, int(cfg_obj.offdiag_repeats))
+    axis_value_specs = _cross_axis_value_transfer_specs(builders) if cfg_obj.include_cross_axis_value_transfer else []
+    axis_family_specs = _axis_family_holdout_specs(builders) if cfg_obj.include_axis_family_holdout else []
+    axis_materiality = _axis_materiality_report(builders) if (axis_value_specs or axis_family_specs) else {}
     novel_probes = _novel_composition_pairs(builders, all_pairs) if cfg_obj.include_novel_composition else []
-    if run_config.quick:
-        axis_probes = {k: v[: min(6, len(v))] for k, v in axis_probes.items()}
-        novel_probes = novel_probes[: min(8, len(novel_probes))]
     _record_common_artifacts(out, seed, cfg_obj, recipes, active_prefs)
     scenario_rows = [
         {"mode": "observe", "phase": "shared_diagonal_train", "event_type": "diagonal_train", "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
         for p in diagonal
     ] + [
-        {"mode": "assist", "phase": "offdiagonal_probe", "event_type": "offdiagonal_transfer", "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
+        {"mode": "assist", "phase": "cross_recipe_pref_transfer", "event_type": "offdiagonal_transfer", "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
         for p in offdiag
+    ] + [
+        {"mode": "observe", "phase": "cross_axis_value_transfer_train", "event_type": "axis_value_train", "axis": spec["axis"], "axis_value": spec["axis_value"], "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
+        for spec in axis_value_specs
+        for p in spec["train_pairs"]
+    ] + [
+        {"mode": "assist", "phase": "cross_axis_value_transfer_probe", "event_type": "axis_value_transfer_probe", "axis": spec["axis"], "axis_value": spec["axis_value"], "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
+        for spec in axis_value_specs
+        for p in spec["test_pairs"]
+    ] + [
+        {"mode": "observe", "phase": "axis_family_holdout_train", "event_type": "axis_family_train", "heldout_axis": spec["axis"], "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
+        for spec in axis_family_specs
+        for p in spec["train_pairs"]
+    ] + [
+        {"mode": "assist", "phase": "axis_family_holdout_probe", "event_type": "axis_family_holdout_probe", "heldout_axis": spec["axis"], "pair": p.label, "recipe": p.recipe_name, "preference": p.preference_name}
+        for spec in axis_family_specs
+        for p in spec["test_pairs"]
     ]
     _append_jsonl(out / "scenario_events.jsonl", scenario_rows)
     per_baseline: Dict[str, Dict[str, Any]] = {}
@@ -6798,11 +6861,51 @@ def run_cross_recipe_transfer_suite(seed: int, out: Path, run_config: RunConfig,
         agent = make_agent(baseline, base_config(seed, run_config))
         name_to_rid: Dict[str, str] = {}
         pref_to_pid: Dict[str, Optional[str]] = {}
+        interference_rows: List[Dict[str, Any]] = []
+        seen_train_pairs: List[RecipePrefPair] = []
         t0 = time.perf_counter()
         for _cycle in range(max(1, int(cfg_obj.diagonal_cycles))):
             for pair in diagonal:
+                before_seen = frozen_eval(agent, seen_train_pairs, name_to_rid) if seen_train_pairs else {}
                 observe_episode(agent, pair, name_to_rid)
                 pref_to_pid[pair.preference_name] = agent.last_pref_id
+                after_seen = frozen_eval(agent, seen_train_pairs, name_to_rid) if seen_train_pairs else {}
+                for prior in seen_train_pairs:
+                    key = _memory_key_for_pair(agent, prior, name_to_rid)
+                    active = bool(key is not None and key in agent.decay.active)
+                    latest = bool(key is not None and agent.decay.latest_by_recipe.get(key[0]) == key[1])
+                    pruned = bool(key is not None and key in agent.decay.pruned)
+                    same_axis = bool(set(prior.applied_axes) & set(pair.applied_axes))
+                    interference_rows.append({
+                        "added_pair": pair.label,
+                        "evaluated_pair": prior.label,
+                        "added_recipe": pair.recipe_name,
+                        "evaluated_recipe": prior.recipe_name,
+                        "same_preference_axis": same_axis,
+                        "same_recipe": pair.recipe_name == prior.recipe_name,
+                        "variant_is_active": active,
+                        "variant_is_pruned": pruned,
+                        "variant_is_latest_pin": latest,
+                        "before_top1": float((before_seen.get(prior.label, {}) or {}).get("top1", 0.0)),
+                        "after_top1": float((after_seen.get(prior.label, {}) or {}).get("top1", 0.0)),
+                        "delta_top1": float((after_seen.get(prior.label, {}) or {}).get("top1", 0.0)) - float((before_seen.get(prior.label, {}) or {}).get("top1", 0.0)),
+                    })
+                if pair not in seen_train_pairs:
+                    seen_train_pairs.append(pair)
+        train_seen_recipes = {p.recipe_name for p in diagonal}
+        train_seen_pairs = {p.label for p in diagonal}
+        train_seen_preferences = {p.preference_name for p in diagonal}
+        train_seen_preferences_by_recipe: Dict[str, set] = defaultdict(set)
+        for p in diagonal:
+            train_seen_preferences_by_recipe[p.recipe_name].add(p.preference_name)
+        diagonal_weights_at_checkpoint = {
+            p.label: variant_weight_for_pair(agent, p, name_to_rid)
+            for p in diagonal
+        }
+        diagonal_latest_pin_integrity = all(
+            weight is not None and abs(float(weight) - 1.0) <= 1e-9
+            for weight in diagonal_weights_at_checkpoint.values()
+        )
         diagonal_cycle_curve: Dict[str, Dict[str, float]] = {}
         if cfg_obj.diagonal_cycle_sweep:
             curve_agent = make_agent(baseline, base_config(seed, run_config))
@@ -6816,7 +6919,7 @@ def run_cross_recipe_transfer_suite(seed: int, out: Path, run_config: RunConfig,
                     cycle_eval = frozen_eval(curve_agent, diagonal, curve_map)
                     diagonal_cycle_curve[str(cycle)] = {
                         "frozen_diagonal_top1": _mean([v.get("top1", 0.0) for v in cycle_eval.values()]),
-                        "frozen_diagonal_top3": _mean([v.get("top3", 0.0) for v in cycle_eval.values()]),
+                        "frozen_diagonal_topk": _mean([v.get("topk", 0.0) for v in cycle_eval.values()]),
                     }
         checkpoint = agent.snapshot()
         frozen_diag = frozen_eval(agent, diagonal, name_to_rid)
@@ -6828,20 +6931,44 @@ def run_cross_recipe_transfer_suite(seed: int, out: Path, run_config: RunConfig,
             pair_rows: List[Dict[str, Any]] = []
             for rep in range(repeats):
                 agent.restore_from(checkpoint)
-                local_map = dict(name_to_rid)
-                oracle_pid = pref_to_pid.get(pair.preference_name)
-                oracle_rid = local_map.get(pair.recipe_name)
-                kwargs = {"oracle_preference_id": oracle_pid} if baseline == "oracle_preference_label" else {}
-                if baseline == "oracle_recipe_and_preference_label":
-                    kwargs = {"oracle_preference_id": oracle_pid, "oracle_recipe_id": oracle_rid}
-                row, steps = assist_episode(agent, pair, local_map, run_config=run_config, event_tag={"condition": "offdiagonal_transfer", "repeat": rep}, **kwargs)
+                try:
+                    local_map = dict(name_to_rid)
+                    oracle_pid = pref_to_pid.get(pair.preference_name)
+                    oracle_rid = local_map.get(pair.recipe_name)
+                    kwargs = {"oracle_preference_id": oracle_pid} if baseline == "oracle_preference_label" else {}
+                    if baseline == "oracle_recipe_and_preference_label":
+                        kwargs = {"oracle_preference_id": oracle_pid, "oracle_recipe_id": oracle_rid}
+                    transfer_cell = _transfer_cell_for_pair(
+                        pair,
+                        seen_recipes=train_seen_recipes,
+                        seen_pairs=train_seen_pairs,
+                        seen_preferences=train_seen_preferences,
+                        seen_preferences_by_recipe=train_seen_preferences_by_recipe,
+                    )
+                    eval_cls = agent.disambig.classify(
+                        agent._tokens_from_action_labels(pair.actions),
+                        agent.memory.library(allowed_keys=agent._active_keys()),
+                    )
+                    row, steps = assist_episode(
+                        agent,
+                        pair,
+                        local_map,
+                        run_config=run_config,
+                        commit=False,
+                        event_tag={"condition": "cross_recipe_pref_transfer", "repeat": rep, "transfer_cell": transfer_cell},
+                        **kwargs,
+                    )
+                finally:
+                    agent.restore_from(checkpoint)
                 row.update({
                     "baseline": baseline,
                     "seen_recipe": True,
                     "seen_preference_global": pair.preference_name in pref_to_pid,
                     "seen_preference_for_recipe": False,
-                    "four_cell_global": "seen_seen" if pair.preference_name in pref_to_pid else "seen_unseen",
-                    "preference_transfer_correct": row.get("classification_kind") in ("known", "preference_shift", "reentry_from_pruned"),
+                    "transfer_cell": transfer_cell,
+                    "classification_kind_eval": eval_cls.kind,
+                    "preference_transfer_correct": eval_cls.kind in ("known", "preference_shift", "reentry_from_pruned"),
+                    "transfer_evaluation_commit": False,
                 })
                 pair_rows.append(row)
                 off_rows.append(row)
@@ -6849,29 +6976,93 @@ def run_cross_recipe_transfer_suite(seed: int, out: Path, run_config: RunConfig,
                 if isinstance(row.get("live_record"), LiveEpisodeRecord):
                     live_records.append(row["live_record"])
                 all_episode_rows.append(row)
-                all_step_rows.extend({"baseline": baseline, "condition": "offdiagonal_transfer", **s} for s in steps)
+                all_step_rows.extend({"baseline": baseline, "condition": "cross_recipe_pref_transfer", **s} for s in steps)
             if baseline == "full":
                 full_matrix[(pair.recipe_name, pair.preference_name)] = _mean([r["live_top1"] for r in pair_rows])
-        axis_metrics: Dict[str, Any] = {}
-        for axis, pairs in axis_probes.items():
-            rows: List[Dict[str, Any]] = []
-            for pair in pairs:
-                agent.restore_from(checkpoint)
-                row, steps = assist_episode(agent, pair, dict(name_to_rid), run_config=run_config, event_tag={"condition": "axis_holdout", "axis": axis})
-                rows.append(row)
-                all_episode_rows.append({"baseline": baseline, **row})
-                all_step_rows.extend({"baseline": baseline, "condition": "axis_holdout", "axis": axis, **s} for s in steps)
-            axis_metrics[axis] = _aggregate_episode_metrics(rows)
-        hamming_rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for pair, hamming in novel_probes:
+        axis_value_metrics: Dict[str, Any] = {}
+        axis_value_rows_all: List[Dict[str, Any]] = []
+        for spec in axis_value_specs:
+            spec_key = f"{spec['axis']}={spec['axis_value']}"
+            result, rows, steps = _run_transfer_condition_probe(
+                baseline,
+                seed,
+                run_config,
+                "cross_axis_value_transfer",
+                spec["train_pairs"],
+                spec["test_pairs"],
+                {"axis": spec["axis"], "axis_value": spec["axis_value"]},
+            )
+            axis_value_metrics[spec_key] = result
+            axis_value_rows_all.extend(rows)
+            all_episode_rows.extend(rows)
+            all_step_rows.extend(steps)
+        cross_axis_value_transfer = {
+            **_aggregate_episode_metrics(axis_value_rows_all),
+            "condition": "cross_axis_value_transfer",
+            "by_axis_value": axis_value_metrics,
+            "n_specs": float(len(axis_value_specs)),
+        }
+        axis_family_metrics: Dict[str, Any] = {}
+        axis_family_rows_all: List[Dict[str, Any]] = []
+        for spec in axis_family_specs:
+            result, rows, steps = _run_transfer_condition_probe(
+                baseline,
+                seed,
+                run_config,
+                "axis_family_holdout",
+                spec["train_pairs"],
+                spec["test_pairs"],
+                {"heldout_axis": spec["axis"]},
+            )
+            by_value: Dict[str, Any] = {}
+            for value, pairs_for_value in spec.get("test_pairs_by_value", {}).items():
+                value_labels = {p.label for p in pairs_for_value}
+                by_value[value] = _aggregate_episode_metrics([r for r in rows if r.get("pair") in value_labels])
+            result["by_heldout_value"] = by_value
+            result["train_preference_names"] = list(spec.get("train_preference_names", ()))
+            axis_family_metrics[spec["axis"]] = result
+            axis_family_rows_all.extend(rows)
+            all_episode_rows.extend(rows)
+            all_step_rows.extend(steps)
+        axis_family_holdout = {
+            **_aggregate_episode_metrics(axis_family_rows_all),
+            "condition": "axis_family_holdout",
+            "by_axis": axis_family_metrics,
+            "n_specs": float(len(axis_family_specs)),
+        }
+        axis_diff_rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        frozen_novel = frozen_eval(agent, [p for p, _h in novel_probes], name_to_rid) if novel_probes else {}
+        for pair, axis_diff_count in novel_probes:
             agent.restore_from(checkpoint)
-            row, steps = assist_episode(agent, pair, dict(name_to_rid), run_config=run_config, event_tag={"condition": "novel_composition", "hamming": hamming})
-            hamming_rows[str(hamming)].append(row)
+            try:
+                row, steps = assist_episode(agent, pair, dict(name_to_rid), run_config=run_config, commit=False, event_tag={"condition": "novel_composition", "axis_diff_count": axis_diff_count})
+            finally:
+                agent.restore_from(checkpoint)
+            axis_diff_rows[str(axis_diff_count)].append(row)
             all_episode_rows.append({"baseline": baseline, **row})
-            all_step_rows.extend({"baseline": baseline, "condition": "novel_composition", "hamming": hamming, **s} for s in steps)
-        novel_metrics = {h: _aggregate_episode_metrics(rows) for h, rows in hamming_rows.items()}
+            all_step_rows.extend({"baseline": baseline, "condition": "novel_composition", "axis_diff_count": axis_diff_count, **s} for s in steps)
+        novel_metrics = {}
+        for h, rows in axis_diff_rows.items():
+            live_h = _aggregate_episode_metrics(rows)
+            frozen_h = _mean([frozen_novel.get(r.get("pair"), {}).get("top1", 0.0) for r in rows])
+            novel_metrics[h] = {
+                **live_h,
+                "frozen_top1": frozen_h,
+                "frozen_to_live_transfer_gain": float(live_h.get("live_top1", 0.0)) - frozen_h,
+            }
         wall_s = time.perf_counter() - t0
-        per_four_cell = {cell: _aggregate_episode_metrics([r for r in off_rows if r.get("four_cell_global") == cell]) for cell in FOUR_CELL_KEYS}
+        live_offdiag = _aggregate_episode_metrics(off_rows)
+        frozen_offdiag_top1 = _mean([v.get("top1", 0.0) for v in frozen_off.values()])
+        per_transfer_cell = {cell: _aggregate_episode_metrics([r for r in off_rows if r.get("transfer_cell") == cell]) for cell in TRANSFER_CELL_KEYS}
+        cross_recipe_pref_transfer = {
+            **live_offdiag,
+            "condition": "cross_recipe_pref_transfer",
+            "frozen_top1": frozen_offdiag_top1,
+            "frozen_to_live_transfer_gain": float(live_offdiag.get("live_top1", 0.0)) - frozen_offdiag_top1,
+            "per_transfer_cell": per_transfer_cell,
+            "train_pairs": [p.label for p in diagonal],
+            "test_pairs": [p.label for p in offdiag],
+        }
         live_records_by_label = {
             label: {"top1": _mean([float(r.get("live_top1", 0.0)) for r in rows])}
             for label, rows in off_rows_by_label.items()
@@ -6881,57 +7072,322 @@ def run_cross_recipe_transfer_suite(seed: int, out: Path, run_config: RunConfig,
             for label, row in frozen_off.items()
         }
         preset_of_label = {p.label: p.preference_name for p in all_pairs}
+        pref_cluster = preference_cluster_metrics(live_records, preset_of_label)
+        slot_matrix: List[List[Optional[float]]] = []
+        slot_support: List[List[int]] = []
+        slot_cell_text: List[List[str]] = []
+        for recipe in recipes:
+            matrix_row: List[Optional[float]] = []
+            support_row: List[int] = []
+            text_row: List[str] = []
+            for pref in active_prefs:
+                label = f"{recipe}/{pref}"
+                if diag_pref_by_recipe.get(recipe) == pref:
+                    matrix_row.append(None)
+                    support_row.append(0)
+                    text_row.append("train")
+                elif label in off_rows_by_label:
+                    rows_for_label = off_rows_by_label[label]
+                    matrix_row.append(_mean([float(r.get("live_top1", 0.0)) for r in rows_for_label]))
+                    support_row.append(len(rows_for_label))
+                    text_row.append("")
+                else:
+                    matrix_row.append(None)
+                    support_row.append(0)
+                    text_row.append("n=0")
+            slot_matrix.append(matrix_row)
+            slot_support.append(support_row)
+            slot_cell_text.append(text_row)
         per_baseline[baseline] = {
-            **_aggregate_episode_metrics(off_rows),
+            **live_offdiag,
             "frozen_diagonal_top1": _mean([v.get("top1", 0.0) for v in frozen_diag.values()]),
-            "frozen_offdiagonal_top1": _mean([v.get("top1", 0.0) for v in frozen_off.values()]),
+            "frozen_offdiagonal_top1": frozen_offdiag_top1,
+            "frozen_transfer_top1": frozen_offdiag_top1,
+            "live_online_transfer_top1": float(live_offdiag.get("live_top1", 0.0)),
+            "frozen_to_live_transfer_gain": float(live_offdiag.get("live_top1", 0.0)) - frozen_offdiag_top1,
+            "inference_time_adaptation_gain": float(live_offdiag.get("live_top1", 0.0)) - frozen_offdiag_top1,
+            "prototype_level_transfer_top1": frozen_offdiag_top1,
             "preference_gate_accuracy": _mean([1.0 if r.get("preference_transfer_correct") else 0.0 for r in off_rows]),
             "preference_transfer_rate": _mean([1.0 if r.get("preference_transfer_correct") else 0.0 for r in off_rows]),
-            "per_four_cell": per_four_cell,
-            **{f"live_top1_{cell}": float(per_four_cell[cell].get("live_top1", 0.0)) for cell in FOUR_CELL_KEYS},
-            "primary_transfer_live_top1": float(per_four_cell["seen_seen"].get("live_top1", 0.0)),
-            "zero_shot_preference_live_top1": float(per_four_cell["seen_unseen"].get("live_top1", 0.0)),
+            "per_transfer_cell": per_transfer_cell,
+            **{f"live_top1_{cell}": float(per_transfer_cell[cell].get("live_top1", 0.0)) for cell in TRANSFER_CELL_KEYS},
+            "primary_transfer_live_top1": float(per_transfer_cell["seen_recipe_preference_seen_elsewhere"].get("live_top1", 0.0)),
+            "seen_recipe_new_preference_live_top1": float(per_transfer_cell["seen_recipe_new_preference"].get("live_top1", 0.0)),
             "diagonal_cycle_curve": diagonal_cycle_curve,
-            "preference_cluster_purity": preference_lock_purity(live_records, preset_of_label),
+            "diagonal_weights_at_checkpoint": diagonal_weights_at_checkpoint,
+            "diagonal_latest_pin_integrity": bool(diagonal_latest_pin_integrity),
+            "diagonal_min_weight_at_checkpoint": min((float(w) for w in diagonal_weights_at_checkpoint.values() if w is not None), default=0.0),
+            "cross_recipe_interference": {
+                "rows": interference_rows,
+                "mean_delta_top1": _mean([float(r.get("delta_top1", 0.0)) for r in interference_rows]),
+                "same_axis_mean_delta_top1": _mean([float(r.get("delta_top1", 0.0)) for r in interference_rows if r.get("same_preference_axis")]),
+                "different_axis_mean_delta_top1": _mean([float(r.get("delta_top1", 0.0)) for r in interference_rows if not r.get("same_preference_axis")]),
+                "active_mean_delta_top1": _mean([float(r.get("delta_top1", 0.0)) for r in interference_rows if r.get("variant_is_active")]),
+                "pruned_mean_delta_top1": _mean([float(r.get("delta_top1", 0.0)) for r in interference_rows if r.get("variant_is_pruned")]),
+                "latest_pinned_mean_delta_top1": _mean([float(r.get("delta_top1", 0.0)) for r in interference_rows if r.get("variant_is_latest_pin")]),
+            },
+            **pref_cluster,
+            "preference_cluster_metrics": pref_cluster,
             "preference_axis_top1": preference_axis_top1(frozen_records_by_label, offdiag),
             "per_recipe_accuracy_matrix": per_recipe_accuracy_matrix(frozen_records_by_label, offdiag),
             "live_per_recipe_accuracy_matrix": per_recipe_accuracy_matrix(live_records_by_label, offdiag),
-            "axis_holdout": axis_metrics,
+            "transfer_slot_heatmap": {
+                "x_slots": [f"P{i + 1}" for i in range(len(active_prefs))],
+                "y_slots": [f"R{i + 1}" for i in range(len(recipes))],
+                "matrix": slot_matrix,
+                "support_matrix": slot_support,
+                "cell_text": slot_cell_text,
+                "diagonal_label": "train",
+                "zero_support_label": "n=0",
+            },
+            "conditions": {
+                "cross_recipe_pref_transfer": cross_recipe_pref_transfer,
+                "cross_axis_value_transfer": cross_axis_value_transfer,
+                "axis_family_holdout": axis_family_holdout,
+            },
+            "cross_recipe_pref_transfer": cross_recipe_pref_transfer,
+            "cross_axis_value_transfer": cross_axis_value_transfer,
+            "axis_family_holdout": axis_family_holdout,
             "novel_composition": novel_metrics,
             "compute": compute_snapshot(agent, wall_s),
             "memory": memory_snapshot(agent),
         }
     _append_jsonl(out / "episode_metrics.jsonl", all_episode_rows)
     _append_jsonl(out / "episode_steps.jsonl", all_step_rows)
+    transfer_slot_heatmap = {
+        "x_slots": [f"P{i + 1}" for i in range(len(active_prefs))],
+        "y_slots": [f"R{i + 1}" for i in range(len(recipes))],
+        "recipe_names_by_slot": {f"R{i + 1}": recipe for i, recipe in enumerate(recipes)},
+        "preference_names_by_slot": {f"P{i + 1}": pref for i, pref in enumerate(active_prefs)},
+        "diagonal_label": "train",
+        "zero_support_label": "n=0",
+        "per_baseline": {
+            b: row.get("transfer_slot_heatmap", {})
+            for b, row in per_baseline.items()
+        },
+        "seed_local_slot_taxonomy": "Slots R1..Rn/P1..Pn are deterministic within seed; aggregate reports must not merge literal recipe names across seeds.",
+    }
+    # Difference heatmap: full agent gain over the no-preference-prototype ablation.
+    # Positive cells (shown in the paper as the primary figure) directly prove that
+    # preference prototypes contribute to transfer.  Cells near zero indicate the
+    # transfer is explained by recipe-level generalisation alone.
+    _full_mat = (per_baseline.get("full", {}) or {}).get("transfer_slot_heatmap", {}).get("matrix", [])
+    _nop_mat  = (per_baseline.get("no_preference_prototype", {}) or {}).get("transfer_slot_heatmap", {}).get("matrix", [])
+    if _full_mat and _nop_mat and len(_full_mat) == len(_nop_mat):
+        transfer_slot_heatmap["prototype_transfer_gain_matrix"] = [
+            [
+                (float(_full_mat[i][j]) - float(_nop_mat[i][j]))
+                if _full_mat[i][j] is not None and _nop_mat[i][j] is not None
+                else None
+                for j in range(len(_full_mat[i]))
+            ]
+            for i in range(len(_full_mat))
+        ]
+    transfer_taxonomy_policy = {
+        "transfer_claim_cells": list(TRANSFER_CELL_KEYS),
+        "main_heatmap_uses_seed_local_slots": True,
+        "diagonal_cells_are_training_support": True,
+        "zero_support_cells_are_marked_n0": True,
+        "exposure_cells": list(FOUR_CELL_KEYS),
+        "four_cell_is_secondary_taxonomy": True,
+    }
     metrics = {
         "seed": seed,
         "recipes": recipes,
         "preferences": list(active_prefs),
         "diagonal_training_pairs": [p.label for p in diagonal],
+        "n_effective_preferences": min(effective_preferences_by_recipe.values(), default=0),
+        "effective_preferences_by_recipe": effective_preferences_by_recipe,
+        "duplicate_orderings_by_recipe": duplicate_orderings_by_recipe,
+        "axis_materiality_report": axis_materiality,
         "n_offdiag": len(offdiag),
-        "n_axis_probe_pairs": sum(len(v) for v in axis_probes.values()),
+        "n_cross_axis_value_specs": len(axis_value_specs),
+        "n_cross_axis_value_test_pairs": sum(len(spec["test_pairs"]) for spec in axis_value_specs),
+        "n_axis_family_holdout_specs": len(axis_family_specs),
+        "n_axis_family_holdout_test_pairs": sum(len(spec["test_pairs"]) for spec in axis_family_specs),
         "n_novel_composition_pairs": len(novel_probes),
         "per_baseline": per_baseline,
-        "derived_views": {
-            "transfer_heatmap": {f"{r}/{p}": v for (r, p), v in full_matrix.items()},
-            "transfer_heatmap_by_baseline": {
-                b: row.get("live_per_recipe_accuracy_matrix", {})
-                for b, row in per_baseline.items()
-            },
-            "frozen_transfer_matrix_by_baseline": {
-                b: row.get("per_recipe_accuracy_matrix", {})
-                for b, row in per_baseline.items()
-            },
-            "composition_curve": {b: row.get("novel_composition", {}) for b, row in per_baseline.items()},
+        "transfer_condition_order": ["cross_recipe_pref_transfer", "cross_axis_value_transfer", "axis_family_holdout"],
+        "transfer_condition_definitions": {
+            "cross_recipe_pref_transfer": "Train diagonal recipe/preference pairs (R_i, P_i); test off-diagonal pairs (R_i, P_j) where recipe and preference were each seen but not together.",
+            "cross_axis_value_transfer": "Train one non-default axis value on one recipe subset; test that same axis value on a held-out recipe subset.",
+            "axis_family_holdout": "Train with non-default values for one target axis absent while other axes may vary; test non-default values of the held-out axis.",
         },
+        "transfer_conditions": {
+            condition: {
+                baseline: row.get(condition, {})
+                for baseline, row in per_baseline.items()
+            }
+            for condition in ("cross_recipe_pref_transfer", "cross_axis_value_transfer", "axis_family_holdout")
+        },
+        "transfer_slot_heatmap": transfer_slot_heatmap,
+        "transfer_taxonomy_policy": transfer_taxonomy_policy,
+        "oracle_references": _oracle_reference_metrics(
+            seed,
+            run_config,
+            diagonal,
+            offdiag,
+        ),
+    }
+    full_transfer = float((per_baseline.get("full", {}) or {}).get("live_online_transfer_top1", 0.0))
+    no_pref_transfer = float((per_baseline.get("no_preference_prototype", {}) or {}).get("live_online_transfer_top1", 0.0))
+    metrics["cross_recipe_pref_transfer_gain"] = {
+        "full_minus_no_preference_transfer_ablation": full_transfer - no_pref_transfer,
+        "full_live_online_transfer_top1": full_transfer,
+        "no_preference_transfer_ablation_live_online_transfer_top1": no_pref_transfer,
+    }
+    # Within-recipe preference generalisation vs. true cross-recipe transfer.
+    # These two effects are computed from separate cells of the transfer taxonomy:
+    #   within_recipe  — seen_recipe_new_preference: the recipe was in training
+    #                    but this specific preference was not.
+    #   cross_recipe   — seen_recipe_preference_seen_elsewhere: the preference was
+    #                    seen on a different recipe; this is the genuine transfer signal.
+    # Reporting them separately makes the transfer claim verifiable.
+    def _cell_top1(bl: str, cell: str) -> float:
+        return float((per_baseline.get(bl, {}) or {}).get("per_transfer_cell", {}).get(cell, {}).get("live_top1", 0.0))
+    metrics["within_vs_cross_recipe_decomposition"] = {
+        baseline: {
+            "within_recipe_pref_generalisation": _cell_top1(baseline, "seen_recipe_new_preference"),
+            "cross_recipe_pref_transfer":        _cell_top1(baseline, "seen_recipe_preference_seen_elsewhere"),
+            "cross_minus_within":                _cell_top1(baseline, "seen_recipe_preference_seen_elsewhere") - _cell_top1(baseline, "seen_recipe_new_preference"),
+            "cross_minus_no_pref_prototype":     _cell_top1(baseline, "seen_recipe_preference_seen_elsewhere") - _cell_top1("no_preference_prototype", "seen_recipe_preference_seen_elsewhere"),
+        }
+        for baseline in per_baseline
     }
     _write_json(out / "metrics.json", metrics)
-    _render_seed_publication_figures(out, "cross_recipe_transfer", metrics)
+    return metrics
+
+
+def run_confidence_threshold_accuracy(seed: int, out: Path, run_config: RunConfig, cfg_obj: ConfidenceThresholdAccuracyConfig) -> Dict[str, Any]:
+    prefs = select_preference_names(cfg_obj.n_preferences)
+    n_diag = min(int(cfg_obj.n_recipes), len(prefs))
+    active_prefs = tuple(prefs[:n_diag])
+    diagonal_spec = _build_exclusive_diagonal(seed, active_prefs, n_diag)
+    if diagonal_spec is None:
+        raise RuntimeError(
+            "confidence_threshold_accuracy requires material recipe/preference pairs; "
+            "run materiality_preflight and fix no-op preference transformations."
+        )
+    recipes = list(diagonal_spec["recipes"])
+    diagonal = list(diagonal_spec["diagonal"])
+    offdiag = list(diagonal_spec["offdiag"])
+    _record_common_artifacts(out, seed, cfg_obj, recipes, active_prefs)
+    scenario_rows = [
+        {
+            "mode": "observe",
+            "phase": "confidence_threshold_train",
+            "event_type": "diagonal_train",
+            "pair": pair.label,
+            "recipe": pair.recipe_name,
+            "preference": pair.preference_name,
+        }
+        for pair in diagonal
+    ] + [
+        {
+            "mode": "assist",
+            "phase": "confidence_threshold_probe",
+            "event_type": "confidence_threshold_probe",
+            "condition": condition,
+            "pair": pair.label,
+            "recipe": pair.recipe_name,
+            "preference": pair.preference_name,
+        }
+        for condition, pairs in (
+            ("direct_retrieval", diagonal),
+            ("offdiagonal_transfer", offdiag),
+        )
+        for pair in pairs
+    ]
+    _append_jsonl(out / "scenario_events.jsonl", scenario_rows)
+
+    thresholds = tuple(float(t) for t in cfg_obj.confidence_thresholds)
+    per_baseline: Dict[str, Any] = {}
+    all_episode_rows: List[Dict[str, Any]] = []
+    all_step_rows: List[Dict[str, Any]] = []
+    for baseline in cfg_obj.baselines:
+        agent = make_agent(baseline, base_config(seed, run_config))
+        name_to_rid: Dict[str, str] = {}
+        t0 = time.perf_counter()
+        for _cycle in range(max(1, int(cfg_obj.diagonal_cycles))):
+            for pair in diagonal:
+                observe_episode(agent, pair, name_to_rid)
+        checkpoint = agent.snapshot()
+        episode_rows: List[Dict[str, Any]] = []
+        step_rows: List[Dict[str, Any]] = []
+        for condition, pairs, repeats in (
+            ("direct_retrieval", diagonal, 1),
+            ("offdiagonal_transfer", offdiag, max(1, int(cfg_obj.offdiag_repeats))),
+        ):
+            for pair in pairs:
+                for rep in range(repeats):
+                    agent.restore_from(checkpoint)
+                    row, steps = assist_episode(
+                        agent,
+                        pair,
+                        dict(name_to_rid),
+                        run_config=run_config,
+                        commit=False,
+                        event_tag={
+                            "condition": condition,
+                            "event_type": "confidence_threshold_probe",
+                            "repeat": rep,
+                            "confidence_threshold_semantics": "posthoc_reporting_cut_not_action_gate",
+                        },
+                    )
+                    row.update({"baseline": baseline, "condition": condition, "repeat": rep})
+                    episode_rows.append(row)
+                    all_episode_rows.append(row)
+                    enriched_steps = [
+                        {
+                            "baseline": baseline,
+                            "condition": condition,
+                            "repeat": rep,
+                            "pair": pair.label,
+                            **step,
+                        }
+                        for step in steps
+                    ]
+                    step_rows.extend(enriched_steps)
+                    all_step_rows.extend(enriched_steps)
+        aggregate = _aggregate_episode_metrics(episode_rows)
+        by_condition = {
+            condition: {
+                **_aggregate_episode_metrics([r for r in episode_rows if r.get("condition") == condition]),
+                "confidence_threshold_accuracy_curve": confidence_threshold_accuracy_curve_from_steps(
+                    [s for s in step_rows if s.get("condition") == condition],
+                    thresholds,
+                ),
+            }
+            for condition in ("direct_retrieval", "offdiagonal_transfer")
+        }
+        per_baseline[baseline] = {
+            **aggregate,
+            "confidence_threshold_accuracy_curve": confidence_threshold_accuracy_curve_from_steps(step_rows, thresholds),
+            "confidence_threshold_accuracy_by_condition": by_condition,
+            "n_scored_robot_turns": float(len([s for s in step_rows if _step_row_confidence(s) is not None])),
+            "confidence_threshold_semantics": "posthoc_reporting_cut_not_action_gate",
+            "robot_turn_denominator": "scheduled_robot_turns_in_alternating_action_protocol",
+            "compute": compute_snapshot(agent, time.perf_counter() - t0),
+            "memory": memory_snapshot(agent),
+        }
+    _append_jsonl(out / "episode_metrics.jsonl", all_episode_rows)
+    _append_jsonl(out / "episode_steps.jsonl", all_step_rows)
+    metrics = {
+        "seed": seed,
+        "thresholds": list(thresholds),
+        "conditions": ["direct_retrieval", "offdiagonal_transfer"],
+        "policy_note": (
+            "Curves are posthoc confidence diagnostics over scheduled robot turns. "
+            "They do not calibrate or change an action-gate threshold."
+        ),
+        "per_baseline": per_baseline,
+    }
+    _write_json(out / "metrics.json", metrics)
     return metrics
 
 
 def run_decay_reentry_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj: DecayReentrySuiteConfig) -> Dict[str, Any]:
-    n_targets = min(3, cfg_obj.n_target_recipes) if run_config.quick else cfg_obj.n_target_recipes
+    n_targets = cfg_obj.n_target_recipes
     target_specs = _target_variants(seed, cfg_obj.n_recipes, n_targets)
     selected_recipes = sorted({p.recipe_name for spec in target_specs for p in (spec[0], spec[1], *spec[2])})
     _record_common_artifacts(out, seed, cfg_obj, selected_recipes, PREFERENCE_NAMES)
@@ -6943,6 +7399,8 @@ def run_decay_reentry_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj
     per_baseline: Dict[str, Any] = {}
     all_rows: List[Dict[str, Any]] = []
     all_steps: List[Dict[str, Any]] = []
+    pruned_step_rows: List[Dict[str, Any]] = []
+    distractor_grid_rows: List[Dict[str, Any]] = []
     for baseline in cfg_obj.baselines:
         arm_rows: Dict[str, Dict[str, Any]] = {}
         baseline_episode_rows: List[Dict[str, Any]] = []
@@ -6959,43 +7417,107 @@ def run_decay_reentry_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj
                 target_rid = name_to_rid0.get(target.recipe_name)
                 target_hash = variant_hash(agent0._tokens_from_action_labels(target.actions))
                 for gap in cfg_obj.gap_sweep:
-                    agent = make_agent(baseline, base_config(seed, run_config))
-                    agent.restore_from(checkpoint)
-                    name_to_rid = dict(name_to_rid0)
-                    _advance_gap(agent, int(gap), distractors, name_to_rid, neutral)
-                    active_before = bool(target_rid is not None and (target_rid, target_hash) in agent.decay.active)
-                    pruned_before = bool(target_rid is not None and ((target_rid, target_hash) in agent.decay.pruned or target_hash in agent.memory.variants.get(target_rid, {})) and not active_before)
-                    row, steps = assist_episode(agent, target, name_to_rid, run_config=run_config, event_tag={"arm": arm_name, "gap": gap, "condition": "decay_reentry", "target_idx": target_idx})
-                    post = frozen_eval(agent, [target], name_to_rid)
-                    row.update({
-                        "baseline": baseline,
-                        "arm": arm_name,
-                        "gap": gap,
-                        "target": target.label,
-                        "same_recipe_variant": variant.label,
-                        "target_idx": target_idx,
-                        "target_active_before": active_before,
-                        "target_pruned_before": pruned_before,
-                        "post_reentry_top1": _mean([v.get("top1", 0.0) for v in post.values()]),
-                        "base_rate_after": float(agent.decay.base_rate),
-                        "global_rate_after": float(agent.decay.global_rate),
-                        "active_variants_end": len(agent.decay.active),
-                        "pruned_variants_end": len(agent.decay.pruned),
-                    })
-                    gap_rows[f"{target_idx}:{gap}"] = row
-                    baseline_episode_rows.append(row)
-                    all_rows.append(row)
-                    all_steps.extend({"baseline": baseline, "arm": arm_name, **s} for s in steps)
-                    last_agent_for_snapshot = agent
+                    if neutral:
+                        distractor_counts = (0,)
+                    else:
+                        distractor_counts = tuple(
+                            c for c in cfg_obj.distractor_counts
+                            if 0 < int(c) <= int(gap)
+                        ) or ((int(gap),) if int(gap) > 0 else (0,))
+                    for n_distractors in distractor_counts:
+                        agent = make_agent(baseline, base_config(seed, run_config))
+                        agent.restore_from(checkpoint)
+                        name_to_rid = dict(name_to_rid0)
+                        _advance_mixed_gap(agent, int(gap), int(n_distractors), distractors, name_to_rid)
+                        active_before = bool(target_rid is not None and (target_rid, target_hash) in agent.decay.active)
+                        pruned_before = bool(target_rid is not None and ((target_rid, target_hash) in agent.decay.pruned or target_hash in agent.memory.variants.get(target_rid, {})) and not active_before)
+                        target_weight_before = (
+                            float(agent.decay.active[(target_rid, target_hash)].weight)
+                            if target_rid is not None and (target_rid, target_hash) in agent.decay.active else 0.0
+                        )
+                        global_rate_before = float(agent.decay.global_rate)
+                        active_variants_before = len(agent.decay.active)
+                        pruned_variants_before = len(agent.decay.pruned)
+                        row, steps = assist_episode(agent, target, name_to_rid, run_config=run_config, event_tag={"arm": arm_name, "gap": gap, "gap_sessions": gap, "n_distractors": n_distractors, "neutral_ticks": int(gap) - int(n_distractors), "condition": "decay_reentry", "target_idx": target_idx})
+                        post = frozen_eval(agent, [target], name_to_rid)
+                        recovery_steps = next((int(s.get("step", 0)) for s in steps if s.get("correct_top1")), -1)
+                        robot_wrong_rate = _mean([1.0 if _row_robot_wrong(s) else 0.0 for s in steps])
+                        row.update({
+                            "baseline": baseline,
+                            "arm": arm_name,
+                            "gap": gap,
+                            "gap_sessions": int(gap),
+                            "n_distractors": int(n_distractors),
+                            "neutral_ticks": int(gap) - int(n_distractors),
+                            "target": target.label,
+                            "same_recipe_variant": variant.label,
+                            "target_idx": target_idx,
+                            "target_active_before": active_before,
+                            "target_pruned_before": pruned_before,
+                            "target_weight_before": target_weight_before,
+                            "active_variants_before": active_variants_before,
+                            "pruned_variants_before": pruned_variants_before,
+                            "global_decay_rate_before": global_rate_before,
+                            "post_reentry_top1": _mean([v.get("top1", 0.0) for v in post.values()]),
+                            "reentry_recovery_steps": recovery_steps,
+                            "robot_wrong_rate": robot_wrong_rate,
+                            "base_rate_after": float(agent.decay.base_rate),
+                            "global_rate_after": float(agent.decay.global_rate),
+                            "active_variants_end": len(agent.decay.active),
+                            "pruned_variants_end": len(agent.decay.pruned),
+                        })
+                        gap_rows[f"{target_idx}:{gap}:{n_distractors}"] = row
+                        baseline_episode_rows.append(row)
+                        all_rows.append(row)
+                        distractor_grid_rows.append(row)
+                        for step_row in steps:
+                            enriched = {
+                                "baseline": baseline,
+                                "arm": arm_name,
+                                "gap_sessions": int(gap),
+                                "n_distractors": int(n_distractors),
+                                "target_pruned_before": pruned_before,
+                                "target_active_before": active_before,
+                                "step_idx": int(step_row.get("step", 0)),
+                                "top1_correct": bool(step_row.get("correct_top1")),
+                                "topk_correct": bool(step_row.get("correct_topk")),
+                                "posterior_recipe_confidence": step_row.get("posterior_confidence"),
+                                "posterior_pref_confidence": step_row.get("posterior_confidence"),
+                                "would_assist_under_gate": bool(_row_policy_bool(step_row, "would_assist_under_gate")),
+                                "robot_wrong": bool(_row_robot_wrong(step_row)),
+                                **step_row,
+                            }
+                            all_steps.append(enriched)
+                            if pruned_before:
+                                pruned_step_rows.append(enriched)
+                        last_agent_for_snapshot = agent
             per_gap_summary: Dict[str, Dict[str, float]] = {}
             for gap in cfg_obj.gap_sweep:
                 rows_for_gap = [r for r in gap_rows.values() if int(r.get("gap", -1)) == int(gap)]
+                active_rows = [r for r in rows_for_gap if r.get("target_active_before")]
+                pruned_rows = [r for r in rows_for_gap if r.get("target_pruned_before")]
+                other_rows  = [r for r in rows_for_gap if not r.get("target_active_before") and not r.get("target_pruned_before")]
                 per_gap_summary[str(gap)] = {
                     **_aggregate_episode_metrics(rows_for_gap),
                     "active_before_rate": _mean([1.0 if r["target_active_before"] else 0.0 for r in rows_for_gap]),
                     "pruned_before_rate": _mean([1.0 if r["target_pruned_before"] else 0.0 for r in rows_for_gap]),
+                    "target_weight_before": _mean([r["target_weight_before"] for r in rows_for_gap]),
+                    "active_variants_before": _mean([r["active_variants_before"] for r in rows_for_gap]),
+                    "pruned_variants_before": _mean([r["pruned_variants_before"] for r in rows_for_gap]),
+                    "global_decay_rate_before": _mean([r["global_decay_rate_before"] for r in rows_for_gap]),
+                    "reentry_recovery_steps": _mean([r["reentry_recovery_steps"] for r in rows_for_gap if int(r["reentry_recovery_steps"]) >= 0]),
+                    "robot_wrong_rate": _mean([r["robot_wrong_rate"] for r in rows_for_gap]),
                     "post_reentry_top1": _mean([r["post_reentry_top1"] for r in rows_for_gap]),
                     "global_rate_after": _mean([r["global_rate_after"] for r in rows_for_gap]),
+                    # Memory-state stratification: the three sub-populations at re-encounter
+                    # tell distinct stories (interference, forgetting, unseen) and must not
+                    # be conflated in the primary figure.
+                    "live_top1_when_active": _mean([r["live_top1"] for r in active_rows]) if active_rows else float("nan"),
+                    "live_top1_when_pruned": _mean([r["live_top1"] for r in pruned_rows]) if pruned_rows else float("nan"),
+                    "live_top1_when_other":  _mean([r["live_top1"] for r in other_rows])  if other_rows  else float("nan"),
+                    "n_active_before": float(len(active_rows)),
+                    "n_pruned_before": float(len(pruned_rows)),
+                    "n_other_before":  float(len(other_rows)),
                 }
             arm_rows[arm_name] = {
                 "per_target_gap": gap_rows,
@@ -7018,13 +7540,50 @@ def run_decay_reentry_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj
         }
     _append_jsonl(out / "episode_metrics.jsonl", all_rows)
     _append_jsonl(out / "episode_steps.jsonl", all_steps)
+    _append_jsonl(out / "pruned_reentry_step_trace.jsonl", pruned_step_rows)
+    _append_jsonl(out / "distractor_grid_rows.jsonl", distractor_grid_rows)
+    pruned_step_trace = {
+        baseline: {
+            "pruned": _step_trace_from_rows([
+                r for r in all_steps
+                if r.get("baseline") == baseline and r.get("target_pruned_before")
+            ]),
+            "active": _step_trace_from_rows([
+                r for r in all_steps
+                if r.get("baseline") == baseline and r.get("target_active_before")
+            ]),
+        }
+        for baseline in sorted({str(r.get("baseline")) for r in all_steps})
+    }
+    distractor_grid = {
+        baseline: {
+            f"{int(r.get('gap_sessions', 0))}:{int(r.get('n_distractors', 0))}": {
+                "gap_sessions": int(r.get("gap_sessions", 0)),
+                "n_distractors": int(r.get("n_distractors", 0)),
+                "reentry_live_top1": float(r.get("live_top1", 0.0)),
+                "post_reentry_top1": float(r.get("post_reentry_top1", 0.0)),
+                "target_active_before": 1.0 if r.get("target_active_before") else 0.0,
+                "target_pruned_before": 1.0 if r.get("target_pruned_before") else 0.0,
+                "target_weight_before": float(r.get("target_weight_before", 0.0)),
+                "active_variants_before": float(r.get("active_variants_before", 0.0)),
+                "pruned_variants_before": float(r.get("pruned_variants_before", 0.0)),
+                "global_decay_rate_before": float(r.get("global_decay_rate_before", 0.0)),
+                "reentry_recovery_steps": float(r.get("reentry_recovery_steps", -1.0)),
+                "robot_wrong_rate": float(r.get("robot_wrong_rate", r.get("wrong_assist_rate", 0.0))),
+            }
+            for r in distractor_grid_rows
+            if r.get("baseline") == baseline
+        }
+        for baseline in sorted({str(r.get("baseline")) for r in distractor_grid_rows})
+    }
     metrics = {
         "seed": seed,
         "targets": [target.label for target, _variant, _distractors in target_specs],
         "same_recipe_variants": [variant.label for _target, variant, _distractors in target_specs],
         "arms": [a for a, _ in arms],
         "per_baseline": per_baseline,
-        "derived_views": {"decay_rate_trace": {b: r.get("arms", {}) for b, r in per_baseline.items()}},
+        "pruned_step_trace": pruned_step_trace,
+        "distractor_grid": distractor_grid,
     }
     no_decay_neutral = _nested_get(metrics, ("per_baseline", "no_decay", "arms", "neutral", "per_gap"), {}) or {}
     if no_decay_neutral:
@@ -7036,24 +7595,462 @@ def run_decay_reentry_suite(seed: int, out: Path, run_config: RunConfig, cfg_obj
         if min_active < 0.99 and _ACTIVE_RESULT is not None:
             _ACTIVE_RESULT.warnings.append("no_decay_neutral_active_before_below_one")
     _write_json(out / "metrics.json", metrics)
-    _render_seed_publication_figures(out, "decay_reentry", metrics)
     return metrics
 
 
-def _macro_f1(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    labels = sorted({str(r.get("gt")) for r in rows} | {str(r.get("pred")) for r in rows})
-    per_class: Dict[str, Dict[str, float]] = {}
-    f1s: List[float] = []
-    for label in labels:
-        tp = sum(1 for r in rows if r.get("gt") == label and r.get("pred") == label)
-        fp = sum(1 for r in rows if r.get("gt") != label and r.get("pred") == label)
-        fn = sum(1 for r in rows if r.get("gt") == label and r.get("pred") != label)
-        precision = tp / max(1, tp + fp)
-        recall = tp / max(1, tp + fn)
-        f1 = 2 * precision * recall / max(precision + recall, 1e-9)
-        per_class[label] = {"precision": precision, "recall": recall, "f1": f1, "support": float(sum(1 for r in rows if r.get("gt") == label))}
-        f1s.append(f1)
-    return {"macro_f1": _mean(f1s), "accuracy": _mean([1.0 if r.get("gt") == r.get("pred") else 0.0 for r in rows]), "per_class": per_class}
+def _disambiguation_shared_validation_protocol(
+    seed: int,
+    run_config: RunConfig,
+    cfg_obj: DisambiguationAuditConfig,
+    pairs: Sequence[RecipePrefPair],
+) -> Dict[str, Any]:
+    identity_by_recipe = {
+        p.recipe_name: p
+        for p in sorted(pairs, key=lambda pair: pair.label)
+        if p.preference_name == "identity"
+    }
+    rng = _rng(seed, 1313)
+    recipe_names = sorted(identity_by_recipe)
+    rng.shuffle(recipe_names)
+    n_holdout = max(1, int(round(float(cfg_obj.validation_fraction) * len(recipe_names)))) if recipe_names else 0
+    heldout_recipes = set(recipe_names[:n_holdout])
+    train_recipe_names = [r for r in recipe_names if r not in heldout_recipes]
+    identity_pairs = [identity_by_recipe[r] for r in train_recipe_names if r in identity_by_recipe]
+    known_shift_pairs = [
+        p for p in sorted(pairs, key=lambda pair: pair.label)
+        if p.recipe_name in set(train_recipe_names)
+        and p.preference_name != "identity"
+        and p.actions != identity_by_recipe[p.recipe_name].actions
+    ]
+    unseen_recipe_pairs = [
+        p for p in sorted(pairs, key=lambda pair: pair.label)
+        if p.recipe_name in heldout_recipes
+        and p.preference_name == "identity"
+    ]
+    if not identity_pairs:
+        return {
+            "protocol": "shared_prefix_full_validation",
+            "validation_rows": [],
+            "partial_precision_recall_curve": {},
+            "full_precision_recall_curve": {},
+            "joint_grid": [],
+            "recommendations": {},
+            "error": "no_train_identity_pairs",
+        }
+
+    agent = make_agent("full", base_config(seed, run_config))
+    name_to_rid: Dict[str, str] = {}
+    for pair in identity_pairs:
+        observe_episode(agent, pair, name_to_rid)
+    active_lib = agent.memory.library(allowed_keys=agent._active_keys())
+    train_identity_pairs = [p for p in identity_pairs if p.preference_name == "identity"]
+    train_identity_actions = list(train_identity_pairs)
+
+    prefix_fracs = tuple(float(f) for f in cfg_obj.prefix_fractions)
+    validation_cases: List[Dict[str, Any]] = []
+
+    def _nearest_train_identity(pair: RecipePrefPair) -> float:
+        return max((jaccard(pair.actions, train_pair.actions) for train_pair in train_identity_actions), default=0.0)
+
+    def _case(pair: RecipePrefPair, case_type: str, expected_memory_state: str, expected_gate: str) -> Dict[str, Any]:
+        return {
+            "case_type": case_type,
+            "pair": pair,
+            "expected_memory_state": expected_memory_state,
+            "expected_gate": expected_gate,
+            "expected_assist": expected_gate == "assist",
+            "true_recipe_id": name_to_rid.get(pair.recipe_name),
+            "nearest_train_identity_jaccard": _nearest_train_identity(pair),
+        }
+
+    for pair in identity_pairs:
+        validation_cases.append(_case(pair, "known_recipe_seen_variant", "active_memory", "assist"))
+    for pair in known_shift_pairs:
+        validation_cases.append(_case(pair, "known_recipe_unseen_preference", "same_recipe_new_preference", "assist"))
+    for pair in unseen_recipe_pairs:
+        validation_cases.append(_case(pair, "unseen_recipe", "no_memory", "observe"))
+
+    def _scores_for_prefix(pair: RecipePrefPair, n_prefix: int) -> Dict[str, Any]:
+        tokens = agent._tokens_from_action_labels(pair.actions)
+        n = max(1, min(int(n_prefix), len(tokens)))
+        prefix = tokens[:n]
+        ranked = agent.disambig.score_partial(prefix, active_lib)
+        partial_recipe = ranked[0][0].recipe_id if ranked else None
+        partial_score = float(ranked[0][1]) if ranked else 0.0
+        cls = agent.disambig.classify(prefix, active_lib, threshold=0.0) if active_lib else None
+        return {
+            "n_prefix": int(n),
+            "prefix_fraction_actual": float(n / max(1, len(tokens))),
+            "partial_score": partial_score,
+            "partial_recipe_id": partial_recipe,
+            "full_jaccard_score": float(cls.jaccard) if cls is not None else 0.0,
+            "full_recipe_id": cls.recipe_id if cls is not None else None,
+            "full_order_distance": float(cls.order_distance) if cls is not None else 0.0,
+        }
+
+    validation_rows: List[Dict[str, Any]] = []
+    for case in validation_cases:
+        pair = case["pair"]
+        tokens = agent._tokens_from_action_labels(pair.actions)
+        for frac in prefix_fracs:
+            n_prefix = max(1, int(math.ceil(float(frac) * len(tokens))))
+            scores = _scores_for_prefix(pair, n_prefix)
+            validation_rows.append({
+                "pair": pair.label,
+                "recipe": pair.recipe_name,
+                "preference": pair.preference_name,
+                "case_type": case["case_type"],
+                "expected_memory_state": case["expected_memory_state"],
+                "expected_gate": case["expected_gate"],
+                "expected_assist": bool(case["expected_assist"]),
+                "true_recipe_id": case["true_recipe_id"],
+                "nearest_train_identity_jaccard": float(case["nearest_train_identity_jaccard"]),
+                "requested_prefix_fraction": float(frac),
+                "recipe_length": len(tokens),
+                **scores,
+            })
+
+    def _safe_rate(num: float, den: float) -> float:
+        return float(num / den) if den else 0.0
+
+    def _decision_report(rows: Sequence[Mapping[str, Any]], decisions: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        tp = fp = tn = fn = 0
+        recipe_correct = []
+        by_case: Dict[str, List[Tuple[Mapping[str, Any], Mapping[str, Any]]]] = defaultdict(list)
+        for row, decision in zip(rows, decisions):
+            expected_assist = bool(row.get("expected_assist"))
+            pred_assist = bool(decision.get("pred_assist"))
+            if pred_assist and expected_assist:
+                tp += 1
+            elif pred_assist and not expected_assist:
+                fp += 1
+            elif (not pred_assist) and expected_assist:
+                fn += 1
+            else:
+                tn += 1
+            if expected_assist and pred_assist and row.get("true_recipe_id") is not None:
+                recipe_correct.append(1.0 if decision.get("pred_recipe_id") == row.get("true_recipe_id") else 0.0)
+            by_case[str(row.get("case_type"))].append((row, decision))
+        precision = _safe_rate(tp, tp + fp)
+        recall = _safe_rate(tp, tp + fn)
+        f1 = _safe_rate(2.0 * precision * recall, precision + recall)
+        case_reports = {}
+        for case_type, vals in by_case.items():
+            expected_known = [v for v in vals if bool(v[0].get("expected_assist"))]
+            expected_observe = [v for v in vals if not bool(v[0].get("expected_assist"))]
+            case_reports[case_type] = {
+                "n": len(vals),
+                "assist_rate": _mean([1.0 if v[1].get("pred_assist") else 0.0 for v in vals]),
+                "false_observe_rate": _mean([1.0 if not v[1].get("pred_assist") else 0.0 for v in expected_known]) if expected_known else 0.0,
+                "observation_recall": _mean([1.0 if not v[1].get("pred_assist") else 0.0 for v in expected_observe]) if expected_observe else 0.0,
+            }
+        return {
+            "precision_known_assist": precision,
+            "recall_known_assist": recall,
+            "f1_known_assist": f1,
+            "known_recipe_false_observe_rate": _safe_rate(fn, tp + fn),
+            "unseen_recipe_false_assist_rate": _safe_rate(fp, fp + tn),
+            "novel_recipe_observation_recall": _safe_rate(tn, fp + tn),
+            "recipe_id_accuracy_when_assisting_known": _mean(recipe_correct),
+            "tp": tp,
+            "fp": fp,
+            "tn": tn,
+            "fn": fn,
+            "n": len(rows),
+            "by_case_type": case_reports,
+        }
+
+    partial_curve: Dict[str, Any] = {}
+    for threshold in cfg_obj.online_partial_thresholds:
+        t = float(threshold)
+        decisions = [
+            {
+                "pred_assist": float(row.get("partial_score", 0.0)) >= t,
+                "pred_recipe_id": row.get("partial_recipe_id"),
+            }
+            for row in validation_rows
+        ]
+        partial_curve[str(t)] = {
+            "online_new_recipe_partial_threshold": t,
+            **_decision_report(validation_rows, decisions),
+        }
+
+    full_curve: Dict[str, Any] = {}
+    for threshold in cfg_obj.thresholds:
+        t = float(threshold)
+        decisions = [
+            {
+                "pred_assist": float(row.get("full_jaccard_score", 0.0)) >= t,
+                "pred_recipe_id": row.get("full_recipe_id"),
+            }
+            for row in validation_rows
+        ]
+        full_curve[str(t)] = {
+            "jaccard_threshold": t,
+            **_decision_report(validation_rows, decisions),
+        }
+
+    lengths = sorted(len(agent._tokens_from_action_labels(case["pair"].actions)) for case in validation_cases)
+    median_len = lengths[len(lengths) // 2] if lengths else int(DEFAULT_CONFIG.min_classify_length)
+    min_length_rules: List[Dict[str, Any]] = []
+    for length in cfg_obj.min_classify_lengths:
+        min_length_rules.append({"rule": "absolute", "value": int(length), "min_classify_length": max(1, int(length)), "fraction": None})
+    for frac in cfg_obj.min_classify_fractions:
+        min_length_rules.append({
+            "rule": "median_recipe_fraction",
+            "value": float(frac),
+            "fraction": float(frac),
+            "min_classify_length": max(3, int(math.ceil(float(frac) * max(1, median_len)))),
+        })
+    deduped_rules: List[Dict[str, Any]] = []
+    seen_rule_keys = set()
+    for rule in min_length_rules:
+        key = (rule["rule"], rule["value"], rule["min_classify_length"])
+        if key not in seen_rule_keys:
+            deduped_rules.append(rule)
+            seen_rule_keys.add(key)
+
+    def _transition_report(partial_threshold: float, jaccard_threshold: float, min_len: int) -> Dict[str, Any]:
+        transition_rows = []
+        for case in validation_cases:
+            pair = case["pair"]
+            tokens = agent._tokens_from_action_labels(pair.actions)
+            if min_len <= 1 or len(tokens) < min_len:
+                continue
+            pre = _scores_for_prefix(pair, min_len - 1)
+            post = _scores_for_prefix(pair, min_len)
+            pre_assist = float(pre["partial_score"]) >= float(partial_threshold)
+            post_assist = float(post["full_jaccard_score"]) >= float(jaccard_threshold)
+            transition_rows.append({
+                "pair": pair.label,
+                "case_type": case["case_type"],
+                "expected_assist": bool(case["expected_assist"]),
+                "pre_n_prefix": min_len - 1,
+                "post_n_prefix": min_len,
+                "pre_partial_score": float(pre["partial_score"]),
+                "post_full_jaccard_score": float(post["full_jaccard_score"]),
+                "pre_assist": bool(pre_assist),
+                "post_assist": bool(post_assist),
+                "assist_decision_flipped": bool(pre_assist != post_assist),
+                "pre_recipe_id": pre["partial_recipe_id"],
+                "post_recipe_id": post["full_recipe_id"],
+                "recipe_id_flipped": bool(pre_assist and post_assist and pre["partial_recipe_id"] != post["full_recipe_id"]),
+            })
+        return {
+            "transition_flip_rate": _mean([1.0 if r["assist_decision_flipped"] else 0.0 for r in transition_rows]),
+            "transition_recipe_flip_rate": _mean([1.0 if r["recipe_id_flipped"] else 0.0 for r in transition_rows]),
+            "n_transition_cases": len(transition_rows),
+            "rows": transition_rows,
+        }
+
+    joint_grid: List[Dict[str, Any]] = []
+    for partial_threshold in cfg_obj.online_partial_thresholds:
+        for jaccard_threshold in cfg_obj.thresholds:
+            for rule in deduped_rules:
+                min_len = int(rule["min_classify_length"])
+                decisions = []
+                for row in validation_rows:
+                    use_partial = int(row.get("n_prefix", 0)) < min_len
+                    if use_partial:
+                        decisions.append({
+                            "pred_assist": float(row.get("partial_score", 0.0)) >= float(partial_threshold),
+                            "pred_recipe_id": row.get("partial_recipe_id"),
+                            "classifier": "partial_prefix",
+                        })
+                    else:
+                        decisions.append({
+                            "pred_assist": float(row.get("full_jaccard_score", 0.0)) >= float(jaccard_threshold),
+                            "pred_recipe_id": row.get("full_recipe_id"),
+                            "classifier": "full_jaccard",
+                        })
+                report = _decision_report(validation_rows, decisions)
+                transition = _transition_report(float(partial_threshold), float(jaccard_threshold), min_len)
+                objective = (
+                    0.30 * float(report["recall_known_assist"])
+                    + 0.25 * float(report["novel_recipe_observation_recall"])
+                    + 0.20 * float(report["recipe_id_accuracy_when_assisting_known"])
+                    + 0.15 * float(report["f1_known_assist"])
+                    + 0.10 * (1.0 - float(transition["transition_flip_rate"]))
+                    - 0.10 * float(report["unseen_recipe_false_assist_rate"])
+                )
+                joint_grid.append({
+                    "online_new_recipe_partial_threshold": float(partial_threshold),
+                    "jaccard_threshold": float(jaccard_threshold),
+                    "min_classify_length": min_len,
+                    "min_classify_rule": rule["rule"],
+                    "min_classify_fraction": rule.get("fraction"),
+                    "median_recipe_length": int(median_len),
+                    "objective": float(objective),
+                    **report,
+                    "transition_consistency": transition,
+                })
+
+    best = max(
+        joint_grid,
+        key=lambda row: (
+            float(row.get("objective", 0.0)),
+            -float(row.get("known_recipe_false_observe_rate", 1.0)),
+            -float(row.get("unseen_recipe_false_assist_rate", 1.0)),
+            -float(row.get("transition_consistency", {}).get("transition_flip_rate", 1.0)),
+            -abs(float(row.get("online_new_recipe_partial_threshold", 0.0)) - float(DEFAULT_CONFIG.online_new_recipe_partial_threshold)),
+            -abs(float(row.get("jaccard_threshold", 0.0)) - float(DEFAULT_CONFIG.jaccard_threshold)),
+        ),
+    ) if joint_grid else {}
+
+    validation_case_counts = Counter(str(case["case_type"]) for case in validation_cases)
+    return {
+        "protocol": "shared_prefix_full_validation",
+        "decision_target": "known recipes should remain assistable; held-out recipes should require observation",
+        "train_pairs": [p.label for p in identity_pairs],
+        "heldout_recipes": sorted(heldout_recipes),
+        "validation_case_counts": {k: int(v) for k, v in sorted(validation_case_counts.items())},
+        "validation_rows": validation_rows,
+        "partial_precision_recall_curve": partial_curve,
+        "full_precision_recall_curve": full_curve,
+        "joint_grid": joint_grid,
+        "transition_metric": "decision flip between partial-prefix prefix_length=min_len-1 and full-jaccard prefix_length=min_len",
+        "recommendations": {
+            "online_new_recipe_partial_threshold": best.get("online_new_recipe_partial_threshold"),
+            "jaccard_threshold": best.get("jaccard_threshold"),
+            "min_classify_length": best.get("min_classify_length"),
+            "min_classify_rule": best.get("min_classify_rule"),
+            "min_classify_fraction": best.get("min_classify_fraction"),
+            "median_recipe_length": best.get("median_recipe_length"),
+            "objective": best.get("objective"),
+            "selected_metrics": {
+                k: best.get(k)
+                for k in (
+                    "precision_known_assist",
+                    "recall_known_assist",
+                    "f1_known_assist",
+                    "known_recipe_false_observe_rate",
+                    "novel_recipe_observation_recall",
+                    "unseen_recipe_false_assist_rate",
+                    "recipe_id_accuracy_when_assisting_known",
+                )
+            },
+            "transition_consistency": best.get("transition_consistency", {}),
+            "defaults": {
+                "online_new_recipe_partial_threshold": float(DEFAULT_CONFIG.online_new_recipe_partial_threshold),
+                "jaccard_threshold": float(DEFAULT_CONFIG.jaccard_threshold),
+                "min_classify_length": int(DEFAULT_CONFIG.min_classify_length),
+            },
+        },
+    }
+
+
+def _posterior_hyperparameter_calibration(
+    seed: int,
+    run_config: RunConfig,
+    cfg_obj: DisambiguationAuditConfig,
+    pairs: Sequence[RecipePrefPair],
+) -> Dict[str, Any]:
+    identity_by_recipe = {
+        p.recipe_name: p
+        for p in pairs
+        if p.preference_name == "identity"
+    }
+    train_pairs = list(identity_by_recipe.values())
+    calibration_pairs = [
+        p for p in pairs
+        if p.recipe_name in identity_by_recipe
+        and p.preference_name != "identity"
+        and p.actions != identity_by_recipe[p.recipe_name].actions
+    ]
+    alpha_grid = tuple(float(x) for x in cfg_obj.posterior_alpha_grid)
+    temp_grid = tuple(float(x) for x in cfg_obj.posterior_global_temperature_grid)
+    calibration_pairs = calibration_pairs[: max(1, int(cfg_obj.posterior_calibration_max_pairs))]
+    if not train_pairs or not calibration_pairs:
+        return {"rows": [], "recommendation": {}, "objective": "hrc_utility"}
+    rows: List[Dict[str, Any]] = []
+    grid_points = [
+        (float(ar), float(ap), float(am), float(gt))
+        for ar in alpha_grid
+        for ap in alpha_grid
+        for am in alpha_grid
+        for gt in temp_grid
+    ]
+    max_grid = max(1, int(cfg_obj.posterior_calibration_max_grid_points))
+    if len(grid_points) > max_grid:
+        defaults = (
+            float(DEFAULT_CONFIG.posterior_alpha_recipe),
+            float(DEFAULT_CONFIG.posterior_alpha_pref),
+            float(DEFAULT_CONFIG.posterior_alpha_memory),
+            float(DEFAULT_CONFIG.posterior_global_temperature),
+        )
+        ranked = sorted(
+            grid_points,
+            key=lambda p: (
+                abs(p[0] - defaults[0]) + abs(p[1] - defaults[1]) + abs(p[2] - defaults[2]) + abs(p[3] - defaults[3]),
+                p,
+            ),
+        )
+        stride = max(1, len(grid_points) // max_grid)
+        spread = grid_points[::stride]
+        grid_points = list(dict.fromkeys([defaults] + ranked[: max_grid // 2] + spread))[:max_grid]
+    for alpha_recipe, alpha_pref, alpha_memory, global_temp in grid_points:
+        cfg = base_config(
+            seed,
+            run_config,
+            posterior_alpha_recipe=float(alpha_recipe),
+            posterior_alpha_pref=float(alpha_pref),
+            posterior_alpha_memory=float(alpha_memory),
+            posterior_global_temperature=float(global_temp),
+        )
+        agent = make_agent("full", cfg)
+        name_to_rid: Dict[str, str] = {}
+        for pair in train_pairs:
+            observe_episode(agent, pair, name_to_rid)
+        eval_rows = []
+        for pair in calibration_pairs:
+            row, _steps = assist_episode(
+                agent,
+                pair,
+                dict(name_to_rid),
+                run_config=run_config,
+                commit=False,
+                event_tag={"condition": "posterior_calibration"},
+            )
+            eval_rows.append(row)
+        agg = _aggregate_episode_metrics(eval_rows)
+        net_value = _hrc_net_action_value(agg)
+        rows.append({
+            "posterior_alpha_recipe": float(alpha_recipe),
+            "posterior_alpha_pref": float(alpha_pref),
+            "posterior_alpha_memory": float(alpha_memory),
+            "posterior_global_temperature": float(global_temp),
+            "hrc_net_action_value": float(net_value),
+            "robot_wrong_rate": float(agg.get("robot_wrong_rate", 0.0)),
+            "live_top1": float(agg.get("live_top1", 0.0)),
+            "net_robot_action_value": float(agg.get("net_robot_action_value", 0.0)),
+            "confidence_ece": float(agg.get("confidence_ece", 0.0)),
+            "confidence_brier": float(agg.get("confidence_brier", 0.0)),
+            "n_calibration_pairs": len(calibration_pairs),
+        })
+    eligible = [
+        r for r in rows
+        if float(r.get("robot_wrong_rate", 1.0)) <= float(DEFAULT_CONFIG.posterior_action_confidence_threshold + 0.45)
+    ] or rows
+    best = max(
+        eligible,
+        key=lambda r: (
+            float(r.get("hrc_net_action_value", 0.0)),
+            float(r.get("live_top1", 0.0)),
+            -float(r.get("confidence_ece", 0.0)),
+        ),
+    )
+    return {
+        "objective": "hrc_net_action_value_with_calibration_diagnostics",
+        "rows": rows,
+        "recommendation": dict(best),
+        "reported_only_does_not_mutate_default_config": True,
+        "default_values": {
+            "posterior_alpha_recipe": float(DEFAULT_CONFIG.posterior_alpha_recipe),
+            "posterior_alpha_pref": float(DEFAULT_CONFIG.posterior_alpha_pref),
+            "posterior_alpha_memory": float(DEFAULT_CONFIG.posterior_alpha_memory),
+            "posterior_global_temperature": float(DEFAULT_CONFIG.posterior_global_temperature),
+        },
+    }
 
 
 def run_disambiguation_audit(seed: int, out: Path, run_config: RunConfig, cfg_obj: DisambiguationAuditConfig) -> Dict[str, Any]:
@@ -7081,17 +8078,15 @@ def run_disambiguation_audit(seed: int, out: Path, run_config: RunConfig, cfg_ob
         train_recipes = {p.recipe_name for p in train_pairs}
         checkpoint = agent.snapshot()
         rows = []
-        gate_rows = []
+        active_route_rows = []
         for pair in val_pairs:
             gt = _memory_state_gt(agent, pair, name_to_rid, train_labels, train_recipes)
             pred = _classify_memory_state_pair(agent, pair, name_to_rid, threshold=float(thr))
             rows.append({"threshold": thr, "pair": pair.label, "recipe": pair.recipe_name, "preference": pair.preference_name, "ground_truth": gt, "predicted": pred, "gt": gt, "pred": pred, "correct": gt == pred})
             agent.restore_from(checkpoint)
-            local_map = dict(name_to_rid)
-            gate_row, _steps = assist_episode(agent, pair, local_map, run_config=run_config, commit=True, event_tag={"threshold": thr, "condition": "gate_decision"})
-            gt_gate = "observe" if pair.recipe_name not in name_to_rid else "assist"
-            pred_gate = "observe" if bool(gate_row.get("needs_observation")) else "assist"
-            gate_rows.append({"threshold": thr, "pair": pair.label, "gt": gt_gate, "pred": pred_gate, "correct": gt_gate == pred_gate})
+            route_mode, route_tags = _user_selected_mode_for_active_memory("assist", agent, pair, name_to_rid)
+            gt_route = "assist" if route_tags["active_recipe_before"] else "observe"
+            active_route_rows.append({"threshold": thr, "pair": pair.label, "gt": gt_route, "pred": route_mode, "correct": gt_route == route_mode, **route_tags})
         matrix = confusion_labels([r["predicted"] for r in rows], [r["ground_truth"] for r in rows])
         report = classifier_report(matrix, MEMORY_STATE_LABELS)
         recipe_agent = make_agent("full", base_config(seed, run_config, jaccard_threshold=float(thr)))
@@ -7102,29 +8097,28 @@ def run_disambiguation_audit(seed: int, out: Path, run_config: RunConfig, cfg_ob
         recipe_train_recipes = {p.recipe_name for p in train_recipe_pairs}
         recipe_checkpoint = recipe_agent.snapshot()
         recipe_rows = []
-        recipe_gate_rows = []
+        recipe_route_rows = []
         for pair in val_recipe_pairs:
             gt = _memory_state_gt(recipe_agent, pair, recipe_map, recipe_train_labels, recipe_train_recipes)
             pred = _classify_memory_state_pair(recipe_agent, pair, recipe_map, threshold=float(thr))
             recipe_rows.append({"threshold": thr, "pair": pair.label, "recipe": pair.recipe_name, "preference": pair.preference_name, "gt": gt, "pred": pred, "correct": gt == pred})
             recipe_agent.restore_from(recipe_checkpoint)
-            gate_row, _steps = assist_episode(recipe_agent, pair, dict(recipe_map), run_config=run_config, commit=True, event_tag={"threshold": thr, "condition": "recipe_holdout_gate_decision"})
-            pred_gate = "observe" if bool(gate_row.get("needs_observation")) else "assist"
-            recipe_gate_rows.append({"threshold": thr, "pair": pair.label, "gt": "observe", "pred": pred_gate, "correct": pred_gate == "observe"})
+            route_mode, route_tags = _user_selected_mode_for_active_memory("assist", recipe_agent, pair, recipe_map)
+            recipe_route_rows.append({"threshold": thr, "pair": pair.label, "gt": "observe", "pred": route_mode, "correct": route_mode == "observe", **route_tags})
         recipe_matrix = confusion_labels([r["pred"] for r in recipe_rows], [r["gt"] for r in recipe_rows])
         per_threshold[str(thr)] = {
             **report,
             "confusion_matrix": matrix.tolist(),
             "rows": rows,
-            "gate_decision": _gate_report(gate_rows),
+            "active_memory_route_decision": _route_report(active_route_rows),
             "recipe_holdout_classification": {**classifier_report(recipe_matrix, MEMORY_STATE_LABELS), "confusion_matrix": recipe_matrix.tolist(), "rows": recipe_rows},
-            "recipe_holdout_gate_decision": _gate_report(recipe_gate_rows),
-            "gate_ground_truth_policy": "observe only for recipes absent from the training recipe map; pruned known recipes are treated as assistable reentry cases",
+            "recipe_holdout_active_memory_route_decision": _route_report(recipe_route_rows),
+            "mode_policy": "user selects observation when the recipe is absent from active memory; otherwise user selects assist",
         }
         _append_jsonl(out / "classification_rows.jsonl", rows)
-        _append_jsonl(out / "gate_decision_rows.jsonl", gate_rows)
+        _append_jsonl(out / "active_memory_route_rows.jsonl", active_route_rows)
         _append_jsonl(out / "recipe_holdout_classification_rows.jsonl", recipe_rows)
-        _append_jsonl(out / "recipe_holdout_gate_rows.jsonl", recipe_gate_rows)
+        _append_jsonl(out / "recipe_holdout_active_memory_route_rows.jsonl", recipe_route_rows)
     best_threshold = max(per_threshold, key=lambda t: per_threshold[t].get("macro_f1", 0.0)) if per_threshold else None
     boundary: Dict[str, Any] = {}
     preference_axis_degradation: Dict[str, Any] = {}
@@ -7160,53 +8154,194 @@ def run_disambiguation_audit(seed: int, out: Path, run_config: RunConfig, cfg_ob
         recipe: materialize_pair(recipe, "identity", fn)
         for recipe, fn in select_recipe_builders(seed, cfg_obj.n_recipes)
     }
-    identity_axes = WorkflowPreference().as_dict()
-    by_hamming: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    by_axis_diff_count: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for pair in val_pairs:
         pref = PRESET_PREFERENCES.get(pair.preference_name)
         if pref is None:
             continue
-        hamming = sum(1 for axis in WORKFLOW_AXES if pref.as_dict().get(axis) != identity_axes.get(axis))
+        axis_diff_count = _preference_axis_difference_count(pref)
         identity_pair = identity_by_recipe.get(pair.recipe_name)
-        by_hamming[hamming].append({
+        by_axis_diff_count[axis_diff_count].append({
             "pair": pair.label,
-            "hamming": hamming,
+            "axis_diff_count": axis_diff_count,
             "jaccard_from_identity": jaccard(identity_pair.actions, pair.actions) if identity_pair else 0.0,
             "kendall_from_identity": kendall_tau_distance(identity_pair.actions, pair.actions) if identity_pair else 0.0,
         })
-    for hamming, rows in sorted(by_hamming.items()):
-        preference_axis_degradation[str(hamming)] = {
+    for axis_diff_count, rows in sorted(by_axis_diff_count.items()):
+        preference_axis_degradation[str(axis_diff_count)] = {
             "mean_jaccard_from_identity": _mean([r["jaccard_from_identity"] for r in rows]),
             "mean_kendall_from_identity": _mean([r["kendall_from_identity"] for r in rows]),
             "n": len(rows),
             "rows": rows,
         }
-    train_identity = [p for p in pairs if p.preference_name == "identity"]
-    probes = [p for p in pairs if p.preference_name != "identity"][: min(20, len(pairs))]
-    gate_agent = make_agent("full", base_config(seed, run_config))
-    gate_map: Dict[str, str] = {}
-    for pair in train_identity:
-        observe_episode(gate_agent, pair, gate_map)
-    gate_curve = coverage_vs_accuracy_curve(gate_agent, probes, gate_map, run_config, cfg_obj.action_gate_thresholds)
+    threshold_calibration = _disambiguation_shared_validation_protocol(seed, run_config, cfg_obj, pairs)
+    posterior_calibration = _posterior_hyperparameter_calibration(seed, run_config, cfg_obj, pairs)
     metrics = {
         "seed": seed,
         "per_threshold": per_threshold,
         "best_threshold": best_threshold,
+        "threshold_calibration": threshold_calibration,
+        "recommended_thresholds": threshold_calibration.get("recommendations", {}),
+        "posterior_hyperparameter_calibration": posterior_calibration,
         "boundary_degradation": boundary,
         "online_prefix_boundary_degradation": boundary,
         "prefix_robustness": prefix_robustness,
         "preference_axis_degradation": preference_axis_degradation,
-        "action_gate_curve": gate_curve,
-        "gate_ground_truth_policy": "pruned known recipes are treated as assistable; only recipe-heldout probes require observe",
+        "mode_policy": "user selects observation when the recipe is absent from active memory; pruned recipes therefore require re-observation for baselines that do not keep an active variant",
     }
     _write_json(out / "metrics.json", metrics)
-    _render_seed_publication_figures(out, "disambiguation_audit", metrics)
     return metrics
 
 
+def earliest_divergence_step(a: Sequence[str], b: Sequence[str]) -> int:
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return min(len(a), len(b))
+
+
+def _recipe_family_jaccard_ambiguities(
+    pairs: Sequence[RecipePrefPair],
+    threshold: float,
+) -> List[Dict[str, Any]]:
+    identities = [p for p in pairs if p.preference_name == "identity"]
+    out: List[Dict[str, Any]] = []
+    for i, a in enumerate(identities):
+        for b in identities[i + 1:]:
+            score = jaccard(a.actions, b.actions)
+            if score >= float(threshold):
+                out.append({
+                    "recipe_a": a.recipe_name,
+                    "recipe_b": b.recipe_name,
+                    "jaccard": float(score),
+                    "threshold": float(threshold),
+                })
+    return out
+
+
+def _deduplicate_preference_pairs(
+    pairs: Sequence[RecipePrefPair],
+    tau_threshold: float = 0.05,
+) -> Tuple[List[RecipePrefPair], List[Dict[str, Any]]]:
+    seen_hashes: set = set()
+    kept: List[RecipePrefPair] = []
+    dropped: List[Dict[str, Any]] = []
+    for pair in pairs:
+        h = tuple(pair.actions)
+        if h in seen_hashes:
+            match = next((p for p in kept if tuple(p.actions) == h), None)
+            dropped.append({
+                "label": pair.label,
+                "preference": pair.preference_name,
+                "reason": "exact_duplicate_ordering",
+                "representative_label": match.label if match else None,
+                "representative_preference": match.preference_name if match else None,
+            })
+            continue
+        near_match: Optional[RecipePrefPair] = None
+        near_tau = 1.0
+        for prior in kept:
+            tau = kendall_tau_distance(pair.actions, prior.actions)
+            if tau < float(tau_threshold):
+                near_match = prior
+                near_tau = tau
+                break
+        if near_match is not None:
+            dropped.append({
+                "label": pair.label,
+                "preference": pair.preference_name,
+                "reason": "near_duplicate_ordering",
+                "kendall_tau": float(near_tau),
+                "representative_label": near_match.label,
+                "representative_preference": near_match.preference_name,
+            })
+            continue
+        seen_hashes.add(h)
+        kept.append(pair)
+    return kept, dropped
+
+
+def _materiality_failure_reasons(
+    summary: Sequence[Mapping[str, Any]],
+    filtered_pairs: Sequence[str],
+    recipe_family_ambiguities: Sequence[Mapping[str, Any]],
+    cfg_obj: MaterialityPreflightConfig,
+) -> List[str]:
+    reasons: List[str] = []
+    for row in summary:
+        recipe = str(row.get("recipe", "unknown_recipe"))
+        if not row.get("passes_min_effective", False):
+            reasons.append(f"{recipe}: only {int(row.get('n_effective_preferences', 0))} effective preferences after dedup")
+        if not row.get("passes_duplicate_ordering", False):
+            reasons.append(f"{recipe}: {int(row.get('near_duplicate_count', 0))} duplicate or near-duplicate orderings")
+    if cfg_obj.fail_on_noop and filtered_pairs:
+        reasons.append(f"noop_pairs={len(filtered_pairs)}")
+    if recipe_family_ambiguities:
+        reasons.append(f"recipe_family_jaccard_ambiguities={len(recipe_family_ambiguities)}")
+    return reasons
+
+
+def _materiality_preflight_pairs(
+    seed: int,
+    cfg_obj: MaterialityPreflightConfig,
+) -> Tuple[List[str], List[RecipePrefPair], Dict[str, Any]]:
+    builders = select_recipe_builders(seed, cfg_obj.n_recipes)
+    selected_pairs: List[RecipePrefPair] = []
+    selection_rows: List[Dict[str, Any]] = []
+    for recipe_name, fn in builders:
+        candidates: List[RecipePrefPair] = []
+        seen_orders: set = set()
+        for pair in _material_pair_candidates(recipe_name, fn, PREFERENCE_NAMES):
+            h = _order_hash(pair)
+            if h in seen_orders:
+                continue
+            seen_orders.add(h)
+            candidates.append(pair)
+        for pref in _build_gap_preferences():
+            try:
+                pair = materialize_custom_pair(recipe_name, pref, fn)
+            except Exception:
+                continue
+            if not pair.base_pref and not pair.applied_axes:
+                continue
+            h = _order_hash(pair)
+            if h in seen_orders:
+                continue
+            seen_orders.add(h)
+            candidates.append(pair)
+        deduped, duplicate_pairs = _deduplicate_preference_pairs(
+            candidates,
+            tau_threshold=float(cfg_obj.near_duplicate_tau_threshold),
+        )
+        pref_rank = {pref: idx for idx, pref in enumerate(PREFERENCE_NAMES)}
+        ordered = sorted(
+            deduped,
+            key=lambda p: (
+                0 if p.preference_name == "identity" else 1,
+                pref_rank.get(p.preference_name, len(pref_rank)),
+                p.preference_name,
+                p.label,
+            ),
+        )
+        kept = ordered[: max(1, int(cfg_obj.n_preferences))]
+        selected_pairs.extend(kept)
+        selection_rows.append({
+            "recipe": recipe_name,
+            "n_candidate_preferences": len(candidates),
+            "n_effective_preferences_available": len(deduped),
+            "n_selected_preferences": len(kept),
+            "dropped_duplicate_or_near_duplicate_pairs": duplicate_pairs,
+            "selected_preferences": [p.preference_name for p in kept],
+        })
+    return [recipe for recipe, _fn in builders], selected_pairs, {
+        "selection_policy": "per_recipe_effective_material_candidates_then_stable_order",
+        "selection_rows": selection_rows,
+    }
+
+
 def run_materiality_preflight(seed: int, out: Path, run_config: RunConfig, cfg_obj: MaterialityPreflightConfig) -> Dict[str, Any]:
-    recipes, pairs = build_pairs(seed, cfg_obj.n_recipes, cfg_obj.n_preferences, require_material=False)
-    prefs = select_preference_names(cfg_obj.n_preferences)
+    recipes, pairs, selection_report = _materiality_preflight_pairs(seed, cfg_obj)
+    prefs = sorted({p.preference_name for p in pairs})
     _record_common_artifacts(out, seed, cfg_obj, recipes, prefs)
     rows = materiality_rows(pairs)
     _append_jsonl(out / "materiality_rows.jsonl", rows)
@@ -7221,7 +8356,11 @@ def run_materiality_preflight(seed: int, out: Path, run_config: RunConfig, cfg_o
             filtered_pairs.append(pair.label)
     for recipe, vals in sorted(by_recipe.items()):
         recipe_pairs = [pair_by_label[v["label"]] for v in vals if v["label"] in pair_by_label]
-        effective = len({p.actions for p in recipe_pairs})
+        deduped_pairs, duplicate_pairs = _deduplicate_preference_pairs(
+            recipe_pairs,
+            tau_threshold=float(cfg_obj.near_duplicate_tau_threshold),
+        )
+        effective = len(deduped_pairs)
         kendalls = [float(v["kendall_from_identity"]) for v in vals if v["preference"] != "identity"]
         pairwise_kendalls = [
             kendall_tau_distance(a.actions, b.actions)
@@ -7229,68 +8368,400 @@ def run_materiality_preflight(seed: int, out: Path, run_config: RunConfig, cfg_o
             for b in recipe_pairs[i + 1:]
             if a.actions != b.actions
         ]
+        divergence_rows = [
+            {
+                "pair_a": a.label,
+                "pair_b": b.label,
+                "earliest_divergence_step": earliest_divergence_step(a.actions, b.actions),
+                "recipe_length": min(len(a.actions), len(b.actions)),
+            }
+            for i, a in enumerate(recipe_pairs)
+            for b in recipe_pairs[i + 1:]
+            if a.actions != b.actions
+        ]
+        late_divergence_cutoff = max(1, min((len(p.actions) for p in recipe_pairs), default=1) // 3)
+        late_diverging = [
+            r for r in divergence_rows
+            if int(r["earliest_divergence_step"]) > late_divergence_cutoff
+        ]
+        classify_late = [
+            r for r in divergence_rows
+            if int(r["earliest_divergence_step"]) > int(cfg_obj.min_classify_length)
+        ]
+        min_divergence = min((int(r["earliest_divergence_step"]) for r in divergence_rows), default=-1)
+        late_diverging_recipe = bool(min_divergence > late_divergence_cutoff) if min_divergence >= 0 else False
         summary.append({
             "recipe": recipe,
             "n_preferences": len(vals),
             "effective_preference_count": effective,
+            "n_effective_preferences": effective,
+            "n_effective_preferences_after_dedup": effective,
             "duplicate_count": sum(1 for v in vals if v["is_duplicate"]),
+            "near_duplicate_count": len(duplicate_pairs),
+            "duplicate_or_near_duplicate_pairs": duplicate_pairs,
             "min_kendall_from_identity": min(kendalls) if kendalls else 0.0,
             "mean_kendall_from_identity": _mean(kendalls),
             "min_pairwise_kendall_per_recipe": min(pairwise_kendalls) if pairwise_kendalls else 0.0,
+            "min_earliest_divergence_per_recipe": min_divergence,
+            "mean_earliest_divergence_per_recipe": _mean([int(r["earliest_divergence_step"]) for r in divergence_rows]),
+            "late_divergence_cutoff": int(late_divergence_cutoff),
+            "n_late_diverging_preference_pairs": len(late_diverging),
+            "n_after_min_classify_length_pairs": len(classify_late),
+            "late_diverging_preference_pairs": late_diverging,
+            "late_diverging_recipe": late_diverging_recipe,
+            "passes_early_divergence": not late_diverging_recipe,
+            "passes_min_classify_divergence": len(classify_late) == 0,
             "passes_min_effective": effective >= int(cfg_obj.min_effective_preferences),
+            "passes_duplicate_ordering": not (cfg_obj.fail_on_duplicate_ordering and duplicate_pairs),
         })
-    pass_preflight = all(r["passes_min_effective"] for r in summary)
+    recipe_family_ambiguities = _recipe_family_jaccard_ambiguities(
+        [p for p in pairs if p.preference_name == "identity"],
+        float(DEFAULT_CONFIG.jaccard_threshold),
+    )
+    pass_preflight = all(
+        r["passes_min_effective"]
+        and r["passes_duplicate_ordering"]
+        for r in summary
+    )
+    failure_reasons = _materiality_failure_reasons(summary, filtered_pairs, recipe_family_ambiguities, cfg_obj)
+    diagnostic_warnings: List[str] = []
+    for row in summary:
+        recipe = str(row.get("recipe", "unknown_recipe"))
+        if not row.get("passes_early_divergence", False):
+            diagnostic_warnings.append(f"{recipe}: late-diverging preference pairs")
+        if not row.get("passes_min_classify_divergence", False):
+            diagnostic_warnings.append(f"{recipe}: divergence after min_classify_length")
     metrics = {
         "seed": seed,
         "n_recipes": len(recipes),
         "n_pairs": len(pairs),
         "n_duplicate_pairs": sum(1 for r in rows if r["is_duplicate"]),
+        "n_near_duplicate_pairs": sum(int(r.get("near_duplicate_count", 0)) for r in summary),
         "n_filtered_no_op_pairs": len(filtered_pairs),
         "filtered_no_op_pairs": filtered_pairs,
+        "n_late_diverging_recipes": sum(1 for r in summary if not r.get("passes_early_divergence", True)),
+        "recipe_family_jaccard_threshold": float(DEFAULT_CONFIG.jaccard_threshold),
+        "recipe_family_jaccard_ambiguities": recipe_family_ambiguities,
+        "n_recipe_family_jaccard_ambiguities": len(recipe_family_ambiguities),
         "summary": summary,
-        "pass_preflight": bool(pass_preflight and (not cfg_obj.fail_on_noop or not filtered_pairs)),
+        "failure_reasons": failure_reasons,
+        "diagnostic_warnings": diagnostic_warnings,
+        "pass_preflight": bool(pass_preflight and not recipe_family_ambiguities and (not cfg_obj.fail_on_noop or not filtered_pairs)),
+        "materiality_selection": selection_report,
         "materiality_report": {
             "filtered_pairs": filtered_pairs,
             "recipe_summary": summary,
+            "recipe_family_jaccard_ambiguities": recipe_family_ambiguities,
+            "failure_reasons": failure_reasons,
+            "diagnostic_warnings": diagnostic_warnings,
+            "selection": selection_report,
         },
     }
     if not metrics["pass_preflight"] and _ACTIVE_RESULT is not None:
         _ACTIVE_RESULT.warnings.append("materiality_preflight_failed")
+    # Discriminability test: does the model actually produce different predictions
+    # after training on P_A vs P_B for the same recipe?  A preference may be
+    # materially distinct (Kendall tau > threshold) but completely indiscriminable
+    # by the model architecture if the state features don't encode the distinction.
+    # We test on a sample of recipes to avoid inflating runtime.
+    discrim_rows: List[Dict[str, Any]] = []
+    test_recipes = sorted(set(p.recipe_name for p in pairs))[:min(len(set(p.recipe_name for p in pairs)), 4)]
+    pair_by_recipe: Dict[str, List[RecipePrefPair]] = defaultdict(list)
+    for p in pairs:
+        pair_by_recipe[p.recipe_name].append(p)
+    for recipe in test_recipes:
+        recipe_pairs = [p for p in pair_by_recipe[recipe] if not p.base_pref]
+        if len(recipe_pairs) < 2:
+            continue
+        pa, pb = recipe_pairs[0], recipe_pairs[1]
+        # Train two separate agents — one on pa, one on pb — then compare predictions.
+        agent_a = make_agent("full", base_config(seed, run_config))
+        ntr_a: Dict[str, str] = {}
+        observe_episode(agent_a, pa, ntr_a)
+        agent_b = make_agent("full", base_config(seed, run_config))
+        ntr_b: Dict[str, str] = {}
+        observe_episode(agent_b, pb, ntr_b)
+        mid = max(1, len(pa.actions) // 2)
+        prefix_a = tuple(agent_a._tokens_from_action_labels(pa.actions[:mid]))
+        prefix_b = tuple(agent_b._tokens_from_action_labels(pb.actions[:mid]))
+        rid_a = ntr_a.get(recipe)
+        rid_b = ntr_b.get(recipe)
+        dist_a = dict(agent_a._conditioned_distribution(list(prefix_a), rid_a, None)) if rid_a else {}
+        dist_b = dict(agent_b._conditioned_distribution(list(prefix_b), rid_b, None)) if rid_b else {}
+        if not dist_a or not dist_b:
+            continue
+        all_acts = set(dist_a) | set(dist_b)
+        floor = 1e-12
+        kl_ab = sum(
+            max(dist_a.get(a, floor), floor) * math.log(max(dist_a.get(a, floor), floor) / max(dist_b.get(a, floor), floor))
+            for a in all_acts
+        )
+        top1_a = max(dist_a, key=dist_a.get)
+        top1_b = max(dist_b, key=dist_b.get)
+        discrim_rows.append({
+            "recipe": recipe,
+            "preference_a": pa.preference_name,
+            "preference_b": pb.preference_name,
+            "kl_divergence_a_from_b": float(kl_ab),
+            "top1_differ": top1_a != top1_b,
+            "top1_a": top1_a,
+            "top1_b": top1_b,
+        })
+    metrics["discriminability"] = {
+        "rows": discrim_rows,
+        "mean_kl_divergence": _mean([r["kl_divergence_a_from_b"] for r in discrim_rows]) if discrim_rows else float("nan"),
+        "fraction_top1_differ": _mean([1.0 if r["top1_differ"] else 0.0 for r in discrim_rows]) if discrim_rows else float("nan"),
+        "n_tested_recipes": len(discrim_rows),
+        "interpretation": (
+            "mean_kl_divergence > 0.1 and fraction_top1_differ > 0.5 indicate that "
+            "preference differences are learnable by the model architecture. "
+            "Low values mean the preference distinction is material in the data but "
+            "not expressed in the prediction distribution — a model-side limitation."
+        ),
+    }
     _write_json(out / "metrics.json", metrics)
     return metrics
 
 
 def run_cl_regularizer_comparison(seed: int, out: Path, run_config: RunConfig, cfg_obj: ComputeTradeoffConfig) -> Dict[str, Any]:
-    cl_run = replace(run_config, baselines=("full", "adaptive", "fixed_decay", "no_decay", "latest_only", "l2_anchor", "ewc", "online_ewc", "experience_replay_bc", "no_replay"))
+    cl_run = replace(run_config, baselines=PAPER_BASELINES)
     return run_deployment_stream(seed, out, cl_run, DeploymentStreamConfig(n_recipes=cfg_obj.n_recipes, n_phase_b_events=cfg_obj.n_events))
+
+
+# ---------------------------------------------------------------------------
+# Experiment: catastrophic vs. selective forgetting
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CatastrophicSelectiveConfig:
+    """Config for the catastrophic-vs-selective forgetting experiment.
+
+    Phase 1: observe recipe A with P1.
+    Phase 2: add N distractor sessions (separate recipes).
+    Phase 3: assist recipe A with P1 (retention) then with P2 (adaptation).
+
+    Three distinct questions:
+      Retention       – is A still correctly assisted after N distractors?
+      Interference    – does adding distractors degrade frozen accuracy on A?
+      Selective prune – after A is pruned, do its patterns bleed into other predictions?
+    """
+    n_distractors: int = 5
+    n_recipes: int = 6
+    gap_sessions: Tuple[int, ...] = (0, 3, 7, 12)
+    baselines: Tuple[str, ...] = ()
+
+
+def run_catastrophic_vs_selective_forgetting(
+    seed: int, out: Path, run_config: RunConfig, cfg_obj: CatastrophicSelectiveConfig
+) -> Dict[str, Any]:
+    """Test catastrophic vs. selective forgetting."""
+    target_specs = _target_variants(seed, cfg_obj.n_recipes, 1)
+    if not target_specs:
+        return {"status": "skip", "reason": "not_enough_recipes"}
+    target, variant, distractors = target_specs[0]
+    baselines = list(cfg_obj.baselines) or list(run_config.baselines)
+    per_baseline: Dict[str, Any] = {}
+    all_rows: List[Dict[str, Any]] = []
+    for baseline in baselines:
+        gap_rows: Dict[str, Any] = {}
+        interference_rows: List[Dict[str, Any]] = []
+        t0 = time.perf_counter()
+        last_agent = None
+        for gap in cfg_obj.gap_sessions:
+            agent = make_agent(baseline, base_config(seed, run_config))
+            name_to_rid: Dict[str, str] = {}
+            observe_episode(agent, target, name_to_rid)
+            observe_episode(agent, variant, name_to_rid)
+            pre_eval = frozen_eval(agent, [target], name_to_rid, run_config)
+            _advance_mixed_gap(agent, int(gap), int(gap), distractors, name_to_rid)
+            post_eval = frozen_eval(agent, [target], name_to_rid, run_config)
+            t_rid = name_to_rid.get(target.recipe_name)
+            t_hash = variant_hash(agent._tokens_from_action_labels(target.actions))
+            target_active = bool(t_rid and (t_rid, t_hash) in agent.decay.active)
+            target_pruned = bool(t_rid and (t_rid, t_hash) in agent.decay.pruned)
+            pre_top1 = float(pre_eval.get(target.label, {}).get("top1", 0.0))
+            post_top1 = float(post_eval.get(target.label, {}).get("top1", 0.0))
+            retention_row, retention_steps = assist_episode(
+                agent, target, name_to_rid, run_config=run_config,
+                commit=False, event_tag={"condition": "retention", "gap": gap},
+            )
+            new_pref_row: Dict[str, Any] = {}
+            if variant.actions != target.actions:
+                new_pref_row, _ = assist_episode(
+                    agent, variant, name_to_rid, run_config=run_config,
+                    commit=False, event_tag={"condition": "new_preference", "gap": gap},
+                )
+            interference_rows.append({
+                "gap": gap, "pre_top1": pre_top1, "post_top1": post_top1,
+                "interference_delta": post_top1 - pre_top1,
+                "target_active_after_gap": target_active,
+                "target_pruned_after_gap": target_pruned,
+            })
+            gap_rows[str(gap)] = {
+                "gap": gap,
+                "target_active_after_gap": target_active,
+                "target_pruned_after_gap": target_pruned,
+                "pre_distractor_frozen_top1": pre_top1,
+                "post_distractor_frozen_top1": post_top1,
+                "interference_delta": post_top1 - pre_top1,
+                "retention_live_top1": float(retention_row.get("live_top1", 0.0)),
+                "new_pref_live_top1": float(new_pref_row.get("live_top1", 0.0)) if new_pref_row else float("nan"),
+                "retention_first_correct_step": next(
+                    (int(s.get("step", 0)) for s in retention_steps if s.get("correct_top1")), -1
+                ),
+            }
+            all_rows.append({"baseline": baseline, **gap_rows[str(gap)]})
+            last_agent = agent
+        per_baseline[baseline] = {
+            "per_gap": gap_rows,
+            "mean_retention_live_top1": _mean([r["retention_live_top1"] for r in gap_rows.values()]),
+            "mean_interference_delta": _mean([r["interference_delta"] for r in gap_rows.values()]),
+            "interference_rows": interference_rows,
+            "compute": compute_snapshot(last_agent or make_agent(baseline, base_config(seed, run_config)), time.perf_counter() - t0),
+        }
+    _append_jsonl(out / "episode_metrics.jsonl", all_rows)
+    metrics = {
+        "seed": seed,
+        "target": target.label,
+        "variant": variant.label,
+        "gap_sessions": list(cfg_obj.gap_sessions),
+        "per_baseline": per_baseline,
+        "caption": (
+            "retention_live_top1: accuracy on known recipe after N distractor sessions. "
+            "interference_delta: frozen accuracy drop on target after distractors (negative = forgetting). "
+            "new_pref_live_top1: cold-start accuracy on a new preference after the gap."
+        ),
+    }
+    _write_json(out / "metrics.json", metrics)
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Experiment: adaptation speed curve
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AdaptationSpeedConfig:
+    """Config for the adaptation-speed-curve experiment.
+
+    After observing recipe A/P1 (Phase A), the human performs A/P2 across
+    n_assist_episodes sequential assist episodes with commit after each.
+    Per-episode accuracy traces the online adaptation trajectory.
+    """
+    n_assist_episodes: int = 5
+    n_recipes: int = 4
+    baselines: Tuple[str, ...] = ()
+
+
+def run_adaptation_speed_curve(
+    seed: int, out: Path, run_config: RunConfig, cfg_obj: AdaptationSpeedConfig
+) -> Dict[str, Any]:
+    """Measure how quickly the agent adapts to a preference shift over sequential episodes.
+
+    Primary outputs:
+      cold_start_top1         – accuracy on episode 1 (no prior exposure to P2)
+      final_episode_top1      – accuracy after n_assist_episodes corrective episodes
+      episodes_to_above_50pct – first episode where live_top1 ≥ 0.50
+
+    Compare oracle_preference_label (upper bound) vs. fixed_decay (no online learning)
+    to bracket the achievable range.
+    """
+    target_specs = _target_variants(seed, cfg_obj.n_recipes, min(2, cfg_obj.n_recipes))
+    if not target_specs:
+        return {"status": "skip", "reason": "not_enough_recipes"}
+    baselines = list(cfg_obj.baselines) or list(run_config.baselines)
+    per_baseline: Dict[str, Any] = {}
+    all_episode_rows: List[Dict[str, Any]] = []
+    for baseline in baselines:
+        per_recipe_curves: List[Dict[str, Any]] = []
+        t0 = time.perf_counter()
+        last_agent = None
+        for target, variant, _ in target_specs:
+            if target.actions == variant.actions:
+                continue
+            agent = make_agent(baseline, base_config(seed, run_config))
+            name_to_rid: Dict[str, str] = {}
+            observe_episode(agent, target, name_to_rid)
+            episode_curve: List[Dict[str, Any]] = []
+            for ep_idx in range(int(cfg_obj.n_assist_episodes)):
+                row, steps = assist_episode(
+                    agent, variant, name_to_rid, run_config=run_config,
+                    commit=False,
+                    event_tag={
+                        "condition": "adaptation_curve",
+                        "episode_idx": ep_idx,
+                        "original_pref": target.preference_name,
+                        "new_pref": variant.preference_name,
+                    },
+                )
+                agent.end_demo()
+                episode_curve.append({
+                    "episode_idx": ep_idx,
+                    "live_top1": float(row.get("live_top1", 0.0)),
+                    "live_topk": float(row.get("live_topk", 0.0)),
+                    "wrong_prediction_future_valid_rate": float(row.get("wrong_prediction_future_valid_rate", 0.0)),
+                    "human_correction_rate": float(row.get("human_correction_rate", 0.0)),
+                    "human_action_fraction": float(row.get("human_action_fraction", 0.0)),
+                    "human_effort_fraction": float(row.get("human_effort_fraction", 0.0)),
+                    "human_workload_reduction_vs_human_only": float(row.get("human_workload_reduction_vs_human_only", 0.0)),
+                    "n_steps": float(row.get("n_steps", 0)),
+                })
+                all_episode_rows.append({
+                    "baseline": baseline,
+                    "recipe": target.recipe_name,
+                    "episode_idx": ep_idx,
+                    **row,
+                })
+            per_recipe_curves.append({
+                "recipe": target.recipe_name,
+                "original_pref": target.preference_name,
+                "new_pref": variant.preference_name,
+                "episode_curve": episode_curve,
+                "cold_start_top1": float(episode_curve[0]["live_top1"]) if episode_curve else float("nan"),
+                "final_episode_top1": float(episode_curve[-1]["live_top1"]) if episode_curve else float("nan"),
+                "episodes_to_above_50pct": next(
+                    (e["episode_idx"] for e in episode_curve if e["live_top1"] >= 0.50), -1
+                ),
+            })
+            last_agent = agent
+        per_baseline[baseline] = {
+            "per_recipe": per_recipe_curves,
+            "mean_cold_start_top1": _mean([r["cold_start_top1"] for r in per_recipe_curves if not math.isnan(r["cold_start_top1"])]),
+            "mean_final_episode_top1": _mean([r["final_episode_top1"] for r in per_recipe_curves if not math.isnan(r["final_episode_top1"])]),
+            "mean_episodes_to_above_50pct": _mean([float(r["episodes_to_above_50pct"]) for r in per_recipe_curves if r["episodes_to_above_50pct"] >= 0]),
+            "compute": compute_snapshot(last_agent or make_agent(baseline, base_config(seed, run_config)), time.perf_counter() - t0),
+        }
+    _append_jsonl(out / "episode_metrics.jsonl", all_episode_rows)
+    metrics = {
+        "seed": seed,
+        "n_assist_episodes": cfg_obj.n_assist_episodes,
+        "per_baseline": per_baseline,
+        "caption": (
+            "cold_start_top1 is episode-1 accuracy under the new preference (no prior exposure). "
+            f"final_episode_top1 is accuracy after {cfg_obj.n_assist_episodes} corrective episodes. "
+            "Bracket against oracle_preference_label (ceiling) and fixed_decay (no learning floor)."
+        ),
+    }
+    _write_json(out / "metrics.json", metrics)
+    return metrics
 
 
 EXPERIMENT_RUNNERS: Dict[str, Callable[[int, Path, RunConfig, Any], Dict[str, Any]]] = {
     "deployment_stream": run_deployment_stream,
+    "deployment_ladder_heterogeneous_prefs": run_deployment_ladder_heterogeneous_prefs,
+    "deployment_ladder_shared_pref": run_deployment_ladder_shared_pref,
     "cross_recipe_transfer": run_cross_recipe_transfer_suite,
+    "confidence_threshold_accuracy": run_confidence_threshold_accuracy,
     "decay_reentry": run_decay_reentry_suite,
     "disambiguation_audit": run_disambiguation_audit,
     "materiality_preflight": run_materiality_preflight,
     "cl_regularizer_comparison": run_cl_regularizer_comparison,
-    "materiality_audit": run_materiality_audit,
     "single_shot_reuse": run_single_shot_reuse,
     "deployment_gate_preference_shift": run_deployment_gate_preference_shift,
-    "cross_recipe_preference_transfer": run_cross_recipe_preference_transfer,
-    "preference_axis_holdout": run_preference_axis_holdout,
-    "novel_preference_composition": run_novel_preference_composition,
-    "adaptive_decay_reentry": run_adaptive_decay_reentry,
-    "multi_user_continual_stream": run_multi_user_continual_stream,
-    "bounded_memory_tradeoff": run_bounded_memory_tradeoff,
-    "compute_tradeoff": run_compute_tradeoff,
     "short_term_capacity_sweep": run_short_term_capacity_sweep,
     "demo_count_sample_efficiency": run_demo_count_sample_efficiency,
-    "disambiguation_threshold_calibration": run_disambiguation_threshold_calibration,
-    "action_gate_threshold_calibration": run_action_gate_threshold_calibration,
-    "boundary_degradation_disambiguation": run_boundary_degradation_disambiguation,
     "frequency_gap_decay_sweep": run_frequency_gap_decay_sweep,
     "mwr_window_sensitivity": run_mwr_window_sensitivity,
-    "reentry_gap_neutral_vs_distractor": run_reentry_gap_neutral_vs_distractor,
-    "active_pruned_decay_probe": run_active_pruned_decay_probe,
     "sparse_first_exposure_pool_sweep": run_sparse_first_exposure_pool_sweep,
     "zipf_usage_sweep": run_zipf_usage_sweep,
     "cycle_width_sparsity_sweep": run_cycle_width_sparsity_sweep,
@@ -7298,9 +8769,17 @@ EXPERIMENT_RUNNERS: Dict[str, Callable[[int, Path, RunConfig, Any], Dict[str, An
     "continual_learning_regularizer_sweep": run_continual_learning_regularizer_sweep,
     "posterior_ablation_matrix": run_posterior_ablation_matrix,
     "recipe_preference_factor_ablation": run_recipe_preference_factor_ablation,
-    "confidence_calibration_reliability": run_confidence_calibration_reliability,
+    "memory_exhaustion_stress": run_memory_exhaustion_stress,
+    "prefix_collision_stress": run_prefix_collision_stress,
+    "preference_thrash_stress": run_preference_thrash_stress,
+    "rare_reentry_stress": run_rare_reentry_stress,
+    "late_distractor_stress": run_late_distractor_stress,
+    "adversarial_stress_suite": run_adversarial_stress_suite,
+    "baseline_hyperparameter_tuning": run_baseline_hyperparameter_tuning,
     "seed_recipe_selection_audit": run_seed_recipe_selection_audit,
     "runtime_scaling_sweep": run_runtime_scaling_sweep,
+    "catastrophic_vs_selective_forgetting": run_catastrophic_vs_selective_forgetting,
+    "adaptation_speed_curve": run_adaptation_speed_curve,
 }
 
 
@@ -7371,11 +8850,6 @@ def aggregate_experiment(exp_dir: Path) -> Dict[str, Any]:
         name: {metric: {"mean": _mean(vals), "ci95": _stderr95(vals), "values": vals} for metric, vals in metric_map.items()}
         for name, metric_map in full_comp.items()
     }
-    _render_aggregate_publication_figures(exp_dir, seed_results)
-    aggregate["figures"] = [
-        {"path": path.name, "bytes": int(path.stat().st_size)}
-        for path in sorted(aggregate_dir.glob("*.png"))
-    ]
     _write_json_file(aggregate_dir / "aggregate.json", aggregate)
     return aggregate
 
@@ -7406,63 +8880,14 @@ def aggregate_run(run_dir: str | Path) -> Dict[str, Any]:
     return run_summary
 
 
-def render_figures(run_dir: str | Path) -> Dict[str, Any]:
-    """Regenerate F-series publication figures from stored result JSON files."""
-    root = Path(run_dir)
-    for result_path in sorted(root.glob("*/seed_*/result.json")):
-        try:
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        experiment = str(result.get("metadata", {}).get("experiment") or result_path.parents[1].name)
-        if experiment in set(CANONICAL_SCENARIOS) | set(APPENDIX_EXPERIMENTS):
-            seed_raw = (result.get("metadata", {}) or {}).get("seed")
-            try:
-                seed = int(seed_raw if seed_raw is not None else result_path.parent.name.rsplit("_", 1)[-1])
-            except Exception:
-                seed = 0
-            previous_active = _ACTIVE_RESULT
-            collector = _SeedResultCollector(experiment, seed, result_path.parent, result.get("config", {}) or {})
-            _set_active_result(collector)
-            try:
-                _render_seed_publication_figures(result_path.parent, experiment, result.get("metrics", {}) or {})
-            finally:
-                _set_active_result(previous_active)
-            existing = result.get("figures", {}) or {}
-            refreshed: Dict[str, Any] = {}
-            for path in sorted(result_path.parent.glob("*.png")):
-                row = dict(collector.figures.get(path.name) or existing.get(path.name, {}) or {})
-                row["path"] = path.name
-                row["bytes"] = int(path.stat().st_size)
-                refreshed[path.name] = row
-            result["figures"] = refreshed
-            _write_json_file(result_path, result)
-    return aggregate_run(run_dir)
-
-
-def _resolve_experiments(experiments: Optional[Sequence[str]], include_appendix: bool = False) -> Tuple[str, ...]:
+def _resolve_experiments(experiments: Optional[Sequence[str]]) -> Tuple[str, ...]:
     if experiments is None:
-        return MAIN_EXPERIMENTS + (APPENDIX_EXPERIMENTS if include_appendix else ())
+        return EXPERIMENTS
     if isinstance(experiments, str):
-        if experiments in {"main", "canonical"}:
-            return MAIN_EXPERIMENTS
-        if experiments == "appendix":
-            return APPENDIX_EXPERIMENTS
-        if experiments == "all":
-            return ALL_EXPERIMENTS
-        if experiments == "legacy":
-            return LEGACY_EXPERIMENTS
+        if experiments in {"all", "experiments"}:
+            return EXPERIMENTS
         return (experiments,)
     return tuple(experiments)
-
-
-def _eta_text(start_s: float, completed: int, total: int) -> str:
-    if completed <= 0:
-        return "ETA unknown"
-    elapsed = time.perf_counter() - start_s
-    remaining = max(0, total - completed)
-    eta = elapsed * remaining / max(1, completed)
-    return f"elapsed={elapsed:.1f}s ETA={eta:.1f}s"
 
 
 def _format_seconds(seconds: Optional[float]) -> str:
@@ -7635,7 +9060,7 @@ def _git_dirty() -> Optional[bool]:
 
 
 def _materiality_preflight_failures(seed: int, cfg_obj: MaterialityPreflightConfig) -> List[str]:
-    _recipes, pairs = build_pairs(seed, cfg_obj.n_recipes, cfg_obj.n_preferences, require_material=False)
+    _recipes, pairs, _selection_report = _materiality_preflight_pairs(seed, cfg_obj)
     rows = materiality_rows(pairs)
     pair_by_label = {p.label: p for p in pairs}
     by_recipe: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -7645,14 +9070,35 @@ def _materiality_preflight_failures(seed: int, cfg_obj: MaterialityPreflightConf
         pair = pair_by_label.get(row["label"])
         if pair is not None and not pair.base_pref and not pair.applied_axes:
             filtered_noops.append(pair.label)
-    failures: List[str] = []
+    summary: List[Dict[str, Any]] = []
     for recipe, vals in sorted(by_recipe.items()):
-        effective = len({pair_by_label[v["label"]].actions for v in vals if v["label"] in pair_by_label})
-        if effective < int(cfg_obj.min_effective_preferences):
-            failures.append(f"{recipe}:effective={effective}")
-    if cfg_obj.fail_on_noop and filtered_noops:
-        failures.append(f"noop_pairs={len(filtered_noops)}")
-    return failures
+        recipe_pairs = [pair_by_label[v["label"]] for v in vals if v["label"] in pair_by_label]
+        deduped, duplicate_pairs = _deduplicate_preference_pairs(
+            recipe_pairs,
+            tau_threshold=float(cfg_obj.near_duplicate_tau_threshold),
+        )
+        divergence_rows = [
+            earliest_divergence_step(a.actions, b.actions)
+            for i, a in enumerate(recipe_pairs)
+            for b in recipe_pairs[i + 1:]
+            if a.actions != b.actions
+        ]
+        late_divergence_cutoff = max(1, min((len(p.actions) for p in recipe_pairs), default=1) // 3)
+        min_divergence = min(divergence_rows, default=-1)
+        summary.append({
+            "recipe": recipe,
+            "n_effective_preferences": len(deduped),
+            "near_duplicate_count": len(duplicate_pairs),
+            "passes_min_effective": len(deduped) >= int(cfg_obj.min_effective_preferences),
+            "passes_duplicate_ordering": not (cfg_obj.fail_on_duplicate_ordering and duplicate_pairs),
+            "passes_early_divergence": not (min_divergence >= 0 and min_divergence > late_divergence_cutoff),
+            "passes_min_classify_divergence": not any(step > int(cfg_obj.min_classify_length) for step in divergence_rows),
+        })
+    recipe_family_ambiguities = _recipe_family_jaccard_ambiguities(
+        [p for p in pairs if p.preference_name == "identity"],
+        float(DEFAULT_CONFIG.jaccard_threshold),
+    )
+    return _materiality_failure_reasons(summary, filtered_noops, recipe_family_ambiguities, cfg_obj)
 
 
 def _run_seed_job(name: str, seed: int, run_dir: str, run_config: RunConfig, cfg_obj: Any) -> Dict[str, Any]:
@@ -7666,6 +9112,17 @@ def _run_seed_job(name: str, seed: int, run_dir: str, run_config: RunConfig, cfg
         random.seed(int(seed))
         np.random.seed(int(seed))
         metrics = runner(int(seed), seed_dir, run_config, cfg_obj)
+        if name == "deployment_stream":
+            scenario_warnings = set(_scenario_warnings(collector._scenario_summary()))
+            critical = {
+                "scenario_has_no_seen_recipe_new_preference_events",
+                "scenario_has_no_recorded_events",
+            }
+            failing = critical & scenario_warnings
+            if failing:
+                raise RuntimeError(
+                    f"Seed {seed}: deployment stream missing critical conditions: {sorted(failing)}."
+                )
         status = {
             "state": "completed",
             "wall_s": float(time.perf_counter() - t0),
@@ -7685,18 +9142,16 @@ def _run_seed_job(name: str, seed: int, run_dir: str, run_config: RunConfig, cfg
         return {"ok": False, "seed": int(seed), "wall_s": status["wall_s"], "result_file": str(seed_dir / "result.json"), "error": status["error"]}
     finally:
         _set_active_result(None)
-        plt.close("all")
 
 
 def run_suite(
     run_config: Optional[RunConfig] = None,
     suite_config: Optional[ExperimentSuiteConfig] = None,
     experiments: Optional[Sequence[str]] = None,
-    include_appendix: bool = False,
 ) -> Dict[str, Any]:
     run_config = run_config or RunConfig()
     suite_config = suite_config or ExperimentSuiteConfig()
-    names = _resolve_experiments(experiments, include_appendix=include_appendix)
+    names = _resolve_experiments(experiments)
     unknown = [name for name in names if name not in EXPERIMENT_RUNNERS]
     if unknown:
         raise KeyError(f"unknown experiments: {unknown}; valid={list(EXPERIMENT_RUNNERS)}")
@@ -7708,22 +9163,24 @@ def run_suite(
         "git_dirty": _git_dirty(),
         "run_config": run_config,
         "suite_config": suite_config,
-        "main_experiments": MAIN_EXPERIMENTS,
-        "appendix_experiments": APPENDIX_EXPERIMENTS,
+        "experiments": EXPERIMENTS,
         "requested_experiments": names,
         "selected_recipes_by_seed": {str(seed): [r for r, _ in stable_recipe_builders(seed)] for seed in run_config.seeds},
         "hostname": socket.gethostname(),
         "python_version": sys.version,
         "numpy_version": np.__version__,
-        "matplotlib_version": matplotlib.__version__,
         "workers": workers,
         "status": {"state": "running", "completed": [], "partial": [], "failed": []},
     }
     _write_json_file(run_dir / "run.json", manifest)
-    if (
-        suite_config.materiality_preflight.fail_on_noop
-        and any(name in set(CANONICAL_SCENARIOS) - {"materiality_preflight"} for name in names)
-    ):
+    preflight_required = {
+        "deployment_stream",
+        "cross_recipe_transfer",
+        "confidence_threshold_accuracy",
+        "decay_reentry",
+        "disambiguation_audit",
+    }
+    if any(name in preflight_required for name in names):
         failures_by_seed = {
             int(seed): _materiality_preflight_failures(int(seed), suite_config.materiality_preflight)
             for seed in run_config.seeds
@@ -7739,7 +9196,7 @@ def run_suite(
             manifest["materiality_preflight_failures"] = failures_by_seed
             _write_json_file(run_dir / "run.json", manifest)
             raise RuntimeError(
-                "Materiality preflight failed before canonical scenario execution: "
+                "Materiality preflight failed before materiality-sensitive experiment execution: "
                 f"{failures_by_seed}. Fix the recipe library or lower min_effective_preferences."
             )
     completed: List[str] = []
@@ -7815,48 +9272,33 @@ def run_suite(
     return result
 
 
-def run_main(run_config: Optional[RunConfig] = None, suite_config: Optional[ExperimentSuiteConfig] = None) -> Dict[str, Any]:
-    return run_suite(run_config=run_config, suite_config=suite_config, experiments=MAIN_EXPERIMENTS)
-
-
-def run_appendix(run_config: Optional[RunConfig] = None, suite_config: Optional[ExperimentSuiteConfig] = None) -> Dict[str, Any]:
-    return run_suite(run_config=run_config, suite_config=suite_config, experiments=APPENDIX_EXPERIMENTS)
-
-
 def main(
     *,
     run_config: Optional[RunConfig] = None,
     suite_config: Optional[ExperimentSuiteConfig] = None,
     experiments: Optional[Sequence[str]] = None,
-    include_appendix: bool = False,
 ) -> Dict[str, Any]:
-    return run_suite(run_config=run_config, suite_config=suite_config, experiments=experiments, include_appendix=include_appendix)
+    return run_suite(run_config=run_config, suite_config=suite_config, experiments=experiments)
 
 
 __all__ = [
     "RunConfig",
     "ExperimentSuiteConfig",
-    "CANONICAL_SCENARIOS",
-    "DERIVED_VIEWS",
-    "MAIN_EXPERIMENTS",
-    "APPENDIX_EXPERIMENTS",
-    "LEGACY_EXPERIMENTS",
-    "ALL_EXPERIMENTS",
+    "EXPERIMENTS",
+    "ORACLE_REFERENCE_BASELINES",
     "DeploymentStreamConfig",
+    "DeploymentLadderConfig",
     "TransferSuiteConfig",
+    "ConfidenceThresholdAccuracyConfig",
     "DecayReentrySuiteConfig",
     "DisambiguationAuditConfig",
     "MaterialityPreflightConfig",
+    "BaselineHyperparameterTuningConfig",
     "LiveStepRecord",
     "LiveEpisodeRecord",
     "binary_decision_metrics",
     "live_episode_metrics",
-    "aggregate_live_episodes",
-    "coverage_vs_accuracy_curve",
     "run_suite",
-    "run_main",
-    "run_appendix",
-    "render_figures",
     "aggregate_run",
     "generate_artifact_guides",
     "main",
