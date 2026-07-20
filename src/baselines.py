@@ -4,21 +4,20 @@ from dataclasses import replace
 import math
 import random
 import time
-import zlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .adaptive_agent import AdaptiveHRCAgent, MODE_ONLINE
-from .memory import Classification, variant_hash
+from .memory import Classification, DecayManager, DemoTransition, Entry, VariantKey, variant_hash
 from .models import (Config,    DEFAULT_CONFIG,     Trajectory,     WelfordFeatureNormalizer,       create_feature_matrix_2_0,      create_state_action_mappings)
-from .posterior import PreferencePrototypeLearner, RecipePrototypeLearner
+from .posterior import MemoryPrior, PreferencePrototypeLearner, RecipePrototypeLearner
 State = Tuple[int, ...]
 
 
 def _symbolic_fit_stats(model_family: str, trajectories: Sequence[Trajectory], estimated_flops: float = 0.0) -> Dict[str, object]:
     n_examples = sum(1 for traj in trajectories for _state, action in traj if action != "stop")
     n_actions = len({action for traj in trajectories for _state, action in traj if action != "stop"})
-    return {"model_family": model_family, "estimated_flops": float(estimated_flops), "n_demonstrations": float(len(trajectories)), "n_examples": float(n_examples), "n_actions": float(n_actions)}
+    return {"model_family": model_family, "estimated_flops": float(estimated_flops), "n_demonstrations": float(len(trajectories)), "n_examples": float(n_examples), "n_actions": float(n_actions), "flop_accounting_scope": f"{model_family}_fit_symbolic_counter_only", "flop_cross_model_comparable": False}
 
 
 # Behavior-cloning support used by BC and replay baselines.
@@ -32,7 +31,7 @@ def _softmax(logits: np.ndarray) -> np.ndarray:
 
 
 class BehaviorCloningHead:
-    """Linear softmax imitation model over state and hashed prefix features."""
+    """Linear softmax imitation model over state and one-hot prefix features."""
     def __init__(self, cfg: Config = DEFAULT_CONFIG):
         self.cfg = cfg
         self.normalizer = WelfordFeatureNormalizer()
@@ -41,6 +40,9 @@ class BehaviorCloningHead:
         self.bias: Optional[np.ndarray] = None
         self.action_to_idx: Dict[str, int] = {}
         self.idx_to_action: Dict[int, str] = {}
+        self.prefix_token_to_idx: Dict[str, int] = {}
+        self.idx_to_prefix_token: Dict[int, str] = {}
+        self.prefix_history_len: int = max(1, int(self.cfg.bc_history_len))
         self.last_fit_stats: Dict[str, object] = {}
 
     def reset(self) -> None:
@@ -48,22 +50,25 @@ class BehaviorCloningHead:
         self.bias = None
         self.action_to_idx = {}
         self.idx_to_action = {}
-        self.last_fit_stats = {"model_family": "behavior_cloning", "estimated_flops": 0.0}
+        self.prefix_token_to_idx = {}
+        self.idx_to_prefix_token = {}
+        self.prefix_history_len = max(1, int(self.cfg.bc_history_len))
+        self.last_fit_stats = {"model_family": "behavior_cloning", "estimated_flops": 0.0, "flop_accounting_scope": "behavior_cloning_fit_dense_numeric_only", "flop_cross_model_comparable": False}
 
     def _history_dim(self) -> int:
-        return max(8, int(self.cfg.bc_history_bins)) * max(1, int(self.cfg.bc_history_len)) + 1
+        return max(1, int(self.cfg.bc_history_len)) * len(self.prefix_token_to_idx) + 1
 
     def _prefix_features(self, prefix: Sequence[str]) -> np.ndarray:
-        bins = max(8, int(self.cfg.bc_history_bins))
         history = max(1, int(self.cfg.bc_history_len))
-        out = np.zeros(history * bins + 1, dtype=np.float32)
+        vocab_size = len(self.prefix_token_to_idx)
+        out = np.zeros(history * vocab_size + 1, dtype=np.float32)
         out[-1] = float(len(prefix))
         for lag in range(1, history + 1):
             if len(prefix) < lag: continue
             token = prefix[-lag]
-            key = f"{lag}:{token}".encode("utf-8")
-            idx = zlib.crc32(key) % bins
-            out[(lag - 1) * bins + idx] += 1.0 / float(lag)
+            token_idx = self.prefix_token_to_idx.get(token)
+            if token_idx is None: continue
+            out[(lag - 1) * vocab_size + token_idx] = 1.0
         return out
 
     def _compose_features(self, state_features: np.ndarray, prefix: Sequence[str]) -> np.ndarray:
@@ -72,6 +77,8 @@ class BehaviorCloningHead:
     def _prepare_examples(self, demonstrations: Sequence[Trajectory], demo_weights: Sequence[float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, int], Dict[int, str]]:
         unique_actions = sorted({a for traj in demonstrations for _, a in traj if a != "stop"})
         if not unique_actions: return (np.zeros((0, 0), dtype=np.float32), np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32), {}, {})
+        self.prefix_token_to_idx = {action: idx for idx, action in enumerate(unique_actions)}
+        self.idx_to_prefix_token = {idx: action for action, idx in self.prefix_token_to_idx.items()}
         state_to_idx, idx_to_state, action_to_idx, idx_to_action = create_state_action_mappings(demonstrations, unique_actions=unique_actions)
         state_matrix, _, _ = create_feature_matrix_2_0(idx_to_state, normalizer=self.normalizer, update_normalizer=True)
         self.state_feature_dim = int(state_matrix.shape[1]) if state_matrix.ndim == 2 else 0
@@ -93,22 +100,60 @@ class BehaviorCloningHead:
             return (np.zeros((0, self.state_feature_dim + self._history_dim()), dtype=np.float32),  np.zeros(0, dtype=np.int64),    np.zeros(0, dtype=np.float32),      action_to_idx,  idx_to_action)
         return (np.vstack(xs).astype(np.float32),                               np.asarray(ys,      dtype=np.int64),                np.asarray(sw, dtype=np.float32),   action_to_idx,  idx_to_action)
 
-    def _warm_start(self, feature_dim: int, action_to_idx: Dict[str, int]) -> Tuple[np.ndarray, np.ndarray]:
+    def _warm_start(
+        self,
+        feature_dim: int,
+        action_to_idx: Dict[str, int],
+        old_weights: Optional[np.ndarray],
+        old_bias: Optional[np.ndarray],
+        old_action_to_idx: Dict[str, int],
+        old_state_feature_dim: int,
+        old_prefix_token_to_idx: Dict[str, int],
+        old_history_len: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         weights = np.zeros((feature_dim, len(action_to_idx)), dtype=np.float32)
         bias = np.zeros(len(action_to_idx), dtype=np.float32)
-        if self.weights is None or self.bias is None: return weights, bias
+        if old_weights is None or old_bias is None: return weights, bias
+        new_history_len = max(1, int(self.cfg.bc_history_len))
+        state_rows = min(old_state_feature_dim, self.state_feature_dim, old_weights.shape[0], weights.shape[0])
+        old_prefix_offset = max(0, old_state_feature_dim)
+        new_prefix_offset = max(0, self.state_feature_dim)
+        old_prefix_vocab_size = len(old_prefix_token_to_idx)
+        new_prefix_vocab_size = len(self.prefix_token_to_idx)
+        shared_history_len = min(max(1, int(old_history_len)), new_history_len)
+        old_len_row = old_prefix_offset + max(1, int(old_history_len)) * old_prefix_vocab_size
+        new_len_row = new_prefix_offset + new_history_len * new_prefix_vocab_size
         for action, new_idx in action_to_idx.items():
-            old_idx = self.action_to_idx.get(action)
+            old_idx = old_action_to_idx.get(action)
             if old_idx is None: continue
-            if old_idx >= self.weights.shape[1] or new_idx >= weights.shape[1]: continue
-            weights[:, new_idx] = self.weights[:, old_idx]
-            bias[new_idx] = self.bias[old_idx]
+            if old_idx >= old_weights.shape[1] or new_idx >= weights.shape[1]: continue
+            if state_rows > 0:
+                weights[:state_rows, new_idx] = old_weights[:state_rows, old_idx]
+            for lag_idx in range(shared_history_len):
+                old_base = old_prefix_offset + lag_idx * old_prefix_vocab_size
+                new_base = new_prefix_offset + lag_idx * new_prefix_vocab_size
+                for token, new_token_idx in self.prefix_token_to_idx.items():
+                    old_token_idx = old_prefix_token_to_idx.get(token)
+                    if old_token_idx is None: continue
+                    old_row = old_base + old_token_idx
+                    new_row = new_base + new_token_idx
+                    if old_row < old_weights.shape[0] and new_row < weights.shape[0]:
+                        weights[new_row, new_idx] = old_weights[old_row, old_idx]
+            if old_len_row < old_weights.shape[0] and new_len_row < weights.shape[0]:
+                weights[new_len_row, new_idx] = old_weights[old_len_row, old_idx]
+            bias[new_idx] = old_bias[old_idx]
         return weights, bias
 
     def fit(self, demonstrations: Sequence[Trajectory], demo_weights: Optional[Sequence[float]] = None) -> None:
         if not demonstrations:
             self.reset()
             return
+        old_weights = self.weights
+        old_bias = self.bias
+        old_action_to_idx = dict(self.action_to_idx)
+        old_state_feature_dim = int(self.state_feature_dim)
+        old_prefix_token_to_idx = dict(self.prefix_token_to_idx)
+        old_history_len = int(self.prefix_history_len)
         self.normalizer = WelfordFeatureNormalizer()
         weights = [1.0] * len(demonstrations) if demo_weights is None else [float(w) for w in demo_weights]
         xs, ys, sample_weights, action_to_idx, idx_to_action = self._prepare_examples(demonstrations, weights)
@@ -117,45 +162,69 @@ class BehaviorCloningHead:
             return
 
         feature_dim = int(xs.shape[1])
-        warm_start = self.weights is not None and self.bias is not None
+        warm_start = old_weights is not None and old_bias is not None
         if warm_start:
-            model_w, model_b = self._warm_start(feature_dim, action_to_idx)
+            model_w, model_b = self._warm_start(
+                feature_dim,
+                action_to_idx,
+                old_weights,
+                old_bias,
+                old_action_to_idx,
+                old_state_feature_dim,
+                old_prefix_token_to_idx,
+                old_history_len,
+            )
             epochs = int(self.cfg.bc_epochs_warm)
         else:
             model_w = np.zeros((feature_dim, len(action_to_idx)), dtype=np.float32)
             model_b = np.zeros(len(action_to_idx), dtype=np.float32)
             epochs = int(self.cfg.bc_epochs_cold)
 
-        total_weight = max(float(np.sum(sample_weights)), 1e-8)
         lr = float(self.cfg.bc_learning_rate)
         l2 = float(self.cfg.bc_l2)
+        batch_size = max(1, int(getattr(self.cfg, "bc_batch_size", 64)))
+        rng = np.random.default_rng(int(getattr(self.cfg, "seed", 1337)))
+        indices = np.arange(len(ys), dtype=np.int64)
 
         for _ in range(max(1, epochs)):
-            logits = xs @ model_w + model_b[None, :]
-            probs = _softmax(logits)
-            delta = probs.copy()
-            delta[np.arange(len(ys)), ys] -= 1.0
-            delta *= (sample_weights[:, None] / total_weight).astype(np.float32)
-            grad_w = (xs.T @ delta).astype(np.float32) + l2 * model_w
-            grad_b = np.sum(delta, axis=0).astype(np.float32)
-            model_w -= lr * grad_w
-            model_b -= lr * grad_b
+            rng.shuffle(indices)
+            for start in range(0, len(indices), batch_size):
+                batch = indices[start:start + batch_size]
+                xb = xs[batch]
+                yb = ys[batch]
+                wb = sample_weights[batch].astype(np.float32)
+                batch_weight = max(float(np.sum(wb)), 1e-8)
+                logits = xb @ model_w + model_b[None, :]
+                probs = _softmax(logits)
+                delta = probs.copy()
+                delta[np.arange(len(yb)), yb] -= 1.0
+                delta *= (wb[:, None] / batch_weight).astype(np.float32)
+                grad_w = (xb.T @ delta).astype(np.float32) + l2 * model_w
+                grad_b = np.sum(delta, axis=0).astype(np.float32)
+                model_w -= lr * grad_w
+                model_b -= lr * grad_b
 
         self.weights = model_w.astype(np.float32)
         self.bias = model_b.astype(np.float32)
         self.action_to_idx = dict(action_to_idx)
         self.idx_to_action = dict(idx_to_action)
+        self.prefix_history_len = max(1, int(self.cfg.bc_history_len))
         n_examples = int(xs.shape[0])
         n_actions = int(len(action_to_idx))
         param_count = int(feature_dim * n_actions + n_actions)
-        # Dense softmax regression accounting from the actual fit.
+        # Dense softmax-regression accounting from the actual fit.  The two
+        # GEMMs scale with the number of examples, while regularisation and
+        # parameter updates occur once *per mini-batch*.  Keeping these
+        # components explicit makes the estimate auditable and prevents a
+        # silent under-count when the batch size changes.
+        n_batches = int(math.ceil(n_examples / float(batch_size)))
         forward = 2.0 * n_examples * feature_dim * n_actions
         softmax_delta = 7.0 * n_examples * n_actions
         grad = 2.0 * feature_dim * n_examples * n_actions + float(n_examples * n_actions)
-        regularize_update = 3.0 * param_count
-        estimated_flops = float(max(1, epochs) * (forward + softmax_delta + grad + regularize_update))
+        optimizer_update = float(n_batches * (4 * feature_dim * n_actions + 2 * n_actions))
+        estimated_flops = float(max(1, epochs) * (forward + softmax_delta + grad + optimizer_update))
         self.last_fit_stats = {"model_family": "behavior_cloning", "estimated_flops": estimated_flops, "n_demonstrations": float(len(demonstrations)), "n_examples": float(n_examples), "n_actions": float(n_actions), "feature_dim": float(feature_dim), "state_feature_dim": float(self.state_feature_dim),
-            "history_dim": float(self._history_dim()), "epochs": float(max(1, epochs)), "warm_start": 1.0 if warm_start else 0.0}
+            "history_dim": float(self._history_dim()), "parameter_count": float(param_count), "bc_prefix_encoding": "one_hot_active_vocab", "bc_prefix_vocab_size": float(len(self.prefix_token_to_idx)), "bc_prefix_feature_dim": float(self._history_dim()), "epochs": float(max(1, epochs)), "batch_size": float(batch_size), "n_batches_per_epoch": float(n_batches), "flop_forward": float(forward), "flop_softmax_delta": float(softmax_delta), "flop_gradient": float(grad), "flop_optimizer_update": float(optimizer_update), "flop_accounting_scope": "behavior_cloning_fit_dense_numeric_only", "flop_cross_model_comparable": False, "warm_start": 1.0 if warm_start else 0.0}
 
     def predict(self, state: State, prefix: Sequence[str]) -> Dict[str, float]:
         if self.weights is None or self.bias is None or not self.idx_to_action: return {}
@@ -168,6 +237,47 @@ class BehaviorCloningHead:
 
 def _without_latest_preference_protection(cfg: Config) -> Config:
     return replace(cfg, protect_latest_preference=False)
+
+
+class FixedRateDecayManager(DecayManager):
+    """Picklable fixed-rate decay manager for the fixed-decay ablation."""
+
+    def __init__(self, cfg: Config = DEFAULT_CONFIG):
+        super().__init__(cfg)
+        self.fixed_rate = float(cfg.decay_init)
+        self.post_grace_decay_rate = self.fixed_rate
+
+    def step(self, now: int, cycle: int, protected_keys: Optional[Sequence[VariantKey]] = None) -> List[VariantKey]:
+        protected = set(protected_keys or ())
+        pruned: List[VariantKey] = []
+        for key, entry in list(self.active.items()):
+            if key in self.latest_keys or key in protected:
+                entry.weight = 1.0
+                self._log_weight(now, entry)
+                continue
+            entry.weight -= self.fixed_rate
+            if entry.weight <= self.cfg.prune_threshold:
+                self._prune_entry(key, entry, now, cycle)
+                pruned.append(key)
+            else:
+                self._log_weight(now, entry)
+        return pruned
+
+
+class NoDecayManager(DecayManager):
+    """Unbounded, no-forgetting manager for the no-decay ablation.
+
+    This comparator retains every registered recipe-preference variant at
+    weight 1.0.  No variant-count capacity exists anywhere in the shared
+    memory manager; this class disables the remaining temporal pruning path.
+    """
+
+    def __init__(self, cfg: Config = DEFAULT_CONFIG):
+        super().__init__(cfg)
+        self.post_grace_decay_rate = 0.0
+
+    def step(self, now: int, cycle: int, protected_keys: Optional[Sequence[VariantKey]] = None) -> List[VariantKey]:
+        return []
 
 
 class AdaptiveDecayAgent(AdaptiveHRCAgent):
@@ -194,13 +304,16 @@ class NoReplayAgent(AdaptiveHRCAgent):
         self.action_vector_to_token.clear()
         self.token_to_action_vector.clear()
         self.token_to_role.clear()
+        self.demo_transition_traces.clear()
         
         self.decay.reuse_gaps.clear()
+        self.decay.reuse_gap_events.clear()
+        self.decay.reentry_events.clear()
         self.decay._reuse_gap_window.clear()
-        self.decay._active_recipe_count_window.clear()
-        self.decay.base_rate = 1.0 / max(1, int(getattr(self.cfg, "decay_horizon_init", 10)))
-        self.decay.global_rate = self.decay.base_rate
-        self.decay.rate_history.append((self.session_counter, self.decay.global_rate))
+        self.decay._recipe_gap_window.clear()
+        self.decay._recipe_last_seen_step.clear()
+        self.decay._last_logged_weight_by_key.clear()
+        self.decay.post_grace_decay_rate = 1.0 / max(1, int(getattr(self.cfg, "decay_after_grace_steps", 3)))
         self.recipe_prototypes = RecipePrototypeLearner(self.cfg)
         self.preference_prototypes = PreferencePrototypeLearner(cfg=self.cfg)
         self.task_signatures.clear()
@@ -212,12 +325,18 @@ class NoReplayAgent(AdaptiveHRCAgent):
         self.posterior.reset()
         self._last_fit_fingerprint = None
 
-    def _replace_memory(self, recipe_id: str, seq: List[str]) -> None:
+    def _replace_memory(
+        self,
+        recipe_id: str,
+        seq: List[str],
+        transitions: Optional[Sequence[DemoTransition]] = None,
+    ) -> None:
         self._clear_memory()
-        self._register_if_live(recipe_id, seq, self.step_counter)
+        self._register_if_live(recipe_id, seq, self.step_counter, transitions=transitions)
 
     def _end_observe_demo(self, apply_decay: bool = False) -> Classification:
         seq = list(self.pending_demo)
+        transition_trace = list(self.pending_demo_transitions)
         active_keys = self._active_keys()
         active_lib = self.memory.library(allowed_keys=active_keys)
         cls = self.disambig.classify(seq, active_lib)
@@ -229,17 +348,20 @@ class NoReplayAgent(AdaptiveHRCAgent):
         else:
             if cls.recipe_id is None: raise RuntimeError(f"disambiguator returned {cls.kind} without a recipe_id")
             rid = cls.recipe_id
-        self._replace_memory(rid, seq)
+        self._replace_memory(rid, seq, transitions=transition_trace)
         self.mode = MODE_ONLINE
         self.pending_demo = []
+        self.pending_demo_transitions = []
         if apply_decay: self.decay.step(self.session_counter, self.retrain_cycle)
         self._retrain()
         return cls
 
     def _end_online_session(self, commit_cls: Classification, reentry_from_pruned: bool = False, apply_decay: bool = False) -> Classification:
         prefix = list(self.current_prefix)
+        transition_trace = list(self.current_transition_trace)
         if not prefix:
             self.current_prefix = []
+            self.current_transition_trace = []
             self.inferred_recipe = None
             self.inferred_variant_hash = None
             self.inferred_latent_pref_id = None
@@ -247,13 +369,14 @@ class NoReplayAgent(AdaptiveHRCAgent):
         if commit_cls.kind == "new_recipe" or commit_cls.recipe_id is None: raise RuntimeError("online new-recipe commit reached mutating path")
 
         rid = commit_cls.recipe_id
-        self._replace_memory(rid, prefix)
+        self._replace_memory(rid, prefix, transitions=transition_trace)
         cls_kind = "known" if commit_cls.kind == "known" else "preference_shift"
         cls = Classification(cls_kind, rid, variant_hash(prefix), commit_cls.jaccard, commit_cls.order_distance)
         if apply_decay: self.decay.step(self.session_counter, self.retrain_cycle)
         self._retrain()
         self.classification_events.append((self.step_counter, cls))
         self.current_prefix = []
+        self.current_transition_trace = []
         self.inferred_recipe = None
         self.inferred_variant_hash = None
         self.inferred_latent_pref_id = None
@@ -270,11 +393,11 @@ class NoReplayAgent(AdaptiveHRCAgent):
             return
         latest = max(entries, key=lambda e: e.last_seen_step)
         build_t0 = time.perf_counter()
-        trajectories, dropped_total = self._build_trajectories([list(latest.ordering)])
+        trajectories, dropped_total = self._build_trajectories([latest])
         build_wall_s = time.perf_counter() - build_t0
         self._prepare_retrain_fit()
         fit_t0 = time.perf_counter()
-        self._fit_heads(trajectories, [1.0])
+        self._fit_heads(trajectories, self._length_normalized_demo_weights([latest], [1.0]))
         fit_wall_s = time.perf_counter() - fit_t0
         self._record_retrain_event(dropped_actions=dropped_total, active_demos=1, total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
 
@@ -294,47 +417,48 @@ class UniformWeightAgent(AdaptiveHRCAgent):
             self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
             self._reset_heads()
             return
-        demos = [list(e.ordering) for e in entries]
         build_t0 = time.perf_counter()
-        trajectories, dropped_total = self._build_trajectories(demos)
+        trajectories, dropped_total = self._build_trajectories(entries)
         build_wall_s = time.perf_counter() - build_t0
         self._prepare_retrain_fit()
         fit_t0 = time.perf_counter()
-        self._fit_heads(trajectories, [1.0] * len(trajectories))
+        weights = self._length_normalized_demo_weights(entries, [1.0] * len(entries))
+        self._fit_heads(trajectories, weights)
         fit_wall_s = time.perf_counter() - fit_t0
-        self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(demos), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
+        self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(entries), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
 
 
 class FixedDecayAgent(AdaptiveHRCAgent):
-    """Global decay rate is frozen to decay_init; adaptive rate disabled."""
+    """Immediate fixed-rate forgetting ablation; adaptive grace horizons disabled."""
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-        self.decay._record_reuse_gap = lambda *args, **kwargs: None       # type: ignore
-        self.decay._recompute_effective = lambda *args, **kwargs: None    # type: ignore
-        self.decay.base_rate = cfg.decay_init
-        self.decay.global_rate = cfg.decay_init
+        self.decay = FixedRateDecayManager(self.cfg)
 
 
 class NoDecayAgent(AdaptiveHRCAgent):
-    """Decay is fully disabled: weights never decrease, nothing is ever pruned. Keeps registration and retraining active so the IRL and Markov heads still learn. This is the complement to FixedDecayAgent for ablations where we want to see what happens with infinite perfect memory."""
+    """Unlimited-memory control: all variants remain active at weight 1.0.
+
+    Keeps registration and retraining active so the IRL and Markov heads still
+    learn, while disabling temporal decay.
+    """
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-        # Disable decay while keeping registration and retraining active.
-        self.decay.step = lambda now, cycle, protected_keys=None: []  # type: ignore[assignment]
-        self.decay._record_reuse_gap = lambda *args, **kwargs: None   # type: ignore
-        self.decay._recompute_effective = lambda *args, **kwargs: None # type: ignore
-        # Keep base/global rate at 0 to make it explicit.
-        self.decay.base_rate = 0.0
-        self.decay.global_rate = 0.0
+        self.decay = NoDecayManager(self.cfg)
 
 
 class LatestOnlyPreferenceAgent(AdaptiveDecayAgent):
     """Keeps only the most recently observed preference variant per recipe."""
 
-    def _register_if_live(self, rid: str, seq: List[str], step: int):
-        variant = super()._register_if_live(rid, seq, step)
+    def _register_if_live(self, rid: str, seq: List[str], step: int, transitions: Optional[Sequence[DemoTransition]] = None, identity_ordering: Optional[Sequence[str]] = None):
+        variant = super()._register_if_live(
+            rid,
+            seq,
+            step,
+            transitions=transitions,
+            identity_ordering=identity_ordering,
+        )
         slot = self.memory.variants.get(rid, {})
         for variant_hash in list(slot.keys()):
             if variant_hash == variant.variant_hash: continue
@@ -397,9 +521,8 @@ class BehaviorCloningAgent(AdaptiveHRCAgent):
     def pruned_influence_audit(self, max_prefixes: int = 24, tolerance: float = 5e-2) -> Dict[str, object]:
         entries = self.decay.active_entries()
         if not entries: return {"max_l1": 0.0, "mean_l1": 0.0, "n_prefixes": 0, "passed": True, "tolerance": float(tolerance), "model_family": "behavior_cloning"}
-        demos = [list(e.ordering) for e in entries]
-        weights = [float(e.weight) for e in entries]
-        trajectories, _ = self._build_trajectories(demos)
+        weights = self._length_normalized_demo_weights(entries, [float(e.weight) for e in entries])
+        trajectories, _ = self._build_trajectories(entries)
         fresh_bc = BehaviorCloningHead(cfg=self.cfg)
         fresh_bc.fit(trajectories, weights)
         prefixes: List[Tuple[str, ...]] = []
@@ -435,9 +558,8 @@ class BehaviorCloningAgent(AdaptiveHRCAgent):
             for p in dist.values(): 
                 if p > 0: ent -= float(p) * math.log(float(p))
             if len(dist) > 1: ent /= math.log(len(dist))
-            threshold = self._action_confidence_threshold()
-            self._set_assist_gate(conf >= threshold, conf, ent, "baseline_policy" if conf >= threshold else "low_action_confidence")
-        else: self._set_assist_gate(False, None, None, "baseline_empty")
+            self._set_action_policy_stats(conf, ent, "baseline_policy")
+        else: self._set_action_policy_stats(None, None, "baseline_empty")
         return dist
 
 
@@ -502,6 +624,16 @@ class EWCAgent(AdaptiveHRCAgent):
         # Consolidated anchor passed to irl.fit — recomputed after every task.
         self._ewc_theta_star_consolidated: Optional[np.ndarray] = None
         self._ewc_fisher_consolidated: Optional[np.ndarray] = None
+        self._ewc_pending_task_demos: List[Any] = []
+        self._custom_fit_stats: Dict[str, Any] = {}
+
+    @property
+    def _ewc_theta_star(self) -> Optional[np.ndarray]:
+        return self._ewc_theta_star_consolidated
+
+    @property
+    def _ewc_fisher(self) -> Optional[np.ndarray]:
+        return self._ewc_fisher_consolidated
 
     @staticmethod
     def _resize_to(arr: Optional[np.ndarray], n: int) -> np.ndarray:
@@ -515,7 +647,62 @@ class EWCAgent(AdaptiveHRCAgent):
         out[:k] = arr[:k]
         return out
 
+    def _record_committed_replay_demo(
+        self,
+        recipe_id: str,
+        variant_hash_: str,
+        ordering: Tuple[str, ...],
+        *,
+        transitions: Tuple[DemoTransition, ...] = (),
+        session_step: int,
+        action_step: int,
+        source_mode: str,
+        entry: Optional[Entry] = None,
+    ) -> None:
+        if entry is not None:
+            self._ewc_pending_task_demos.append(entry)
+        else:
+            self._ewc_pending_task_demos.append({"ordering": tuple(ordering), "transitions": tuple(transitions)})
+
+    @staticmethod
+    def _estimate_fisher_flops(trajectories: Sequence[Trajectory], n_features: int) -> float:
+        state_visits = sum(len(traj) for traj in trajectories)
+        return float(3.0 * max(0, state_visits) * max(1, int(n_features)))
+
+    def _record_ewc_accounting(self, aux_fit_stats: Dict[str, Any], fisher_flops: float) -> None:
+        primary_stats = dict(getattr(self.irl, "last_fit_stats", {}) or {})
+        primary_est = primary_stats.get("estimated_flops", 0.0)
+        aux_est = aux_fit_stats.get("estimated_flops", 0.0)
+        try:
+            primary_flops = float(primary_est)
+        except (TypeError, ValueError):
+            primary_flops = 0.0
+        try:
+            aux_flops = float(aux_est)
+        except (TypeError, ValueError):
+            aux_flops = 0.0
+        if not math.isfinite(primary_flops):
+            primary_flops = 0.0
+        if not math.isfinite(aux_flops):
+            aux_flops = 0.0
+        try:
+            fisher_flops = float(fisher_flops)
+        except (TypeError, ValueError):
+            fisher_flops = 0.0
+        if not math.isfinite(fisher_flops):
+            fisher_flops = 0.0
+        self._custom_fit_stats = {
+            "estimated_flops": float(primary_flops + aux_flops + fisher_flops),
+            "ewc_primary_estimated_flops": float(primary_flops),
+            "ewc_aux_estimated_flops": float(aux_flops),
+            "ewc_fisher_estimated_flops": float(fisher_flops),
+            "ewc_aux_iterations_run": float(aux_fit_stats.get("iterations_run", 0.0) or 0.0),
+            "ewc_aux_n_states": float(aux_fit_stats.get("n_states", 0.0) or 0.0),
+            "ewc_aux_n_features": float(aux_fit_stats.get("n_features", 0.0) or 0.0),
+        }
+
     def _fit_heads(self, trajectories, weights) -> None:
+        self._custom_fit_stats = {}
         self.irl.fit(
             trajectories, weights,
             ewc_theta_star=self._ewc_theta_star_consolidated,
@@ -531,10 +718,33 @@ class EWCAgent(AdaptiveHRCAgent):
             normalizer=self.irl.normalizer,
         )
         if self.irl.theta is None:
+            self._record_ewc_accounting({}, 0.0)
             return
 
-        new_theta = self.irl.theta.astype(np.float32)   # theta_i*
-        new_fisher = self.irl.fisher_diagonal(trajectories, weights)
+        pending = list(self._ewc_pending_task_demos)
+        self._ewc_pending_task_demos = []
+        if pending:
+            task_trajectories, _ = self._build_trajectories(pending)
+            task_weights = self._length_normalized_demo_weights(pending, [1.0] * len(pending))
+        else:
+            task_trajectories = list(trajectories)
+            task_weights = [float(w) for w in weights]
+        task_irl = type(self.irl)(cfg=self.cfg)
+        task_irl.fit(
+            task_trajectories,
+            task_weights,
+            ewc_theta_star=self._ewc_theta_star_consolidated,
+            ewc_fisher=self._ewc_fisher_consolidated,
+        )
+        aux_fit_stats = dict(getattr(task_irl, "last_fit_stats", {}) or {})
+        if task_irl.theta is None:
+            self._record_ewc_accounting(aux_fit_stats, 0.0)
+            return
+
+        new_theta = task_irl.theta.astype(np.float32)   # theta_i*
+        fisher_flops = self._estimate_fisher_flops(task_trajectories, int(new_theta.shape[0]))
+        new_fisher = task_irl.fisher_diagonal(task_trajectories, task_weights)
+        self._record_ewc_accounting(aux_fit_stats, fisher_flops)
         if new_fisher is None:
             return
         new_fisher = new_fisher.astype(np.float32)       # F_i
@@ -567,36 +777,55 @@ class ExperienceReplayAgent(BehaviorCloningAgent):
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-        self._buffer: List[List[str]] = []
-        self._buffered_keys: set = set()
+        self._buffer: List[Any] = []
+        self._all_seen_orderings: List[List[str]] = []
         self._seen: int = 0
         self._rng = random.Random(getattr(cfg, "seed", 1337))
         self._last_replay_metadata: Dict[str, Any] = self.replay_buffer_metadata()
 
-    def _buffer_add(self, ordering: List[str]) -> None:
+    def _replay_record(self, ordering: Sequence[str], transitions: Sequence[DemoTransition] = ()) -> Dict[str, Any]:
+        return {"ordering": list(ordering), "transitions": tuple(transitions)}
+
+    def _record_ordering(self, record: Any) -> List[str]:
+        if isinstance(record, dict):
+            return list(record.get("ordering", ()))
+        return list(record)
+
+    def _buffer_add(self, record: Any) -> None:
         cap = max(1, int(self.cfg.er_buffer_size))
         self._seen += 1
+        stored = self._replay_record(self._record_ordering(record), record.get("transitions", ()) if isinstance(record, dict) else ())
         if len(self._buffer) < cap:
-            self._buffer.append(list(ordering))
+            self._buffer.append(stored)
             return
         j = self._rng.randrange(self._seen)
-        if j < cap: self._buffer[j] = list(ordering)
+        if j < cap: self._buffer[j] = stored
 
     def replay_buffer_metadata(self) -> Dict[str, Any]:
         n_buffered = len(getattr(self, "_buffer", []))
-        footprint = sum(len(ordering) for ordering in getattr(self, "_buffer", []))
-        return {"policy": "uniform_reservoir", "er_buffer_size": int(self.cfg.er_buffer_size), "er_batch_size": int(self.cfg.er_batch_size), "n_buffered": int(n_buffered), "replay_memory_footprint": int(footprint), "replay_memory_steps": int(footprint)}
+        footprint = sum(len(self._record_ordering(record)) for record in getattr(self, "_buffer", []))
+        return {"policy": "uniform_reservoir", "er_buffer_size": int(self.cfg.er_buffer_size), "er_batch_size": int(self.cfg.er_batch_size), "n_buffered": int(n_buffered), "n_seen": int(getattr(self, "_seen", 0)), "replay_memory_footprint": int(footprint), "replay_memory_steps": int(footprint)}
+
+    def _record_committed_replay_demo(
+        self,
+        recipe_id: str,
+        variant_hash_: str,
+        ordering: Tuple[str, ...],
+        *,
+        transitions: Tuple[DemoTransition, ...] = (),
+        session_step: int,
+        action_step: int,
+        source_mode: str,
+        entry: Optional[Entry] = None,
+    ) -> None:
+        demo = list(ordering)
+        self._all_seen_orderings.append(demo)
+        self._buffer_add(self._replay_record(demo, transitions))
 
     def _retrain(self) -> None:
         if self._frozen: return
         retrain_t0 = time.perf_counter()
         self.retrain_cycle += 1
-        # Reservoir-add newly committed active entries. This baseline disables latest-preference protection, so `decay.latest_keys` may be empty; using it here silently starves replay and yields an empty predictor.
-        entries = self.decay.active_entries()
-        for entry in entries:
-            if entry.key in self._buffered_keys: continue
-            self._buffered_keys.add(entry.key)
-            self._buffer_add(list(entry.ordering))
 
         if not self._buffer:
             self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
@@ -607,13 +836,9 @@ class ExperienceReplayAgent(BehaviorCloningAgent):
         batch_size = max(1, int(self.cfg.er_batch_size))
         k = min(batch_size, len(self._buffer))
         sampled = self._rng.sample(self._buffer, k) if k > 0 else []
-        demos: List[List[str]] = []
-        seen_keys: set = set()
+        demos: List[Any] = []
         for s in sampled:
-            key = tuple(s)
-            if key in seen_keys: continue
-            seen_keys.add(key)
-            demos.append(list(s))
+            demos.append(s)
         if not demos:
             self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
             self._reset_heads()
@@ -623,7 +848,7 @@ class ExperienceReplayAgent(BehaviorCloningAgent):
         build_t0 = time.perf_counter()
         trajectories, dropped_total = self._build_trajectories(demos)
         build_wall_s = time.perf_counter() - build_t0
-        weights = [1.0] * len(demos)  # uniform, by design (no decay leakage).
+        weights = self._length_normalized_demo_weights(demos, [1.0] * len(demos))  # uniform demo mass; no decay leakage.
         self._reset_heads()
         fit_t0 = time.perf_counter()
         self._fit_heads(trajectories, weights)
@@ -643,21 +868,47 @@ class RecencyPrioritizedReplayAgent(ExperienceReplayAgent):
 
     def _refresh_buffer_view(self) -> None:
         ordered = sorted(self._recency_records.values(), key=lambda r: (int(r.get("last_seen_session", 0)), tuple(r.get("ordering", ()))), reverse=True)
-        self._buffer = [list(r.get("ordering", ())) for r in ordered]
+        self._buffer = [dict(r) for r in ordered]
 
-    def _upsert_record(self, entry) -> None:
+    def _upsert_ordering_record(
+        self,
+        key: Tuple[str, str],
+        ordering: Sequence[str],
+        last_seen_session: int,
+        source_mode: str = "",
+        transitions: Sequence[DemoTransition] = (),
+    ) -> None:
         cap = max(1, int(self.cfg.er_buffer_size))
-        key = entry.key
         existing = self._recency_records.get(key)
         if existing is None and len(self._recency_records) >= cap:
             evict_key = min(
                 self._recency_records,
                 key=lambda k: (int(self._recency_records[k].get("last_seen_session", 0)), int(self._recency_records[k].get("seen_count", 0)), k))
             self._recency_records.pop(evict_key, None)
-        rec = self._recency_records.setdefault(key, {"ordering": list(entry.ordering), "last_seen_session": int(entry.last_seen_step), "seen_count": 0})
-        rec["ordering"] = list(entry.ordering)
-        rec["last_seen_session"] = int(entry.last_seen_step)
+        rec = self._recency_records.setdefault(key, {"ordering": list(ordering), "last_seen_session": int(last_seen_session), "seen_count": 0, "source_mode": source_mode, "transitions": tuple(transitions)})
+        rec["ordering"] = list(ordering)
+        rec["last_seen_session"] = int(last_seen_session)
         rec["seen_count"] = int(rec.get("seen_count", 0)) + 1
+        rec["source_mode"] = source_mode or str(rec.get("source_mode", ""))
+        if transitions:
+            rec["transitions"] = tuple(transitions)
+
+    def _upsert_record(self, entry) -> None:
+        self._upsert_ordering_record(entry.key, entry.ordering, int(entry.last_seen_step), getattr(entry, "source_mode", ""), getattr(entry, "transitions", ()))
+
+    def _record_committed_replay_demo(
+        self,
+        recipe_id: str,
+        variant_hash_: str,
+        ordering: Tuple[str, ...],
+        *,
+        transitions: Tuple[DemoTransition, ...] = (),
+        session_step: int,
+        action_step: int,
+        source_mode: str,
+        entry: Optional[Entry] = None,
+    ) -> None:
+        self._upsert_ordering_record((recipe_id, variant_hash_), ordering, int(session_step), source_mode, transitions)
 
     def _sample_records(self, k: int) -> List[Dict[str, Any]]:
         records = list(self._recency_records.values())
@@ -665,23 +916,15 @@ class RecencyPrioritizedReplayAgent(ExperienceReplayAgent):
         now = max([int(r.get("last_seen_session", 0)) for r in records] + [int(self.session_counter)])
         alpha = max(0.0, float(self.cfg.er_recency_alpha))
         mix = min(max(float(self.cfg.er_uniform_mix), 0.0), 1.0)
-        remaining = list(records)
-        sampled: List[Dict[str, Any]] = []
-        while remaining and len(sampled) < min(k, len(records)):
-            raw = [(max(0, now - int(r.get("last_seen_session", 0))) + 1.0) ** (-alpha) for r in remaining]
-            total_raw = max(float(sum(raw)), 1e-12)
-            uniform = 1.0 / len(remaining)
-            weights = [(1.0 - mix) * (w / total_raw) + mix * uniform for w in raw]
-            choice = self._rng.random()
-            acc = 0.0
-            picked = len(remaining) - 1
-            for idx, weight in enumerate(weights):
-                acc += float(weight)
-                if choice <= acc:
-                    picked = idx
-                    break
-            sampled.append(remaining.pop(picked))
-        return sampled
+        raw = np.asarray([(max(0, now - int(r.get("last_seen_session", 0))) + 1.0) ** (-alpha) for r in records], dtype=np.float64)
+        total_raw = float(raw.sum())
+        probs = raw / total_raw if total_raw > 0.0 else np.ones(len(records), dtype=np.float64) / len(records)
+        probs = (1.0 - mix) * probs + mix * (np.ones(len(records), dtype=np.float64) / len(records))
+        probs = probs / max(float(probs.sum()), 1e-12)
+        n = min(k, len(records))
+        rng = np.random.default_rng(self._rng.randrange(0, 2**32))
+        indices = rng.choice(len(records), size=n, replace=False, p=probs)
+        return [records[int(i)] for i in indices]
 
     def replay_buffer_metadata(self) -> Dict[str, Any]:
         records = list(getattr(self, "_recency_records", {}).values())
@@ -693,8 +936,6 @@ class RecencyPrioritizedReplayAgent(ExperienceReplayAgent):
         if self._frozen: return
         retrain_t0 = time.perf_counter()
         self.retrain_cycle += 1
-        entries = self.decay.active_entries()
-        for entry in entries: self._upsert_record(entry)
         self._refresh_buffer_view()
         if not self._recency_records:
             self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
@@ -709,7 +950,7 @@ class RecencyPrioritizedReplayAgent(ExperienceReplayAgent):
             key = tuple(demo)
             if not demo or key in seen_keys: continue
             seen_keys.add(key)
-            demos.append(demo)
+            demos.append(record)
         if not demos:
             self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
             self._reset_heads()
@@ -718,12 +959,301 @@ class RecencyPrioritizedReplayAgent(ExperienceReplayAgent):
         build_t0 = time.perf_counter()
         trajectories, dropped_total = self._build_trajectories(demos)
         build_wall_s = time.perf_counter() - build_t0
-        weights = [1.0] * len(demos)
+        weights = self._length_normalized_demo_weights(demos, [1.0] * len(demos))
         self._reset_heads()
         fit_t0 = time.perf_counter()
         self._fit_heads(trajectories, weights)
         fit_wall_s = time.perf_counter() - fit_t0
         self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(demos), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
+
+
+class _IRLReplayAgentBase(AdaptiveHRCAgent):
+    """Replay-data baseline that keeps the full IRL/Markov/posterior predictor."""
+
+    replay_policy_name = "replay"
+
+    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
+        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
+        self._replay_prediction_entries: List[Entry] = []
+        self._last_replay_metadata: Dict[str, Any] = {}
+
+    def _copy_entry(self, entry: Entry) -> Entry:
+        return Entry(
+            recipe_id=entry.recipe_id,
+            variant_hash=entry.variant_hash,
+            ordering=tuple(entry.ordering),
+            weight=1.0,
+            added_step=int(entry.added_step),
+            added_cycle=int(entry.added_cycle),
+            last_seen_step=int(entry.last_seen_step),
+            seen_count=int(getattr(entry, "seen_count", 1)),
+            source_mode=str(getattr(entry, "source_mode", "")),
+            transitions=tuple(getattr(entry, "transitions", ())),
+            identity_ordering=tuple(getattr(entry, "identity_ordering", ())),
+        )
+
+    def _make_replay_entry(
+        self,
+        recipe_id: str,
+        variant_hash_: str,
+        ordering: Sequence[str],
+        *,
+        session_step: int,
+        source_mode: str,
+        seen_count: int = 1,
+        transitions: Sequence[DemoTransition] = (),
+    ) -> Entry:
+        return Entry(
+            recipe_id=recipe_id,
+            variant_hash=variant_hash_,
+            ordering=tuple(ordering),
+            weight=1.0,
+            added_step=int(session_step),
+            added_cycle=int(self.retrain_cycle),
+            last_seen_step=int(session_step),
+            seen_count=int(seen_count),
+            source_mode=str(source_mode),
+            transitions=tuple(transitions),
+            identity_ordering=tuple(ordering),
+        )
+
+    def _set_replay_prediction_entries(self, entries: Sequence[Entry]) -> None:
+        self._replay_prediction_entries = [self._copy_entry(e) for e in entries]
+
+    def _active_keys(self) -> set:
+        return {entry.key for entry in self._replay_prediction_entries}
+
+    def _memory_state_for_recipe(self, rid: str) -> MemoryPrior:
+        entries = [entry for entry in self._replay_prediction_entries if entry.recipe_id == rid]
+        if entries:
+            return MemoryPrior(state="active", active_weight=max(float(e.weight) for e in entries))
+        return MemoryPrior("absent")
+
+    def _replay_fit_stats(self) -> Dict[str, object]:
+        return {
+            "predictor_family": "irl_markov_posterior",
+            "replay_data_policy": self.replay_policy_name,
+        }
+
+    def _fit_replay_entries(self, entries: Sequence[Entry], retrain_t0: float, sampler: str) -> None:
+        sampled_entries = [self._copy_entry(e) for e in entries]
+        if not sampled_entries:
+            self._last_replay_metadata = {**self.replay_buffer_metadata(), "n_sampled": 0, "sampler": sampler, "predictor_family": "irl_markov_posterior"}
+            self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
+            self._reset_heads()
+            self._set_replay_prediction_entries([])
+            self._rebuild_active_prototypes([])
+            self._last_fit_fingerprint = None
+            return
+        self._last_replay_metadata = {**self.replay_buffer_metadata(), "n_sampled": int(len(sampled_entries)), "sampler": sampler, "predictor_family": "irl_markov_posterior"}
+        build_t0 = time.perf_counter()
+        trajectories, dropped_total = self._build_trajectories(sampled_entries)
+        build_wall_s = time.perf_counter() - build_t0
+        weights = self._length_normalized_demo_weights(sampled_entries, [1.0] * len(sampled_entries))
+        self._reset_heads()
+        self._custom_fit_stats = self._replay_fit_stats()
+        fit_t0 = time.perf_counter()
+        self._fit_heads(trajectories, weights)
+        fit_wall_s = time.perf_counter() - fit_t0
+        self._set_replay_prediction_entries(sampled_entries)
+        self._rebuild_active_prototypes(sampled_entries)
+        self._last_fit_fingerprint = None
+        self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(sampled_entries), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
+
+
+class IRLExperienceReplayAgent(_IRLReplayAgentBase):
+    """Uniform reservoir replay with the same IRL/Markov/posterior predictor as the full system.
+
+    This isolates memory/data management: the predictor family stays fixed, but
+    training and live prototype state are rebuilt from a uniform replay sample
+    instead of the adaptive decay active set.
+    """
+
+    replay_policy_name = "uniform_reservoir"
+
+    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
+        super().__init__(cfg=cfg, **kw)
+        self._buffer: List[Entry] = []
+        self._seen: int = 0
+        self._rng = random.Random(getattr(cfg, "seed", 1337))
+        self._last_replay_metadata = self.replay_buffer_metadata()
+
+    def _buffer_add(self, entry: Entry) -> None:
+        cap = max(1, int(self.cfg.er_buffer_size))
+        self._seen += 1
+        copied = self._copy_entry(entry)
+        if len(self._buffer) < cap:
+            self._buffer.append(copied)
+            return
+        j = self._rng.randrange(self._seen)
+        if j < cap:
+            self._buffer[j] = copied
+
+    def replay_buffer_metadata(self) -> Dict[str, Any]:
+        footprint = sum(len(entry.ordering) for entry in getattr(self, "_buffer", []))
+        return {
+            "policy": str(getattr(self, "replay_policy_name", "uniform_reservoir")),
+            "predictor_family": "irl_markov_posterior",
+            "er_buffer_size": int(self.cfg.er_buffer_size),
+            "er_batch_size": int(self.cfg.er_batch_size),
+            "n_buffered": int(len(getattr(self, "_buffer", []))),
+            "n_seen": int(getattr(self, "_seen", 0)),
+            "replay_memory_footprint": int(footprint),
+            "replay_memory_steps": int(footprint),
+        }
+
+    def _record_committed_replay_demo(
+        self,
+        recipe_id: str,
+        variant_hash_: str,
+        ordering: Tuple[str, ...],
+        *,
+        transitions: Tuple[DemoTransition, ...] = (),
+        session_step: int,
+        action_step: int,
+        source_mode: str,
+        entry: Optional[Entry] = None,
+    ) -> None:
+        replay_entry = self._make_replay_entry(recipe_id, variant_hash_, ordering, session_step=session_step, source_mode=source_mode, transitions=transitions)
+        self._buffer_add(replay_entry)
+
+    def _retrain(self) -> None:
+        if self._frozen:
+            return
+        retrain_t0 = time.perf_counter()
+        self.retrain_cycle += 1
+        if not self._buffer:
+            self._fit_replay_entries([], retrain_t0, "uniform_without_replacement")
+            return
+        batch_size = max(1, int(self.cfg.er_batch_size))
+        sampled = self._rng.sample(self._buffer, min(batch_size, len(self._buffer)))
+        self._fit_replay_entries(sampled, retrain_t0, "uniform_without_replacement")
+
+
+class BudgetMatchedUniformReplayAgent(IRLExperienceReplayAgent):
+    """Legacy explicit-budget uniform replay with the full predictor.
+
+    Per-recipe capacity is intentionally absent from the system.  This class
+    therefore uses the explicit global ``er_buffer_size`` configured for the
+    replay baseline rather than deriving a budget from adaptive-agent memory.
+    """
+
+    replay_policy_name = "budget_matched_uniform_replay"
+
+    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
+        super().__init__(cfg=cfg, **kw)
+
+    def replay_buffer_metadata(self) -> Dict[str, Any]:
+        meta = super().replay_buffer_metadata()
+        meta.update({
+            "policy": self.replay_policy_name,
+            "budget_match_reference": "explicit_er_buffer_size",
+            "explicit_replay_budget": int(self.cfg.er_buffer_size),
+            "uses_adaptive_decay_weights": False,
+        })
+        return meta
+
+
+class IRLRecencyPrioritizedReplayAgent(_IRLReplayAgentBase):
+    """Recency-prioritized replay with the full IRL/Markov/posterior predictor."""
+
+    replay_policy_name = "recency_prioritized"
+
+    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
+        super().__init__(cfg=cfg, **kw)
+        self._recency_records: Dict[Tuple[str, str], Entry] = {}
+        self._buffer: List[Entry] = []
+        self._rng = random.Random(getattr(cfg, "seed", 1337))
+        self._last_replay_metadata = self.replay_buffer_metadata()
+
+    def _refresh_buffer_view(self) -> None:
+        self._buffer = sorted(
+            [self._copy_entry(e) for e in self._recency_records.values()],
+            key=lambda e: (int(e.last_seen_step), e.recipe_id, e.variant_hash),
+            reverse=True,
+        )
+
+    def _upsert_record(self, entry: Entry) -> None:
+        cap = max(1, int(self.cfg.er_buffer_size))
+        key = entry.key
+        copied = self._copy_entry(entry)
+        existing = self._recency_records.get(key)
+        if existing is None and len(self._recency_records) >= cap:
+            evict_key = min(
+                self._recency_records,
+                key=lambda k: (
+                    int(self._recency_records[k].last_seen_step),
+                    int(self._recency_records[k].added_step),
+                    k,
+                ),
+            )
+            self._recency_records.pop(evict_key, None)
+        elif existing is not None:
+            copied.added_step = existing.added_step
+            copied.added_cycle = existing.added_cycle
+            copied.seen_count = int(getattr(existing, "seen_count", 1)) + 1
+        else:
+            copied.seen_count = max(1, int(getattr(copied, "seen_count", 1)))
+        self._recency_records[key] = copied
+
+    def _record_committed_replay_demo(
+        self,
+        recipe_id: str,
+        variant_hash_: str,
+        ordering: Tuple[str, ...],
+        *,
+        transitions: Tuple[DemoTransition, ...] = (),
+        session_step: int,
+        action_step: int,
+        source_mode: str,
+        entry: Optional[Entry] = None,
+    ) -> None:
+        replay_entry = self._make_replay_entry(recipe_id, variant_hash_, ordering, session_step=session_step, source_mode=source_mode, transitions=transitions)
+        self._upsert_record(replay_entry)
+
+    def _sample_records(self, k: int) -> List[Entry]:
+        records = list(self._recency_records.values())
+        if not records or k <= 0:
+            return []
+        now = max([int(r.last_seen_step) for r in records] + [int(self.session_counter)])
+        alpha = max(0.0, float(self.cfg.er_recency_alpha))
+        mix = min(max(float(self.cfg.er_uniform_mix), 0.0), 1.0)
+        raw = np.asarray([(max(0, now - int(r.last_seen_step)) + 1.0) ** (-alpha) for r in records], dtype=np.float64)
+        total_raw = float(raw.sum())
+        probs = raw / total_raw if total_raw > 0.0 else np.ones(len(records), dtype=np.float64) / len(records)
+        probs = (1.0 - mix) * probs + mix * (np.ones(len(records), dtype=np.float64) / len(records))
+        probs = probs / max(float(probs.sum()), 1e-12)
+        n = min(k, len(records))
+        rng = np.random.default_rng(self._rng.randrange(0, 2**32))
+        indices = rng.choice(len(records), size=n, replace=False, p=probs)
+        return [self._copy_entry(records[int(i)]) for i in indices]
+
+    def replay_buffer_metadata(self) -> Dict[str, Any]:
+        records = list(getattr(self, "_recency_records", {}).values())
+        footprint = sum(len(entry.ordering) for entry in records)
+        return {
+            "policy": "recency_prioritized",
+            "predictor_family": "irl_markov_posterior",
+            "alpha": float(self.cfg.er_recency_alpha),
+            "uniform_mix": float(self.cfg.er_uniform_mix),
+            "er_buffer_size": int(self.cfg.er_buffer_size),
+            "er_batch_size": int(self.cfg.er_batch_size),
+            "n_buffered": int(len(records)),
+            "replay_memory_footprint": int(footprint),
+            "replay_memory_steps": int(footprint),
+        }
+
+    def _retrain(self) -> None:
+        if self._frozen:
+            return
+        retrain_t0 = time.perf_counter()
+        self.retrain_cycle += 1
+        self._refresh_buffer_view()
+        if not self._recency_records:
+            self._fit_replay_entries([], retrain_t0, "recency_prioritized_without_replacement")
+            return
+        sampled = self._sample_records(max(1, int(self.cfg.er_batch_size)))
+        self._fit_replay_entries(sampled, retrain_t0, "recency_prioritized_without_replacement")
 
 
 class BigramOnlyAgent(AdaptiveHRCAgent):
@@ -752,7 +1282,24 @@ class BigramOnlyAgent(AdaptiveHRCAgent):
                 scalar_updates += 1
         # Wipe the parent heads so any accidental call returns nothing.
         self._reset_heads()
-        self._custom_fit_stats = {**_symbolic_fit_stats("bigram", trajectories, estimated_flops=0.0), "scalar_counter_updates": float(scalar_updates)}
+        # Each counter update performs at least a lookup, addition, and store.
+        estimated_flops = float(3.0 * max(1, scalar_updates))
+        self._custom_fit_stats = {**_symbolic_fit_stats("bigram", trajectories, estimated_flops=estimated_flops), "scalar_counter_updates": float(scalar_updates)}
+
+    def baseline_memory_metadata(self) -> Dict[str, Any]:
+        bigram_edges = sum(len(row) for row in self._bigram.values())
+        unigram_types = len(self._unigram)
+        counter_mass = sum(self._unigram.values()) + sum(sum(row.values()) for row in self._bigram.values())
+        return {
+            "policy": "token_bigram",
+            "bigram_contexts": int(len(self._bigram)),
+            "bigram_edges": int(bigram_edges),
+            "unigram_types": int(unigram_types),
+            "counter_entries": int(unigram_types + bigram_edges),
+            "counter_mass": int(counter_mass),
+            "baseline_memory_footprint": int(unigram_types + bigram_edges),
+            "baseline_memory_steps": int(counter_mass),
+        }
 
     def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
         prefix = list(prefix) if prefix is not None else list(self.current_prefix)
@@ -776,7 +1323,7 @@ class BigramOnlyAgent(AdaptiveHRCAgent):
 
     def _set_bigram_gate(self, dist: Dict[str, float]) -> None:
         if not dist:
-            self._set_assist_gate(False, None, None, "baseline_empty")
+            self._set_action_policy_stats(None, None, "baseline_empty")
             return
         conf = max(float(v) for v in dist.values())
         ent = 0.0
@@ -785,8 +1332,7 @@ class BigramOnlyAgent(AdaptiveHRCAgent):
                 ent -= float(p) * math.log(float(p))
         if len(dist) > 1:
             ent /= math.log(len(dist))
-        threshold = self._action_confidence_threshold()
-        self._set_assist_gate(conf >= threshold, conf, ent, "baseline_policy" if conf >= threshold else "low_action_confidence")
+        self._set_action_policy_stats(conf, ent, "baseline_policy")
 
 
 class FrequencyConditionedBigramAgent(AdaptiveHRCAgent):
@@ -819,7 +1365,7 @@ class FrequencyConditionedBigramAgent(AdaptiveHRCAgent):
                 for action in entry.ordering: counts[action] = counts.get(action, 0.0) + float(entry.weight)
         total = float(sum(counts.values()))
         if total <= 0:
-            self._set_assist_gate(False, None, None, "baseline_empty")
+            self._set_action_policy_stats(None, None, "baseline_empty")
             return {}
         dist = {action: count / total for action, count in counts.items()}
         conf = max(dist.values())
@@ -827,29 +1373,8 @@ class FrequencyConditionedBigramAgent(AdaptiveHRCAgent):
         for p in dist.values():
             if p > 0: ent -= float(p) * math.log(float(p))
         if len(dist) > 1: ent /= math.log(len(dist))
-        threshold = self._action_confidence_threshold()
-        self._set_assist_gate(conf >= threshold, conf, ent, "baseline_policy" if conf >= threshold else "low_action_confidence")
+        self._set_action_policy_stats(conf, ent, "baseline_policy")
         return dist
-
-
-class UniformValidActionAgent(AdaptiveHRCAgent):
-    """Uniform over the tokens this agent has seen anywhere in any active demo.
-    The cheapest possible floor: no model, no learning, no preference signal; just "I've seen these tokens, so any of them could be next." Treats every candidate as equally likely. Useful as a sanity floor on every accuracy figure: any baseline below this is degenerate."""
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-
-    def _fit_heads(self, trajectories, weights) -> None:
-        # Vocabulary is built lazily from active demo tokens at predict time.
-        self._reset_heads()
-        self._custom_fit_stats = _symbolic_fit_stats("uniform_valid", trajectories, estimated_flops=0.0)
-
-    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
-        vocab: set = set()
-        for e in self.decay.active_entries(): vocab.update(e.ordering)
-        if not vocab: return {}
-        u = 1.0 / len(vocab)
-        return {a: u for a in vocab}
 
 
 class OracleCeilingAgent(AdaptiveHRCAgent):
@@ -950,23 +1475,11 @@ class MostFrequentNextAgent(AdaptiveHRCAgent):
 
 BASELINE_AGENTS = {
     "latest_only": LatestOnlyPreferenceAgent,
-    "no_replay": NoReplayAgent,
-    "uniform_weight": UniformWeightAgent,
     "fixed_decay": FixedDecayAgent,
     "no_decay": NoDecayAgent,
-    "l2_anchor": L2AnchorAgent,
     "bc": BehaviorCloningAgent,
     # Kirkpatrick et al. 2017: cumulative-Fisher, precision-weighted anchor.
     "ewc": EWCAgent,
-    # Sliding single-anchor variant (ablation: only last task protected).
-    "progressive_anchor_ewc": ProgressiveAnchorEWCAgent,
-    # Schwarz et al. 2018 EWC++: EMA of single-anchor Fisher and theta.
-    "online_ewc": OnlineEWCAgent,
     "experience_replay_bc": ExperienceReplayAgent,
-    "recency_prioritized_replay": RecencyPrioritizedReplayAgent,
     "bigram": BigramOnlyAgent,
-    "frequency_conditioned_bigram": FrequencyConditionedBigramAgent,
-    "most_frequent": MostFrequentNextAgent,
-    "uniform_valid": UniformValidActionAgent,
-    "oracle_ceiling": OracleCeilingAgent,
 }

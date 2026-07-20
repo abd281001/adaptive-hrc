@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .environment import CONTAINERS, INGREDIENTS, validate_ordering
+from .environment import CONTAINERS, INGREDIENTS, task_goal_signature, validate_ordering
 
 # Axes & presets
 INGREDIENT_FLOW_VALUES          = ("serial", "prep_first")
@@ -113,13 +113,13 @@ PRESET_PREFERENCES: Dict[str, WorkflowPreference] = {
     # P6: all non-default workflow axes for maximal restructuring.
     "p6_full_restructure": WorkflowPreference(ingredient_flow="prep_first",                 equipment_setup="frontloaded",                  serving_setup="frontloaded",                    cleanup_timing="as_soon_as_free",               seasoning_timing="late",                         container_loading_style="batch_before_cook",     cook_start_timing="deferred",                    serving_priority="cleanup_before_serve"),
     # P7-P10 isolate the newly added workflow axes so transfer experiments can hold out one axis family cleanly.
-    "p7_late_seasoning": WorkflowPreference(seasoning_timing="late"),
-    "p8_batch_container_loading": WorkflowPreference(container_loading_style="batch_before_cook"),
-    "p9_deferred_cook_start": WorkflowPreference(cook_start_timing="deferred"),
-    "p10_cleanup_before_serve": WorkflowPreference(serving_priority="cleanup_before_serve"),
+    "p7_late_seasoning":                    WorkflowPreference(seasoning_timing="late"),
+    "p8_batch_container_loading":           WorkflowPreference(container_loading_style="batch_before_cook"),
+    "p9_deferred_cook_start":               WorkflowPreference(cook_start_timing="deferred"),
+    "p10_cleanup_before_serve":             WorkflowPreference(serving_priority="cleanup_before_serve"),
     # Composed presets for non-diagonal preference-composition probes.
-    "p11_late_season_batch_load": WorkflowPreference(seasoning_timing="late",               container_loading_style="batch_before_cook"),
-    "p12_defer_cook_cleanup_before_serve": WorkflowPreference(cook_start_timing="deferred", serving_priority="cleanup_before_serve"),}
+    "p11_late_season_batch_load":           WorkflowPreference(seasoning_timing="late",                         container_loading_style="batch_before_cook"),
+    "p12_defer_cook_cleanup_before_serve":  WorkflowPreference(cook_start_timing="deferred",                    serving_priority="cleanup_before_serve"),}
 PREFERENCE_NAMES: Tuple[str, ...] = tuple(PRESET_PREFERENCES.keys())
 
 
@@ -397,6 +397,7 @@ class WorkflowPreferenceModifier:
 
     def modify_recipe_with_report(self, actions: Sequence[str], preference: WorkflowPreference) -> ModificationResult:
         if not _try_validate(actions):  raise ValueError("modify_recipe: input action list is already invalid")
+        base_goal = task_goal_signature(actions)
         modified = list(actions)
         applied: List[str] = []
         failed: List[str] = []
@@ -406,14 +407,15 @@ class WorkflowPreferenceModifier:
             value = prefs_dict[axis]
             before = list(modified)
             candidate = self.AXIS_FN[axis](modified, value)
-            if not _try_validate(candidate):
+            if not validate_ordering(candidate, expected_goal=base_goal):
                 failed.append(axis)
                 continue
             modified = list(candidate)
             if tuple(modified) != tuple(before): applied.append(axis)
             elif value != self.DEFAULT_VALUES[axis]: failed.append(axis)
             else: unchanged.append(axis)
-        if not _try_validate(modified):     raise ValueError("modify_recipe: composite preference reordering is invalid")
+        if not validate_ordering(modified, expected_goal=base_goal):
+            raise ValueError("modify_recipe: composite preference reordering is invalid or changes the task goal")
         result = ModificationResult(actions=modified, applied_axes=applied, failed_axes=failed, unchanged_axes=unchanged, axis_values=dict(prefs_dict))
         self.last_result = result
         return result
@@ -431,4 +433,14 @@ def materialize(actions: Sequence[str], preset_name: str) -> List[str]:
 def materialize_with_report(actions: Sequence[str], preset_name: str) -> ModificationResult:
     if preset_name not in PRESET_PREFERENCES:       raise KeyError(f"unknown preset {preset_name!r}; known: {sorted(PRESET_PREFERENCES)}")
     pref = PRESET_PREFERENCES[preset_name]
+    # Identity is the experimental control: it must preserve the generator's
+    # raw ordering exactly, rather than passing through a normalising modifier.
+    if preset_name == "identity":
+        return ModificationResult(
+            actions=list(actions),
+            applied_axes=[],
+            failed_axes=[],
+            unchanged_axes=list(WorkflowPreferenceModifier.AXIS_ORDER),
+            axis_values=dict(pref.as_dict()),
+        )
     return WorkflowPreferenceModifier().modify_recipe_with_report(actions, pref)

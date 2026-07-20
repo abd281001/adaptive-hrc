@@ -17,14 +17,12 @@ from .models import top_k
 @dataclass(frozen=True)
 class HRCTimingConfig:
     human_action_time: float = 4.0
-    robot_correct_action_time: float = 6.0
+    robot_correct_action_time: float = 4.0
     robot_wrong_action_time: float = 2.0
-    # Intervention/correction effort: noticing the error, interrupting current
-    # activity, and executing the correct action costs more than a pre-planned
-    # human step.  Equal to human_action_time collapses human_effort_fraction
-    # to human_action_fraction, making them redundant (identical floats).
-    human_correction_time: float = 5.0
-    wrong_action_extra_penalty: float = 3.0
+    # A correction bundles error recognition, state restoration, and the correct
+    # human action. It is one intervention event, but costs more than a planned
+    # human step because it includes undoing the robot's wrong action.
+    human_correction_time: float = 8.0
 
 
 DEFAULT_HRC_TIMING = HRCTimingConfig()
@@ -73,6 +71,24 @@ class HRCRobotTurn:
 
 
 @dataclass(frozen=True)
+class HRCHumanShadowTurn:
+    recipe_step: int
+    human_turn_idx: int
+    prefix: Tuple[str, ...]
+    actual: str
+    actual_action: str
+    distribution: Dict[str, float]
+    ranked: Tuple[str, ...]
+    predicted: Optional[str]
+    correct_top1: bool
+    correct_topk: bool
+    prediction_wall_s: float
+    scheduled_actor: str = "human"
+    executed_by: str = "human"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class HRCInteractionSummary:
     n_recipe_steps: int
     n_robot_turns: int
@@ -92,41 +108,63 @@ class HRCInteractionSummary:
     hrc_robot_wrong_time: float
     hrc_human_action_time: float
     hrc_human_correction_time: float
-    hrc_wrong_action_extra_penalty_time: float
-    human_action_fraction: float
     human_effort_time: float
-    human_effort_fraction: float
 
 
 @dataclass(frozen=True)
 class HRCInteractionTrace:
     robot_turns: Tuple[HRCRobotTurn, ...]
+    human_shadow_turns: Tuple[HRCHumanShadowTurn, ...]
     summary: HRCInteractionSummary
 
 
-def _action_distribution_stats(dist: Mapping[str, float], ranked: Sequence[str], predicted: Optional[str]) -> Dict[str, Optional[float]]:
+def _action_distribution_stats(
+    dist: Mapping[str, float],
+    ranked: Sequence[str],
+    predicted: Optional[str],
+    *,
+    normalization_vocab_size: Optional[int] = None,
+) -> Dict[str, Optional[float]]:
     predicted_confidence = float(dist.get(predicted, 0.0)) if predicted is not None else None
     ranked_probs = [float(dist.get(token, 0.0)) for token in ranked]
     margin = None
-    if ranked_probs:
-        margin = ranked_probs[0] - (ranked_probs[1] if len(ranked_probs) > 1 else 0.0)
+    if ranked_probs: margin = ranked_probs[0] - (ranked_probs[1] if len(ranked_probs) > 1 else 0.0)
     positive_probs = [float(p) for p in dist.values() if float(p) > 0.0]
-    if len(positive_probs) > 1:
-        entropy = -sum(p * math.log(max(p, 1e-12)) for p in positive_probs) / math.log(len(positive_probs))
-    elif len(positive_probs) == 1:
-        entropy = 0.0
-    else:
-        entropy = None
+    support_size = len(positive_probs)
+    raw_entropy = -sum(p * math.log(max(p, 1e-12)) for p in positive_probs) if positive_probs else None
+    vocab_entropy = None
+    if normalization_vocab_size is not None:
+        vocab_size = max(0, int(normalization_vocab_size))
+        if vocab_size > 1 and raw_entropy is not None:
+            vocab_entropy = float(raw_entropy) / math.log(vocab_size)
+        elif vocab_size == 1 and support_size <= 1:
+            vocab_entropy = 0.0
     return {
         "confidence": predicted_confidence,
         "margin": margin,
-        "entropy": entropy,
+        "entropy": vocab_entropy,
+        "raw_entropy": raw_entropy,
+        "active_vocab_normalized_entropy": vocab_entropy,
+        "support_size": float(support_size),
+        "normalization_vocab_size": float(normalization_vocab_size) if normalization_vocab_size is not None else None,
     }
 
 
-def policy_distribution_diagnostics(dist: Mapping[str, float], ranked: Sequence[str], predicted: Optional[str]) -> Dict[str, Any]:
+def policy_distribution_diagnostics(
+    dist: Mapping[str, float],
+    ranked: Sequence[str],
+    predicted: Optional[str],
+    *,
+    normalization_vocab_size: Optional[int] = None,
+    normalization_name: str = "active_memory_action_vocab",
+) -> Dict[str, Any]:
     """Return policy-distribution diagnostics for a scheduled robot turn."""
-    stats = _action_distribution_stats(dist, ranked, predicted)
+    stats = _action_distribution_stats(
+        dist,
+        ranked,
+        predicted,
+        normalization_vocab_size=normalization_vocab_size,
+    )
     confidence = stats["confidence"]
     margin = stats["margin"]
     entropy = stats["entropy"]
@@ -134,6 +172,15 @@ def policy_distribution_diagnostics(dist: Mapping[str, float], ranked: Sequence[
         "policy_confidence": confidence,
         "policy_margin": margin,
         "policy_entropy": entropy,
+        "policy_raw_entropy": stats["raw_entropy"],
+        "policy_active_vocab_normalized_entropy": stats["active_vocab_normalized_entropy"],
+        "policy_support_size": stats["support_size"],
+        "policy_entropy_normalization_vocab_size": stats["normalization_vocab_size"],
+        "policy_entropy_normalization": (
+            normalization_name
+            if stats["active_vocab_normalized_entropy"] is not None
+            else "unavailable_active_memory_action_vocab"
+        ),
     }
 
 
@@ -149,6 +196,7 @@ def run_alternating_hrc_episode(
     prob_floor: float,
     timing: HRCTimingConfig = DEFAULT_HRC_TIMING,
     capture_robot_metadata: Optional[Callable[[HRCDecisionContext], Mapping[str, Any]]] = None,
+    on_robot_feedback: Optional[Callable[[HRCDecisionContext], None]] = None,
 ) -> HRCInteractionTrace:
     """Run the intended HRC protocol: human first, then robot turns with correction."""
     robot_turn_next = False
@@ -168,13 +216,34 @@ def run_alternating_hrc_episode(
     hrc_robot_wrong_time = 0.0
     hrc_human_action_time = 0.0
     hrc_human_correction_time = 0.0
-    hrc_extra_penalty_time = 0.0
     robot_turns = []
+    human_shadow_turns = []
     floor = max(float(prob_floor), 1e-12)
 
     for idx, (obs, actual, action_label) in enumerate(zip(observations, actual_tokens, actual_actions)):
         if not robot_turn_next:
+            prefix = tuple(current_prefix())
             human_turn_count += 1
+            if human_turn_count > 1:
+                t_pred = time.perf_counter()
+                raw_dist = predict_distribution(prefix)
+                prediction_wall_s = time.perf_counter() - t_pred
+                dist = dict(raw_dist)
+                ranked = tuple(top_k(dist, k=max(1, int(topk))) if dist else ())
+                predicted = ranked[0] if ranked else None
+                human_shadow_turns.append(HRCHumanShadowTurn(
+                    recipe_step=idx,
+                    human_turn_idx=human_turn_count - 1,
+                    prefix=prefix,
+                    actual=actual,
+                    actual_action=action_label,
+                    distribution=dist,
+                    ranked=ranked,
+                    predicted=predicted,
+                    correct_top1=bool(ranked and ranked[0] == actual),
+                    correct_topk=bool(actual in ranked),
+                    prediction_wall_s=float(prediction_wall_s),
+                ))
             hrc_human_action_time += float(timing.human_action_time)
             hrc_total_time += float(timing.human_action_time)
             observe_ground_truth(obs, None)
@@ -213,11 +282,9 @@ def run_alternating_hrc_episode(
             step_time = (
                 float(timing.robot_wrong_action_time)
                 + float(timing.human_correction_time)
-                + float(timing.wrong_action_extra_penalty)
             )
             hrc_robot_wrong_time += float(timing.robot_wrong_action_time)
             hrc_human_correction_time += float(timing.human_correction_time)
-            hrc_extra_penalty_time += float(timing.wrong_action_extra_penalty)
             human_correction_count += 1
             robot_wrong_count += 1
             future_valid_wrong_count += int(future_valid_wrong)
@@ -240,6 +307,8 @@ def run_alternating_hrc_episode(
             prediction_wall_s=float(prediction_wall_s),
         )
         metadata = dict(capture_robot_metadata(context) or {}) if capture_robot_metadata is not None else {}
+        if on_robot_feedback is not None:
+            on_robot_feedback(context)
         hrc_total_time += step_time
         human_actions_so_far = human_turn_count + human_correction_count
         human_effort_time_so_far = (
@@ -273,14 +342,13 @@ def run_alternating_hrc_episode(
         observe_ground_truth(obs, dist)
 
     human_only_time = float(len(actual_tokens) * float(timing.human_action_time))
-    human_action_fraction = float((human_turn_count + human_correction_count) / max(1, len(actual_tokens)))
     human_effort_time = float(
         human_turn_count * float(timing.human_action_time)
         + human_correction_count * float(timing.human_correction_time)
     )
-    human_effort_fraction = float(human_effort_time / max(human_only_time, 1e-12)) if human_only_time > 0.0 else 0.0
     return HRCInteractionTrace(
         robot_turns=tuple(robot_turns),
+        human_shadow_turns=tuple(human_shadow_turns),
         summary=HRCInteractionSummary(
             n_recipe_steps=len(actual_tokens),
             n_robot_turns=robot_turn_idx,
@@ -300,9 +368,6 @@ def run_alternating_hrc_episode(
             hrc_robot_wrong_time=float(hrc_robot_wrong_time),
             hrc_human_action_time=float(hrc_human_action_time),
             hrc_human_correction_time=float(hrc_human_correction_time),
-            hrc_wrong_action_extra_penalty_time=float(hrc_extra_penalty_time),
-            human_action_fraction=human_action_fraction,
             human_effort_time=human_effort_time,
-            human_effort_fraction=human_effort_fraction,
         ),
     )

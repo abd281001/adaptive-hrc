@@ -23,6 +23,10 @@ class RecipePrototype:
     n_demos: int = 0
     mass: float = 0.0
     precedence_counts: Counter = field(default_factory=Counter)
+    start_token_counts: Counter = field(default_factory=Counter)
+    position_token_counts: Dict[int, Counter] = field(default_factory=dict)
+    adjacent_bigram_counts: Counter = field(default_factory=Counter)
+    adjacent_trigram_counts: Counter = field(default_factory=Counter)
     terminal_signatures: List[State] = field(default_factory=list)
 
     def fold_demo(self, tokens: Sequence[str], terminal_state: Optional[State], weight: float = 1.0) -> "RecipePrototype":
@@ -31,12 +35,24 @@ class RecipePrototype:
         new_action_set = frozenset(self.action_set | set(tokens))
         new_counts = Counter(self.action_counts)
         new_prec = Counter(self.precedence_counts)
+        new_start = Counter(self.start_token_counts)
+        new_position = {int(pos): Counter(counts) for pos, counts in self.position_token_counts.items()}
+        new_bigram = Counter(self.adjacent_bigram_counts)
+        new_trigram = Counter(self.adjacent_trigram_counts)
         for t in tokens: new_counts[t] += weight
         for i, a in enumerate(tokens):
             for b in tokens[i + 1:]: new_prec[(a, b)] += weight
+        if tokens:
+            new_start[tokens[0]] += weight
+        for i, token in enumerate(tokens):
+            new_position.setdefault(i, Counter())[token] += weight
+        for i in range(max(0, len(tokens) - 1)):
+            new_bigram[(tokens[i], tokens[i + 1])] += weight
+        for i in range(max(0, len(tokens) - 2)):
+            new_trigram[(tokens[i], tokens[i + 1], tokens[i + 2])] += weight
         new_signatures = list(self.terminal_signatures[-(MAX_TERMINAL_SIGNATURES - 1):])
         if terminal_state is not None: new_signatures.append(terminal_state)
-        return RecipePrototype(recipe_id=self.recipe_id, action_set=new_action_set, action_counts=new_counts, n_demos=self.n_demos + 1, mass=self.mass + weight, precedence_counts=new_prec, terminal_signatures=new_signatures)
+        return RecipePrototype(recipe_id=self.recipe_id, action_set=new_action_set, action_counts=new_counts, n_demos=self.n_demos + 1, mass=self.mass + weight, precedence_counts=new_prec, start_token_counts=new_start, position_token_counts=new_position, adjacent_bigram_counts=new_bigram, adjacent_trigram_counts=new_trigram, terminal_signatures=new_signatures)
 
 
 class RecipePrototypeLearner:
@@ -60,8 +76,31 @@ class RecipePrototypeLearner:
     def all(self) -> List[RecipePrototype]:
         return list(self.prototypes.values())
 
-    def remaining_action_mass(self, prefix_tokens: Sequence[str], recipe_id: str) -> Dict[str, float]:
+    @staticmethod
+    def _remaining_from_weighted_orderings(prefix_tokens: Sequence[str], variants: Sequence[Tuple[Sequence[str], float]]) -> Dict[str, float]:
+        counts: Counter = Counter()
+        mass = 0.0
+        for ordering, weight in variants:
+            w = max(0.0, float(weight if weight is not None else 1.0))
+            if w <= 0.0:
+                continue
+            mass += w
+            for tok in ordering:
+                counts[tok] += w
+        if mass <= 0.0:
+            return {}
+        used = Counter(prefix_tokens)
+        remaining: Dict[str, float] = {}
+        for tok, cnt in counts.items():
+            rem = max((float(cnt) / mass) - float(used.get(tok, 0)), 0.0)
+            if rem > 0.0:
+                remaining[tok] = rem
+        return remaining
+
+    def remaining_action_mass(self, prefix_tokens: Sequence[str], recipe_id: str, variants: Optional[Sequence[Tuple[Sequence[str], float]]] = None) -> Dict[str, float]:
         """Weighted remaining recipe actions after subtracting the observed prefix."""
+        if variants is not None:
+            return self._remaining_from_weighted_orderings(prefix_tokens, variants)
         proto = self.prototypes.get(recipe_id)
         if proto is None: return {}
         mass = max(float(proto.mass), 1.0)
@@ -76,33 +115,51 @@ class RecipePrototypeLearner:
 
     # scoring
     def recipe_match(self, prefix_tokens: Sequence[str], recipe_id: str) -> float:
-        """Compatibility between an observed prefix and this recipe's action set. Uses asymmetric overlap: the fraction of prefix tokens that appear in the recipe's known action set. Returns 0.0 if the recipe is unknown or the prefix is empty. This is intentionally coarse. 
-        Richer features such as object-role and state-effect signatures live in the prototype but are not used here yet. """
+        """Preference-invariant compatibility between an observed prefix and a recipe.
+
+        This deliberately ignores directional order. Recipe identity should
+        answer "are these actions part of this recipe?", while preference
+        prototypes own the order-sensitive evidence.
+        """
         proto = self.prototypes.get(recipe_id)
         if proto is None or not prefix_tokens or not proto.action_set: return 0.0
         prefix_set = set(prefix_tokens)
         if not prefix_set: return 0.0
-        overlap = len(prefix_set & proto.action_set) / max(len(prefix_set), 1)
+        fallback = max(0.0, min(1.0, float(getattr(self.cfg, "recipe_match_position_fallback", 0.0))))
+        matched_unique = len(prefix_set & proto.action_set)
+        precision = sum(1.0 for token in prefix_tokens if token in proto.action_set) / max(len(prefix_tokens), 1)
+        recall = matched_unique / max(len(proto.action_set), 1)
+        f1 = (2.0 * precision * recall / max(precision + recall, 1e-8)) if precision > 0.0 and recall > 0.0 else 0.0
         pairs = [(a, b) for i, a in enumerate(prefix_tokens) for b in prefix_tokens[i + 1:]]
-        if not pairs: return overlap
-        ok = 0.0
-        for a, b in pairs:
-            fwd = float(proto.precedence_counts.get((a, b), 0.0))
-            rev = float(proto.precedence_counts.get((b, a), 0.0))
-            ok += 1.0 if fwd >= rev and fwd > 0.0 else 0.0
+        cooccurrence_score = None
+        if pairs:
+            ok = 0.0
+            for a, b in pairs:
+                fwd = float(proto.precedence_counts.get((a, b), 0.0))
+                rev = float(proto.precedence_counts.get((b, a), 0.0))
+                if fwd > 0.0 or rev > 0.0:
+                    ok += 1.0
+                elif a in proto.action_set and b in proto.action_set:
+                    ok += fallback
+            cooccurrence_score = ok / max(len(pairs), 1)
         token_w = max(0.0, float(getattr(self.cfg, "recipe_match_token_weight", 0.70)))
         precedence_w = max(0.0, float(getattr(self.cfg, "recipe_match_precedence_weight", 0.30)))
+        if cooccurrence_score is None:
+            precedence_w = 0.0
         total_w = token_w + precedence_w
-        if total_w <= 0.0: return overlap
-        return (token_w * overlap + precedence_w * (ok / max(len(pairs), 1))) / total_w
+        if total_w <= 0.0: return f1
+        score = token_w * f1
+        if cooccurrence_score is not None:
+            score += precedence_w * cooccurrence_score
+        return score / total_w
 
-    def frontier(self, prefix_tokens: Sequence[str], recipe_id: str, variants: Sequence[Tuple[Sequence[str], float]], align_weight: float = 0.45) -> Dict[str, float]:
+    def frontier(self, prefix_tokens: Sequence[str], recipe_id: str, variants: Sequence[Tuple[Sequence[str], float]], align_weight: float = 0.45, remaining_variants: Optional[Sequence[Tuple[Sequence[str], float]]] = None) -> Dict[str, float]:
         """Distribution over plausible next tokens for this recipe. Exact variant alignment is only part of the signal. The remaining prototype mass keeps recipe-valid but unseen-order actions available so a preference prototype learned on another recipe can transfer."""
         aligned = self._align_frontier(prefix_tokens, variants)
         proto = self.prototypes.get(recipe_id)
         remaining: Dict[str, float] = {}
         if proto is not None:
-            remaining = self.remaining_action_mass(prefix_tokens, recipe_id)
+            remaining = self.remaining_action_mass(prefix_tokens, recipe_id, variants=remaining_variants)
             z = sum(remaining.values())
             if z > 0.0: remaining = {tok: v / z for tok, v in remaining.items()}
         if not aligned: return remaining
@@ -135,6 +192,24 @@ AXIS_SPLIT_THRESHOLD   = 0.35
 # Embedding
 SCALAR_FEATURES: Tuple[str, ...] = ("retrieval_before_first_add", "prep_before_first_add", "prep_completion_before_assembly", "serving_vessel_staging_time", "cleanup_delay_after_last_use", "appliance_activation_position", "container_setup_lead_time")
 CRITICAL_AXIS_FEATURES: Tuple[str, ...] = ("retrieval_before_first_add", "prep_before_first_add", "prep_completion_before_assembly", "cleanup_delay_after_last_use", "container_setup_lead_time")
+
+# These are workflow relations whose order can plausibly express a user
+# preference.  We deliberately exclude hard causal dependencies (for example,
+# serving before an ingredient is prepared), because those would make every
+# recipe look similar without representing a preference.  The role ontology is
+# task-interface knowledge; no preference label or recipe name enters this
+# representation.
+PREFERENCE_PRECEDENCE_PAIRS: Tuple[Tuple[str, str], ...] = (
+    (ROLE_RETRIEVE_CONTAINER, ROLE_RETRIEVE_INGREDIENT),
+    (ROLE_RETRIEVE_CONTAINER, ROLE_PREPARE_INGREDIENT),
+    (ROLE_RETRIEVE_INGREDIENT, ROLE_PREPARE_INGREDIENT),
+    (ROLE_RETRIEVE_INGREDIENT, ROLE_ADD_TO_CONTAINER),
+    (ROLE_PREPARE_INGREDIENT, ROLE_ADD_TO_CONTAINER),
+    (ROLE_ACTIVATE_APPLIANCE, ROLE_PREPARE_INGREDIENT),
+    (ROLE_ACTIVATE_APPLIANCE, ROLE_COOK_OR_BLEND),
+    (ROLE_CLEAN_CONTAINER, ROLE_SERVE),
+    (ROLE_STAGE_SERVING_VESSEL, ROLE_SERVE),
+)
 
 
 def _safe_div(a: float, b: float) -> float: return a / b if b > 0 else 0.0
@@ -193,6 +268,30 @@ def role_order_features(roles: Sequence[str]) -> Dict[str, float]:
     return feats
 
 
+def role_precedence_profile(roles: Sequence[str]) -> Dict[Tuple[str, str], float]:
+    """Return observed, recipe-normalized preference precedence evidence.
+
+    Each value is in ``[-1, 1]``.  ``+1`` means every instance of the first
+    role precedes every instance of the second; ``-1`` is the reverse.  Missing
+    roles are absent from the returned mapping rather than interpreted as an
+    ordering choice.  This lets two recipes compare only the workflow axes
+    they genuinely share.
+    """
+    positions: Dict[str, List[int]] = {}
+    for idx, role in enumerate(roles):
+        positions.setdefault(role, []).append(idx)
+    profile: Dict[Tuple[str, str], float] = {}
+    for first, second in PREFERENCE_PRECEDENCE_PAIRS:
+        first_pos = positions.get(first, ())
+        second_pos = positions.get(second, ())
+        if not first_pos or not second_pos:
+            continue
+        total = len(first_pos) * len(second_pos)
+        before = sum(1 for left in first_pos for right in second_pos if left < right)
+        profile[(first, second)] = 2.0 * _safe_div(float(before), float(total)) - 1.0
+    return profile
+
+
 def role_bigram_counts(roles: Sequence[str]) -> Counter:
     return Counter(role_bigrams(roles))
 
@@ -229,9 +328,15 @@ def _cosine(a: Dict, b: Dict) -> float:
 
 
 def build_embedding(roles: Sequence[str]) -> Dict[str, float]:
-    """Build a single concatenated, L2-normalized embedding for a role sequence. Keys are namespaced: ``scalar:<feature>``, ``bi:<r1>|<r2>``, ``tri:<r1>|<r2>|<r3>``."""
+    """Build a preference embedding with explicit reusable precedence axes.
+
+    Local role n-grams are retained as a sparse-data fallback, but the learner
+    gives shared precedence evidence priority during clustering and scoring.
+    """
     out: Dict[str, float] = {}
     for k, v in role_order_features(roles).items():             out[f"scalar:{k}"] = float(v)
+    for (first, second), value in role_precedence_profile(roles).items():
+        out[f"precedence:{first}|{second}"] = float(value)
     bigram_total = max(1, len(roles) - 1)
     for (a, b), c in role_bigram_counts(roles).items():         out[f"bi:{a}|{b}"] = c / bigram_total
     trigram_total = max(1, len(roles) - 2)
@@ -250,6 +355,13 @@ class PreferencePrototype:
     start_role_counts: Counter = field(default_factory=Counter)
     bigram_counts: Counter = field(default_factory=Counter)
     trigram_counts: Counter = field(default_factory=Counter)
+    bigram_context_totals: Counter = field(default_factory=Counter)
+    trigram_context_totals: Counter = field(default_factory=Counter)
+    # Only observed role pairs contribute support.  A missing role is not
+    # evidence for either ordering, which is essential when transferring
+    # between recipes with different ingredient/action inventories.
+    precedence_totals: Counter = field(default_factory=Counter)
+    precedence_support: Counter = field(default_factory=Counter)
     recipes_seen: set = field(default_factory=set)
 
     def update_from(self, demo_embedding: Dict[str, float], roles: Sequence[str], recipe_id: str, weight: float = 1.0) -> None:
@@ -272,8 +384,15 @@ class PreferencePrototype:
         self.mass = new_mass
         for name, value in role_order_features(roles).items(): self.scalar_totals[name] += weight * float(value)
         if roles:                         self.start_role_counts[roles[0]] += weight
-        for bg in role_bigrams(roles):  self.bigram_counts[bg] += weight
-        for tg in role_trigrams(roles): self.trigram_counts[tg] += weight
+        for bg in role_bigrams(roles):
+            self.bigram_counts[bg] += weight
+            self.bigram_context_totals[bg[0]] += weight
+        for tg in role_trigrams(roles):
+            self.trigram_counts[tg] += weight
+            self.trigram_context_totals[(tg[0], tg[1])] += weight
+        for pair, value in role_precedence_profile(roles).items():
+            self.precedence_totals[pair] += weight * float(value)
+            self.precedence_support[pair] += weight
         if recipe_id is not None:       self.recipes_seen.add(recipe_id)
 
     def bigram_distribution(self) -> Dict[Tuple[str, str], float]:
@@ -283,29 +402,74 @@ class PreferencePrototype:
         if self.mass <= 0.0: return {name: 0.0 for name in SCALAR_FEATURES}
         return {name: float(self.scalar_totals.get(name, 0.0)) / float(self.mass) for name in SCALAR_FEATURES}
 
+    def precedence_profile(self) -> Dict[Tuple[str, str], float]:
+        return {
+            pair: float(self.precedence_totals[pair]) / float(support)
+            for pair, support in self.precedence_support.items()
+            if float(support) > 0.0
+        }
+
 class PreferencePrototypeLearner:
     """Soft-clustering registry of latent preference prototypes.
     Decision rule per completed demo: material workflow-axis gaps create a new prototype; otherwise `max_sim >= MATCH_THRESHOLD` hard-updates the argmax; low-similarity/high-entropy cases create novelty; ambiguous cases soft-update the top prototypes."""
 
-    def __init__(self, match_threshold: float = MATCH_THRESHOLD, novelty_max_similarity: float = NOVELTY_MAX_SIMILARITY, novelty_entropy_min: float = NOVELTY_ENTROPY_MIN, tau_pref_cluster: float = TAU_PREF_CLUSTER, axis_split_threshold: float = AXIS_SPLIT_THRESHOLD, cfg: Optional[Any] = None) -> None:
+    def __init__(self, match_threshold: Optional[float] = None, novelty_max_similarity: Optional[float] = None, novelty_entropy_min: Optional[float] = None, tau_pref_cluster: Optional[float] = None, axis_split_threshold: Optional[float] = None, cfg: Optional[Any] = None) -> None:
         self.cfg = cfg
         self.prototypes: Dict[str, PreferencePrototype] = {}
         self._next_pref_id = 1
-        self.match_threshold = float(match_threshold)
-        self.novelty_max_similarity = float(novelty_max_similarity)
-        self.novelty_entropy_min = float(novelty_entropy_min)
-        self.tau_pref_cluster = float(tau_pref_cluster)
-        self.axis_split_threshold = float(axis_split_threshold)
+        self.match_threshold = float(getattr(cfg, "preference_match_threshold", MATCH_THRESHOLD) if match_threshold is None else match_threshold)
+        self.novelty_max_similarity = float(getattr(cfg, "preference_novelty_max_similarity", NOVELTY_MAX_SIMILARITY) if novelty_max_similarity is None else novelty_max_similarity)
+        self.novelty_entropy_min = float(getattr(cfg, "preference_novelty_entropy_min", NOVELTY_ENTROPY_MIN) if novelty_entropy_min is None else novelty_entropy_min)
+        self.tau_pref_cluster = float(getattr(cfg, "preference_cluster_temperature", TAU_PREF_CLUSTER) if tau_pref_cluster is None else tau_pref_cluster)
+        self.axis_split_threshold = float(getattr(cfg, "preference_axis_split_threshold", AXIS_SPLIT_THRESHOLD) if axis_split_threshold is None else axis_split_threshold)
+        self._cached_role_unigrams: Optional[Counter] = None
+        self._cached_role_unigram_total: float = 0.0
 
     def _new_pref_id(self) -> str:
         pid = f"P{self._next_pref_id}"
         self._next_pref_id += 1
         return pid
 
-    def _soft_assignment(self, embedding: Dict[str, float]) -> Tuple[Dict[str, float], List[Tuple[str, float]]]:
+    def _invalidate_cache(self) -> None:
+        self._cached_role_unigrams = None
+        self._cached_role_unigram_total = 0.0
+
+    def _precedence_similarity(
+        self,
+        profile: Mapping[Tuple[str, str], float],
+        proto: PreferencePrototype,
+    ) -> Tuple[Optional[float], int]:
+        proto_profile = proto.precedence_profile()
+        common = sorted(set(profile) & set(proto_profile))
+        if not common:
+            return None, 0
+        # Values live in [-1, 1], so this converts absolute disagreement into
+        # a bounded agreement score in [0, 1].
+        agreement = [1.0 - min(2.0, abs(float(profile[pair]) - float(proto_profile[pair]))) / 2.0 for pair in common]
+        return sum(agreement) / len(agreement), len(common)
+
+    def _prototype_similarity(
+        self,
+        embedding: Dict[str, float],
+        precedence_profile: Mapping[Tuple[str, str], float],
+        proto: PreferencePrototype,
+    ) -> float:
+        legacy = _cosine(embedding, proto.embedding)
+        precedence, n_common = self._precedence_similarity(precedence_profile, proto)
+        if precedence is None or n_common <= 0:
+            return legacy
+        weight = max(0.0, min(1.0, float(getattr(self.cfg, "preference_precedence_similarity_weight", 0.75))))
+        return weight * precedence + (1.0 - weight) * legacy
+
+    def _soft_assignment(
+        self,
+        embedding: Dict[str, float],
+        precedence_profile: Mapping[Tuple[str, str], float],
+    ) -> Tuple[Dict[str, float], List[Tuple[str, float]]]:
         """Return softmax(similarities / tau) + sorted similarity list."""
         sims: List[Tuple[str, float]] = []
-        for pid, proto in self.prototypes.items(): sims.append((pid, _cosine(embedding, proto.embedding)))
+        for pid, proto in self.prototypes.items():
+            sims.append((pid, self._prototype_similarity(embedding, precedence_profile, proto)))
         if not sims: return {}, []
         # softmax with temperature
         scaled = [(pid, s / max(self.tau_pref_cluster, 1e-8)) for pid, s in sims]
@@ -343,10 +507,13 @@ class PreferencePrototypeLearner:
             if not self.prototypes:
                 pid = self._new_pref_id()
                 self.prototypes[pid] = PreferencePrototype(pref_id=pid)
+                self._invalidate_cache()
                 return pid
             return next(iter(self.prototypes))
+        self._invalidate_cache()
         emb = build_embedding(roles)
         scalar_profile = role_order_features(roles)
+        precedence_profile = role_precedence_profile(roles)
 
         # Cold-start: first demo creates the seed prototype.
         if not self.prototypes:
@@ -356,12 +523,25 @@ class PreferencePrototypeLearner:
             self.prototypes[pid] = proto
             return pid
 
-        q, sims = self._soft_assignment(emb)
+        q, sims = self._soft_assignment(emb, precedence_profile)
         max_sim = sims[0][1] if sims else 0.0
         argmax_pid = sims[0][0] if sims else None
         h_norm = self._normalized_entropy(q)
 
-        if argmax_pid is not None and self._critical_axis_gap(scalar_profile, self.prototypes[argmax_pid].scalar_profile()) >= self.axis_split_threshold:
+        precedence_gap = 0.0
+        if argmax_pid is not None:
+            proto_precedence = self.prototypes[argmax_pid].precedence_profile()
+            common = set(precedence_profile) & set(proto_precedence)
+            precedence_gap = max(
+                (abs(float(precedence_profile[pair]) - float(proto_precedence[pair])) for pair in common),
+                default=0.0,
+            )
+        split_gap = max(
+            self._critical_axis_gap(scalar_profile, self.prototypes[argmax_pid].scalar_profile()) if argmax_pid is not None else 0.0,
+            precedence_gap,
+        )
+        precedence_split = float(getattr(self.cfg, "preference_precedence_split_threshold", self.axis_split_threshold))
+        if argmax_pid is not None and split_gap >= min(self.axis_split_threshold, precedence_split):
             pid = self._new_pref_id()
             proto = PreferencePrototype(pref_id=pid)
             proto.update_from(emb, roles, recipe_id or "", weight=weight)
@@ -385,29 +565,111 @@ class PreferencePrototypeLearner:
         for pid, _ in topk: self.prototypes[pid].update_from(emb, roles, recipe_id or "", weight=weight * q.get(pid, 0.0))
         return argmax_pid or next(iter(self.prototypes))
 
+    def _aggregate_role_unigram_counts(self) -> Counter:
+        if self._cached_role_unigrams is not None:
+            return Counter(self._cached_role_unigrams)
+        counts: Counter = Counter()
+        for proto in self.prototypes.values():
+            for role, count in proto.start_role_counts.items():
+                counts[role] += count
+            for (_a, b), count in proto.bigram_counts.items():
+                counts[b] += count
+        self._cached_role_unigrams = Counter(counts)
+        self._cached_role_unigram_total = float(sum(counts.values()))
+        return counts
+
     # scoring
     def score_prefix(self, prefix_roles: Sequence[str], pref_id: str) -> float:
-        """Log-probability proxy of an observed role prefix under prototype `pref_id`. Uses the first-role distribution plus smoothed bigrams, normalized by evidence count. Returns 0.0 (i.e. log 1.0) for an unknown prototype or empty prefix."""
+        """Cumulative role-order evidence for a prefix under one preference.
+
+        The score is a capped log-likelihood ratio against an active-support
+        role-unigram baseline. Unlike a per-token average, repeated correct
+        evidence can sharpen the posterior; the cap keeps this term comparable
+        to recipe and memory evidence on long prefixes.
+        """
         proto = self.prototypes.get(pref_id)
         if proto is None or not prefix_roles: return 0.0
-        bigrams = proto.bigram_distribution()
-        # Smoothing floor: avoid -inf for never-seen bigrams.
-        floor = 1.0 / max(1, sum(proto.bigram_counts.values()) + 1)
-        total = 0.0
-        n = 0
-        if proto.start_role_counts:
-            den0 = sum(proto.start_role_counts.values())
-            p0 = (proto.start_role_counts.get(prefix_roles[0], 0.0) + 0.1) / (den0 + 0.1 * len(ROLES))
-            total += math.log(max(p0, floor))
-            n += 1
-        for bg in role_bigrams(prefix_roles):
-            p = bigrams.get(bg, floor)
-            total += math.log(max(p, floor))
-            n += 1
-        return total / max(n, 1)
+        smooth = 0.1
+        n_roles = max(1, len(ROLES))
+        aggregate_roles = self._aggregate_role_unigram_counts()
+        aggregate_total = self._cached_role_unigram_total
+        proto_start_total = float(sum(proto.start_role_counts.values()))
+        proto_bigram_total = float(sum(proto.bigram_counts.values()))
 
-    def score_action_role(self, candidate_role: str, prefix_roles: Sequence[str], pref_id: str, candidate_roles: Optional[Sequence[str]] = None) -> float:
-        """Preference score for one candidate role under prototype `pref_id`. Local bigram/trigram evidence is blended with phase-level scalar cues (e.g., retrieve/prep before first add, early/late cleanup). The phase term is what makes a preference learned on one recipe transferable to a recipe with a different number of ingredients."""
+        def unigram_prob(role: str) -> float:
+            return (float(aggregate_roles.get(role, 0.0)) + smooth) / (aggregate_total + smooth * n_roles)
+
+        def start_prob(role: str) -> float:
+            return (float(proto.start_role_counts.get(role, 0.0)) + smooth) / (proto_start_total + smooth * n_roles)
+
+        def bigram_prob(bg: Tuple[str, str]) -> float:
+            return (float(proto.bigram_counts.get(bg, 0.0)) + smooth) / (proto_bigram_total + smooth * n_roles * n_roles)
+
+        total = 0.0
+        p0 = max(start_prob(prefix_roles[0]), _LOG_FLOOR)
+        b0 = max(unigram_prob(prefix_roles[0]), _LOG_FLOOR)
+        total += math.log(p0) - math.log(b0)
+        for bg in role_bigrams(prefix_roles):
+            p = max(bigram_prob(bg), _LOG_FLOOR)
+            baseline = max(unigram_prob(bg[0]) * unigram_prob(bg[1]), _LOG_FLOOR)
+            total += math.log(p) - math.log(baseline)
+        prefix_precedence = role_precedence_profile(prefix_roles)
+        proto_precedence = proto.precedence_profile()
+        common = set(prefix_precedence) & set(proto_precedence)
+        if common:
+            # Convert agreement in [0, 1] to centred evidence in [-1, 1].
+            # Unlike an absolute position feature, this compares only pairs
+            # available in the current recipe prefix.
+            precedence_evidence = sum(
+                1.0 - abs(float(prefix_precedence[pair]) - float(proto_precedence[pair]))
+                for pair in common
+            ) / len(common)
+            total += float(getattr(self.cfg, "preference_precedence_prefix_weight", 1.20)) * precedence_evidence
+        temp = max(float(getattr(self.cfg, "preference_prefix_llr_temperature", 1.0)), 1e-8)
+        cap = max(0.0, float(getattr(self.cfg, "preference_prefix_llr_cap", 8.0)))
+        total /= temp
+        if cap > 0.0:
+            total = max(-cap, min(cap, total))
+        return total
+
+    @staticmethod
+    def _precedence_action_score(
+        candidate_role: str,
+        candidate_roles: Sequence[str],
+        precedence_profile: Mapping[Tuple[str, str], float],
+    ) -> Optional[float]:
+        """Score whether executing ``candidate_role`` now obeys known axes.
+
+        The candidate set is recipe-derived.  Consequently this is an ordering
+        preference over available actions, not a Full-only feasibility mask.
+        """
+        remaining = Counter(candidate_roles)
+        scores: List[float] = []
+        for (first, second), preference in precedence_profile.items():
+            if candidate_role == first and remaining.get(second, 0) > 0:
+                scores.append((float(preference) + 1.0) / 2.0)
+            elif candidate_role == second and remaining.get(first, 0) > 0:
+                scores.append((1.0 - float(preference)) / 2.0)
+        if not scores:
+            return None
+        # Preserve a nonzero floor so a noisy single correction cannot make
+        # a recipe-supported action mathematically impossible.
+        return max(0.05, min(1.0, sum(scores) / len(scores)))
+
+    def score_action_role(
+        self,
+        candidate_role: str,
+        prefix_roles: Sequence[str],
+        pref_id: str,
+        candidate_roles: Optional[Sequence[str]] = None,
+        session_precedence: Optional[Mapping[Tuple[str, str], float]] = None,
+    ) -> float:
+        """Score an available role from reusable precedence first, local cues second.
+
+        ``session_precedence`` is temporary evidence from human corrections in
+        the current interaction.  It is supplied by the agent and never folded
+        into a persistent prototype here.
+        """
         proto = self.prototypes.get(pref_id)
         if proto is None or candidate_role not in ROLES: return 0.0
         bg = proto.bigram_counts
@@ -416,15 +678,42 @@ class PreferencePrototypeLearner:
         if len(prefix_roles) >= 2 and tg:
             last_two = (prefix_roles[-2], prefix_roles[-1])
             num = tg.get((last_two[0], last_two[1], candidate_role), 0)
-            den = sum(c for k, c in tg.items() if k[0] == last_two[0] and k[1] == last_two[1])
+            den = proto.trigram_context_totals.get(last_two, 0)
             if den > 0: local = (num + 0.1) / (den + 0.1 * len(ROLES))
         elif len(prefix_roles) >= 1 and bg:
             last = prefix_roles[-1]
             num = bg.get((last, candidate_role), 0)
-            den = sum(c for k, c in bg.items() if k[0] == last)
+            den = proto.bigram_context_totals.get(last, 0)
             if den > 0: local = (num + 0.1) / (den + 0.1 * len(ROLES))
         phase = self._phase_action_score(candidate_role, prefix_roles, proto, candidate_roles)
-        return max(1e-6, 0.20 * local + 0.80 * phase)
+        candidates = list(candidate_roles or ())
+        persistent_precedence = self._precedence_action_score(
+            candidate_role,
+            candidates,
+            proto.precedence_profile(),
+        )
+        session_score = self._precedence_action_score(
+            candidate_role,
+            candidates,
+            session_precedence or {},
+        )
+        if persistent_precedence is None and session_score is None:
+            return max(1e-6, 0.20 * local + 0.80 * phase)
+        if persistent_precedence is None:
+            precedence = float(session_score)
+        elif session_score is None:
+            precedence = float(persistent_precedence)
+        else:
+            session_weight = max(0.0, min(1.0, float(getattr(self.cfg, "session_correction_precedence_weight", 0.75))))
+            precedence = (1.0 - session_weight) * float(persistent_precedence) + session_weight * float(session_score)
+        precedence_weight = max(0.0, min(1.0, float(getattr(self.cfg, "preference_precedence_action_weight", 0.65))))
+        legacy = 0.25 * local + 0.75 * phase
+        # Map [0, 1] precedence agreement into a positive ordering factor.  A
+        # strong reusable ordering must be able to overcome recipe-frontier
+        # frequency mass; otherwise it cannot transfer an unseen permutation.
+        precedence_factor = 0.20 + 1.80 * precedence
+        preference_score = precedence_weight * precedence_factor + (1.0 - precedence_weight) * legacy
+        return max(1e-6, preference_score)
 
     def _phase_action_score(self, candidate_role: str, prefix_roles: Sequence[str], proto: PreferencePrototype, candidate_roles: Optional[Sequence[str]] = None) -> float:
         def cfg_float(name: str, default: float) -> float: return float(getattr(self.cfg, name, default))
@@ -475,24 +764,22 @@ _LOG_FLOOR = 1e-6
 class MemoryPrior:
     state: str
     active_weight: float = 0.0
-    sessions_since_pruned: Optional[int] = None
-    is_latest: bool = False
 
 
 @dataclass
 class PosteriorWeights:
-    """Calibration knobs for normalized posterior expert combination."""
+    """Calibration knobs for raw-evidence posterior expert combination."""
     alpha_recipe: float = 1.0
     alpha_pref:   float = 1.5
     alpha_memory: float = 0.5
+    alpha_compat: float = 0.5
     temperature_recipe: float = 1.0
     temperature_pref:   float = 1.0
     temperature_memory: float = 1.0
+    temperature_compat: float = 1.0
     global_temperature: float = 1.0
     memory_prior_floor: float = 1e-6
     active_prior_floor: float = 0.05
-    pruned_prior_initial: float = 0.50
-    pruned_prior_half_life: float = 10.0
     absent_prior: float = 0.10
 
 
@@ -523,8 +810,8 @@ class OnlinePreferencePosterior:
     def reset(self) -> None:
         self._joint = {}
 
-    def update(self, prefix_tokens: Sequence[str], prefix_roles: Sequence[str], recipe_protos: RecipePrototypeLearner, pref_protos:   PreferencePrototypeLearner, memory_state_for_recipe) -> Dict[Tuple[str, str], float]:
-        """Recompute the posterior from normalized recipe, preference, and memory experts."""
+    def update(self, prefix_tokens: Sequence[str], prefix_roles: Sequence[str], recipe_protos: RecipePrototypeLearner, pref_protos:   PreferencePrototypeLearner, memory_state_for_recipe, memory_state_for_pair=None, compatibility_for_pair=None) -> Dict[Tuple[str, str], float]:
+        """Recompute the posterior from calibrated raw expert evidence."""
         recipe_ids = [p.recipe_id for p in recipe_protos.all()]
         if not recipe_ids:  recipe_ids = [self.UNSEEN_RECIPE]
         pref_ids = pref_protos.all_pref_ids()
@@ -533,14 +820,26 @@ class OnlinePreferencePosterior:
         log_recipe = {rid: self._log_p_recipe(prefix_tokens, rid, recipe_protos) for rid in recipe_ids}
         log_pref = {pid: self._log_p_pref(prefix_roles, pid, pref_protos) for pid in pref_ids}
         memory_priors = {rid: (MemoryPrior("absent") if rid == self.UNSEEN_RECIPE else self._coerce_memory_prior(memory_state_for_recipe(rid))) for rid in recipe_ids}
-        log_memory = {rid: self._log_p_memory(prior, self.weights) for rid, prior in memory_priors.items()}
-        p_recipe = _softmax_log_values(log_recipe, self.weights.temperature_recipe)
-        p_pref = _softmax_log_values(log_pref, self.weights.temperature_pref)
-        p_memory = _softmax_log_values(log_memory, self.weights.temperature_memory)
         log_scores: Dict[Tuple[str, str], float] = {}
         for rid in recipe_ids:
             for pid in pref_ids:
-                score = (self.weights.alpha_recipe * math.log(max(p_recipe.get(rid, 0.0), _LOG_FLOOR)) + self.weights.alpha_pref * math.log(max(p_pref.get(pid, 0.0), _LOG_FLOOR)) + self.weights.alpha_memory * math.log(max(p_memory.get(rid, 0.0), _LOG_FLOOR)))
+                if callable(memory_state_for_pair) and rid != self.UNSEEN_RECIPE and pid != self.UNSEEN_PREF:
+                    pair_prior = self._coerce_memory_prior(memory_state_for_pair(rid, pid))
+                else:
+                    pair_prior = memory_priors.get(rid, MemoryPrior("absent"))
+                compat = 1.0
+                if callable(compatibility_for_pair) and rid != self.UNSEEN_RECIPE and pid != self.UNSEEN_PREF:
+                    try:
+                        compat = float(compatibility_for_pair(rid, pid))
+                    except Exception:
+                        compat = 1.0
+                log_compat = math.log(max(float(compat), _LOG_FLOOR))
+                score = (
+                    self.weights.alpha_recipe * self._temperature_scale(log_recipe.get(rid, math.log(_LOG_FLOOR)), self.weights.temperature_recipe)
+                    + self.weights.alpha_pref * self._temperature_scale(log_pref.get(pid, 0.0), self.weights.temperature_pref)
+                    + self.weights.alpha_memory * self._temperature_scale(self._log_p_memory(pair_prior, self.weights), self.weights.temperature_memory)
+                    + self.weights.alpha_compat * self._temperature_scale(log_compat, self.weights.temperature_compat)
+                )
                 log_scores[(rid, pid)] = score
 
         # Softmax-normalize.
@@ -551,9 +850,13 @@ class OnlinePreferencePosterior:
         return self._joint
 
     @staticmethod
+    def _temperature_scale(log_score: float, temperature: float) -> float:
+        return float(log_score) / max(float(temperature), 1e-8)
+
+    @staticmethod
     def _coerce_memory_prior(value: Any) -> MemoryPrior:
         if isinstance(value, MemoryPrior):  return value
-        if isinstance(value, Mapping):      return MemoryPrior(state=str(value.get("state", "absent")), active_weight=float(value.get("active_weight", 0.0) or 0.0), sessions_since_pruned=value.get("sessions_since_pruned"), is_latest=bool(value.get("is_latest", False)))
+        if isinstance(value, Mapping):      return MemoryPrior(state=str(value.get("state", "absent")), active_weight=float(value.get("active_weight", 0.0) or 0.0))
         state = str(value)
         if state == "active":               return MemoryPrior("active", active_weight=1.0)
         return MemoryPrior(state)
@@ -562,34 +865,23 @@ class OnlinePreferencePosterior:
     def _log_p_recipe(prefix_tokens: Sequence[str], rid: str, recipe_protos: RecipePrototypeLearner) -> float:
         """log P(prefix | recipe). Uses the prototype's recipe_match score as a calibrated similarity in [0, 1]."""
         if rid == OnlinePreferencePosterior.UNSEEN_RECIPE:  return math.log(_LOG_FLOOR * 5)
-        proto = recipe_protos.get(rid)
         match = recipe_protos.recipe_match(prefix_tokens, rid)
-        mass = 1.0 if proto is None else max(float(proto.mass), 1.0)
-        return math.log(max(match, _LOG_FLOOR)) + 0.10 * math.log(mass)
+        return math.log(max(match, _LOG_FLOOR))
 
     @staticmethod
     def _log_p_pref(prefix_roles: Sequence[str], pid: str, pref_protos: PreferencePrototypeLearner) -> float:
-        """log P(prefix | preference). The prototype's score_prefix already returns a length-normalized log-probability; we pass it through."""
+        """Preference prefix evidence as a capped role-order log-likelihood ratio."""
         if pid == OnlinePreferencePosterior.UNSEEN_PREF:    return math.log(_LOG_FLOOR * 5)
-        proto = pref_protos.prototypes.get(pid)
-        mass = 1.0 if proto is None else max(float(proto.mass), 1.0)
-        return pref_protos.score_prefix(prefix_roles, pid) + 0.10 * math.log(mass)
+        return pref_protos.score_prefix(prefix_roles, pid)
 
     @staticmethod
     def _log_p_memory(prior: MemoryPrior, weights: PosteriorWeights) -> float:
-        """Continuous memory prior with active weights and pruned half-life."""
+        """Continuous memory prior derived only from active replay weight."""
         floor = max(float(weights.memory_prior_floor), _LOG_FLOOR)
-        if prior.is_latest:
-            return math.log(1.0)
         if prior.state == "active":
             active_weight = max(0.0, min(1.0, float(prior.active_weight)))
             p = float(weights.active_prior_floor) + (1.0 - float(weights.active_prior_floor)) * active_weight
             return math.log(max(p, floor))
-        if prior.state == "pruned":
-            half_life = max(float(weights.pruned_prior_half_life), 1.0)
-            sessions = max(0.0, float(prior.sessions_since_pruned or 0.0))
-            discount = 2.0 ** (-(sessions / half_life))
-            return math.log(max(float(weights.pruned_prior_initial) * discount, floor))
         return math.log(max(float(weights.absent_prior), floor))
 
     # queries

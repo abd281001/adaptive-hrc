@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
+import hashlib
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
@@ -44,8 +45,7 @@ def observations_from_actions(actions: Sequence[str]) -> List[ActionObservation]
     out: List[ActionObservation] = []
     for action in actions:
         before = tuple(tracker.get_state_vector().astype(int).tolist())
-        try:                tracker.apply_action(action)
-        except ValueError:  pass        # Corruption/OOD stress tests deliberately inject impossible actions.  The observed state does not change; the binary action vector therefore becomes the zero transition.
+        tracker.apply_action(action)
         after = tuple(tracker.get_state_vector().astype(int).tolist())
         vec = transition_vector(before, after)
         out.append(ActionObservation(before, vec, after))
@@ -107,6 +107,49 @@ def _build_index_sets():
 
 _INDEX_SETS = _build_index_sets()
 _CONTAINER_SET = set(CONTAINERS)
+_INGREDIENT_LOCATION_INDICES = frozenset(
+    index
+    for index, (item, _location) in _INDEX_SETS["at_location"].items()
+    if item in INGREDIENTS
+)
+
+
+def identity_transition_vector(before: Sequence[int], after: Sequence[int]) -> ActionVector:
+    """Canonicalize a transition for recipe identity without changing policy data.
+
+    Moving a container transports its current contents, so the raw state delta
+    differs between an empty and loaded move even though the demonstrated
+    semantic operation is identical.  For identity only, remove ingredient
+    location deltas whenever a container changes location.  Container identity,
+    source/destination, loading, processing, and all other effects remain.
+
+    The decoder uses only observed state differences and the fixed feature
+    ontology; no simulator action string, recipe id, or preference label enters
+    this representation.
+    """
+    raw = list(transition_vector(before, after))
+    n = min(len(before), len(after))
+    if len(raw) != 2 * n:
+        return tuple(raw)
+    moved_container = any(
+        item in _CONTAINER_SET
+        and int(before[index]) != int(after[index])
+        for index, (item, _location) in _INDEX_SETS["at_location"].items()
+        if index < n
+    )
+    if moved_container:
+        for index in _INGREDIENT_LOCATION_INDICES:
+            if index < n:
+                raw[index] = 0
+                raw[n + index] = 0
+    return tuple(int(value) for value in raw)
+
+
+def identity_token_from_observation(observation: ActionObservation) -> str:
+    """Stable anonymous recipe-identity token for one observed transition."""
+    vector = identity_transition_vector(observation.state, observation.next_state)
+    payload = bytes(vector)
+    return "identity_" + hashlib.sha256(payload).hexdigest()[:16]
 
 def _diff_indices(before: Sequence[int], after: Sequence[int]):
     """Return (turned_on, turned_off) as lists of feature indices."""
@@ -209,6 +252,7 @@ class PreferenceSignature:
     scalar_features: Tuple[Tuple[str, float], ...]
     role_bigrams: Tuple[Tuple[Tuple[str, str], int], ...]
     role_trigrams: Tuple[Tuple[Tuple[str, str, str], int], ...]
+    precedence_features: Tuple[Tuple[Tuple[str, str], float], ...] = ()
 
 
 def _sorted_counts(counter: Counter) -> Tuple[Tuple, ...]:
@@ -258,4 +302,30 @@ def task_signature_from_tokens(tokens: Sequence[str], token_to_action_vector: Ma
 def preference_signature_from_roles(roles: Sequence[str]) -> PreferenceSignature:
     """Build a transferable preference signature from role order only."""
     features = _role_order_scalar_features(list(roles))
-    return PreferenceSignature(scalar_features=tuple(sorted((k, float(v)) for k, v in features.items())),       role_bigrams=_sorted_counts(Counter(role_bigrams(roles))),      role_trigrams=_sorted_counts(Counter(role_trigrams(roles))))
+    positions: Dict[str, List[int]] = {}
+    for idx, role in enumerate(roles):
+        positions.setdefault(role, []).append(idx)
+    precedence: Dict[Tuple[str, str], float] = {}
+    for first, second in (
+        (ROLE_RETRIEVE_CONTAINER, ROLE_RETRIEVE_INGREDIENT),
+        (ROLE_RETRIEVE_CONTAINER, ROLE_PREPARE_INGREDIENT),
+        (ROLE_RETRIEVE_INGREDIENT, ROLE_PREPARE_INGREDIENT),
+        (ROLE_RETRIEVE_INGREDIENT, ROLE_ADD_TO_CONTAINER),
+        (ROLE_PREPARE_INGREDIENT, ROLE_ADD_TO_CONTAINER),
+        (ROLE_ACTIVATE_APPLIANCE, ROLE_PREPARE_INGREDIENT),
+        (ROLE_ACTIVATE_APPLIANCE, ROLE_COOK_OR_BLEND),
+        (ROLE_CLEAN_CONTAINER, ROLE_SERVE),
+        (ROLE_STAGE_SERVING_VESSEL, ROLE_SERVE),
+    ):
+        left, right = positions.get(first, ()), positions.get(second, ())
+        if not left or not right:
+            continue
+        total = len(left) * len(right)
+        before = sum(1 for lidx in left for ridx in right if lidx < ridx)
+        precedence[(first, second)] = 2.0 * (before / total) - 1.0
+    return PreferenceSignature(
+        scalar_features=tuple(sorted((k, float(v)) for k, v in features.items())),
+        role_bigrams=_sorted_counts(Counter(role_bigrams(roles))),
+        role_trigrams=_sorted_counts(Counter(role_trigrams(roles))),
+        precedence_features=tuple(sorted(precedence.items())),
+    )

@@ -37,7 +37,7 @@ LOCATIONS   = ["storage", "prep_station", "cooking_station", "plating_station", 
 # ═════════════════════════════════════════════════════════════════════════════
 class StateTracker:
     """PDDL-style kitchen simulator with a class-shared feature map. 
-    Feature names are systematic e.g. `tomato_at_prep_station`, `pot_contains_rice`, `chicken_cooked`, `stove_on`, .. so the feature dimension is fully determined by the vocabulary constants above. This is what makes IRL warm-starting valid across retrains: the weight vector's length never changes.
+    Feature names are systematic e.g. `tomato_at_prep_station`, `pot_contains_rice`, `chicken_cooked`, `stove_on`, .. so the feature dimension is fully determined by the vocabulary constants above. This keeps the state representation stable for any caller that intentionally preserves model parameters across fits.
     """
 
     # Shared across all instances — built lazily on first __init__.
@@ -114,10 +114,13 @@ class StateTracker:
         return None
 
     # ─── action dispatch ─────────────────────────────────────────────────────
-    def apply_action(self, action_str):
+    def apply_action(self, action_str, *, enforce_preconditions: bool = False):
         """Parse and apply an action like ``transfer (tomato, from=storage, to=prep_station)``.
 
-        Each branch enforces its own preconditions and raises ValueError on violation. Action strings come verbatim from `RecipeGenerator` demos, so precondition failures indicate a recipe bug, not a runtime user error.
+        By default this is a simulation replay operator: precondition failures
+        do not create no-op transitions, so preference-reordered demonstrations
+        still produce learner-facing state changes.  Callers that validate a
+        candidate ordering should pass ``enforce_preconditions=True``.
         """
         action_str = action_str.strip()
 
@@ -129,14 +132,18 @@ class StateTracker:
         def _loc(part):
             return part.split("=")[1] if "=" in part else part
 
+        def _require(condition, msg):
+            if enforce_preconditions and not condition:
+                raise ValueError(msg)
+
         # ── transfer (item, from=L1, to=L2) — move a free item between locations
         if action_str.startswith("transfer"):
             parts    = _parse(action_str)
             item     = parts[0]
             from_loc = _loc(parts[1])
             to_loc   = _loc(parts[2])
-            if self.get_feature(f"{item}_at_{from_loc}") != 1:          raise ValueError(f"Precondition failed: {item} not at {from_loc}")
-            if self.is_contained(item):                                 raise ValueError(f"Precondition failed: {item} is contained")
+            _require(self.get_feature(f"{item}_at_{from_loc}") == 1, f"Precondition failed: {item} not at {from_loc}")
+            _require(not self.is_contained(item), f"Precondition failed: {item} is contained")
             self.set_feature(f"{item}_at_{from_loc}", 0)
             self.set_feature(f"{item}_at_{to_loc}",   1)
 
@@ -144,9 +151,9 @@ class StateTracker:
         elif action_str.startswith("load"):
             parts     = _parse(action_str)
             item      = parts[0]; container = parts[1]; location = parts[2]
-            if self.get_feature(f"{item}_at_{location}") != 1:          raise ValueError(f"Precondition failed: {item} not at {location}")
-            if self.get_feature(f"{container}_at_{location}") != 1:     raise ValueError(f"Precondition failed: {container} not at {location}")
-            if self.is_contained(item):                                 raise ValueError(f"Precondition failed: {item} already contained")
+            _require(self.get_feature(f"{item}_at_{location}") == 1, f"Precondition failed: {item} not at {location}")
+            _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
+            _require(not self.is_contained(item), f"Precondition failed: {item} already contained")
             self.set_feature(f"{item}_at_{location}", 0)
             self.set_feature(f"{container}_contains_{item}", 1)
 
@@ -154,8 +161,8 @@ class StateTracker:
         elif action_str.startswith("unload"):
             parts     = _parse(action_str)
             item      = parts[0]; container = parts[1]; location = parts[2]
-            if self.get_feature(f"{container}_contains_{item}") != 1:   raise ValueError(f"Precondition failed: {item} not in {container}")
-            if self.get_feature(f"{container}_at_{location}") != 1:     raise ValueError(f"Precondition failed: {container} not at {location}")
+            _require(self.get_feature(f"{container}_contains_{item}") == 1, f"Precondition failed: {item} not in {container}")
+            _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
             self.set_feature(f"{container}_contains_{item}", 0)
             self.set_feature(f"{item}_at_{location}", 1)
 
@@ -163,7 +170,7 @@ class StateTracker:
         elif action_str.startswith("move_container"):
             parts     = _parse(action_str)
             container = parts[0]; from_loc = _loc(parts[1]); to_loc = _loc(parts[2])
-            if self.get_feature(f"{container}_at_{from_loc}") != 1:     raise ValueError(f"Precondition failed: {container} not at {from_loc}")
+            _require(self.get_feature(f"{container}_at_{from_loc}") == 1, f"Precondition failed: {container} not at {from_loc}")
             self.set_feature(f"{container}_at_{from_loc}", 0)
             self.set_feature(f"{container}_at_{to_loc}", 1)
             # Drag along every ingredient currently held by this container.
@@ -177,8 +184,8 @@ class StateTracker:
             parts    = _parse(action_str)
             item     = parts[0]
             location = parts[1] if len(parts) > 1 else "prep_station"
-            if item not in CUTTABLES:                                   raise ValueError(f"Precondition failed: {item} is not cuttable")
-            if self.get_feature(f"{item}_at_{location}") != 1:          raise ValueError(f"Precondition failed: {item} not at {location}")
+            _require(item in CUTTABLES, f"Precondition failed: {item} is not cuttable")
+            _require(self.get_feature(f"{item}_at_{location}") == 1, f"Precondition failed: {item} not at {location}")
             self.set_feature(f"{item}_cut", 1)
 
         # ── grate (item, location=prep_station)
@@ -186,8 +193,8 @@ class StateTracker:
             parts    = _parse(action_str)
             item     = parts[0]
             location = parts[1] if len(parts) > 1 else "prep_station"
-            if item not in GRATABLE:                                    raise ValueError(f"Precondition failed: {item} is not gratable")
-            if self.get_feature(f"{item}_at_{location}") != 1:          raise ValueError(f"Precondition failed: {item} not at {location}")
+            _require(item in GRATABLE, f"Precondition failed: {item} is not gratable")
+            _require(self.get_feature(f"{item}_at_{location}") == 1, f"Precondition failed: {item} not at {location}")
             self.set_feature(f"{item}_grated", 1)
 
         # ── cook (item, container=pot, location=cooking_station) — single-item cook. Both "cook " and "cook(" prefixes accepted so we don't collide with cook_contents.
@@ -196,10 +203,10 @@ class StateTracker:
             item      = parts[0]
             container = parts[1] if len(parts) > 1 else "pot"
             location  = parts[2] if len(parts) > 2 else "cooking_station"
-            if item not in COOKABLES:                                   raise ValueError(f"Precondition failed: {item} is not cookable")
-            if self.get_feature(f"{container}_contains_{item}") != 1:   raise ValueError(f"Precondition failed: {item} not in {container}")
-            if self.get_feature(f"{container}_at_{location}") != 1:     raise ValueError(f"Precondition failed: {container} not at {location}")
-            if location == "cooking_station" and self.get_feature("stove_on") != 1:     raise ValueError("Precondition failed: stove not on")
+            _require(item in COOKABLES, f"Precondition failed: {item} is not cookable")
+            _require(self.get_feature(f"{container}_contains_{item}") == 1, f"Precondition failed: {item} not in {container}")
+            _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
+            _require(location != "cooking_station" or self.get_feature("stove_on") == 1, "Precondition failed: stove not on")
             self.set_feature(f"{item}_cooked", 1)
 
         # ── cook_contents (container, location) — cook every cookable ingredient inside
@@ -207,8 +214,16 @@ class StateTracker:
             parts     = _parse(action_str)
             container = parts[0]
             location  = parts[1] if len(parts) > 1 else "cooking_station"
-            if self.get_feature(f"{container}_at_{location}") != 1:                     raise ValueError(f"Precondition failed: {container} not at {location}")
-            if location == "cooking_station" and self.get_feature("stove_on") != 1:     raise ValueError("Precondition failed: stove not on")
+            _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
+            _require(location != "cooking_station" or self.get_feature("stove_on") == 1, "Precondition failed: stove not on")
+            _require(
+                any(
+                    self.get_feature(f"{container}_contains_{ingredient}") == 1
+                    and ingredient in COOKABLES
+                    for ingredient in INGREDIENTS
+                ),
+                f"Precondition failed: {container} contains no cookable ingredients",
+            )
             for ingredient in INGREDIENTS:
                 if (self.get_feature(f"{container}_contains_{ingredient}") == 1 and ingredient in COOKABLES): self.set_feature(f"{ingredient}_cooked", 1)
 
@@ -217,9 +232,9 @@ class StateTracker:
             parts     = _parse(action_str)
             container = parts[0]
             location  = parts[1] if len(parts) > 1 else None
-            if location and self.get_feature(f"{container}_at_{location}") != 1:        raise ValueError(f"Precondition failed: {container} not at {location}")
+            _require(not location or self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
             contained = [ing for ing in INGREDIENTS if ing != "mixture" and self.get_feature(f"{container}_contains_{ing}") == 1]
-            if len(contained) < 2:                                                      raise ValueError(f"combine requires >=2 ingredients in {container}")
+            _require(len(contained) >= 2, f"combine requires >=2 ingredients in {container}")
             for ing in contained:
                 self.set_feature(f"{container}_contains_{ing}", 0)
                 self.set_feature(f"{ing}_in_mixture", 1)
@@ -231,8 +246,8 @@ class StateTracker:
             parts     = _parse(action_str)
             container = parts[0]; seasoning = parts[1]
             location  = parts[2] if len(parts) > 2 else None
-            if seasoning not in SEASONINGS:                                             raise ValueError(f"{seasoning} is not a seasoning")
-            if location and self.get_feature(f"{container}_at_{location}") != 1:        raise ValueError(f"{container} not at {location}")
+            _require(seasoning in SEASONINGS, f"{seasoning} is not a seasoning")
+            _require(not location or self.get_feature(f"{container}_at_{location}") == 1, f"{container} not at {location}")
             for ing in INGREDIENTS:
                 if self.get_feature(f"{container}_contains_{ing}") == 1:
                     self.set_feature(f"{ing}_seasoned", 1)
@@ -243,8 +258,8 @@ class StateTracker:
             parts     = _parse(action_str)
             target    = parts[0]; seasoning = parts[1]
             location  = parts[2] if len(parts) > 2 else None
-            if seasoning not in SEASONINGS:                                             raise ValueError(f"{seasoning} is not a seasoning")
-            if location and self.get_feature(f"{target}_at_{location}") != 1:           raise ValueError(f"{target} not at {location}")
+            _require(seasoning in SEASONINGS, f"{seasoning} is not a seasoning")
+            _require(not location or self.get_feature(f"{target}_at_{location}") == 1, f"{target} not at {location}")
             self.set_feature(f"{target}_seasoned", 1)
             self.set_feature(f"{target}_seasoned_with_{seasoning}", 1)
 
@@ -253,11 +268,11 @@ class StateTracker:
             parts    = _parse(action_str)
             liquid   = parts[0]; from_c = parts[1]; to_c = parts[2]
             location = parts[3] if len(parts) > 3 else None
-            if liquid not in LIQUID_INGREDIENTS:                                        raise ValueError(f"{liquid} is not a liquid")
-            if self.get_feature(f"{from_c}_contains_{liquid}") != 1:                    raise ValueError(f"{liquid} not in {from_c}")
+            _require(liquid in LIQUID_INGREDIENTS, f"{liquid} is not a liquid")
+            _require(self.get_feature(f"{from_c}_contains_{liquid}") == 1, f"{liquid} not in {from_c}")
             if location:
-                if self.get_feature(f"{from_c}_at_{location}") != 1:                    raise ValueError(f"{from_c} not at {location}")
-                if self.get_feature(f"{to_c}_at_{location}") != 1:                      raise ValueError(f"{to_c} not at {location}")
+                _require(self.get_feature(f"{from_c}_at_{location}") == 1, f"{from_c} not at {location}")
+                _require(self.get_feature(f"{to_c}_at_{location}") == 1, f"{to_c} not at {location}")
             self.set_feature(f"{from_c}_contains_{liquid}", 0)
             self.set_feature(f"{to_c}_contains_{liquid}", 1)
             if location:    self.set_feature(f"{liquid}_at_{location}", 1)
@@ -279,10 +294,10 @@ class StateTracker:
             parts     = _parse(action_str)
             container = parts[0]
             location  = parts[1] if len(parts) > 1 else "blending_station"
-            if self.get_feature(f"{container}_at_{location}") != 1:                     raise ValueError(f"{container} not at {location}")
-            if self.get_feature("blender_on") != 1:                                     raise ValueError("blender not on")
+            _require(self.get_feature(f"{container}_at_{location}") == 1, f"{container} not at {location}")
+            _require(self.get_feature("blender_on") == 1, "blender not on")
             contained = [ing for ing in INGREDIENTS if ing != "mixture" and self.get_feature(f"{container}_contains_{ing}") == 1]
-            if len(contained) < 1:                                                      raise ValueError(f"blend requires >=1 ingredient in {container}")
+            _require(len(contained) >= 1, f"blend requires >=1 ingredient in {container}")
             for ing in contained:
                 self.set_feature(f"{container}_contains_{ing}", 0)
                 self.set_feature(f"{ing}_in_mixture", 1)
@@ -294,7 +309,7 @@ class StateTracker:
             parts    = _parse(action_str)
             plate    = parts[0]
             location = parts[1] if len(parts) > 1 else "serving_station"
-            if self.get_feature(f"{plate}_at_{location}") != 1:                         raise ValueError(f"{plate} not at {location}")
+            _require(self.get_feature(f"{plate}_at_{location}") == 1, f"{plate} not at {location}")
             self.set_feature("plate_served", 1)
 
         # ── wash (item, location=washing_station)
@@ -302,7 +317,7 @@ class StateTracker:
             parts    = _parse(action_str)
             item     = parts[0]
             location = parts[1] if len(parts) > 1 else "washing_station"
-            if self.get_feature(f"{item}_at_{location}") != 1:                          raise ValueError(f"{item} not at {location}")
+            _require(self.get_feature(f"{item}_at_{location}") == 1, f"{item} not at {location}")
             self.set_feature(f"{item}_washed", 1)
 
         else:                                                                           raise ValueError(f"Unknown action: {action_str}")
@@ -312,14 +327,53 @@ class StateTracker:
 _FEAT = StateTracker._build_feature_map()
 
 
-def validate_ordering(actions):
-    """Return True if every action in `actions` applies cleanly to a fresh StateTracker. Used by the preference modifier to reject reorderings that violate kitchen preconditions before they ever enter the dataset preserving the invariant that no variant with a broken precondition chain can reach the learners.
+_GOAL_FEATURE_INDICES = tuple(
+    index
+    for name, index in _FEAT.items()
+    if "_at_" not in name
+    and not name.endswith("_washed")
+    and name not in {"stove_on", "sink_on", "blender_on"}
+)
+
+
+def replay_validated_actions(actions):
+    """Strictly replay a task and return its final symbolic state.
+
+    Dataset construction is the one place where the simulator may validate a
+    symbolic action list.  A candidate is invalid if an action violates a
+    precondition *or* leaves the state unchanged.  The latter catches actions
+    such as cooking an empty container, which otherwise create spurious
+    preference variants under permissive replay.
     """
     tracker = StateTracker()
-    for a in actions:
-        try:            tracker.apply_action(a)
-        except ValueError:  return False
-    return True
+    for action in actions:
+        before = tuple(tracker.get_state_vector().astype(int).tolist())
+        tracker.apply_action(action, enforce_preconditions=True)
+        after = tuple(tracker.get_state_vector().astype(int).tolist())
+        if after == before:
+            raise ValueError(f"No-effect action in validated ordering: {action}")
+    return tuple(tracker.get_state_vector().astype(int).tolist())
+
+
+def task_goal_signature(actions):
+    """Return the preference-invariant task outcome for dataset validation.
+
+    Locations, cleaned flags, and appliance switches encode workflow choices;
+    all remaining symbolic predicates encode the delivered task outcome.
+    This is evaluator-only validation metadata and is never passed to the
+    learner or used for online identity inference.
+    """
+    final_state = replay_validated_actions(actions)
+    return tuple(final_state[index] for index in _GOAL_FEATURE_INDICES)
+
+
+def validate_ordering(actions, *, expected_goal=None):
+    """Return whether an ordering is executable, effectful, and goal-preserving."""
+    try:
+        goal = task_goal_signature(actions)
+    except (ValueError, IndexError, KeyError):
+        return False
+    return expected_goal is None or tuple(goal) == tuple(expected_goal)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
