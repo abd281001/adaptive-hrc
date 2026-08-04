@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from src.environment import StateTracker
+from src.adaptive_agent import AdaptiveHRCAgent
 from src.models import (
     Config,
     MaxEntIRL2,
@@ -56,6 +57,24 @@ class IRLHelperTests(unittest.TestCase):
         np.testing.assert_allclose(col_min2, col_min)
         np.testing.assert_allclose(col_max2, col_max)
 
+    def test_oil_has_the_same_dedicated_location_features_as_milk(self):
+        """Oil must not be represented only through aggregate counts."""
+        initial = StateTracker()
+        oil_at_prep = StateTracker()
+        oil_at_prep.apply_action("transfer (oil, from=storage, to=prep_station)")
+        milk_at_prep = StateTracker()
+        milk_at_prep.apply_action("transfer (milk, from=storage, to=prep_station)")
+
+        matrix, _, _ = create_feature_matrix_2_0({
+            0: tuple(initial.get_state_vector().tolist()),
+            1: tuple(oil_at_prep.get_state_vector().tolist()),
+            2: tuple(milk_at_prep.get_state_vector().tolist()),
+        })
+        oil_delta_size = int(np.count_nonzero(matrix[1] - matrix[0]))
+        milk_delta_size = int(np.count_nonzero(matrix[2] - matrix[0]))
+        self.assertGreaterEqual(oil_delta_size, 4)
+        self.assertEqual(oil_delta_size, milk_delta_size)
+
 
 class LearningHeadTests(unittest.TestCase):
     def test_ngram_markov_prefers_matching_context(self):
@@ -91,13 +110,51 @@ class LearningHeadTests(unittest.TestCase):
             verbose=False,
             maxent_iters_cold=5,
             maxent_iters_warm=3,
-            maxent_mc_rollouts=10,
         )
         model = MaxEntIRL2(cfg=cfg)
         model.fit([demo], demo_weights=[1.0])
         dist = model.predict(demo[0][0])
         self.assertTrue(dist)
         self.assertAlmostEqual(sum(dist.values()), 1.0, places=6)
+        self.assertEqual(model.last_fit_stats["expected_feature_method"], "dp_occupancy")
+        self.assertEqual(model.last_fit_stats["flop_accounting_scope"], "maxent_fit_partial_arithmetic_only")
+        self.assertFalse(model.last_fit_stats["flop_cross_model_comparable"])
+        self.assertIn("best_demo_nll", model.last_fit_stats)
+        self.assertTrue(np.isfinite(model.last_fit_stats["best_demo_nll"]))
+        self.assertIn("deviate_margin_min", model.last_fit_stats)
+        self.assertGreater(model.last_fit_stats["deviate_margin_n"], 0.0)
+
+    def test_valid_action_expansion_uses_environment_preconditions(self):
+        demo = _valid_trajectory(["transfer (pot, from=storage, to=cooking_station)"])
+        cfg = Config(
+            verbose=False,
+            maxent_iters_cold=2,
+            maxent_iters_warm=1,
+            maxent_valid_action_expansion=True,
+        )
+        model = MaxEntIRL2(cfg=cfg)
+        model.fit([demo], demo_weights=[1.0])
+        stats = model.last_fit_stats["valid_action_expansion"]
+        self.assertEqual(stats["enabled"], 1.0)
+        self.assertGreater(stats["attempted"], 0.0)
+        self.assertGreater(stats["accepted"], 0.0)
+
+    def test_valid_action_expansion_rejects_anonymous_tokens(self):
+        tracker = StateTracker()
+        s0 = tuple(tracker.get_state_vector().tolist())
+        tracker.apply_action("transfer (pot, from=storage, to=cooking_station)")
+        s1 = tuple(tracker.get_state_vector().tolist())
+        demos = [[(s0, "act_1"), (s1, "stop")]]
+        cfg = Config(
+            verbose=False,
+            maxent_iters_cold=2,
+            maxent_iters_warm=1,
+            maxent_valid_action_expansion=True,
+        )
+        model = MaxEntIRL2(cfg=cfg)
+        model.fit(demos, demo_weights=[1.0])
+        stats = model.last_fit_stats["valid_action_expansion"]
+        self.assertEqual(stats["accepted"], 0.0)
 
 
 class WeightedLossContractTests(unittest.TestCase):
@@ -118,10 +175,11 @@ class WeightedLossContractTests(unittest.TestCase):
         ]
 
     def test_irl_responds_to_absolute_weight_scale(self):
-        cfg = Config(verbose=False, maxent_iters_cold=8, maxent_iters_warm=4, maxent_mc_rollouts=8)
         demos = self._two_demos()
-        m1 = MaxEntIRL2(cfg=cfg); m1.fit(demos, demo_weights=[1.0, 1.0])
-        m2 = MaxEntIRL2(cfg=cfg); m2.fit(demos, demo_weights=[0.05, 0.05])
+        cfg1 = Config(verbose=False, seed=17, maxent_iters_cold=5, maxent_iters_warm=3)
+        cfg2 = Config(verbose=False, seed=17, maxent_iters_cold=5, maxent_iters_warm=3)
+        m1 = MaxEntIRL2(cfg=cfg1); m1.fit(demos, demo_weights=[1.0, 1.0])
+        m2 = MaxEntIRL2(cfg=cfg2); m2.fit(demos, demo_weights=[0.05, 0.05])
         # Same relative weighting; under the new contract, absolute scale matters.
         self.assertFalse(np.allclose(m1.theta, m2.theta), "IRL theta should change with absolute weight scale")
 
@@ -152,6 +210,18 @@ class WeightedLossContractTests(unittest.TestCase):
         head.fit(demos, weights=[1.0, 0.0])  # second demo's "pan" should not appear
         self.assertNotIn("transfer (pan, from=storage, to=cooking_station)", head.vocab)
 
+    def test_ngram_unknown_state_uses_hamming_nearest_state(self):
+        demos = [
+            [((0, 0, 0), "near_zero"), ((0, 0, 1), "stop")],
+            [((1, 1, 1), "near_one"), ((1, 1, 0), "stop")],
+        ]
+        state_to_idx = {(0, 0, 0): 0, (1, 1, 1): 1}
+        idx_to_state = {idx: state for state, idx in state_to_idx.items()}
+        head = NGramMarkov(order=1, prob_floor=1e-6)
+        head.fit(demos, weights=[1.0, 1.0], state_to_idx=state_to_idx, idx_to_state=idx_to_state)
+        dist = head.predict((1, 1, 0), [])
+        self.assertEqual(top_k(dist, 1)[0], "near_one")
+
 
 class ReproducibilityTests(unittest.TestCase):
     """Same seed -> same theta. Per-Config rng/prng must isolate stochastic
@@ -164,9 +234,9 @@ class ReproducibilityTests(unittest.TestCase):
                 "turn_on (stove, cooking_station)",
             ]),
         ]
-        cfg1 = Config(verbose=False, seed=1337, maxent_iters_cold=10, maxent_iters_warm=4, maxent_mc_rollouts=8)
+        cfg1 = Config(verbose=False, seed=1337, maxent_iters_cold=10, maxent_iters_warm=4)
+        cfg2 = Config(verbose=False, seed=1337, maxent_iters_cold=10, maxent_iters_warm=4)
         m1 = MaxEntIRL2(cfg=cfg1); m1.fit(demos, demo_weights=[1.0])
-        cfg2 = Config(verbose=False, seed=1337, maxent_iters_cold=10, maxent_iters_warm=4, maxent_mc_rollouts=8)
         m2 = MaxEntIRL2(cfg=cfg2); m2.fit(demos, demo_weights=[1.0])
         np.testing.assert_array_equal(m1.theta, m2.theta)
 
@@ -177,9 +247,9 @@ class ReproducibilityTests(unittest.TestCase):
                 "turn_on (stove, cooking_station)",
             ]),
         ]
-        cfg1 = Config(verbose=False, seed=1, maxent_iters_cold=10, maxent_iters_warm=4, maxent_mc_rollouts=8)
+        cfg1 = Config(verbose=False, seed=1, maxent_iters_cold=10, maxent_iters_warm=4)
+        cfg2 = Config(verbose=False, seed=2, maxent_iters_cold=10, maxent_iters_warm=4)
         m1 = MaxEntIRL2(cfg=cfg1); m1.fit(demos, demo_weights=[1.0])
-        cfg2 = Config(verbose=False, seed=2, maxent_iters_cold=10, maxent_iters_warm=4, maxent_mc_rollouts=8)
         m2 = MaxEntIRL2(cfg=cfg2); m2.fit(demos, demo_weights=[1.0])
         self.assertFalse(np.array_equal(m1.theta, m2.theta), "different seeds must produce different theta")
 

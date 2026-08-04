@@ -18,36 +18,6 @@ from .environment import (_FEAT, CONTAINERS, COOKABLES, CUTTABLES, GRATABLE, ING
 State = Tuple[int, ...]
 Trajectory = List[Tuple[State, str]]
 
-
-def _sample_categorical(probs: Sequence[float], rng: Optional[random.Random] = None) -> int:
-    """Sample an index from a categorical distribution in Python space.
-    Pass ``rng`` (a ``random.Random`` instance, typically ``cfg.prng``) for
-    seeded reproducibility. Falls back to the global ``random`` module only
-    when no rng is supplied; the IRL fit loop should pass the configured RNG.
-    """
-    if len(probs) == 0: raise ValueError("cannot sample from an empty probability vector")
-
-    total = 0.0
-    clean: List[float] = []
-    for p in probs:
-        val = float(p)
-        if val > 0.0 and np.isfinite(val):
-            clean.append(val)
-            total += val
-        else:
-            clean.append(0.0)
-
-    r = rng if rng is not None else random
-    if total <= 0.0: return r.randrange(len(clean))
-
-    threshold = r.random() * total
-    cumulative = 0.0
-    for idx, p in enumerate(clean):
-        cumulative += p
-        if threshold <= cumulative: return idx
-    return len(clean) - 1
-
-
 def _soft_value(q_vals: Sequence[float], temperature) -> float:
     """Numerically stable soft value without per-state NumPy allocations."""
     if len(q_vals) == 0: return 0.0
@@ -86,14 +56,6 @@ class Config:
     prune_threshold:    float = 1e-9
     mwr_window:         int   = 30               # Diagnostic global reuse-gap trace length; adaptive logic uses decay_reuse_window per recipe.
     protect_latest_preference:  bool  = True     # Experimental condition: protect the latest preference variant of each recipe from decay/pruning. This is enabled for the main adaptive agent only; baselines explicitly disable it.
-    pref_transfer_alpha:        float = 0.6      # blend weight for preference signal in cross-recipe transfer
-    posterior_switch_margin:     float = 0.30   # min log-ratio for recipe identity switch
-    posterior_switch_agreement:  int   = 3      # consecutive observed actions new argmax must win
-    posterior_switch_min_confidence: float = 0.55
-    posterior_switch_min_gap:        float = 0.05
-    posterior_switch_fast_confidence: float = 0.95
-    posterior_switch_fast_gap:        float = 0.35
-    posterior_switch_fast_margin:     float = 1.25
     # disambiguator
     jaccard_threshold:          float = 0.96
     identity_jaccard_threshold: float = 0.96  # Canonical-transition identity acceptance threshold.
@@ -117,8 +79,9 @@ class Config:
     maxent_temperature:     float = 0.5
     maxent_learning_rate:   float = 0.05
     maxent_l2:              float = 0.01
-    maxent_mc_rollouts:     int   = 150
-    maxent_mc_horizon:      int   = 45   # max steps per MC rollout; should exceed longest recipe
+    # Expected discounted features are computed by deterministic finite-horizon
+    # occupancy propagation, not Monte-Carlo rollout sampling.
+    maxent_dp_horizon:      int   = 45   # Must exceed the longest task trajectory.
     maxent_iters_cold:      int   = 100
     maxent_iters_warm:      int   = 40
     maxent_valid_action_expansion: bool = False  # Keep direct Config() and experiment RunConfig defaults aligned; expansion must be explicitly enabled.
@@ -136,11 +99,7 @@ class Config:
     bc_epochs_cold:     int   = 120
     bc_epochs_warm:     int   = 60
     bc_batch_size:      int   = 64
-    # Experience replay baselines. er_buffer_size is the reservoir capacity;
-    # er_batch_size is the number of replay trajectories drawn at each retrain.
-    # Defaults replay the full reservoir so settled evaluation is not dominated
-    # by vocabulary dropout. Recency-prioritized ER uses the same capacity/head
-    # with a blended recency/uniform sampler.
+    # Experience replay baselines
     er_buffer_size: int = 256
     er_batch_size:  int = 256
     er_recency_alpha: float = 1.0
@@ -149,67 +108,13 @@ class Config:
     verbose: bool = True
     # diagnostic profiling: when True, the agent and disambiguator accumulate per-event call counts + wall_s into self.profile / self.disambig.profile. Off by default; negligible overhead when off (one bool check per wrap).
     profile: bool = False
-    # Posterior expert-combination weights and temperatures. Expert log-evidence
-    # is temperature-calibrated independently, then combined with one final
-    # softmax so hypothesis-set size does not alter the expert scale.
-    posterior_alpha_recipe:      float = 1.0
-    posterior_alpha_pref:        float = 1.5
-    posterior_alpha_memory:      float = 0.5
-    posterior_alpha_compat:      float = 0.5
-    posterior_temperature_recipe: float = 1.0
-    posterior_temperature_pref:   float = 1.0
-    posterior_temperature_memory: float = 1.0
-    posterior_temperature_compat: float = 1.0
-    posterior_global_temperature: float = 1.0
-    posterior_compat_smoothing: float = 0.25
-    posterior_compat_floor: float = 1e-4
-    preference_prefix_llr_temperature: float = 1.0
-    preference_prefix_llr_cap: float = 8.0
-    memory_prior_floor:          float = 1e-6
-    active_prior_floor:          float = 0.05
-    absent_prior:                float = 0.10
-    recipe_match_token_weight:      float = 0.70
-    recipe_match_precedence_weight: float = 0.30
-    recipe_match_prefix_weight:     float = 0.45
-    recipe_match_position_fallback: float = 0.50
-    phase_score_retrieve_boost:      float = 5.0
-    phase_score_prep_boost:          float = 4.0
-    phase_score_early_add_suppress:  float = 0.18
-    phase_score_prep_done_boost:     float = 3.0
-    phase_score_early_cook_suppress: float = 0.20
-    phase_score_cleanup_early_supp:  float = 0.20
-    phase_score_cleanup_late_boost:  float = 2.0
-    phase_score_threshold:           float = 0.65
-    phase_score_cleanup_eager_threshold: float = 0.35
-    phase_score_position_base:       float = 0.85
-    phase_score_position_match_weight: float = 0.30
-    phase_score_container_base:      float = 0.65
-    phase_score_container_lead_weight: float = 0.70
-    phase_score_max_clamp:           float = 6.0
-    phase_score_strength:            float = 1.0
-    recipe_frontier_align_weight: float = 0.45  # Remaining mass goes to recipe-level candidates, enabling cross-recipe preference transfer beyond exact replay.
-    recipe_frontier_transfer_align_weight: float = 0.0  # When a pref prototype has not seen this recipe, suppress exact-variant alignment so the recipe prototype exposes reorderable candidates.
-    # Preference-conditioned next-action prediction.
-    posterior_action_topk:          int     = 16
-    posterior_assist_strength:      float   = 0.70
-    posterior_assist_strength_min:  float   = 0.15
-    posterior_assist_strength_max:  float   = 0.90
-    posterior_assist_agreement_bonus: float = 0.15
-    posterior_assist_disagreement_penalty: float = 0.45
-    posterior_assist_conditioned_advantage_bonus: float = 0.15
-    posterior_assist_margin_advantage_bonus: float = 0.10
-    posterior_assist_entropy_advantage_bonus: float = 0.10
-    # The structural expert should be trusted only when the joint
-    # recipe/preference posterior is concentrated.  This is an online,
-    # pre-action quantity: it never uses the outcome of the current turn.
-    posterior_assist_posterior_confidence_weight: float = 0.20
-    posterior_assist_posterior_margin_bonus: float = 0.10
-    locked_variant_action_boost: float = 0.70
     online_new_recipe_min_prefix:   int     = 3
     online_new_recipe_partial_threshold: float = 0.30
     min_classify_length: int = 6
     online_unknown_confirm_streak: int = 3
-    online_commit_full_threshold: float = 0.75
+    # A perfect identity match plus deployable policy evidence should promote
+    # directly at this threshold.
+    online_commit_full_threshold: float = 0.70
     online_commit_tentative_threshold: float = 0.45
     provisional_commit_weight: float = 0.20
     provisional_confirm_window: int = 5
@@ -219,42 +124,12 @@ class Config:
     # auditable and allow sensitivity analyses without editing source code.
     online_commit_identity_weight: float = 0.46
     online_commit_identity_margin_weight: float = 0.18
-    online_commit_recipe_posterior_weight: float = 0.20
-    online_commit_recipe_gap_weight: float = 0.08
     online_commit_policy_confidence_weight: float = 0.04
-    online_commit_posterior_agreement_weight: float = 0.04
     online_commit_late_agreement_bonus: float = 0.06
     online_commit_identity_margin_scale: float = 0.25
-    online_commit_recipe_gap_scale: float = 0.10
     online_commit_known_identity_threshold: float = 0.99
     online_commit_known_score_floor: float = 0.90
     online_commit_empty_library_score_ceiling: float = 0.40
-    # Latent-preference clustering thresholds.
-    preference_match_threshold: float = 0.70
-    preference_novelty_max_similarity: float = 0.45
-    preference_novelty_entropy_min: float = 0.60
-    preference_cluster_temperature: float = 0.50
-    preference_axis_split_threshold: float = 0.35
-    # Preference prototypes are clustered primarily with recipe-normalized
-    # role-precedence evidence.  Legacy local n-grams remain a sparse-data
-    # fallback, rather than the primary transfer representation.
-    preference_precedence_similarity_weight: float = 0.75
-    preference_precedence_split_threshold: float = 0.45
-    preference_precedence_action_weight: float = 0.65
-    preference_precedence_prefix_weight: float = 1.20
-    # Human corrections create session-local precedence evidence.  It is
-    # reset at the end of the session and is never added to persistent memory
-    # except through the ordinary complete-demo commit path.
-    session_correction_adaptation: bool = True
-    session_correction_precedence_weight: float = 0.75
-    # Ablation switches. Each disables one component of the preference-conditioned pathway so the experiment matrix can attribute gains to specific components. All default to False (full system).
-    ablation_disable_preference_head:       bool = False
-    ablation_disable_recipe_prototype:      bool = False
-    ablation_disable_posterior:             bool = False
-    # Oracle leakage upper bounds. Clearly labelled, not deployable. These only take effect when the harness routes through ``predict_with_oracle``; they do NOT change the unconditioned signature of predict_next_tokens.
-    ablation_oracle_preference_label:       bool = False
-    ablation_oracle_recipe_and_preference_label: bool = False
-
     def __post_init__(self) -> None:
         # Per-instance RNGs derived from `seed`. Using these (instead of the `np.random` and `random` module globals) is the contract that makes parallel-seed runs reproducible: each Config gets its own bit-stream. Field-set bypass keeps the dataclass usable without `frozen=False` semantics.
         object.__setattr__(self, "rng",  np.random.default_rng(int(self.seed)))
@@ -331,7 +206,7 @@ class WelfordFeatureNormalizer:
 
 def create_feature_matrix_2_0(idx_to_state: Dict[int, State], col_min_known: Optional[np.ndarray] = None, col_max_known: Optional[np.ndarray] = None, normalizer: Optional[WelfordFeatureNormalizer] = None, update_normalizer = False):
     """Fixed-dimensional engineered feature matrix over symbolic states. `normalizer` uses streaming Welford statistics. When no normalizer is supplied, `col_min_known` and `col_max_known` are interpreted as mean/scale statistics."""
-    key_ingredients = ["tomato", "onion", "mushroom", "rice", "meat", "chicken", "fish", "egg", "banana", "strawberries", "lettuce", "cheese", "garlic", "yoghurt", "milk"]
+    key_ingredients = ["tomato", "onion", "mushroom", "rice", "meat", "chicken", "fish", "egg", "banana", "strawberries", "lettuce", "cheese", "garlic", "yoghurt", "milk", "oil"]
     key_containers  = ["pot", "pan", "plate", "bowl"]
     key_locs        = ["prep_station", "cooking_station", "plating_station", "blending_station"]
 
@@ -372,7 +247,7 @@ def create_feature_matrix_2_0(idx_to_state: Dict[int, State], col_min_known: Opt
         for ing in ["chicken", "fish", "mixture"]:
             f.append(_safe_feat(s, f"{ing}_seasoned"))
         # 5) Tool and serving status.
-        for key in ["stove_on", "sink_on", "blender_on", "plate_served"]: f.append(_safe_feat(s, key))
+        for key in ["stove_on", "sink_on", "blender_on", "dish_served"]: f.append(_safe_feat(s, key))
         # 6) Key ingredient x location grid.
         for ing in key_ingredients:
             for loc in key_locs: f.append(_safe_feat(s, f"{ing}_at_{loc}"))
@@ -411,10 +286,8 @@ def create_feature_matrix_2_0(idx_to_state: Dict[int, State], col_min_known: Opt
     return fm.astype(np.float32), mean.astype(np.float32), scale.astype(np.float32)
 
 
-def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarray, state_to_idx: Dict[State, int], action_to_idx: Dict[str, int], cfg: Config, init_weights: Optional[np.ndarray] = None, demo_weights: Optional[Sequence[float]] = None, 
-                  ewc_theta_star: Optional[np.ndarray] = None, ewc_fisher: Optional[np.ndarray] = None, extra_transitions: Optional[Dict[Tuple[State, str], State]] = None):
-    """Importance-weighted MaxEnt IRL with demo-augmented MDP and optional warm starts.
-    When `ewc_theta_star` and `ewc_fisher` are provided, an in-loop Fisher-weighted quadratic penalty `(ewc_lambda/2) * Σ_i F_i (θ_i - θ*_i)^2` is added to the ascent gradient at every iteration (Kirkpatrick et al.). The `maxent_l2` term is kept as a separate isotropic prior."""
+def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarray, state_to_idx: Dict[State, int], action_to_idx: Dict[str, int], cfg: Config, init_weights: Optional[np.ndarray] = None, demo_weights: Optional[Sequence[float]] = None, ewc_theta_star: Optional[np.ndarray] = None, ewc_fisher: Optional[np.ndarray] = None, extra_transitions: Optional[Dict[Tuple[State, str], State]] = None):
+    """Importance-weighted MaxEnt IRL with demo-augmented MDP and optional EWC."""
     n_states, n_features = feature_matrix.shape
     n_actions = len(action_to_idx)
     if n_states == 0 or n_features == 0 or n_actions == 0:
@@ -484,7 +357,6 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
     temperature = cfg.maxent_temperature
     learning_rate = cfg.maxent_learning_rate
     l2 = cfg.maxent_l2
-    mc_count = max(1, int(cfg.maxent_mc_rollouts))
     n_iterations = cfg.maxent_iters_warm if init_weights is not None else cfg.maxent_iters_cold
 
     q_values: Dict[Tuple[int, int], float] = {}
@@ -530,7 +402,7 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
                 continue
             dist: Dict[int, float] = {start: 1.0}
             discount = 1.0
-            for _t in range(cfg.maxent_mc_horizon):
+            for _t in range(cfg.maxent_dp_horizon):
                 next_dist: Dict[int, float] = {}
                 for s_idx, mass in dist.items():
                     if mass <= 0.0:
@@ -602,9 +474,8 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
         if ewc_theta_star is not None and ewc_fisher is not None:
             n = min(reward_weights.shape[0], int(ewc_theta_star.shape[0]), int(ewc_fisher.shape[0]))
             if n > 0:
-                lam = float(cfg.ewc_lambda)
                 penalty = np.zeros_like(reward_weights)
-                penalty[:n] = (lam * ewc_fisher[:n].astype(np.float32) * (reward_weights[:n] - ewc_theta_star[:n].astype(np.float32)))
+                penalty[:n] = float(cfg.ewc_lambda) * ewc_fisher[:n].astype(np.float32) * (reward_weights[:n] - ewc_theta_star[:n].astype(np.float32))
                 gradient -= penalty
         grad_norm = float(np.linalg.norm(gradient))
         best_grad_norm = min(best_grad_norm, grad_norm)
@@ -623,7 +494,7 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
         new_vals = best_rewards.copy()
         for (s_idx, a_idx) in state_action_pairs:
             ns = transition_model.get((s_idx, a_idx))
-            best_q[(s_idx, a_idx)] = best_rewards[s_idx] + (gamma * best_values[ns] if ns is not None else best_rewards[s_idx])
+            best_q[(s_idx, a_idx)] = best_rewards[s_idx] + (gamma * best_values[ns] if ns is not None else 0.0)
         for s_idx in s_to_actions:
             best_q[(s_idx, deviate_a)] = best_rewards[s_idx] + gamma * best_values[null_s]
         for s_idx, a_list in s_to_actions.items():
@@ -680,9 +551,7 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
         "iterations_run": float(iterations_run),
         "vi_sweeps": float(total_vi_sweeps),
         "final_vi_sweeps": float(final_vi_sweeps),
-        "mc_rollouts_requested_per_iteration": float(mc_count),
-        "mc_rollouts_run": 0.0,
-        "mc_steps": float(occupancy_state_updates),
+        "dp_occupancy_state_updates": float(occupancy_state_updates),
         "expected_feature_method": "dp_occupancy",
         "best_demo_nll": float(best_nll),
         "best_grad_norm": float(best_grad_norm),
@@ -785,7 +654,7 @@ def _maxent_fit_flop_estimate(stats: Dict[str, Any]) -> float:
     n_demo_visits = float(stats.get("n_demo_state_visits", 0.0))
     iterations = float(stats.get("iterations_run", 0.0))
     vi_sweeps = float(stats.get("vi_sweeps", 0.0) + stats.get("final_vi_sweeps", 0.0))
-    mc_steps = float(stats.get("mc_steps", 0.0))
+    dp_occupancy_state_updates = float(stats.get("dp_occupancy_state_updates", 0.0))
     ewc_enabled = bool(stats.get("ewc_enabled", 0.0))
 
     empirical_feature_work = 2.0 * n_demo_visits * n_features
@@ -795,9 +664,9 @@ def _maxent_fit_flop_estimate(stats: Dict[str, Any]) -> float:
     # multiplied by nonexistent dense action-feature products.
     vi_scalar_work = vi_sweeps * ((4.0 * n_state_actions) + (8.0 * n_policy_edges))
     policy_scalar_work = iterations * 8.0 * n_policy_edges
-    rollout_feature_work = 2.0 * mc_steps * n_features
+    occupancy_feature_work = 2.0 * dp_occupancy_state_updates * n_features
     gradient_work = iterations * (8.0 * n_features + (4.0 * n_features if ewc_enabled else 0.0))
-    return float(empirical_feature_work + reward_dot_work + vi_scalar_work + policy_scalar_work + rollout_feature_work + gradient_work)
+    return float(empirical_feature_work + reward_dot_work + vi_scalar_work + policy_scalar_work + occupancy_feature_work + gradient_work)
 
 
 class MaxEntIRL2:
@@ -940,6 +809,8 @@ class MaxEntIRL2:
         if clip > 0.0:
             fisher = np.clip(fisher, 0.0, clip).astype(np.float32)
         return fisher
+
+
 
 
 class _StateNNMixin:

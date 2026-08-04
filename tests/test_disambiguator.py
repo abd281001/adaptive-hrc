@@ -8,6 +8,10 @@ from src.memory import (
     variant_hash,
 )
 from src.models import Config
+from src.representations import identity_token_from_observation, observations_from_actions
+from src.adaptive_agent import AdaptiveHRCAgent
+from src.environment import gen
+from src.preferences import materialize
 
 
 TOMATO_ONION_SOUP = "tomato_onion_soup_v1"
@@ -79,6 +83,80 @@ class DisambiguatorTests(unittest.TestCase):
         v2 = KnownVariant(TOMATO_ONION_SOUP, ALT_PREF, ("a", "c", "b", "d"))
         ranked = self.d.score_partial(["a", "b"], [v1, v2])
         self.assertEqual(ranked[0][0].variant_hash, BASE_PREF)
+
+    def test_canonical_identity_recognizes_reordered_context_variant(self):
+        cfg = Config(identity_jaccard_threshold=0.8, identity_score_margin=0.05)
+        d = Disambiguator(cfg)
+        raw_base = ("raw_move_empty", "raw_load")
+        raw_variant = ("raw_load", "raw_move_loaded")
+        identity = ("identity_load", "identity_move_bowl")
+        lib = [KnownVariant(TOMATO_ONION_SOUP, variant_hash(raw_base), raw_base, identity)]
+        cls = d.classify(raw_variant, lib, identity_sequence=("identity_load", "identity_move_bowl"))
+        self.assertEqual(cls.kind, "preference_shift")
+        self.assertEqual(cls.recipe_id, TOMATO_ONION_SOUP)
+
+    def test_identity_margin_rejects_ambiguous_recipe(self):
+        cfg = Config(identity_jaccard_threshold=0.8, identity_score_margin=0.05)
+        d = Disambiguator(cfg)
+        seq = ("raw_new_a", "raw_new_b")
+        lib = [
+            KnownVariant("R1", variant_hash(("raw_a",)), ("raw_a",), ("identity_a", "identity_b")),
+            KnownVariant("R2", variant_hash(("raw_b",)), ("raw_b",), ("identity_a", "identity_b")),
+        ]
+        cls = d.classify(seq, lib, identity_sequence=("identity_a", "identity_b"))
+        self.assertEqual(cls.kind, "new_recipe")
+
+
+class CanonicalIdentityTokenTests(unittest.TestCase):
+    def test_loaded_and_empty_container_moves_have_the_same_identity_token(self):
+        empty_actions = [
+            "transfer (bowl, from=storage, to=prep_station)",
+            "move_container (bowl, from=prep_station, to=plating_station)",
+        ]
+        loaded_actions = [
+            "transfer (bowl, from=storage, to=prep_station)",
+            "transfer (tomato, from=storage, to=prep_station)",
+            "load (tomato, bowl, prep_station)",
+            "move_container (bowl, from=prep_station, to=plating_station)",
+        ]
+        empty_move = observations_from_actions(empty_actions)[-1]
+        loaded_move = observations_from_actions(loaded_actions)[-1]
+        self.assertEqual(empty_move.action_vector, loaded_move.action_vector)
+        self.assertEqual(
+            identity_token_from_observation(empty_move),
+            identity_token_from_observation(loaded_move),
+        )
+
+    def test_default_ladder_variants_remain_known_among_all_recipes(self):
+        """Regression for representative isolated and composition variants."""
+        agent = AdaptiveHRCAgent(Config(
+            verbose=False,
+            maxent_iters_cold=1,
+            maxent_iters_warm=1,
+        ))
+
+        def encode(actions):
+            raw, identity = [], []
+            for observation in observations_from_actions(actions):
+                raw.append(agent._token_for_vector(observation.action_vector))
+                identity.append(identity_token_from_observation(observation))
+            return raw, identity
+
+        for recipe_id, recipe_fn in gen.recipe_library().items():
+            raw, identity = encode(recipe_fn())
+            agent.memory.register(recipe_id, raw, step=1, identity_ordering=identity)
+        library = agent.memory.library()
+
+        for preference in (
+            "p6_deferred_cook_start",
+            "p12_multi_stage_reorganization",
+            "p14_mise_load_clean",
+        ):
+            for recipe_id, recipe_fn in gen.recipe_library().items():
+                raw, identity = encode(materialize(recipe_fn(), preference))
+                cls = agent.disambig.classify(raw, library, identity_sequence=identity)
+                self.assertNotEqual(cls.kind, "new_recipe", f"{recipe_id}/{preference}")
+                self.assertEqual(cls.recipe_id, recipe_id, f"{recipe_id}/{preference}")
 
 
 if __name__ == "__main__":

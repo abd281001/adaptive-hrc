@@ -292,38 +292,9 @@ class VariantMemory:
         candidates = [v for v in slot.values() if (v.recipe_id, v.variant_hash) in allowed_keys]
         return max(candidates, key=lambda v: v.last_seen_step) if candidates else None
 
-
-@lru_cache(maxsize=65536)
-def _aligned_next_index_cached(prefix: Tuple[str, ...], ordering: Tuple[str, ...]) -> int:
-    n_p, n_o = len(prefix), len(ordering)
-    if n_p == 0: return 0
-    # Build LCS table to find the longest common subsequence. dp[i][j] = length of LCS of prefix[:i] and ordering[:j]
-    dp = [[0] * (n_o + 1) for _ in range(n_p + 1)]
-    for i in range(1, n_p + 1):
-        for j in range(1, n_o + 1):
-            if prefix[i - 1] == ordering[j - 1]:    dp[i][j] = dp[i - 1][j - 1] + 1
-            else:                                   dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
-    # Backtrack to find the last matched position in ordering.
-    i, j = n_p, n_o
-    last_matched_j = -1
-    while i > 0 and j > 0:
-        if prefix[i - 1] == ordering[j - 1]:
-            last_matched_j = max(last_matched_j, j - 1)
-            i -= 1
-            j -= 1
-        elif dp[i - 1][j] >= dp[i][j - 1]:  i -= 1
-        else:                               j -= 1
-    return last_matched_j + 1 if last_matched_j >= 0 else 0
-
-def _aligned_next_index(prefix: Sequence[str], ordering: Sequence[str]) -> int:
-    """Return the index of the next action in `ordering` after the LCS-aligned prefix. Uses an LCS pass that respects ordering direction so that preference-shifted prefixes still produce a sensible next-position estimate."""
-    return _aligned_next_index_cached(tuple(prefix), tuple(ordering))
-
-
 def clear_all_module_caches() -> None:
     """Clear module-level caches that can otherwise bleed across seed jobs."""
     _lcs_aligned_subsequence_cached.cache_clear()
-    _aligned_next_index_cached.cache_clear()
 
 
 # Adaptive rehearsal weighting

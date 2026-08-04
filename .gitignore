@@ -5,7 +5,18 @@ venv/
 talents-zsc/
 eval_results/
 
-src/evaluations.py
-
 src/__pycache__
 tests/__pycache__
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+# Local cache/output
+.cache/
+results/

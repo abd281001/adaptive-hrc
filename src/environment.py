@@ -61,11 +61,13 @@ class StateTracker:
         for item in COOKABLES:              fm[f"{item}_cooked"]  = idx; idx += 1
         for item in INGREDIENTS:            fm[f"{item}_seasoned"]= idx; idx += 1
         for item in ITEMS:                  fm[f"{item}_washed"]  = idx; idx += 1
-        # Global tool state and dish-delivered flag
+        # Global tool state and dish-delivered flag. A dish may be served in
+        # either a plate or a glass (smoothies), hence this deliberately does
+        # not encode a vessel type in its name.
         fm["stove_on"]     = idx; idx += 1
         fm["sink_on"]      = idx; idx += 1
         fm["blender_on"]   = idx; idx += 1
-        fm["plate_served"] = idx; idx += 1
+        fm["dish_served"]  = idx; idx += 1
         # Mixture membership (excluding "mixture" itself)
         for ingredient in INGREDIENTS:
             if ingredient != "mixture":     fm[f"{ingredient}_in_mixture"] = idx; idx += 1
@@ -166,18 +168,13 @@ class StateTracker:
             self.set_feature(f"{container}_contains_{item}", 0)
             self.set_feature(f"{item}_at_{location}", 1)
 
-        # ── move_container (container, from=L1, to=L2) — container carries its contents
+        # ── move_container (container, from=L1, to=L2)
         elif action_str.startswith("move_container"):
             parts     = _parse(action_str)
             container = parts[0]; from_loc = _loc(parts[1]); to_loc = _loc(parts[2])
             _require(self.get_feature(f"{container}_at_{from_loc}") == 1, f"Precondition failed: {container} not at {from_loc}")
             self.set_feature(f"{container}_at_{from_loc}", 0)
             self.set_feature(f"{container}_at_{to_loc}", 1)
-            # Drag along every ingredient currently held by this container.
-            for ingredient in INGREDIENTS:
-                if self.get_feature(f"{container}_contains_{ingredient}") == 1:
-                    self.set_feature(f"{ingredient}_at_{from_loc}", 0)
-                    self.set_feature(f"{ingredient}_at_{to_loc}", 1)
 
         # ── cut (item, location=prep_station)
         elif action_str.startswith("cut"):
@@ -197,13 +194,16 @@ class StateTracker:
             _require(self.get_feature(f"{item}_at_{location}") == 1, f"Precondition failed: {item} not at {location}")
             self.set_feature(f"{item}_grated", 1)
 
-        # ── cook (item, container=pot, location=cooking_station) — single-item cook. Both "cook " and "cook(" prefixes accepted so we don't collide with cook_contents.
+        # ── cook (item, container=pot|pan, location=cooking_station) —
+        # single-item cook. Both "cook " and "cook(" prefixes are accepted
+        # so we don't collide with cook_contents.
         elif action_str.startswith("cook ") or action_str.startswith("cook("):
             parts     = _parse(action_str)
             item      = parts[0]
             container = parts[1] if len(parts) > 1 else "pot"
             location  = parts[2] if len(parts) > 2 else "cooking_station"
             _require(item in COOKABLES, f"Precondition failed: {item} is not cookable")
+            _require(container in {"pot", "pan"}, f"Precondition failed: {container} is not cook-safe")
             _require(self.get_feature(f"{container}_contains_{item}") == 1, f"Precondition failed: {item} not in {container}")
             _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
             _require(location != "cooking_station" or self.get_feature("stove_on") == 1, "Precondition failed: stove not on")
@@ -214,6 +214,7 @@ class StateTracker:
             parts     = _parse(action_str)
             container = parts[0]
             location  = parts[1] if len(parts) > 1 else "cooking_station"
+            _require(container in {"pot", "pan"}, f"Precondition failed: {container} is not cook-safe")
             _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
             _require(location != "cooking_station" or self.get_feature("stove_on") == 1, "Precondition failed: stove not on")
             _require(
@@ -239,27 +240,36 @@ class StateTracker:
                 self.set_feature(f"{container}_contains_{ing}", 0)
                 self.set_feature(f"{ing}_in_mixture", 1)
             self.set_feature(f"{container}_contains_mixture", 1)
-            if location: self.set_feature(f"mixture_at_{location}", 1)
 
-        # ── season_container (container, seasoning, location?) — apply seasoning to every ingredient currently inside the container.
+        # ── season_container (container, seasoning, location) — apply
+        # seasoning to every ingredient currently inside a grounded container.
         elif action_str.startswith("season_container"):
             parts     = _parse(action_str)
             container = parts[0]; seasoning = parts[1]
             location  = parts[2] if len(parts) > 2 else None
             _require(seasoning in SEASONINGS, f"{seasoning} is not a seasoning")
-            _require(not location or self.get_feature(f"{container}_at_{location}") == 1, f"{container} not at {location}")
+            _require(location is not None, "season_container requires an explicit location")
+            _require(self.get_feature(f"{container}_at_{location}") == 1, f"{container} not at {location}")
+            _require(
+                any(self.get_feature(f"{container}_contains_{ingredient}") == 1 for ingredient in INGREDIENTS),
+                f"Precondition failed: {container} contains no ingredients",
+            )
             for ing in INGREDIENTS:
                 if self.get_feature(f"{container}_contains_{ing}") == 1:
                     self.set_feature(f"{ing}_seasoned", 1)
                     self.set_feature(f"{ing}_seasoned_with_{seasoning}", 1)
 
-        # ── season (target, seasoning, location?) — single-item seasoning
+        # ── season (target, seasoning, location) — single-item seasoning.
+        # The explicit grounded location prevents remote seasoning of an item
+        # that is elsewhere or contained in an unrelated vessel.
         elif action_str.startswith("season"):
             parts     = _parse(action_str)
             target    = parts[0]; seasoning = parts[1]
             location  = parts[2] if len(parts) > 2 else None
+            _require(target in INGREDIENTS, f"{target} is not an ingredient")
             _require(seasoning in SEASONINGS, f"{seasoning} is not a seasoning")
-            _require(not location or self.get_feature(f"{target}_at_{location}") == 1, f"{target} not at {location}")
+            _require(location is not None, "season requires an explicit location")
+            _require(self.get_feature(f"{target}_at_{location}") == 1, f"{target} not at {location}")
             self.set_feature(f"{target}_seasoned", 1)
             self.set_feature(f"{target}_seasoned_with_{seasoning}", 1)
 
@@ -275,16 +285,17 @@ class StateTracker:
                 _require(self.get_feature(f"{to_c}_at_{location}") == 1, f"{to_c} not at {location}")
             self.set_feature(f"{from_c}_contains_{liquid}", 0)
             self.set_feature(f"{to_c}_contains_{liquid}", 1)
-            if location:    self.set_feature(f"{liquid}_at_{location}", 1)
 
         # ── turn_on / turn_off (tool)
         elif action_str.startswith("turn_on"):
             tool = _parse(action_str)[0]
+            _require(tool in {"stove", "sink", "blender"}, f"Precondition failed: unknown tool {tool}")
             if   tool == "stove":   self.set_feature("stove_on",   1)
             elif tool == "sink":    self.set_feature("sink_on",    1)
             elif tool == "blender": self.set_feature("blender_on", 1)
         elif action_str.startswith("turn_off"):
             tool = _parse(action_str)[0]
+            _require(tool in {"stove", "sink", "blender"}, f"Precondition failed: unknown tool {tool}")
             if   tool == "stove":   self.set_feature("stove_on",   0)
             elif tool == "sink":    self.set_feature("sink_on",    0)
             elif tool == "blender": self.set_feature("blender_on", 0)
@@ -302,15 +313,21 @@ class StateTracker:
                 self.set_feature(f"{container}_contains_{ing}", 0)
                 self.set_feature(f"{ing}_in_mixture", 1)
             self.set_feature(f"{container}_contains_mixture", 1)
-            self.set_feature(f"mixture_at_{location}", 1)
 
-        # ── serve (plate, location=serving_station) — flips the dish-delivered flag
+        # ── serve (vessel, serving_station) — accepts a completed plated dish
+        # or smoothie glass, never an empty vessel or a plating-station proxy.
         elif action_str.startswith("serve"):
             parts    = _parse(action_str)
-            plate    = parts[0]
+            vessel   = parts[0]
             location = parts[1] if len(parts) > 1 else "serving_station"
-            _require(self.get_feature(f"{plate}_at_{location}") == 1, f"{plate} not at {location}")
-            self.set_feature("plate_served", 1)
+            _require(vessel in {"plate", "glass"}, f"Precondition failed: {vessel} is not a serving vessel")
+            _require(location == "serving_station", "serve requires serving_station")
+            _require(self.get_feature(f"{vessel}_at_{location}") == 1, f"{vessel} not at {location}")
+            _require(
+                any(self.get_feature(f"{vessel}_contains_{ingredient}") == 1 for ingredient in INGREDIENTS),
+                f"{vessel} contains no dish",
+            )
+            self.set_feature("dish_served", 1)
 
         # ── wash (item, location=washing_station)
         elif action_str.startswith("wash"):

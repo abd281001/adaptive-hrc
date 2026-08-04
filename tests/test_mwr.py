@@ -1,6 +1,6 @@
-"""Tests for the max-over-window reuse-gap scheme in DecayManager."""
-import sys
+"""Tests for per-recipe moving-window retention horizons in DecayManager."""
 import os
+import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -10,126 +10,97 @@ from src.memory import DecayManager
 from src.models import Config, DEFAULT_CONFIG
 
 
-def _record_gap(dm: DecayManager, gap: int) -> None:
-    dm._record_reuse_gap(("R", "variant"), gap, step=gap)
+KEY_A = ("R1", "variant_a")
+KEY_A_ALT = ("R1", "variant_b")
+KEY_B = ("R2", "variant_a")
 
 
-class TestMaxOverWindow(unittest.TestCase):
+def _record_gap(dm: DecayManager, key, gap: int) -> None:
+    dm._record_reuse_gap(key, gap, step=gap)
 
-    def test_base_rate_tracks_max_over_window(self):
-        """base_rate should track 1 / max(window) as gaps enter and evict."""
-        cfg = replace(DEFAULT_CONFIG, mwr_window=5, decay_init=0.5)
-        dm = DecayManager(cfg)
 
-        for g in (5, 20, 8, 40, 15):
-            _record_gap(dm, g)
-        # window is full: [5, 20, 8, 40, 15]; max=40
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
+class TestReuseGapWindow(unittest.TestCase):
+    def test_cold_start_horizon_yields_to_moving_window_maximum(self):
+        dm = DecayManager(replace(DEFAULT_CONFIG, decay_horizon_init=15, decay_horizon_floor=6, decay_reuse_window=3))
 
-        # push five gap=10 entries; evicts 5, 20, 8, 40, 15 one by one
-        _record_gap(dm, 10)   # window [20, 8, 40, 15, 10]; max=40
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
-        _record_gap(dm, 10)   # [8, 40, 15, 10, 10]; max=40
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
-        _record_gap(dm, 10)   # [40, 15, 10, 10, 10]; max=40
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
-        _record_gap(dm, 10)   # [15, 10, 10, 10, 10]; max=15
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 15, places=9)
-        _record_gap(dm, 10)   # [10, 10, 10, 10, 10]; max=10
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 10, places=9)
+        self.assertAlmostEqual(dm.recipe_horizon_for("R1"), 15.0)
+        _record_gap(dm, KEY_A, 5)
+        self.assertAlmostEqual(dm.recipe_horizon_for("R1"), 6.0)
+        for gap in (20, 8, 4):
+            _record_gap(dm, KEY_A, gap)
+        self.assertEqual(dm.recipe_window_snapshot("R1"), [20, 8, 4])
+        self.assertAlmostEqual(dm.recipe_horizon_for("R1"), 20.0)
 
-    def test_window_eviction_removes_old_influence(self):
-        """Filling with gap=100 pins rate low; flooding with gap=2 recovers it
-        once the long entries evict."""
-        cfg = replace(DEFAULT_CONFIG, mwr_window=3, decay_init=0.5)
-        dm = DecayManager(cfg)
+        _record_gap(dm, KEY_A, 3)
+        self.assertEqual(dm.recipe_window_snapshot("R1"), [8, 4, 3])
+        self.assertAlmostEqual(dm.recipe_horizon_for("R1"), 8.0)
 
-        for _ in range(3):
-            _record_gap(dm, 100)
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 100, places=9)
+    def test_recipe_windows_are_independent(self):
+        dm = DecayManager(replace(DEFAULT_CONFIG, decay_horizon_init=21, decay_reuse_window=3))
 
-        for _ in range(3):
-            _record_gap(dm, 2)
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 10, places=9)
+        _record_gap(dm, KEY_A, 6)
+        _record_gap(dm, KEY_B, 30)
 
-    def test_window_size_1_tracks_instant_gap(self):
-        """mwr_window=1 tracks the latest gap subject to the initial horizon floor."""
-        cfg = replace(DEFAULT_CONFIG, mwr_window=1, decay_init=0.2)
-        dm = DecayManager(cfg)
+        self.assertAlmostEqual(dm.horizon_for(KEY_A), 6.0)
+        self.assertAlmostEqual(dm.horizon_for(KEY_B), 30.0)
 
-        _record_gap(dm, 5)
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 10, places=9)
+    def test_preferences_of_same_recipe_share_horizon(self):
+        dm = DecayManager(replace(DEFAULT_CONFIG, decay_horizon_init=21, decay_reuse_window=3))
 
-        _record_gap(dm, 40)
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 40, places=9)
+        _record_gap(dm, KEY_A, 5)
 
-    def test_gap_larger_than_window_is_stored(self):
-        """mwr_window limits stored samples, not the gap magnitude."""
-        cfg = replace(DEFAULT_CONFIG, mwr_window=30, decay_init=0.1)
-        dm = DecayManager(cfg)
+        self.assertAlmostEqual(dm.horizon_for(KEY_A), 6.0)
+        self.assertAlmostEqual(dm.horizon_for(KEY_A_ALT), 6.0)
 
-        _record_gap(dm, 38)
+    def test_short_reuse_gaps_shorten_horizon_after_long_gap_expires(self):
+        dm = DecayManager(replace(DEFAULT_CONFIG, decay_horizon_init=21, decay_horizon_floor=6, decay_reuse_window=3))
+
+        for gap in (20, 8, 4):
+            _record_gap(dm, KEY_A, gap)
+        self.assertAlmostEqual(dm.horizon_for(KEY_A), 20.0)
+        _record_gap(dm, KEY_A, 3)
+        self.assertAlmostEqual(dm.horizon_for(KEY_A), 8.0)
+        _record_gap(dm, KEY_A, 1)
+        self.assertAlmostEqual(dm.horizon_for(KEY_A), 6.0)
+
+    def test_gap_larger_than_diagnostic_window_is_stored(self):
+        dm = DecayManager(replace(DEFAULT_CONFIG, mwr_window=30))
+
+        _record_gap(dm, KEY_A, 38)
+
         self.assertEqual(dm.window_snapshot(), [38])
-        self.assertAlmostEqual(dm.base_rate, 1.0 / 38, places=9)
+        self.assertEqual(dm.recipe_window_snapshot("R1"), [38])
+        self.assertAlmostEqual(dm.horizon_for(KEY_A), 38.0)
 
-    def test_short_reuse_gap_respects_initial_horizon(self):
-        """Frequent repeats do not shorten retention below H_init=10."""
-        cfg = replace(DEFAULT_CONFIG, mwr_window=5, decay_init=0.1)
-        dm = DecayManager(cfg)
-
-        _record_gap(dm, 2)
-        self.assertAlmostEqual(dm.base_rate, 0.1, places=9)
-        self.assertEqual(dm.base_rate, 1.0 / cfg.decay_horizon_init)
-
-    def test_window_snapshot_length_bounded(self):
-        """Window should never exceed mwr_window entries."""
-        cfg = replace(DEFAULT_CONFIG, mwr_window=4)
+    def test_diagnostic_window_length_is_bounded(self):
+        cfg = replace(DEFAULT_CONFIG, mwr_window=4, decay_reuse_window=3)
         dm = DecayManager(cfg)
         for i in range(20):
-            _record_gap(dm, i + 1)
-        snap = dm.window_snapshot()
-        self.assertLessEqual(len(snap), 4)
+            _record_gap(dm, KEY_A, i + 1)
+
+        self.assertLessEqual(len(dm.window_snapshot()), 4)
+        self.assertLessEqual(len(dm.recipe_window_snapshot("R1")), 3)
 
     def test_zero_gap_ignored(self):
-        """Gap of 0 should be silently ignored."""
-        cfg = replace(DEFAULT_CONFIG, mwr_window=5, decay_init=0.3)
-        dm = DecayManager(cfg)
-        rate_before = dm.base_rate
-        _record_gap(dm, 0)
-        self.assertEqual(dm.base_rate, rate_before)
+        dm = DecayManager(replace(DEFAULT_CONFIG, decay_reuse_window=3))
+        horizon_before = dm.horizon_for(KEY_A)
+
+        _record_gap(dm, KEY_A, 0)
+
+        self.assertEqual(dm.horizon_for(KEY_A), horizon_before)
         self.assertEqual(dm.window_snapshot(), [])
+        self.assertEqual(dm.recipe_window_snapshot("R1"), [])
 
-    def test_mwr_window_is_explicit_config(self):
-        """MWR window size is configured directly."""
-        from src.models import Config
-        cfg = Config(decay_init=0.1, mwr_window=42)
-        self.assertEqual(cfg.mwr_window, 42)
+    def test_decay_reuse_window_is_explicit_config(self):
+        cfg = Config(decay_reuse_window=2)
+        self.assertEqual(cfg.decay_reuse_window, 2)
+        dm = DecayManager(cfg)
 
-    def test_mwr_window_per_scenario_override(self):
-        """A smaller window recovers faster after a pinning long gap evicts."""
-        cfg_fast = replace(DEFAULT_CONFIG, mwr_window=3, decay_init=0.5)
-        cfg_slow = replace(DEFAULT_CONFIG, mwr_window=30, decay_init=0.5)
-        dm_fast = DecayManager(cfg_fast)
-        dm_slow = DecayManager(cfg_slow)
+        for gap in (10, 20, 40):
+            _record_gap(dm, KEY_A, gap)
 
-        # Fill both with gap=100, pinning base_rate low.
-        for _ in range(3):
-            _record_gap(dm_fast, 100)
-        for _ in range(30):
-            _record_gap(dm_slow, 100)
-
-        # Feed 5 short gaps of 5. The fast window (size=3) evicts all 100s
-        # within 3 samples and should now track 1/5; the slow window still has
-        # 100s dominating the max.
-        for _ in range(5):
-            _record_gap(dm_fast, 5)
-            _record_gap(dm_slow, 5)
-
-        self.assertGreater(
-            dm_fast.base_rate,
-            dm_slow.base_rate,
-            "Smaller window should have recovered faster once long gaps evicted",
-        )
+        self.assertEqual(dm.recipe_window_snapshot("R1"), [20, 40])
+        self.assertAlmostEqual(dm.horizon_for(KEY_A), 40.0)
 
 
 if __name__ == "__main__":

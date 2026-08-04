@@ -142,7 +142,6 @@ def _action_distribution_stats(
     return {
         "confidence": predicted_confidence,
         "margin": margin,
-        "entropy": vocab_entropy,
         "raw_entropy": raw_entropy,
         "active_vocab_normalized_entropy": vocab_entropy,
         "support_size": float(support_size),
@@ -167,11 +166,9 @@ def policy_distribution_diagnostics(
     )
     confidence = stats["confidence"]
     margin = stats["margin"]
-    entropy = stats["entropy"]
     return {
         "policy_confidence": confidence,
         "policy_margin": margin,
-        "policy_entropy": entropy,
         "policy_raw_entropy": stats["raw_entropy"],
         "policy_active_vocab_normalized_entropy": stats["active_vocab_normalized_entropy"],
         "policy_support_size": stats["support_size"],

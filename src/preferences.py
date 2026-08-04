@@ -1,11 +1,11 @@
 """Main workflow-preference generator for adaptive HRC experiments. This module is the canonical preference generator. It uses orthogonal workflow axes:
-    ingredient_flow:          serial | prep_first
-    equipment_setup:          frontloaded | just_in_time
+    ingredient_flow:          serial | mise_en_place
+    equipment_setup:          pre_staged | just_in_time
     serving_setup:            frontloaded | just_in_time
-    cleanup_timing:           after_service | as_soon_as_free
-    seasoning_timing:         before_cook | late
-    container_loading_style:  incremental | batch_before_cook
+    container_loading_style:  incremental | just_in_time
+    appliance_shutdown_timing: immediate | deferred
     cook_start_timing:        as_soon_as_ready | deferred
+    cleanup_timing:           after_service | as_soon_as_free
     serving_priority:         serve_when_ready | cleanup_before_serve
 Key invariants:
     * No action is inserted, deleted, or rewritten — every transform is a reordering of the base recipe's existing actions.
@@ -22,44 +22,44 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .environment import CONTAINERS, INGREDIENTS, task_goal_signature, validate_ordering
 
 # Axes & presets
-INGREDIENT_FLOW_VALUES          = ("serial", "prep_first")
-EQUIPMENT_SETUP_VALUES          = ("frontloaded", "just_in_time")
+INGREDIENT_FLOW_VALUES          = ("serial", "mise_en_place")
+EQUIPMENT_SETUP_VALUES          = ("pre_staged", "just_in_time")
 SERVING_SETUP_VALUES            = ("frontloaded", "just_in_time")
 CLEANUP_TIMING_VALUES           = ("after_service", "as_soon_as_free")
-SEASONING_TIMING_VALUES         = ("before_cook", "late")
-CONTAINER_LOADING_STYLE_VALUES  = ("incremental", "batch_before_cook")
+APPLIANCE_SHUTDOWN_TIMING_VALUES = ("immediate", "deferred")
+CONTAINER_LOADING_STYLE_VALUES  = ("incremental", "just_in_time")
 COOK_START_TIMING_VALUES        = ("as_soon_as_ready", "deferred")
 SERVING_PRIORITY_VALUES         = ("serve_when_ready", "cleanup_before_serve")
 AXES: Tuple[str, ...] = (
     "ingredient_flow",
     "equipment_setup",
     "serving_setup",
-    "cleanup_timing",
-    "seasoning_timing",
     "container_loading_style",
+    "appliance_shutdown_timing",
     "cook_start_timing",
+    "cleanup_timing",
     "serving_priority",
 )
 AXIS_VALUES: Dict[str, Tuple[str, ...]] = {
-    "ingredient_flow":          INGREDIENT_FLOW_VALUES,
-    "equipment_setup":          EQUIPMENT_SETUP_VALUES,
-    "serving_setup":            SERVING_SETUP_VALUES,
-    "cleanup_timing":           CLEANUP_TIMING_VALUES,
-    "seasoning_timing":         SEASONING_TIMING_VALUES,
-    "container_loading_style":  CONTAINER_LOADING_STYLE_VALUES,
-    "cook_start_timing":        COOK_START_TIMING_VALUES,
-    "serving_priority":         SERVING_PRIORITY_VALUES,
+    "ingredient_flow":            INGREDIENT_FLOW_VALUES,
+    "equipment_setup":            EQUIPMENT_SETUP_VALUES,
+    "serving_setup":              SERVING_SETUP_VALUES,
+    "container_loading_style":    CONTAINER_LOADING_STYLE_VALUES,
+    "appliance_shutdown_timing":  APPLIANCE_SHUTDOWN_TIMING_VALUES,
+    "cook_start_timing":          COOK_START_TIMING_VALUES,
+    "cleanup_timing":             CLEANUP_TIMING_VALUES,
+    "serving_priority":           SERVING_PRIORITY_VALUES,
 }
 
 @dataclass(frozen=True)
 class WorkflowPreference:
     ingredient_flow: str = "serial"
-    equipment_setup: str = "just_in_time"
+    equipment_setup: str = "pre_staged"
     serving_setup: str = "just_in_time"
-    cleanup_timing: str = "after_service"
-    seasoning_timing: str = "before_cook"
     container_loading_style: str = "incremental"
+    appliance_shutdown_timing: str = "immediate"
     cook_start_timing: str = "as_soon_as_ready"
+    cleanup_timing: str = "after_service"
     serving_priority: str = "serve_when_ready"
     def __post_init__(self):
         for axis, value in self.as_dict().items():
@@ -70,10 +70,10 @@ class WorkflowPreference:
             f"if-{self.ingredient_flow}"
             f"_eq-{self.equipment_setup}"
             f"_sv-{self.serving_setup}"
-            f"_cu-{self.cleanup_timing}"
-            f"_se-{self.seasoning_timing}"
             f"_cl-{self.container_loading_style}"
+            f"_sh-{self.appliance_shutdown_timing}"
             f"_co-{self.cook_start_timing}"
+            f"_cu-{self.cleanup_timing}"
             f"_sp-{self.serving_priority}"
         )
     def as_dict(self) -> Dict[str, str]:
@@ -81,10 +81,10 @@ class WorkflowPreference:
             "ingredient_flow": self.ingredient_flow,
             "equipment_setup": self.equipment_setup,
             "serving_setup": self.serving_setup,
-            "cleanup_timing": self.cleanup_timing,
-            "seasoning_timing": self.seasoning_timing,
             "container_loading_style": self.container_loading_style,
+            "appliance_shutdown_timing": self.appliance_shutdown_timing,
             "cook_start_timing": self.cook_start_timing,
+            "cleanup_timing": self.cleanup_timing,
             "serving_priority": self.serving_priority,
         }
 
@@ -98,28 +98,39 @@ class ModificationResult:
 
 # Preset library used by the experimental conditions. Names are short tags that label one (recipe, preference) row in test schedules; the simulator uses them only to stratify episodes — they never enter the learner.
 PRESET_PREFERENCES: Dict[str, WorkflowPreference] = {
-    # Identity preset = the recipe's natural ordering with no axis transforms.
-    "identity":        WorkflowPreference(  ingredient_flow="serial",                       equipment_setup="just_in_time",                 serving_setup="just_in_time",                   cleanup_timing="after_service"),
-    # P1: prep-first batching, just-in-time equipment/serving, defer cleanup.
-    "p1_prep_first":   WorkflowPreference(  ingredient_flow="prep_first",                   equipment_setup="just_in_time",                 serving_setup="just_in_time",                   cleanup_timing="after_service"),
-    # P2: frontload equipment + serving (e.g. mise-en-place style).
-    "p2_frontload":    WorkflowPreference(  ingredient_flow="serial",                       equipment_setup="frontloaded",                  serving_setup="frontloaded",                    cleanup_timing="after_service"),
-    # P3: serial ingredients, just-in-time equipment/serving, eager cleanup.
-    "p3_clean_eager":  WorkflowPreference(  ingredient_flow="serial",                       equipment_setup="just_in_time",                 serving_setup="just_in_time",                   cleanup_timing="as_soon_as_free"),
-    # P4: combine prep_first + clean_eager under just-in-time setup.
-    "p4_prep_clean":   WorkflowPreference(  ingredient_flow="prep_first",                   equipment_setup="just_in_time",                 serving_setup="just_in_time",                   cleanup_timing="as_soon_as_free"),
-    # P5: prep-first mise-en-place with eager cleanup.
-    "p5_prep_stage_clean": WorkflowPreference(ingredient_flow="prep_first",                 equipment_setup="just_in_time",                 serving_setup="frontloaded",                    cleanup_timing="as_soon_as_free"),
-    # P6: all non-default workflow axes for maximal restructuring.
-    "p6_full_restructure": WorkflowPreference(ingredient_flow="prep_first",                 equipment_setup="frontloaded",                  serving_setup="frontloaded",                    cleanup_timing="as_soon_as_free",               seasoning_timing="late",                         container_loading_style="batch_before_cook",     cook_start_timing="deferred",                    serving_priority="cleanup_before_serve"),
-    # P7-P10 isolate the newly added workflow axes so transfer experiments can hold out one axis family cleanly.
-    "p7_late_seasoning":                    WorkflowPreference(seasoning_timing="late"),
-    "p8_batch_container_loading":           WorkflowPreference(container_loading_style="batch_before_cook"),
-    "p9_deferred_cook_start":               WorkflowPreference(cook_start_timing="deferred"),
-    "p10_cleanup_before_serve":             WorkflowPreference(serving_priority="cleanup_before_serve"),
-    # Composed presets for non-diagonal preference-composition probes.
-    "p11_late_season_batch_load":           WorkflowPreference(seasoning_timing="late",                         container_loading_style="batch_before_cook"),
-    "p12_defer_cook_cleanup_before_serve":  WorkflowPreference(cook_start_timing="deferred",                    serving_priority="cleanup_before_serve"),}
+    "identity": WorkflowPreference(),
+    # Isolated, goal-preserving primary axes in WorkflowPreference axis order.
+    "p1_mise_en_place": WorkflowPreference(ingredient_flow="mise_en_place"),
+    "p2_equipment_just_in_time": WorkflowPreference(equipment_setup="just_in_time"),
+    "p3_frontload_serving_setup": WorkflowPreference(serving_setup="frontloaded"),
+    "p4_load_just_in_time": WorkflowPreference(container_loading_style="just_in_time"),
+    "p5_shutdown_late": WorkflowPreference(appliance_shutdown_timing="deferred"),
+    "p6_deferred_cook_start": WorkflowPreference(cook_start_timing="deferred"),
+    "p7_clean_eager": WorkflowPreference(cleanup_timing="as_soon_as_free"),
+    "p8_cleanup_before_serve": WorkflowPreference(serving_priority="cleanup_before_serve"),
+    # Explicit composition probes; they are not part of the primary axis ladder.
+    "p9_equipment_jit_frontload_serving": WorkflowPreference(
+        equipment_setup="just_in_time", serving_setup="frontloaded",
+    ),
+    "p10_mise_en_place_clean": WorkflowPreference(
+        ingredient_flow="mise_en_place", cleanup_timing="as_soon_as_free",
+    ),
+    "p11_mise_en_place_serving_clean": WorkflowPreference(
+        ingredient_flow="mise_en_place", serving_setup="frontloaded",
+        cleanup_timing="as_soon_as_free",
+    ),
+    "p12_multi_stage_reorganization": WorkflowPreference(
+        ingredient_flow="mise_en_place", serving_setup="frontloaded",
+        container_loading_style="just_in_time", cleanup_timing="as_soon_as_free",
+    ),
+    "p13_equipment_jit_clean": WorkflowPreference(
+        equipment_setup="just_in_time", cleanup_timing="as_soon_as_free",
+    ),
+    "p14_mise_load_clean": WorkflowPreference(
+        ingredient_flow="mise_en_place", container_loading_style="just_in_time",
+        cleanup_timing="as_soon_as_free",
+    ),
+}
 PREFERENCE_NAMES: Tuple[str, ...] = tuple(PRESET_PREFERENCES.keys())
 
 
@@ -194,11 +205,51 @@ def _move_matching_block(actions: Sequence[str], predicate, *, earliest: bool) -
     return list(actions)
 
 
+def _move_matching_actions_goal_preserving(
+    actions: Sequence[str],
+    predicate,
+    *,
+    earliest: bool,
+) -> List[str]:
+    """Move each matching action to a valid extreme without changing the goal.
+
+    Block moves are only sound when all selected actions share one contiguous
+    dependency window.  Recipe loads and equipment actions do not: a single
+    recipe can contain a storage load, an intermediate transfer, and a final
+    mixture load.  This scheduler moves one *identified occurrence* at a time
+    and accepts an insertion only when the complete candidate remains both
+    executable and goal-equivalent to the input recipe.
+    """
+    base = list(actions)
+    base_goal = task_goal_signature(base)
+    tagged = list(enumerate(base))
+    target_ids = [uid for uid, action in tagged if predicate(action)]
+    ordered_ids = target_ids if earliest else list(reversed(target_ids))
+
+    for target_id in ordered_ids:
+        current_idx = next(idx for idx, (uid, _action) in enumerate(tagged) if uid == target_id)
+        item = tagged.pop(current_idx)
+        positions = range(0, len(tagged) + 1) if earliest else range(len(tagged), -1, -1)
+        for position in positions:
+            candidate = tagged[:position] + [item] + tagged[position:]
+            candidate_actions = [action for _uid, action in candidate]
+            if validate_ordering(candidate_actions, expected_goal=base_goal):
+                tagged = candidate
+                break
+        else:
+            # The original placement is valid by construction; retain it when
+            # no more extreme goal-preserving placement exists.
+            tagged.insert(current_idx, item)
+
+    result = [action for _uid, action in tagged]
+    return result if validate_ordering(result, expected_goal=base_goal) else base
+
+
 def _is_equipment_setup(action: str) -> bool:               return (_verb(action) in ("transfer", "move_container") and _arg0(action) in CONTAINERS and _arg0(action) != "plate" and _source(action) == "storage")
 
 def _is_cleanup_transport(action: str, item: str) -> bool:  return (_verb(action) in ("transfer", "move_container") and _arg0(action) == item and _destination(action) == "washing_station")
 
-def _is_seasoning_action(action: str) -> bool:              return _verb(action) in ("season", "season_container")
+def _is_ingredient_retrieval(action: str) -> bool:          return _verb(action) == "transfer" and _source(action) == "storage" and _arg0(action) in INGREDIENTS
 
 def _is_productive_load(action: str) -> bool:
     args = _args(action)
@@ -240,42 +291,25 @@ def _cleanup_blocks(actions: Sequence[str]) -> Tuple[List[str], List[List[str]]]
 
 # Axis transforms
 def _apply_ingredient_flow(actions: Sequence[str], value: str) -> List[str]:
-    """`serial` is per-ingredient pipeline; ``prep_first`` batches retrievals, then preps, then loads. For a serial recipe (the natural ordering of all RecipeGenerator outputs) the prep-first reorder pulls all retrieve→storage transfers to the front, then all cut/grate actions, then everything else. We validate; if invalid we fall back to the input unchanged."""
+    """Use raw serial order or a full, goal-preserving mise-en-place policy."""
     if value == "serial":       return list(actions)
-    if value != "prep_first":   return list(actions)
-
-    # Phase A: retrievals from storage of *ingredients* go first.
-    retrievals, rest =  _stable_partition(actions, lambda a: (_verb(a) == "transfer" and _arg_kw(a, "from") == "storage" and _arg0(a) in INGREDIENTS))
-    # Phase B: prep actions (cut/grate) collected from `rest`.
-    preps, rest2 =      _stable_partition(rest, lambda a: _verb(a) in ("cut", "grate"))
-    candidate = retrievals + preps + rest2
-    if _try_validate(candidate): return candidate
-    # Phase A only.
-    candidate = retrievals + rest
-    if _try_validate(candidate): return candidate
-    return list(actions)
+    if value != "mise_en_place": return list(actions)
+    return _move_matching_actions_goal_preserving(
+        actions,
+        lambda action: (
+            _is_ingredient_retrieval(action)
+            or _verb(action) in ("cut", "grate")
+            or _is_productive_load(action)
+        ),
+        earliest=True,
+    )
 
 
 def _apply_equipment_setup(actions: Sequence[str], value: str) -> List[str]:
-    """Move non-serving container setup to early or late valid positions. `frontloaded` pulls setup actions as early as the environment permits. `just_in_time` pushes them as late as possible while preserving the full ordering's validity. Some storage-loaded containers cannot move
-      before the storage load; validation keeps those cases at the first physically possible point."""
-    if value not in ("frontloaded", "just_in_time"): return list(actions)
-
-    setup_actions = [a for a in actions if _is_equipment_setup(a)]
-    if not setup_actions: return list(actions)
-
-    candidate = list(actions)
-    if value == "frontloaded":
-        lower = 0
-        for setup in setup_actions:
-            candidate, pos = _move_one_action(candidate, setup, earliest=True, lower_bound=lower)
-            lower = pos + 1
-    else:
-        for setup in setup_actions:
-            candidate, _pos = _move_one_action(candidate, setup, earliest=False)
-
-    if _try_validate(candidate): return candidate
-    return list(actions)
+    """Contrast raw pre-staging with last-valid, just-in-time equipment setup."""
+    if value == "pre_staged": return list(actions)
+    if value != "just_in_time": return list(actions)
+    return _move_matching_actions_goal_preserving(actions, _is_equipment_setup, earliest=False)
 
 
 def _apply_serving_setup(actions: Sequence[str], value: str) -> List[str]:
@@ -332,21 +366,21 @@ def _apply_cleanup_timing(actions: Sequence[str], value: str) -> List[str]:
     return list(actions)
 
 
-def _apply_seasoning_timing(actions: Sequence[str], value: str) -> List[str]:
-    """`late` delays seasoning to the latest executable point. The default leaves the recipe's native seasoning order unchanged."""
-    if value == "before_cook":
+def _apply_appliance_shutdown_timing(actions: Sequence[str], value: str) -> List[str]:
+    """Delay appliance shutdown until the last goal-preserving opportunity."""
+    if value == "immediate":
         return list(actions)
-    if value == "late":
-        return _move_matching_block(actions, _is_seasoning_action, earliest=False)
+    if value == "deferred":
+        return _move_matching_actions_goal_preserving(actions, lambda action: _verb(action) == "turn_off", earliest=False)
     return list(actions)
 
 
 def _apply_container_loading_style(actions: Sequence[str], value: str) -> List[str]:
-    """`batch_before_cook` pulls non-serving load actions earlier when dependencies permit it."""
+    """Use raw incremental loading or defer each load to its last valid point."""
     if value == "incremental":
         return list(actions)
-    if value == "batch_before_cook":
-        return _move_matching_block(actions, _is_productive_load, earliest=True)
+    if value == "just_in_time":
+        return _move_matching_actions_goal_preserving(actions, _is_productive_load, earliest=False)
     return list(actions)
 
 
@@ -370,22 +404,16 @@ def _apply_serving_priority(actions: Sequence[str], value: str) -> List[str]:
 # Public modifier
 class WorkflowPreferenceModifier:
     """Apply a workflow preference to a base recipe action list."""
-    AXIS_ORDER: Tuple[str, ...] = (
-        "ingredient_flow",
-        "equipment_setup",
-        "serving_setup",
-        "container_loading_style",
-        "seasoning_timing",
-        "cook_start_timing",
-        "cleanup_timing",
-        "serving_priority",
-    )
+    # ``AXES`` is the single canonical schema and transform order. Keeping
+    # this alias prevents documentation, metadata, and composition order from
+    # drifting apart again.
+    AXIS_ORDER: Tuple[str, ...] = AXES
     AXIS_FN = {
         "ingredient_flow": _apply_ingredient_flow,
         "equipment_setup": _apply_equipment_setup,
         "serving_setup": _apply_serving_setup,
         "container_loading_style": _apply_container_loading_style,
-        "seasoning_timing": _apply_seasoning_timing,
+        "appliance_shutdown_timing": _apply_appliance_shutdown_timing,
         "cook_start_timing": _apply_cook_start_timing,
         "cleanup_timing": _apply_cleanup_timing,
         "serving_priority": _apply_serving_priority,
@@ -405,6 +433,12 @@ class WorkflowPreferenceModifier:
         prefs_dict = preference.as_dict()
         for axis in self.AXIS_ORDER:
             value = prefs_dict[axis]
+            if value == self.DEFAULT_VALUES[axis]:
+                # A default value denotes the raw generator policy, not an
+                # instruction to run a second hidden transform.  This makes
+                # one-axis presets genuinely one-axis interventions.
+                unchanged.append(axis)
+                continue
             before = list(modified)
             candidate = self.AXIS_FN[axis](modified, value)
             if not validate_ordering(candidate, expected_goal=base_goal):

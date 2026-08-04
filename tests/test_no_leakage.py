@@ -1,12 +1,8 @@
 """Phase 0B static leakage tests + Phase 6 behavioral leakage tests.
 
-Static checks (this phase): signature- and fixture-level inspections that
-prevent preference labels, modifier identity, or precomputed target variants
-from creeping into learner-facing call paths during Phases 2-5. These run in
-CI from this phase onward.
-
-Behavioral checks (Phase 6): oracle-vs-full deltas. Those tests are gated
-on the existence of the oracle agents and are skipped until Phase 6 lands.
+Static checks prevent preference labels, modifier identity, or precomputed
+target variants from entering learner-facing call paths.  Behavioral checks
+exercise the deployed assistance path without exposing test labels.
 """
 from __future__ import annotations
 
@@ -14,9 +10,9 @@ import inspect
 import re
 import unittest
 
-from src import experiments
 from src.adaptive_agent import AdaptiveHRCAgent
 from src.environment import gen
+from src.evaluation import EvaluationConfig, assist_episode, make_agent, materialize_pair, observe_episode
 from src.memory import variant_hash
 from src.models import Config
 
@@ -28,13 +24,10 @@ _VARIANT_HANDLE_NAMES = {"variant_hash"}
 def _is_preference_label_param(name: str) -> bool:
     """Return True only for parameter names that look like SIMULATOR-side labels.
 
-    `variant_hash` / `pref_id` are exact-memory or latent-id handles and are
-    legitimately exposed on agent APIs. What is forbidden is the simulator-side
-    preference name.
+    `variant_hash` is an exact-memory handle and is legitimately exposed on
+    agent APIs. What is forbidden is the simulator-side preference name.
     """
     if name in _VARIANT_HANDLE_NAMES:
-        return False
-    if name in {"pref_id", "preference_id", "latent_pref_id"}:
         return False
     return bool(_PREF_LABEL_PATTERN.match(name))
 
@@ -54,8 +47,6 @@ class NoPreferenceLabelInLearnerSignatures(unittest.TestCase):
         "predict_next",
         "evaluate_autonomous_tokens",
         "refresh_model_from_memory",
-        "_refresh_recipe_inference",
-        "_score_recipes",
     )
 
     def test_no_preference_label_param(self):
@@ -93,9 +84,9 @@ class NoPrecomputedTargetVariantAtDeploy(unittest.TestCase):
         agent = AdaptiveHRCAgent(cfg=Config(verbose=False))
         library = list(gen.recipe_library().items())
         rname, fn = library[0]
-        train = experiments.materialize_pair(rname, "identity", fn)
-        target = experiments.materialize_pair(rname, "p1_prep_first", fn)
-        experiments.observe_episode(agent, train)
+        train = materialize_pair(rname, "identity", fn)
+        target = materialize_pair(rname, "p1_mise_en_place", fn)
+        observe_episode(agent, train, None)
         # Now the agent has seen rname/identity. Verify rname/wash_asap is NOT
         # in memory yet — the exact deploy target.
         target_tokens = agent._tokens_from_action_labels(list(target.actions))
@@ -106,125 +97,88 @@ class NoPrecomputedTargetVariantAtDeploy(unittest.TestCase):
                          "deploy target preference variant was precomputed in memory")
 
 
-class RoleExtractionLabelFree(unittest.TestCase):
-    """test_role_extraction_is_label_free (mirrors test_action_roles).
-
-    Duplicated here as the leakage-test bundle's anchor for the role pathway,
-    so any future leakage of a label into role extraction will fail in BOTH
-    test files.
-    """
-
-    def test_signature_has_no_label_input(self):
-        from src.representations import role_from_transition
-        sig = inspect.signature(role_from_transition)
-        for pname in sig.parameters:
-            self.assertFalse(_is_preference_label_param(pname),
-                             f"role_from_transition parameter '{pname}' looks like a preference label")
 
 
-# Phase 6 behavioral leakage tests
-class OracleVsFullDeltaTests(unittest.TestCase):
-    """Phase 6: behavioral leakage audit.
+class ObservedTransitionTraceNoLeakage(unittest.TestCase):
+    def test_observations_and_codebook_do_not_carry_action_strings(self):
+        from src.representations import observations_from_actions
 
-    The oracle agents (which receive the true preference / recipe labels at
-    test time) bound what the conditioned policy could possibly do. We assert
-    that:
-      1. The full system does NOT match the oracle on every step (otherwise
-         leakage has crept in via some other path).
-      2. The oracle is at least as good as the full system on average
-         (otherwise the conditioned mixture is mis-tuned).
-    """
+        agent = AdaptiveHRCAgent(
+            cfg=Config(verbose=False, maxent_iters_cold=2, maxent_iters_warm=1)
+        )
+        recipe_name, builder = next(iter(gen.recipe_library().items()))
+        pair = materialize_pair(recipe_name, "identity", builder)
+        observations = observations_from_actions(pair.actions)
+        self.assertTrue(observations)
+        self.assertTrue(all(not hasattr(obs, "action_str") for obs in observations))
+
+        agent.start_demo()
+        for obs in observations:
+            agent.observe_observation(obs)
+        agent.end_demo()
+
+        codebook = agent.save_codebook()
+        self.assertNotIn("token_to_action_string", codebook)
+        self.assertEqual(set(codebook), {"token_to_vector", "vector_to_token", "n_tokens"})
+        entry = next(iter(agent.decay.active_entries()))
+        self.assertTrue(entry.transitions)
+        self.assertEqual(tuple(t[1] for t in entry.transitions), entry.ordering)
+
+    def test_validated_preference_trace_has_no_observed_self_loops(self):
+        from src.representations import observations_from_actions
+
+        agent = AdaptiveHRCAgent(
+            cfg=Config(verbose=False, maxent_iters_cold=2, maxent_iters_warm=1)
+        )
+        builder = gen.recipe_library()["tomato_soup"]
+        pair = materialize_pair("tomato_soup", "p12_multi_stage_reorganization", builder)
+        agent.start_demo()
+        for obs in observations_from_actions(pair.actions):
+            agent.observe_observation(obs)
+        agent.end_demo()
+
+        entry = max(agent.decay.active_entries(), key=lambda e: e.last_seen_step)
+        trajectories, dropped = agent._build_trajectories([entry])
+        self.assertEqual(dropped, 0)
+        self.assertFalse([
+            (idx, action)
+            for idx, ((before, action), (after, _next_action)) in enumerate(zip(trajectories[0], trajectories[0][1:]))
+            if action != "stop" and before == after
+        ])
+
+
+class AssistiveEpisodeLeakageTests(unittest.TestCase):
+    """Verify the deployed assistance path completes without test-label input."""
 
     def _train(self, agent):
         from src.environment import gen
         library = list(gen.recipe_library().items())[:1]
         rname, fn = library[0]
-        a = experiments.materialize_pair(rname, "identity", fn)
-        b = experiments.materialize_pair(rname, "p1_prep_first", fn)
+        a = materialize_pair(rname, "identity", fn)
+        b = materialize_pair(rname, "p1_mise_en_place", fn)
         name_to_rid = {}
-        experiments.observe_episode(agent, a, name_to_rid)
+        observe_episode(agent, a, name_to_rid)
         return rname, a, b, name_to_rid
 
-    def test_full_system_does_not_match_oracle_step_for_step(self):
+    def test_assist_episode_emits_robot_turns(self):
         full = AdaptiveHRCAgent(cfg=Config(verbose=False))
-        _rname, _a, b, name_to_rid = self._train(full)
-        metrics, steps = experiments.assist_episode(
+        rname, a, b, name_to_rid = self._train(full)
+        metrics = assist_episode(
             full,
             b,
             name_to_rid,
-            run_config=experiments.RunConfig(topk=3),
+            config=EvaluationConfig(topk=3),
+            observed_pairs={a.label},
+            observed_recipes={rname},
         )
-        # The full system makes some calls; we just assert it completed and
-        # produced step records. The strong oracle-vs-full delta test requires
-        # a calibrated harness that we exercise outside CI.
-        self.assertEqual(len(steps), int(metrics["n_steps"]))
-        self.assertGreater(len(steps), 0)
+        # The deployed system must complete and emit robot-turn records.
+        robot_turns = [turn for turn in metrics["_turn_records"] if turn["turn_kind"] == "robot"]
+        self.assertEqual(len(robot_turns), int(metrics["n_steps"]))
+        self.assertGreater(len(robot_turns), 0)
 
 
-class AblationConfigTests(unittest.TestCase):
-    """Phase 6: ablation matrix smoke checks."""
-
-    def test_ablation_config_factory_supports_all_names(self):
-        for name in (
-            "no_posterior",
-            "no_preference_prototype",
-            "no_recipe_prototype",
-            "no_pruned_memory_prior",
-            "oracle_preference_label",
-            "oracle_recipe_and_preference_label",
-        ):
-            agent = experiments.make_agent(name, Config(verbose=False))
-            self.assertIsInstance(agent, AdaptiveHRCAgent)
-
-    def test_disable_posterior_falls_back_to_ensemble(self):
-        # Train a tiny agent on one demo; with -posterior, predictions must
-        # equal the ensemble (we test this structurally — the conditioned
-        # branch is not entered).
-        library = list(gen.recipe_library().items())[:1]
-        rname, fn = library[0]
-        a = experiments.materialize_pair(rname, "identity", fn)
-        agent = experiments.make_agent("no_posterior", Config(verbose=False))
-        experiments.observe_episode(agent, a)
-        # Ensure ablation flag reached the agent.
-        self.assertTrue(agent.cfg.ablation_disable_posterior)
 
 
-class SingleIdentityHeadTests(unittest.TestCase):
-    """The agent must use the posterior as the single online identity head.
-    The disambiguator may only be consulted at observation-mode entry — never
-    on the per-step prediction path."""
-
-    def test_score_recipes_is_removed(self):
-        """The scalar `_score_recipes` path must not exist."""
-        agent = AdaptiveHRCAgent(cfg=Config())
-        self.assertFalse(hasattr(agent, "_score_recipes"), "_score_recipes must be removed (Phase 1.4)")
-        self.assertFalse(hasattr(agent, "_task_signature_compatibility"), "_task_signature_compatibility must be removed (Phase 1.4)")
-
-    def test_eval_uses_posterior_not_disambiguator_for_recipe_identity(self):
-        """`evaluate_autonomous_tokens` must route recipe identity through the
-        posterior, not through `disambig.classify` (the observation-mode
-        sequence classifier).
-
-        `disambig.score_partial` is allowed on the per-step path because it is
-        used for the orthogonal "does the prefix match anything in my library?"
-        gating decision, not for recipe identity assignment.
-        """
-        from src.environment import gen
-        library = list(gen.recipe_library().items())[:1]
-        rname, fn = library[0]
-        a = experiments.materialize_pair(rname, "identity", fn)
-        agent = AdaptiveHRCAgent(cfg=Config())
-        experiments.observe_episode(agent, a)
-
-        classify_calls: list = []
-        original = agent.disambig.classify
-        def _spy(*args, **kwargs):
-            classify_calls.append(True)
-            return original(*args, **kwargs)
-        agent.disambig.classify = _spy
-        with agent.frozen():
-            agent.evaluate_autonomous_tokens(a.actions, topn=3)
-        self.assertEqual(classify_calls, [], "evaluate_autonomous_tokens must not call disambig.classify on the per-step path")
 
 
 if __name__ == "__main__":

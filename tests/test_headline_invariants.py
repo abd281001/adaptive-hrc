@@ -1,59 +1,65 @@
-"""Fast invariants for paper-facing headline metrics.
-
-These tests protect against silent regressions where headline metric support is
-structurally invalid.
-"""
+"""Fast invariants for evaluator-facing, paper-level metrics."""
 from __future__ import annotations
 
 import math
 import unittest
 
-from src.experiments import (
-    _four_cell,
-    bwt_zero_shot_checkpoints,
-    calibration_curve_from_steps,
-    mean_ci95,
-)
+from src.evaluation import EvaluationConfig, RecipePreferencePair, _exposure_tags, aggregate_episode_metrics
 from src.models import DEFAULT_CONFIG
 
 
 class HeadlineInvariantTests(unittest.TestCase):
-    def test_default_decay_horizon_is_ten_sessions(self):
-        self.assertEqual(DEFAULT_CONFIG.decay_horizon_init, 10)
-        self.assertAlmostEqual(DEFAULT_CONFIG.min_global_rate, 0.02)
+    def test_default_decay_horizon_matches_retention_spec(self):
+        self.assertEqual(DEFAULT_CONFIG.decay_horizon_init, 15)
+        self.assertEqual(DEFAULT_CONFIG.decay_horizon_floor, 6)
+        self.assertEqual(DEFAULT_CONFIG.decay_after_grace_steps, 3)
+        self.assertEqual(DEFAULT_CONFIG.decay_reuse_window, 3)
 
-    def test_mean_ci95_filters_nonfinite_values(self):
-        mean, ci = mean_ci95([float("nan"), float("inf"), 1.0, 3.0])
-        self.assertAlmostEqual(mean, 2.0)
-        self.assertGreater(ci, 0.0)
-        empty_mean, empty_ci = mean_ci95([float("nan"), float("-inf")])
-        self.assertTrue(math.isnan(empty_mean))
-        self.assertEqual(empty_ci, 0.0)
+    def test_evaluator_default_uses_the_published_topk_setting(self):
+        self.assertEqual(EvaluationConfig().topk, 3)
+        self.assertEqual(EvaluationConfig().n_recipes, 15)
+        self.assertEqual(EvaluationConfig().ladder_rungs, 9)
 
-    def test_bwt_zero_shot_requires_nonempty_holdout_support(self):
-        phase_a = {
-            "train": {"top1": 0.8},
-            "heldout": {"top1": 0.4},
-        }
-        final = {
-            "train": {"top1": 0.7},
-            "heldout": {"top1": 0.6},
-        }
-        out = bwt_zero_shot_checkpoints(phase_a, final, phase_a_seen_labels=["train"])
-        self.assertEqual(out["n_zero_shot_tasks"], 1)
-        self.assertFalse(math.isnan(out["zero_shot_transfer"]))
+    def test_aggregate_ignores_nonfinite_metric_values(self):
+        metrics = aggregate_episode_metrics([
+            {
+                "hrc_robot_turn_count": float("nan"),
+                "hrc_robot_correct_count": float("inf"),
+                "hrc_robot_topk_hit_count": 0,
+                "testing_total_action_time": float("nan"),
+                "testing_human_only_action_time": float("inf"),
+            },
+            {
+                "hrc_robot_turn_count": 2,
+                "hrc_robot_correct_count": 1,
+                "hrc_robot_topk_hit_count": 2,
+                "testing_total_action_time": 3.0,
+                "testing_human_only_action_time": 2.0,
+            },
+        ])
+        self.assertAlmostEqual(metrics["live_top1"], 0.5)
+        self.assertAlmostEqual(metrics["live_topk"], 1.0)
+        self.assertAlmostEqual(metrics["testing_normalized_interaction_cost"], 1.5)
+        self.assertFalse(math.isnan(metrics["live_top1"]))
 
-    def test_calibration_curve_uses_step_confidence_support(self):
-        rows = [
-            {"policy_diagnostics": {"policy_confidence": i / 99}, "correct_top1": i % 2 == 0}
-            for i in range(100)
-        ]
-        out = calibration_curve_from_steps(rows, n_bins=10)
-        self.assertEqual(sum(int(row["n_steps"]) for row in out), 100)
-        self.assertEqual(len(out), 10)
+    def test_empty_aggregate_is_marked_not_run_not_zero_accuracy(self):
+        metrics = aggregate_episode_metrics([])
+        self.assertEqual(metrics["status"], "not_run")
+        self.assertIsNone(metrics["live_top1"])
+        self.assertIsNone(metrics["human_correction_rate"])
 
-    def test_cross_product_offdiagonal_cell_is_known_recipe_new_preference(self):
-        self.assertEqual(_four_cell(seen_recipe=True, seen_preference=False), "seen_recipe_new_preference")
+    def test_exposure_cell_marks_known_recipe_new_preference(self):
+        pair = RecipePreferencePair("recipe", "alternative", ("opaque",))
+        tags = _exposure_tags(
+            pair,
+            observed_recipes={"recipe"},
+            observed_preferences=set(),
+            observed_pairs=set(),
+            preferences_by_recipe={"recipe": set()},
+            axis_values_by_recipe={"recipe": set()},
+        )
+        self.assertEqual(tags["four_cell_before"], "seen_recipe_new_preference")
+        self.assertEqual(tags["transfer_cell_before"], "seen_recipe_new_preference")
 
 
 if __name__ == "__main__":

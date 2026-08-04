@@ -37,7 +37,7 @@ class VariantMemoryTests(unittest.TestCase):
         self.assertEqual(library[0].variant_hash, v1.variant_hash)
 
     def test_register_never_evicts_known_variants(self):
-        memory = VariantMemory(Config(max_variants_per_recipe=1))
+        memory = VariantMemory(Config())
         v1 = memory.register(TOMATO_ONION_SOUP, ["a", "b"], step=1)
         v2 = memory.register(TOMATO_ONION_SOUP, ["b", "a"], step=2)
         self.assertIn(v1.variant_hash, memory.variants[TOMATO_ONION_SOUP])

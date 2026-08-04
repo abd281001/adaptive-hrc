@@ -1,6 +1,6 @@
 """Evaluation harness for the adaptive preference-learning HRC benchmark.
 
-This module keeps one runner, three scenario generators, compact episode-level logging, frozen
+This module keeps one runner, five scenario generators, compact episode-level logging, frozen
 evaluation, and the diagnostics needed for the paper claims.
 """
 from __future__ import annotations
@@ -17,30 +17,29 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
-from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 DEFAULT_NATIVE_THREADS_PER_WORKER = 1
-PAPER_SEEDS = (1337, 2024, 7, 9001, 31415)
+# Fifteen fixed paired replications. The original five seeds are retained;
+# the ten-seed extension was drawn once from ``random.Random(20250817)`` and
+# stored literally so the paper protocol is independent of Python PRNG
+# implementation details.
+PAPER_SEEDS = (
+    1337, 2024, 7, 9001, 31415,
+    977683127, 391693862, 224405947, 1115789944, 206259923,
+    369598007, 905883393, 1388713902, 1782798442, 448584643,
+)
 PAIRED_BOOTSTRAP_SAMPLES = 10_000
-# One-factor-at-a-time checks around the online self-training rule.  The
-# identity/posterior pair preserves their combined 0.66 contribution, so that
-# comparison changes evidence allocation rather than total score scale.
+# One-factor-at-a-time checks around the deployable online self-training rule.
 COMMIT_SENSITIVITY_SPECS: Tuple[Tuple[str, Mapping[str, float]], ...] = (
     ("default", {}),
     ("tentative_threshold_low", {"online_commit_tentative_threshold": 0.30}),
     ("tentative_threshold_high", {"online_commit_tentative_threshold": 0.60}),
     ("full_threshold_low", {"online_commit_full_threshold": 0.60}),
     ("full_threshold_high", {"online_commit_full_threshold": 0.90}),
-    ("identity_evidence_low", {
-        "online_commit_identity_weight": 0.30,
-        "online_commit_recipe_posterior_weight": 0.36,
-    }),
-    ("identity_evidence_high", {
-        "online_commit_identity_weight": 0.60,
-        "online_commit_recipe_posterior_weight": 0.06,
-    }),
+    ("identity_evidence_low", {"online_commit_identity_weight": 0.30}),
+    ("identity_evidence_high", {"online_commit_identity_weight": 0.60}),
 )
 NATIVE_THREAD_ENV_VARS = (
     "OPENBLAS_NUM_THREADS",
@@ -124,26 +123,33 @@ def _apply_native_thread_limit(threads: int) -> Dict[str, Any]:
 _set_native_thread_env(DEFAULT_NATIVE_THREADS_PER_WORKER, override=False)
 
 from .adaptive_agent import AdaptiveHRCAgent
-from .baselines import BASELINE_AGENTS, OracleCeilingAgent
+from .baselines import BASELINE_AGENTS
 from .environment import gen
 from .hrc_simulation import DEFAULT_HRC_TIMING, run_alternating_hrc_episode
-from .memory import VariantKey, variant_hash
+from .memory import VariantKey, clear_all_module_caches, variant_hash
 from .models import DEFAULT_CONFIG, Config
-from .preferences import PRESET_PREFERENCES, materialize_with_report
+from .preferences import PREFERENCE_NAMES, PRESET_PREFERENCES, materialize_with_report
 from .representations import observations_from_actions
 
 
 SCENARIO_LADDER_HETEROGENEOUS = "ladder_heterogeneous"
 SCENARIO_LADDER_HOMOGENEOUS = "ladder_homogeneous"
 SCENARIO_DEPLOYMENT_RANDOM = "ladder_deployment_random"
+SCENARIO_AXIS_HOLDOUT = "axis_holdout"
+SCENARIO_PREFERENCE_HOLDOUT = "preference_holdout"
 SCENARIOS = (
     SCENARIO_LADDER_HETEROGENEOUS,
     SCENARIO_LADDER_HOMOGENEOUS,
     SCENARIO_DEPLOYMENT_RANDOM,
+    SCENARIO_AXIS_HOLDOUT,
+    SCENARIO_PREFERENCE_HOLDOUT,
 )
 
 DEFAULT_BASELINES = (
     "full",
+    "offline_pretrained_frozen",
+    "offline_all_recipes_identity_frozen",
+    "adaptive_decay",
     "latest_only",
     "fixed_decay",
     "no_decay",
@@ -161,19 +167,16 @@ CLAIRVOYANT_LEAKAGE_WARNING = (
 )
 
 DEFAULT_LADDER_PREFERENCES = (
+    # Primary 9-rung protocol: identity plus one non-default axis per rung.
     "identity",
-    "p2_frontload",
-    "p3_clean_eager",
-    "p5_prep_stage_clean",
-    "p6_full_restructure",
-    "p9_deferred_cook_start",
-    "p10_cleanup_before_serve",
-    "p12_defer_cook_cleanup_before_serve",
-    "p1_prep_first",
-    "p4_prep_clean",
-    "p7_late_seasoning",
-    "p8_batch_container_loading",
-    "p11_late_season_batch_load",
+    "p1_mise_en_place",
+    "p2_equipment_just_in_time",
+    "p3_frontload_serving_setup",
+    "p4_load_just_in_time",
+    "p5_shutdown_late",
+    "p6_deferred_cook_start",
+    "p7_clean_eager",
+    "p8_cleanup_before_serve",
 )
 
 OBSERVATION_MODE_EXTRA_TIME_PER_STEP = 1.0
@@ -227,50 +230,55 @@ class ScenarioPlan:
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    # Five fixed, paired scenario draws are the minimum paper protocol.  The
+    # Fifteen fixed, paired scenario draws are the default paper protocol. The
     # runner still accepts any explicit seed tuple for smoke tests or larger
     # final studies.
     seeds: Tuple[int, ...] = PAPER_SEEDS
     scenarios: Tuple[str, ...] = SCENARIOS
     baselines: Tuple[str, ...] = DEFAULT_BASELINES
+    # Used only by ``offline_pretrained_frozen``.  The selected subsets are
+    # deterministic within each paired scenario seed; all deployment events
+    # then run with a fixed policy and fixed memory.
+    offline_pretrained_recipe_fraction: float = 0.50
+    offline_pretrained_preference_fraction: float = 0.50
     output_dir: str = "results/evaluation"
     workers: int = 0
     native_threads_per_worker: int = DEFAULT_NATIVE_THREADS_PER_WORKER
     print_eta: bool = True
     include_clairvoyant_oracle: bool = True
-    n_recipes: int = 6
-    ladder_rungs: int = 5
+    n_recipes: int = 15
+    ladder_rungs: int = 9
     ladder_preferences: Tuple[str, ...] = DEFAULT_LADDER_PREFERENCES
-    allow_repeated_ladder_orderings: bool = False
-    min_distinct_ladder_orderings: int = 2
-    settle_repeats_per_update: int = 1
-    deployment_events: int = 80
-    deployment_onboarding_recipes: int = 3
-    # The probabilities define a fixed per-seed quota allocation; event order
-    # is randomized only within feasibility constraints so each requested
-    # condition has adequate support.
-    deployment_quota_controlled: bool = True
-    deployment_preference_shift_prob: float = 0.28
-    deployment_transfer_probe_prob: float = 0.22
-    deployment_reentry_prob: float = 0.14
-    deployment_new_recipe_prob: float = 0.10
-    # Retained only for backwards-compatible configuration parsing. Known
-    # recipes are never silently routed to observation: all preference changes
-    # use assist mode under the stated interaction protocol.
-    deployment_random_observation_prob: float = 0.0
-    deployment_reentry_oldest_fraction: float = 0.35
-    deployment_reentry_prefer_displaced: bool = True
-    deployment_transfer_fresh_gap_events: int = 2
-    deployment_transfer_aged_gap_events: int = 8
+    # Each settled block contains a seed-fixed total of 2--2.5 times its
+    # climb subgroup size.
+    settle_repeat_multiplier_min: float = 2.0
+    settle_repeat_multiplier_max: float = 2.5
+    # The randomized ladder samples a subgroup independently at each rung;
+    # homogeneous and heterogeneous ladders always use every recipe.
+    random_ladder_min_recipes_per_rung: int = 3
+    # The random deployment ladder includes one mechanism-matched delayed
+    # recurrence probe in each eligible rung. The probe is the current
+    # (just-updated) recipe--preference pair, selected only after at least two
+    # distinct conflicting variants for that recipe have entered history. Its
+    # delay is calibrated to the full model's per-recipe grace horizon and
+    # pruning rate; it replaces an ordinary settled repeat, so the episode
+    # budget is unchanged.
+    random_ladder_recurrence_min_prior_conflicts: int = 2
+    random_ladder_recurrence_min_intervening_events: int = 4
     route_absent_recipe_assists_to_observe: bool = True
+    # The full system's realized observation/assist route is the canonical
+    # interaction schedule. Every deployable baseline is evaluated under that
+    # same schedule, preventing a weaker memory from buying extra supervision
+    # by routing more events to observation mode.
+    match_baseline_execution_modes_to_full: bool = True
     # A matched, non-mutating probe immediately before each explicitly tagged
     # primary assist event.  Random deployment extends this to every routed
     # assist event.  This is the comparable prediction metric; live
     # interaction cost still uses the actual routed event.
     pre_event_frozen_probes: bool = True
-    # Applies to the heterogeneous ladder only.  The homogeneous ladder uses
-    # explicit rung boundaries; randomized deployment uses event-local probes
-    # rather than repeated full-grid sweeps.
+    # Applies to the heterogeneous ladder only. Homogeneous and holdout
+    # ladders use explicit rung boundaries; randomized deployment uses
+    # event-local probes rather than repeated full-grid sweeps.
     frozen_eval_period: int = 4
     frozen_eval_max_pairs: int = 48
     active_only_audit_period: int = 2
@@ -280,6 +288,9 @@ class EvaluationConfig:
     profile: bool = False
     run_commit_sensitivity: bool = False
     model_overrides: Mapping[str, Any] = field(default_factory=dict)
+    # A descriptive label persisted in the existing evaluation_config and
+    # suite summary.  It never changes agent behaviour.
+    experiment_label: str = "standard_evaluation"
 
 
 @dataclass
@@ -292,10 +303,10 @@ class EventStreamRun:
     episode_rows: List[Dict[str, Any]]
     frozen_rows: List[Dict[str, Any]]
     memory_rows: List[Dict[str, Any]]
-    prototype_rows: List[Dict[str, Any]]
     active_audit_rows: List[Dict[str, Any]]
     oracle_pruning_rows: List[Dict[str, Any]]
     turn_rows: List[Dict[str, Any]]
+    initial_memory: Dict[str, Any]
     wall_s: float
 
 
@@ -371,16 +382,10 @@ def base_config(seed: int, eval_config: EvaluationConfig, **overrides: Any) -> C
 def make_agent(name: str, cfg: Config) -> AdaptiveHRCAgent:
     registry: Dict[str, Callable[..., AdaptiveHRCAgent]] = {
         "full": AdaptiveHRCAgent,
-        "oracle": OracleCeilingAgent,
         **BASELINE_AGENTS,
     }
     if name not in registry:
         raise KeyError(f"unknown baseline {name!r}; available={sorted(registry)}")
-    # Session-local correction adaptation is a proposed Full component.  It
-    # must not silently improve a comparator simply because the shared HRC
-    # runner delivers feedback to every agent.
-    if name != "full":
-        cfg = replace(cfg, session_correction_adaptation=False)
     return registry[name](cfg=cfg)
 
 
@@ -396,6 +401,46 @@ def select_recipe_builders(seed: int, n_recipes: int) -> List[Tuple[str, Callabl
     return items[: max(1, min(int(n_recipes), len(items)))]
 
 
+def _sampled_recipe_builders(config: EvaluationConfig, seed: int) -> List[Tuple[str, Callable[[], List[str]]]]:
+    """Draw the experimental recipe panel without filtering on axis support.
+
+    A seed therefore samples from the full recipe population.  A non-identity
+    preference that leaves one sampled recipe unchanged is omitted only from
+    that rung; it must never cause the recipe itself to be replaced by a more
+    convenient one.
+    """
+    return select_recipe_builders(seed, max(1, int(config.n_recipes)))
+
+
+def _effective_pairs_by_preference(
+    recipe_name: str,
+    builder: Callable[[], List[str]],
+    preferences: Sequence[str],
+) -> Dict[str, RecipePreferencePair]:
+    """Materialize useful preference variants for one fixed raw recipe.
+
+    Identity remains an explicit control.  Other preferences are omitted when
+    they reproduce identity or an earlier emitted ordering, avoiding no-op
+    trials while retaining the recipe in every other applicable rung.
+    """
+    base = tuple(builder())
+    pairs: Dict[str, RecipePreferencePair] = {}
+    seen: Dict[Tuple[str, ...], str] = {}
+    for preference_name in preferences:
+        try:
+            pair = materialize_pair(recipe_name, preference_name, builder)
+        except Exception:
+            continue
+        if preference_name != "identity" and pair.actions == base:
+            continue
+        duplicate_of = seen.get(pair.actions)
+        if duplicate_of is not None:
+            continue
+        seen[pair.actions] = preference_name
+        pairs[preference_name] = pair
+    return pairs
+
+
 def materialize_pair(recipe_name: str, preference_name: str, builder: Callable[[], List[str]]) -> RecipePreferencePair:
     if preference_name not in PRESET_PREFERENCES:
         raise KeyError(f"unknown preference {preference_name!r}")
@@ -409,149 +454,9 @@ def materialize_pair(recipe_name: str, preference_name: str, builder: Callable[[
     )
 
 
-def distinct_pairs_for_recipe(
-    recipe_name: str,
-    builder: Callable[[], List[str]],
-    preferences: Sequence[str],
-    min_pairs: int,
-    *,
-    allow_repeated_orderings: bool,
-) -> List[RecipePreferencePair]:
-    pairs: List[RecipePreferencePair] = []
-    seen_orderings: Dict[Tuple[str, ...], str] = {}
-    for pref in preferences:
-        try:
-            pair = materialize_pair(recipe_name, pref, builder)
-        except Exception:
-            continue
-        duplicate_of = seen_orderings.get(pair.actions)
-        if duplicate_of is not None:
-            if not allow_repeated_orderings:
-                continue
-            pair = replace(
-                pair,
-                ordering_is_distinct=False,
-                duplicate_of_preference=duplicate_of,
-            )
-        else:
-            seen_orderings[pair.actions] = pref
-        pairs.append(pair)
-        if len(pairs) >= min_pairs:
-            break
-    return pairs
-
-
 def _preferences(config: EvaluationConfig) -> List[str]:
     prefs = [p for p in config.ladder_preferences if p in PRESET_PREFERENCES]
     return prefs if "identity" in prefs else ["identity", *prefs]
-
-
-def _pair_matrix(config: EvaluationConfig, seed: int) -> Tuple[List[str], List[str], Dict[str, List[RecipePreferencePair]]]:
-    min_pairs = max(2, int(config.ladder_rungs))
-    strict = not bool(config.allow_repeated_ladder_orderings)
-    min_distinct = min_pairs if strict else max(1, int(config.min_distinct_ladder_orderings))
-    target_recipes = max(1, int(config.n_recipes))
-    matrix: Dict[str, List[RecipePreferencePair]] = {}
-    recipes: List[str] = []
-    for recipe_name, builder in shuffled_recipe_builders(seed):
-        pairs = distinct_pairs_for_recipe(
-            recipe_name,
-            builder,
-            _preferences(config),
-            min_pairs,
-            allow_repeated_orderings=not strict,
-        )
-        distinct_count = sum(1 for pair in pairs if pair.ordering_is_distinct)
-        if len(pairs) >= min_pairs and distinct_count >= min_distinct:
-            matrix[recipe_name] = pairs[:min_pairs]
-            recipes.append(recipe_name)
-            if len(recipes) >= target_recipes:
-                break
-    if len(recipes) < target_recipes:
-        raise RuntimeError(
-            f"only {len(recipes)} recipes support {min_pairs} operative preference rungs"
-        )
-    prefs = sorted({p.preference_name for pairs in matrix.values() for p in pairs})
-    return recipes, prefs, matrix
-
-
-def _shared_preference_matrix(config: EvaluationConfig, seed: int) -> Tuple[List[str], List[str], Dict[str, List[RecipePreferencePair]]]:
-    builders = shuffled_recipe_builders(seed)
-    prefs = _preferences(config)
-    n_rungs = max(2, int(config.ladder_rungs))
-    target_recipes = max(1, int(config.n_recipes))
-    strict = not bool(config.allow_repeated_ladder_orderings)
-    min_distinct = n_rungs if strict else max(1, int(config.min_distinct_ladder_orderings))
-    pair_cache: Dict[str, Dict[str, RecipePreferencePair]] = {}
-    for recipe, builder in builders:
-        by_pref: Dict[str, RecipePreferencePair] = {}
-        for pref in prefs:
-            try:
-                by_pref[pref] = materialize_pair(recipe, pref, builder)
-            except Exception:
-                pass
-        pair_cache[recipe] = by_pref
-
-    combos = combinations(prefs, n_rungs)
-    if "identity" in prefs:
-        combos = (combo for combo in combos if "identity" in combo)
-
-    best_preferences: Tuple[str, ...] = ()
-    best_matrix: Dict[str, List[RecipePreferencePair]] = {}
-    for combo in combos:
-        candidate: Dict[str, List[RecipePreferencePair]] = {}
-        for recipe, builder in builders:
-            pairs: List[RecipePreferencePair] = []
-            seen: Dict[Tuple[str, ...], str] = {}
-            for pref in combo:
-                pair = pair_cache.get(recipe, {}).get(pref)
-                if pair is None:
-                    pairs = []
-                    break
-                duplicate_of = seen.get(pair.actions)
-                if duplicate_of is not None:
-                    if strict:
-                        pairs = []
-                        break
-                    pair = replace(pair, ordering_is_distinct=False, duplicate_of_preference=duplicate_of)
-                else:
-                    seen[pair.actions] = pref
-                pairs.append(pair)
-            if not pairs:
-                continue
-            if sum(1 for pair in pairs if pair.ordering_is_distinct) >= min_distinct:
-                candidate[recipe] = pairs
-        if len(candidate) > len(best_matrix):
-            best_preferences = tuple(combo)
-            best_matrix = candidate
-
-    selected_recipes = [recipe for recipe, _ in builders if recipe in best_matrix][:target_recipes]
-    if len(selected_recipes) < target_recipes:
-        raise RuntimeError(
-            f"only {len(selected_recipes)} homogeneous recipes support {n_rungs} operative shared rungs"
-        )
-    return selected_recipes, list(best_preferences), {recipe: best_matrix[recipe] for recipe in selected_recipes}
-
-
-def _largest_common_latin_matrix(config: EvaluationConfig, seed: int) -> Tuple[List[str], List[str], Dict[str, List[RecipePreferencePair]]]:
-    """Find the largest square recipe/preference set valid for Latin transfer.
-
-    A heterogeneous cross-transfer rung is meaningful only when every selected
-    preference is materially valid for every selected recipe.  Rather than
-    silently substituting arbitrary per-recipe preferences or failing at an
-    aspirational size, reduce to the largest common square subset.
-    """
-    max_size = min(max(2, int(config.n_recipes)), max(2, int(config.ladder_rungs)), len(_preferences(config)))
-    for size in range(max_size, 1, -1):
-        candidate = replace(config, n_recipes=size, ladder_rungs=size)
-        try:
-            recipes, preferences, matrix = _shared_preference_matrix(candidate, seed)
-        except RuntimeError:
-            continue
-        if len(recipes) == size and len(preferences) == size:
-            return recipes, preferences, matrix
-    raise RuntimeError("no common recipe/preference subset of size at least two supports a valid Latin transfer ladder")
-
 
 def _scenario_tag(config: EvaluationConfig, scenario: str, **extra: Any) -> Dict[str, Any]:
     return {
@@ -573,439 +478,659 @@ def _preference_tags(pair: RecipePreferencePair) -> Dict[str, Any]:
     }
 
 
+def _settle_block_size(
+    config: EvaluationConfig,
+    subgroup_size: int,
+    rng: random.Random,
+) -> int:
+    """Choose a phase-level settled-block budget without equalizing recipes.
+
+    The default is intentionally specified at the subgroup level, rather than
+    as a repeat-after-each-update count.  This is the experimental distinction
+    between a climb (one exposure to every selected pair) and a settled block
+    (random reuse of the complete just-climbed pair set).
+    """
+    n_pairs = max(0, int(subgroup_size))
+    if n_pairs == 0:
+        return 0
+    lower = max(n_pairs, int(math.ceil(float(config.settle_repeat_multiplier_min) * n_pairs)))
+    upper = max(lower, int(math.floor(float(config.settle_repeat_multiplier_max) * n_pairs)))
+    return rng.randint(lower, upper)
+
+
+def _randomized_settle_order(
+    pairs: Sequence[RecipePreferencePair],
+    total_repeats: int,
+    rng: random.Random,
+) -> List[RecipePreferencePair]:
+    """Return an unequal random reuse sequence covering the full climb set.
+
+    Every climbed pair occurs at least once.  The deliberate two-extra-draw
+    allocation prevents an accidental exactly balanced block when there are
+    multiple pairs, while the remaining draws are sampled uniformly and the
+    sequence is shuffled.  Thus order and counts are not a hidden factorial
+    control variable.
+    """
+    unique_pairs = list(pairs)
+    if not unique_pairs or total_repeats <= 0:
+        return []
+    total = max(len(unique_pairs), int(total_repeats))
+    counts = {pair.label: 1 for pair in unique_pairs}
+    remaining = total - len(unique_pairs)
+    if len(unique_pairs) > 1 and remaining >= 2:
+        anchor = rng.choice(unique_pairs)
+        counts[anchor.label] += 2
+        remaining -= 2
+    for _ in range(remaining):
+        counts[rng.choice(unique_pairs).label] += 1
+    by_label = {pair.label: pair for pair in unique_pairs}
+    order = [by_label[label] for label, count in counts.items() for _ in range(count)]
+    rng.shuffle(order)
+    return order
+
+
+def _settle_counts(order: Sequence[RecipePreferencePair]) -> Dict[str, int]:
+    return dict(Counter(pair.label for pair in order))
+
+
+def _place_horizon_calibrated_recurrence_probe(
+    order: Sequence[RecipePreferencePair],
+    target: RecipePreferencePair,
+    *,
+    required_delay_events: int,
+    rng: random.Random,
+) -> Tuple[List[RecipePreferencePair], Optional[int]]:
+    """Place the first settled occurrence after the required delay.
+
+    The sequence multiset is preserved exactly.  This is important because the
+    delayed-recurrence condition must not receive more target exposures or a
+    larger settled block than the ordinary random-ladder condition.  The
+    caller places ``target`` last in its climb block, so this settled index is
+    also the number of intervening episode events between update and probe.
+    """
+    original = list(order)
+    target_count = sum(pair.label == target.label for pair in original)
+    if target_count <= 0:
+        return original, None
+
+    probe_position = max(0, int(required_delay_events))
+    if probe_position > len(original) - target_count:
+        return original, None
+    non_targets = [pair for pair in original if pair.label != target.label]
+    prefix = non_targets[:probe_position]
+    suffix = non_targets[probe_position:] + [target] * (target_count - 1)
+    rng.shuffle(suffix)
+    return prefix + [target] + suffix, probe_position
+
+
 def build_ladder_heterogeneous(config: EvaluationConfig, seed: int) -> ScenarioPlan:
-    recipes, preferences, matrix = _largest_common_latin_matrix(config, seed)
+    """Build an all-recipe, phase-level heterogeneous preference ladder.
+
+    Each recipe receives its own seeded random permutation of the available
+    preference pairs.  This keeps its per-rung assignment heterogeneous while
+    allowing a shared preference to occur for several recipes naturally.  It
+    deliberately does *not* impose an off-diagonal Latin-square constraint:
+    at the requested 15 recipes / 9 rungs that constraint would silently drop
+    seven recipes, contradicting the experimental population.
+    """
+    rng = random.Random(int(seed) + 1103)
+    # Every seed keeps its randomly sampled recipe panel.  Each recipe then
+    # draws independently from the full fifteen-preference pool, so several
+    # recipes may naturally share a preference within one rung.
+    recipe_builders = _sampled_recipe_builders(config, seed)
+    recipes = [recipe for recipe, _builder in recipe_builders]
+    preferences = list(PREFERENCE_NAMES)
+    matrix = {
+        recipe: _effective_pairs_by_preference(recipe, builder, preferences)
+        for recipe, builder in recipe_builders
+    }
     events: List[ScenarioEvent] = []
-    n_rungs = len(preferences)
+    n_rungs = max(2, int(config.ladder_rungs))
+    # A recipe with fewer than nine *distinct, effective* orderings is kept
+    # in the seed panel.  It simply has no item in the surplus rung(s), rather
+    # than being replaced by a recipe selected for high axis coverage.  This
+    # is the intended exception to the all-recipes-per-rung rule.
+    pair_order: Dict[str, List[Optional[RecipePreferencePair]]] = {}
+    for recipe in recipes:
+        effective = list(matrix[recipe].values())
+        sampled = rng.sample(effective, k=min(n_rungs, len(effective)))
+        pair_order[recipe] = [*sampled, *([None] * max(0, n_rungs - len(sampled)))]
+        rng.shuffle(pair_order[recipe])
+    prior_preference_sources: Dict[str, RecipePreferencePair] = {}
+
     for rung in range(n_rungs):
-        for recipe_idx, recipe in enumerate(recipes):
-            pair = matrix[recipe][(recipe_idx + rung) % len(matrix[recipe])]
+        phase_id = f"rung_{rung:02d}"
+        climb_pairs = [
+            pair_order[recipe][rung]
+            for recipe in recipes
+            if pair_order[recipe][rung] is not None
+        ]
+        omitted_nonoperative_count = len(recipes) - len(climb_pairs)
+        for recipe_idx, pair in enumerate(climb_pairs):
+            assert pair is not None
+            common = {
+                "rung_idx": rung,
+                "phase_id": phase_id,
+                "phase_role": "climb",
+                "phase_position": recipe_idx,
+                "subgroup_id": phase_id,
+                "subgroup_size": len(climb_pairs),
+                "climb_block_size": len(climb_pairs),
+                "recipe_position": recipe_idx,
+                "ladder_structure": "heterogeneous_all_recipe_seeded_permutations",
+                "target_pair_seen_before": False,
+                "sampled_recipe_count": len(recipes),
+                "omitted_nonoperative_recipe_count": omitted_nonoperative_count,
+            }
             if rung == 0:
                 events.append(ScenarioEvent("observe", pair, _scenario_tag(
                     config,
                     SCENARIO_LADDER_HETEROGENEOUS,
                     event_type="onboarding_observation",
                     condition="onboarding_observation",
-                    rung_idx=rung,
-                    recipe_position=recipe_idx,
-                    ladder_structure="heterogeneous_latin_square",
+                    condition_family="initial_learning",
+                    evaluation_phase="climb",
+                    primary_probe=False,
                     hypothesis_tags=["initial_learning"],
+                    **common,
                 )))
                 continue
-            source_idx = (recipe_idx + rung) % n_rungs
-            source_recipe = recipes[source_idx]
-            source_pair = matrix[source_recipe][source_idx]
+            source_pair = prior_preference_sources.get(pair.preference_name)
+            is_cross_recipe_transfer = source_pair is not None and source_pair.recipe_name != recipe
+            hypothesis_tags = [
+                "cross_recipe_transfer" if is_cross_recipe_transfer else "known_recipe_new_preference_adaptation",
+                "emergent_axis_composition" if pair.is_composed_preference else "single_axis_preference",
+            ]
             base_tags = _scenario_tag(
                 config,
                 SCENARIO_LADDER_HETEROGENEOUS,
-                event_type="cross_recipe_transfer_first_exposure",
-                condition="heterogeneous_cross_recipe_transfer_first_exposure",
-                condition_family="cross_recipe_transfer",
-                evaluation_phase="first_exposure",
+                event_type=(
+                    "heterogeneous_climb_cross_recipe_transfer"
+                    if is_cross_recipe_transfer else "heterogeneous_climb_preference_update"
+                ),
+                condition=(
+                    "heterogeneous_cross_recipe_transfer"
+                    if is_cross_recipe_transfer else "heterogeneous_preference_update"
+                ),
+                condition_family=("cross_recipe_transfer" if is_cross_recipe_transfer else "within_recipe_new_preference"),
+                evaluation_phase="climb",
                 primary_probe=True,
-                rung_idx=rung,
-                recipe_position=recipe_idx,
-                source_recipe=source_recipe,
-                source_pair=source_pair.label,
-                source_preference=pair.preference_name,
-                source_initial_event_idx=source_idx,
-                scheduled_source_age_events=len(events) - source_idx,
-                target_pair_seen_before=False,
-                ladder_structure="heterogeneous_latin_square",
+                source_recipe=(source_pair.recipe_name if is_cross_recipe_transfer else None),
+                source_pair=(source_pair.label if is_cross_recipe_transfer else None),
+                source_preference=(source_pair.preference_name if is_cross_recipe_transfer else None),
                 preference_non_default_axes=list(pair.non_default_axes),
-                hypothesis_tags=[
-                    "cross_recipe_transfer",
-                    "emergent_axis_composition" if pair.is_composed_preference else "single_axis_preference",
-                ],
+                hypothesis_tags=hypothesis_tags,
+                **common,
             )
             events.append(ScenarioEvent("assist", pair, base_tags))
-            for repeat in range(max(0, int(config.settle_repeats_per_update))):
-                events.append(ScenarioEvent("assist", pair, {
-                    **base_tags,
-                    "event_type": "settled_reuse_probe",
-                    "condition": "heterogeneous_settled_reuse",
-                    "condition_family": "post_update_settling",
-                    "evaluation_phase": "post_commit_settling",
-                    "primary_probe": False,
-                    "settle_repeat_idx": repeat,
-                    "hypothesis_tags": ["post_update_settling", "retention_after_adaptation"],
-                }))
+        settled_order = _randomized_settle_order(
+            climb_pairs,
+            _settle_block_size(config, len(climb_pairs), rng),
+            rng,
+        )
+        counts = _settle_counts(settled_order)
+        seen_settle_count: Counter[str] = Counter()
+        for settle_idx, pair in enumerate(settled_order):
+            seen_settle_count[pair.label] += 1
+            events.append(ScenarioEvent("assist", pair, _scenario_tag(
+                config,
+                SCENARIO_LADDER_HETEROGENEOUS,
+                event_type="heterogeneous_settled_phase_reuse",
+                condition="heterogeneous_settled_phase_reuse",
+                condition_family="settled_phase_reuse",
+                evaluation_phase="settled",
+                primary_probe=False,
+                rung_idx=rung,
+                phase_id=phase_id,
+                phase_role="settled",
+                phase_position=settle_idx,
+                subgroup_id=phase_id,
+                subgroup_size=len(climb_pairs),
+                climb_block_size=len(climb_pairs),
+                settled_block_size=len(settled_order),
+                settle_repeat_idx=seen_settle_count[pair.label] - 1,
+                settle_repeat_count_for_pair=counts[pair.label],
+                ladder_structure="heterogeneous_all_recipe_seeded_permutations",
+                hypothesis_tags=["settled_phase_reuse", "retention_after_adaptation"],
+                preference_non_default_axes=list(pair.non_default_axes),
+            )))
+        for pair in climb_pairs:
+            assert pair is not None
+            prior_preference_sources.setdefault(pair.preference_name, pair)
     return ScenarioPlan(
         scenario=SCENARIO_LADDER_HETEROGENEOUS,
         seed=seed,
         events=tuple(events),
-        eval_pairs=tuple(pair for pairs in matrix.values() for pair in pairs[:n_rungs]),
+        eval_pairs=tuple(
+            pair
+            for recipe in recipes
+            for pair in pair_order[recipe]
+            if pair is not None
+        ),
         selected_recipes=tuple(recipes),
         selected_preferences=tuple(preferences),
-        description="Off-diagonal Latin ladder over the largest common valid recipe/preference subset. Each primary post-onboarding event is a labelled, first-exposure cross-recipe transfer probe with a scheduled source age; post-commit repeats are reported separately as settling.",
+        description="Fifteen-recipe heterogeneous phase ladder. Each recipe independently samples effective preferences from the full fifteen-preference pool; shared preferences within a rung are allowed. A recipe with fewer effective variants than rungs is omitted only from those otherwise non-operative rungs, and every rung settles by random reuse of its climbed pairs.",
     )
 
 
 def build_ladder_homogeneous(config: EvaluationConfig, seed: int) -> ScenarioPlan:
-    recipes, preferences, matrix = _shared_preference_matrix(config, seed + 101)
+    """Build an all-recipe shared-preference climb/settle ladder."""
+    rng = random.Random(int(seed) + 1207)
+    recipe_builders = _sampled_recipe_builders(config, seed + 101)
+    recipes = [recipe for recipe, _builder in recipe_builders]
+    preferences = _preferences(config)
+    n_rungs = min(max(2, int(config.ladder_rungs)), len(preferences))
+    matrix = {
+        recipe: _effective_pairs_by_preference(recipe, builder, preferences[:n_rungs])
+        for recipe, builder in recipe_builders
+    }
     events: List[ScenarioEvent] = []
-    n_rungs = max(2, int(config.ladder_rungs))
     for rung in range(n_rungs):
-        for recipe_idx, recipe in enumerate(recipes):
-            pair = matrix[recipe][rung]
+        phase_id = f"rung_{rung:02d}"
+        preference_name = preferences[rung]
+        climb_pairs = [
+            matrix[recipe][preference_name]
+            for recipe in recipes
+            if preference_name in matrix[recipe]
+        ]
+        if not climb_pairs:
+            raise RuntimeError(
+                f"homogeneous rung {rung} ({preference_name}) has no effective recipe/preference pairs"
+            )
+        omitted_noop_count = len(recipes) - len(climb_pairs)
+        for recipe_idx, pair in enumerate(climb_pairs):
+            common = {
+                "rung_idx": rung,
+                "phase_id": phase_id,
+                "phase_role": "climb",
+                "phase_position": recipe_idx,
+                "subgroup_id": phase_id,
+                "subgroup_size": len(climb_pairs),
+                "climb_block_size": len(climb_pairs),
+                "recipe_position": recipe_idx,
+                "ladder_structure": "homogeneous_all_recipe_shared_preference",
+                "target_pair_seen_before": False,
+                "sampled_recipe_count": len(recipes),
+                "omitted_noop_recipe_count": omitted_noop_count,
+                "shared_preference": preference_name,
+            }
             if rung == 0:
                 events.append(ScenarioEvent("observe", pair, _scenario_tag(
                     config,
                     SCENARIO_LADDER_HOMOGENEOUS,
                     event_type="onboarding_observation",
                     condition="onboarding_observation",
-                    rung_idx=rung,
-                    recipe_position=recipe_idx,
-                    ladder_structure="homogeneous_shared_preference",
+                    condition_family="initial_learning",
+                    evaluation_phase="climb",
+                    primary_probe=False,
                     hypothesis_tags=["initial_learning"],
+                    **common,
                 )))
                 continue
             base_tags = _scenario_tag(
                 config,
                 SCENARIO_LADDER_HOMOGENEOUS,
-                event_type="shared_preference_transfer_probe",
+                event_type="homogeneous_climb_shared_preference_update",
                 condition="homogeneous_shared_preference_update",
                 condition_family="homogeneous_shared_preference_update",
-                evaluation_phase="first_exposure",
+                evaluation_phase="climb",
                 primary_probe=True,
-                rung_idx=rung,
-                recipe_position=recipe_idx,
-                ladder_structure="homogeneous_shared_preference",
                 **_preference_tags(pair),
+                **common,
             )
             events.append(ScenarioEvent("assist", pair, base_tags))
-            for repeat in range(max(0, int(config.settle_repeats_per_update))):
-                events.append(ScenarioEvent("assist", pair, {
-                    **base_tags,
-                    "event_type": "settled_reuse_probe",
-                    "condition": "homogeneous_settled_reuse",
-                    "condition_family": "post_update_settling",
-                    "evaluation_phase": "post_commit_settling",
-                    "primary_probe": False,
-                    "settle_repeat_idx": repeat,
-                    "hypothesis_tags": ["post_update_settling", "retention_after_adaptation"],
-                }))
+        settled_order = _randomized_settle_order(
+            climb_pairs,
+            _settle_block_size(config, len(climb_pairs), rng),
+            rng,
+        )
+        counts = _settle_counts(settled_order)
+        seen_settle_count: Counter[str] = Counter()
+        for settle_idx, pair in enumerate(settled_order):
+            seen_settle_count[pair.label] += 1
+            events.append(ScenarioEvent("assist", pair, _scenario_tag(
+                config,
+                SCENARIO_LADDER_HOMOGENEOUS,
+                event_type="homogeneous_settled_phase_reuse",
+                condition="homogeneous_settled_phase_reuse",
+                condition_family="settled_phase_reuse",
+                evaluation_phase="settled",
+                primary_probe=False,
+                rung_idx=rung,
+                phase_id=phase_id,
+                phase_role="settled",
+                phase_position=settle_idx,
+                subgroup_id=phase_id,
+                subgroup_size=len(climb_pairs),
+                climb_block_size=len(climb_pairs),
+                settled_block_size=len(settled_order),
+                settle_repeat_idx=seen_settle_count[pair.label] - 1,
+                settle_repeat_count_for_pair=counts[pair.label],
+                ladder_structure="homogeneous_all_recipe_shared_preference",
+                hypothesis_tags=["settled_phase_reuse", "retention_after_adaptation"],
+                preference_non_default_axes=list(pair.non_default_axes),
+            )))
     return ScenarioPlan(
         scenario=SCENARIO_LADDER_HOMOGENEOUS,
         seed=seed,
         events=tuple(events),
-        eval_pairs=tuple(pair for pairs in matrix.values() for pair in pairs[:n_rungs]),
+        eval_pairs=tuple(pair for recipe in recipes for pair in matrix[recipe].values()),
         selected_recipes=tuple(recipes),
         selected_preferences=tuple(preferences),
-        description="Structured ladder where every recipe shares the same preference at each rung.",
+        description="Fifteen-recipe homogeneous phase ladder. Every rung uses one shared preference across the sampled panel; only recipe-specific no-op variants are omitted, then the effective rung pairs are randomly reused in a 2--2.5x settled block.",
     )
 
 
 def build_deployment_random(config: EvaluationConfig, seed: int) -> ScenarioPlan:
-    """Build one paired, quota-controlled stochastic deployment stream.
+    """Build a phase-structured random ladder distinct from heterogeneity.
 
-    The generator never observes an already known recipe.  Requested event
-    frequencies are converted to quotas before randomisation, so a seed cannot
-    accidentally contain no transfer or re-entry evidence.  The plan itself
-    cannot inspect mutable baseline memory; actual active/pruned state remains
-    evaluator-side metadata recorded immediately before each event.
+    At each rung, the climb subgroup is sampled independently (rather than
+    containing every recipe or following a balanced recipe--preference design).
+    New recipes are observed when first sampled; known recipes receive one
+    unseen preference pair.  The subsequent settled block samples only the
+    just-climbed pairs.  Cross-recipe reuse can arise naturally, but is neither
+    quota-forced nor Latin-square-balanced, making this a stress test of the
+    learned representation under variable recipe coverage and interference.
     """
     rng = random.Random(int(seed) + 2027)
-    recipes, preferences, matrix = _pair_matrix(config, seed + 202)
+    recipe_builders = _sampled_recipe_builders(config, seed + 202)
+    recipes = [recipe for recipe, _builder in recipe_builders]
+    preferences = list(PREFERENCE_NAMES)
+    matrix = {
+        recipe: list(_effective_pairs_by_preference(recipe, builder, preferences).values())
+        for recipe, builder in recipe_builders
+    }
     events: List[ScenarioEvent] = []
     observed_recipes: set[str] = set()
-    current_pref_idx = {recipe: 0 for recipe in recipes}
-    seen_by_label: Dict[str, RecipePreferencePair] = {}
-    last_event_by_label: Dict[str, int] = {}
+    climbed_pair_labels: set[str] = set()
+    prior_preference_sources: Dict[str, List[RecipePreferencePair]] = defaultdict(list)
+    # This is evaluator-only scheduling state.  It never enters an agent
+    # prompt, feature vector, or action-selection interface.
+    prior_pairs_by_recipe: Dict[str, List[RecipePreferencePair]] = defaultdict(list)
+    # Mirror the full system's decay-clock inputs from the planned accepted
+    # interaction stream. This is schedule construction only; agents receive
+    # neither these counters nor the evaluator preference labels.
+    decay_cfg = base_config(seed, config)
+    reuse_window = max(1, int(getattr(decay_cfg, "decay_reuse_window", 3)))
+    decay_horizon_floor = max(0, int(getattr(decay_cfg, "decay_horizon_floor", 6)))
+    decay_horizon_init = max(0, int(getattr(decay_cfg, "decay_horizon_init", 15)))
+    decay_after_grace_steps = max(1, int(getattr(decay_cfg, "decay_after_grace_steps", 3)))
+    planned_recipe_last_session: Dict[str, int] = {}
+    planned_recipe_reuse_gaps: Dict[str, List[int]] = defaultdict(list)
 
-    def append_event(mode: str, pair: RecipePreferencePair, *, stream_idx: int, **tags: Any) -> None:
-        event_idx = len(events)
-        events.append(ScenarioEvent(mode, pair, _scenario_tag(
-            config,
-            SCENARIO_DEPLOYMENT_RANDOM,
-            deployment_event_idx=event_idx,
-            stream_idx=stream_idx,
-            deployment_randomized=True,
-            deployment_schedule="quota_controlled_randomized",
-            **tags,
-        )))
-        seen_by_label[pair.label] = pair
-        last_event_by_label[pair.label] = event_idx
+    for rung in range(max(2, int(config.ladder_rungs))):
+        phase_start_event_idx = len(events)
+        phase_id = f"rung_{rung:02d}"
+        minimum = min(len(recipes), max(1, int(config.random_ladder_min_recipes_per_rung)))
+        subgroup_size = rng.randint(minimum, len(recipes))
+        subgroup = rng.sample(recipes, k=subgroup_size)
+        prior_sources = {pref: list(pairs) for pref, pairs in prior_preference_sources.items()}
+        climb_pairs: List[RecipePreferencePair] = []
 
-    onboarding = min(max(1, int(config.deployment_onboarding_recipes)), len(recipes))
-    for idx, recipe in enumerate(recipes[:onboarding]):
-        pair = matrix[recipe][0]
-        observed_recipes.add(recipe)
-        current_pref_idx[recipe] = 0
-        append_event(
-            "observe",
-            pair,
-            stream_idx=-1,
-            event_type="deployment_onboarding_observation",
-            condition="deployment_onboarding",
-            condition_family="initial_learning",
-            recipe_position=idx,
-            rung_idx=0,
-            primary_probe=False,
-            hypothesis_tags=["initial_learning"],
+        for recipe in subgroup:
+            unseen = [pair for pair in matrix[recipe] if pair.label not in climbed_pair_labels]
+            # With the standard rungs<=available pairs design this fallback is
+            # unreachable.  Keep it explicit for intentional long stress runs.
+            candidates = unseen or list(matrix[recipe])
+            cross_candidates = [
+                pair for pair in candidates
+                if any(source.recipe_name != recipe for source in prior_sources.get(pair.preference_name, []))
+            ]
+            globally_novel = [pair for pair in candidates if pair.preference_name not in prior_sources]
+            if cross_candidates and rng.random() < 0.55:
+                pair = rng.choice(cross_candidates)
+            else:
+                pair = rng.choice(globally_novel or candidates)
+            climb_pairs.append(pair)
+
+        # The target is a newly updated pair whose recipe has accumulated at
+        # least two *different* older variants.  Moving the target to the end
+        # of the climb makes the later settled position an exact, transparent
+        # update-to-recurrence lag.  We only relabel/reorder an existing
+        # settled repeat; the pair multiset and total event count are fixed.
+        settled_order = _randomized_settle_order(
+            climb_pairs,
+            _settle_block_size(config, len(climb_pairs), rng),
+            rng,
         )
-
-    n_stream_events = max(0, int(config.deployment_events))
-
-    def quota_allocation() -> Dict[str, int]:
-        requested = {
-            "new_recipe": max(0.0, float(config.deployment_new_recipe_prob)),
-            "preference_shift": max(0.0, float(config.deployment_preference_shift_prob)),
-            "cross_transfer": max(0.0, float(config.deployment_transfer_probe_prob)),
-            "reentry": max(0.0, float(config.deployment_reentry_prob)),
-        }
-        total = sum(requested.values())
-        scale = 1.0 / total if total > 1.0 else 1.0
-        raw = {name: n_stream_events * probability * scale for name, probability in requested.items()}
-        counts = {name: int(math.floor(value)) for name, value in raw.items()}
-        assigned = sum(counts.values())
-        for name in sorted(raw, key=lambda key: (raw[key] - counts[key], key), reverse=True):
-            if assigned >= n_stream_events:
-                break
-            counts[name] += 1
-            assigned += 1
-        # A requested transfer requires at least one source preference shift.
-        if counts["cross_transfer"] > 0 and counts["preference_shift"] == 0:
-            counts["preference_shift"] = 1
-        counts["new_recipe"] = min(counts["new_recipe"], max(0, len(recipes) - onboarding))
-        assigned = sum(counts.values())
-        # The final residual is a direct-retrieval control.  If setup rounding
-        # overcommits a very short stream, reduce new-recipe quota first.
-        while assigned > n_stream_events and counts["new_recipe"] > 0:
-            counts["new_recipe"] -= 1
-            assigned -= 1
-        while assigned > n_stream_events and counts["preference_shift"] > 1:
-            counts["preference_shift"] -= 1
-            assigned -= 1
-        counts["routine"] = max(0, n_stream_events - assigned)
-        return counts
-
-    remaining = quota_allocation()
-
-    def known_recipe(*, exclude: Optional[str] = None) -> Optional[str]:
-        candidates = sorted(observed_recipes)
-        if exclude is not None:
-            candidates = [recipe for recipe in candidates if recipe != exclude]
-        return rng.choice(candidates) if candidates else None
-
-    def current_pair(recipe: str) -> RecipePreferencePair:
-        return matrix[recipe][current_pref_idx[recipe]]
-
-    def shift_candidates() -> List[Tuple[str, int, RecipePreferencePair]]:
-        candidates: List[Tuple[str, int, RecipePreferencePair]] = []
-        for recipe in sorted(observed_recipes):
-            for pref_idx, pair in enumerate(matrix[recipe]):
-                if pref_idx != current_pref_idx[recipe] and pair.label not in seen_by_label:
-                    candidates.append((recipe, pref_idx, pair))
-        return candidates
-
-    def transfer_candidates(required_gap: int) -> List[Tuple[RecipePreferencePair, RecipePreferencePair, int, int]]:
-        candidates: List[Tuple[RecipePreferencePair, RecipePreferencePair, int, int]] = []
-        for source_label, source_pair in seen_by_label.items():
-            source_event_idx = last_event_by_label[source_label]
-            gap = len(events) - source_event_idx
-            if gap < required_gap:
+        recurrence_target: Optional[RecipePreferencePair] = None
+        recurrence_probe_position: Optional[int] = None
+        recurrence_conflicting_preferences: Tuple[str, ...] = ()
+        recurrence_conflicting_pair_labels: Tuple[str, ...] = ()
+        recurrence_current_reuse_gap: Optional[int] = None
+        recurrence_grace_horizon: Optional[int] = None
+        recurrence_required_delay: Optional[int] = None
+        min_conflicts = max(1, int(config.random_ladder_recurrence_min_prior_conflicts))
+        # The selected target is placed last in the climb, so this is its
+        # planned session index and the exact point at which the old latest
+        # variant becomes unpinned in the full system.
+        target_session = phase_start_event_idx + len(climb_pairs)
+        delayed_candidates: List[Dict[str, Any]] = []
+        for pair in climb_pairs:
+            if pair.label in climbed_pair_labels:
                 continue
-            for target_recipe in sorted(observed_recipes):
-                if target_recipe == source_pair.recipe_name:
-                    continue
-                for target_idx, candidate in enumerate(matrix[target_recipe]):
-                    if candidate.preference_name == source_pair.preference_name and candidate.label not in seen_by_label:
-                        candidates.append((source_pair, candidate, target_idx, gap))
-        return candidates
-
-    def reentry_candidates() -> Tuple[List[str], List[str]]:
-        displaced = [
-            label for label, pair in seen_by_label.items()
-            if pair.preference_name != current_pair(pair.recipe_name).preference_name
-        ]
-        eligible = displaced if (config.deployment_reentry_prefer_displaced and displaced) else list(seen_by_label)
-        return eligible, displaced
-
-    transfer_ordinal = 0
-    for stream_idx in range(n_stream_events):
-        fresh_gap = max(1, int(config.deployment_transfer_fresh_gap_events))
-        aged_gap = max(fresh_gap, int(config.deployment_transfer_aged_gap_events))
-        any_transfer_pool = transfer_candidates(1)
-        fresh_transfer_pool = [candidate for candidate in any_transfer_pool if candidate[3] <= fresh_gap]
-        aged_transfer_pool = [candidate for candidate in any_transfer_pool if candidate[3] >= aged_gap]
-        desired_transfer_age = "fresh" if transfer_ordinal % 2 == 0 else "aged"
-        transfer_pool = fresh_transfer_pool if desired_transfer_age == "fresh" else aged_transfer_pool
-
-        selectable = [name for name, count in remaining.items() if count > 0]
-        if not selectable:
-            selectable = ["routine"]
-        # A queued transfer without a source forces an available source shift
-        # before random selection.  This is the minimal causal setup needed to
-        # make a transfer probe valid rather than relabelling routine reuse.
-        if (
-            remaining.get("cross_transfer", 0) > 0
-            and (not any_transfer_pool or (desired_transfer_age == "fresh" and not fresh_transfer_pool))
-            and remaining.get("preference_shift", 0) > 0
-        ):
-            requested_type = "preference_shift"
-        else:
-            # Do not consume an aged-transfer quota before its designated
-            # source has aged; schedule another requested event if one exists.
-            deferred_cross = (
-                remaining.get("cross_transfer", 0) > 0
-                and not transfer_pool
-                and any(name != "cross_transfer" for name in selectable)
+            earlier_pairs = [
+                earlier for earlier in prior_pairs_by_recipe.get(pair.recipe_name, [])
+                if earlier.label != pair.label
+            ]
+            conflicts = tuple(sorted({earlier.preference_name for earlier in earlier_pairs}))
+            if len(conflicts) < min_conflicts:
+                continue
+            last_session = planned_recipe_last_session.get(pair.recipe_name)
+            if last_session is None:
+                continue
+            current_reuse_gap = target_session - int(last_session)
+            prospective_gaps = (
+                list(planned_recipe_reuse_gaps.get(pair.recipe_name, []))[-(reuse_window - 1):]
+                + [current_reuse_gap]
+            )[-reuse_window:]
+            grace_horizon = (
+                max(decay_horizon_floor, max(prospective_gaps))
+                if prospective_gaps else max(decay_horizon_init, decay_horizon_floor)
             )
-            candidate_types = [name for name in selectable if not (deferred_cross and name == "cross_transfer")]
-            weights = [max(1, int(remaining.get(name, 0))) for name in candidate_types]
-            requested_type = rng.choices(candidate_types, weights=weights, k=1)[0]
-        if remaining.get(requested_type, 0) > 0:
-            remaining[requested_type] -= 1
+            # The old latest has age ``current_reuse_gap`` at the target
+            # update. Once unpinned, it first decays when age exceeds the
+            # grace horizon and is pruned after the configured number of
+            # overdue sessions. The fixed lower bound prevents a degenerate
+            # immediate repeat when the horizon is already satisfied.
+            required_delay = max(
+                max(0, int(config.random_ladder_recurrence_min_intervening_events)),
+                max(0, int(grace_horizon) - int(current_reuse_gap)) + decay_after_grace_steps,
+            )
+            delayed_candidates.append({
+                "target": pair,
+                "conflicting_preferences": conflicts,
+                "conflicting_pair_labels": tuple(sorted({earlier.label for earlier in earlier_pairs})),
+                "current_reuse_gap": int(current_reuse_gap),
+                "grace_horizon": int(grace_horizon),
+                "required_delay": int(required_delay),
+            })
 
-        event_idx = len(events)
-        common = {
-            "quota_requested_type": requested_type,
-            "quota_remaining_after_selection": dict(remaining),
-        }
+        # A target can be used only if every duplicate occurrence can remain
+        # after the required horizon-calibrated delay. Otherwise a target
+        # repeat would appear before the mechanism is engaged.
+        viable_candidates = [
+            candidate for candidate in delayed_candidates
+            if len(settled_order) - _settle_counts(settled_order).get(candidate["target"].label, 0)
+            >= int(candidate["required_delay"])
+        ]
+        if viable_candidates:
+            selected = rng.choice(viable_candidates)
+            recurrence_target = selected["target"]
+            recurrence_conflicting_preferences = selected["conflicting_preferences"]
+            recurrence_conflicting_pair_labels = selected["conflicting_pair_labels"]
+            recurrence_current_reuse_gap = selected["current_reuse_gap"]
+            recurrence_grace_horizon = selected["grace_horizon"]
+            recurrence_required_delay = selected["required_delay"]
+            target_idx = climb_pairs.index(recurrence_target)
+            climb_pairs.append(climb_pairs.pop(target_idx))
+            settled_order, recurrence_probe_position = _place_horizon_calibrated_recurrence_probe(
+                settled_order,
+                recurrence_target,
+                required_delay_events=recurrence_required_delay,
+                rng=rng,
+            )
+            # Defensive fallback for nonstandard small blocks or invalid user
+            # overrides: retain the ordinary settled order instead of creating
+            # a mislabeled mechanism probe.
+            if recurrence_probe_position is None:
+                recurrence_target = None
+                recurrence_conflicting_preferences = ()
+                recurrence_conflicting_pair_labels = ()
+                recurrence_current_reuse_gap = None
+                recurrence_grace_horizon = None
+                recurrence_required_delay = None
 
-        if requested_type == "new_recipe":
-            candidates = sorted(set(recipes) - observed_recipes)
-            if candidates:
-                recipe = rng.choice(candidates)
-                pair = matrix[recipe][0]
+        for climb_idx, pair in enumerate(climb_pairs):
+            recipe = pair.recipe_name
+            source_candidates = [
+                source for source in prior_sources.get(pair.preference_name, [])
+                if source.recipe_name != recipe
+            ]
+            source_pair = rng.choice(source_candidates) if source_candidates else None
+            common = {
+                "rung_idx": rung,
+                "phase_id": phase_id,
+                "phase_role": "climb",
+                "phase_position": climb_idx,
+                "subgroup_id": phase_id,
+                "subgroup_size": subgroup_size,
+                "climb_block_size": subgroup_size,
+                "random_subgroup_recipe_coverage": float(subgroup_size) / max(1, len(recipes)),
+                "ladder_structure": "random_variable_subgroup_phase_ladder",
+                "target_pair_seen_before": pair.label in climbed_pair_labels,
+            }
+            if recipe not in observed_recipes:
                 observed_recipes.add(recipe)
-                current_pref_idx[recipe] = 0
-                append_event(
-                    "observe",
-                    pair,
-                    stream_idx=stream_idx,
-                    event_type="deployment_new_recipe_observation",
-                    condition="deployment_new_recipe",
+                events.append(ScenarioEvent("observe", pair, _scenario_tag(
+                    config,
+                    SCENARIO_DEPLOYMENT_RANDOM,
+                    event_type="random_ladder_climb_new_recipe_observation",
+                    condition="random_ladder_new_recipe",
                     condition_family="new_recipe_learning",
-                    rung_idx=0,
+                    evaluation_phase="climb",
                     primary_probe=False,
-                    hypothesis_tags=["new_recipe_learning", "unseen_unseen_control"],
-                    **common,
-                )
-                continue
-
-        if requested_type == "preference_shift":
-            candidates = shift_candidates()
-            if candidates:
-                globally_new = [candidate for candidate in candidates if candidate[2].preference_name not in {pair.preference_name for pair in seen_by_label.values()}]
-                recipe, pref_idx, pair = rng.choice(globally_new or candidates)
-                preference_seen_elsewhere = any(
-                    seen.preference_name == pair.preference_name and seen.recipe_name != recipe
-                    for seen in seen_by_label.values()
-                )
-                current_pref_idx[recipe] = pref_idx
-                hypothesis = ["known_recipe_new_preference_adaptation"] if not preference_seen_elsewhere else ["known_recipe_new_pair"]
-                hypothesis.append("emergent_axis_composition" if pair.is_composed_preference else "single_axis_preference")
-                append_event(
-                    "assist",
-                    pair,
-                    stream_idx=stream_idx,
-                    event_type="deployment_preference_shift",
-                    condition="deployment_preference_shift",
-                    condition_family=("within_recipe_new_preference" if not preference_seen_elsewhere else "known_recipe_new_pair_with_prior_transfer_support"),
-                    evaluation_phase="first_exposure",
-                    primary_probe=True,
-                    rung_idx=pref_idx,
-                    target_preference_seen_other_recipe_before=preference_seen_elsewhere,
-                    hypothesis_tags=hypothesis,
+                    hypothesis_tags=["new_recipe_learning", "random_climb"],
                     preference_non_default_axes=list(pair.non_default_axes),
                     **common,
-                )
-                continue
-
-        if requested_type == "cross_transfer":
-            pool = transfer_pool or any_transfer_pool
-            if pool:
-                # Fresh/aged source exposure is counterbalanced by transfer
-                # ordinal; if the desired aged support is unavailable we retain
-                # the probe but mark the achieved source age explicitly.
-                source_pair, pair, target_idx, source_age = rng.choice(pool)
-                current_pref_idx[pair.recipe_name] = target_idx
-                achieved_bucket = "aged" if source_age >= aged_gap else ("fresh" if source_age <= fresh_gap else "intermediate")
-                target_met = source_age <= fresh_gap if desired_transfer_age == "fresh" else source_age >= aged_gap
-                append_event(
-                    "assist",
-                    pair,
-                    stream_idx=stream_idx,
-                    event_type="deployment_cross_recipe_transfer_probe",
-                    condition="deployment_cross_recipe_transfer",
-                    condition_family="cross_recipe_transfer",
-                    evaluation_phase="first_exposure",
+                )))
+            else:
+                is_cross_recipe_transfer = source_pair is not None
+                events.append(ScenarioEvent("assist", pair, _scenario_tag(
+                    config,
+                    SCENARIO_DEPLOYMENT_RANDOM,
+                    event_type=(
+                        "random_ladder_climb_cross_recipe_transfer"
+                        if is_cross_recipe_transfer else "random_ladder_climb_preference_update"
+                    ),
+                    condition=(
+                        "random_ladder_cross_recipe_transfer"
+                        if is_cross_recipe_transfer else "random_ladder_preference_update"
+                    ),
+                    condition_family=("cross_recipe_transfer" if is_cross_recipe_transfer else "within_recipe_new_preference"),
+                    evaluation_phase="climb",
                     primary_probe=True,
-                    rung_idx=target_idx,
-                    source_recipe=source_pair.recipe_name,
-                    source_pair=source_pair.label,
-                    source_preference=source_pair.preference_name,
-                    target_pair_seen_before=False,
-                    scheduled_source_age_events=source_age,
-                    scheduled_source_age_target=desired_transfer_age,
-                    scheduled_source_age_target_met=target_met,
-                    source_age_bucket=achieved_bucket,
-                    hypothesis_tags=["cross_recipe_transfer", "preference_reuse_under_new_recipe_context"],
+                    source_recipe=(source_pair.recipe_name if source_pair else None),
+                    source_pair=(source_pair.label if source_pair else None),
+                    source_preference=(source_pair.preference_name if source_pair else None),
+                    hypothesis_tags=[
+                        "cross_recipe_transfer" if is_cross_recipe_transfer else "known_recipe_new_preference_adaptation",
+                        "random_climb",
+                        "emergent_axis_composition" if pair.is_composed_preference else "single_axis_preference",
+                    ],
                     preference_non_default_axes=list(pair.non_default_axes),
                     **common,
-                )
-                transfer_ordinal += 1
-                continue
+                )))
 
-        if requested_type == "reentry":
-            eligible, displaced = reentry_candidates()
-            if eligible:
-                ordered = sorted(eligible, key=lambda label: (last_event_by_label[label], label))
-                oldest_pool = ordered[:max(
-                    1,
-                    int(math.ceil(len(ordered) * max(0.0, min(1.0, config.deployment_reentry_oldest_fraction)))),
-                )]
-                selected_label = rng.choice(oldest_pool)
-                pair = seen_by_label[selected_label]
-                prior_event_idx = last_event_by_label[selected_label]
-                target_idx = next(idx for idx, candidate in enumerate(matrix[pair.recipe_name]) if candidate.label == pair.label)
-                was_current_preference = pair.preference_name == current_pair(pair.recipe_name).preference_name
-                current_pref_idx[pair.recipe_name] = target_idx
-                append_event(
-                    "assist",
-                    pair,
-                    stream_idx=stream_idx,
-                    event_type="deployment_reentry_probe",
-                    condition="deployment_reentry",
-                    condition_family="selective_forgetting_reentry",
-                    evaluation_phase="reentry",
-                    primary_probe=True,
-                    rung_idx=target_idx,
-                    scheduled_reentry_gap_events=event_idx - prior_event_idx,
-                    reentry_schedule_policy="oldest_displaced_preference_pool",
-                    reentry_candidate_count=len(seen_by_label),
-                    reentry_displaced_candidate_count=len(displaced),
-                    reentry_target_is_current_preference=was_current_preference,
-                    hypothesis_tags=["selective_forgetting_reentry", "retention_after_interference"],
-                    preference_non_default_axes=list(pair.non_default_axes),
-                    **common,
-                )
-                continue
-
-        # Either a requested condition exhausted its feasible support or this
-        # slot was allocated to controls.  Keep the fallback explicit rather
-        # than mislabelling it as transfer or adaptation.
-        recipe = known_recipe()
-        if recipe is None:
-            raise RuntimeError("deployment stream has no known recipe after onboarding")
-        pair = current_pair(recipe)
-        append_event(
-            "assist",
-            pair,
-            stream_idx=stream_idx,
-            event_type="deployment_routine_reuse",
-            condition="deployment_routine_reuse",
-            condition_family="direct_retrieval_control",
-            evaluation_phase="direct_retrieval",
-            primary_probe=True,
-            rung_idx=current_pref_idx[recipe],
-            quota_fallback_from=(requested_type if requested_type != "routine" else None),
-            hypothesis_tags=["routine_reuse", "direct_retrieval_control"],
-            preference_non_default_axes=list(pair.non_default_axes),
-            **common,
-        )
+        counts = _settle_counts(settled_order)
+        seen_settle_count: Counter[str] = Counter()
+        for settle_idx, pair in enumerate(settled_order):
+            seen_settle_count[pair.label] += 1
+            is_delayed_recurrence_probe = bool(
+                recurrence_target is not None
+                and recurrence_probe_position is not None
+                and pair.label == recurrence_target.label
+                and settle_idx == recurrence_probe_position
+            )
+            event_type = (
+                "random_ladder_delayed_recurrence_probe"
+                if is_delayed_recurrence_probe else "random_ladder_settled_phase_reuse"
+            )
+            condition = (
+                "random_ladder_delayed_recurrence_interference"
+                if is_delayed_recurrence_probe else "random_ladder_settled_phase_reuse"
+            )
+            condition_family = (
+                "delayed_recurrence_interference"
+                if is_delayed_recurrence_probe else "settled_phase_reuse"
+            )
+            hypothesis_tags = ["settled_phase_reuse", "retention_after_adaptation", "random_settled_reuse"]
+            if is_delayed_recurrence_probe:
+                hypothesis_tags.append("delayed_recurrence_interference")
+            events.append(ScenarioEvent("assist", pair, _scenario_tag(
+                config,
+                SCENARIO_DEPLOYMENT_RANDOM,
+                event_type=event_type,
+                condition=condition,
+                condition_family=condition_family,
+                evaluation_phase="settled",
+                primary_probe=is_delayed_recurrence_probe,
+                rung_idx=rung,
+                phase_id=phase_id,
+                phase_role="settled",
+                phase_position=settle_idx,
+                subgroup_id=phase_id,
+                subgroup_size=subgroup_size,
+                climb_block_size=subgroup_size,
+                settled_block_size=len(settled_order),
+                settle_repeat_idx=seen_settle_count[pair.label] - 1,
+                settle_repeat_count_for_pair=counts[pair.label],
+                random_subgroup_recipe_coverage=float(subgroup_size) / max(1, len(recipes)),
+                ladder_structure="random_variable_subgroup_phase_ladder",
+                delayed_recurrence_probe=is_delayed_recurrence_probe,
+                delayed_recurrence_update_rung=(rung if is_delayed_recurrence_probe else None),
+                delayed_recurrence_intervening_event_count=(
+                    recurrence_probe_position if is_delayed_recurrence_probe else None
+                ),
+                delayed_recurrence_required_intervening_event_count=(
+                    recurrence_required_delay if is_delayed_recurrence_probe else None
+                ),
+                delayed_recurrence_current_reuse_gap_events=(
+                    recurrence_current_reuse_gap if is_delayed_recurrence_probe else None
+                ),
+                delayed_recurrence_predicted_grace_horizon_events=(
+                    recurrence_grace_horizon if is_delayed_recurrence_probe else None
+                ),
+                delayed_recurrence_prune_confirmation_events=(
+                    decay_after_grace_steps if is_delayed_recurrence_probe else None
+                ),
+                delayed_recurrence_historical_conflicting_preference_count=(
+                    len(recurrence_conflicting_preferences) if is_delayed_recurrence_probe else None
+                ),
+                delayed_recurrence_historical_conflicting_preferences=(
+                    list(recurrence_conflicting_preferences) if is_delayed_recurrence_probe else None
+                ),
+                delayed_recurrence_historical_conflicting_pair_labels=(
+                    list(recurrence_conflicting_pair_labels) if is_delayed_recurrence_probe else None
+                ),
+                hypothesis_tags=hypothesis_tags,
+                preference_non_default_axes=list(pair.non_default_axes),
+            )))
+        for pair in climb_pairs:
+            climbed_pair_labels.add(pair.label)
+            prior_preference_sources[pair.preference_name].append(pair)
+            prior_pairs_by_recipe[pair.recipe_name].append(pair)
+        # Advance the schedule mirror after the phase is complete. Settled
+        # repeats count because each accepted HRC episode advances the decay
+        # clock and updates the per-recipe reuse-gap window in the full agent.
+        for session_idx, event in enumerate(events[phase_start_event_idx:], start=phase_start_event_idx + 1):
+            recipe = event.pair.recipe_name
+            previous = planned_recipe_last_session.get(recipe)
+            if previous is not None:
+                gaps = planned_recipe_reuse_gaps[recipe]
+                gaps.append(int(session_idx) - int(previous))
+                del gaps[:-reuse_window]
+            planned_recipe_last_session[recipe] = int(session_idx)
 
     return ScenarioPlan(
         scenario=SCENARIO_DEPLOYMENT_RANDOM,
@@ -1014,7 +1139,198 @@ def build_deployment_random(config: EvaluationConfig, seed: int) -> ScenarioPlan
         eval_pairs=tuple(pair for recipe in recipes for pair in matrix[recipe]),
         selected_recipes=tuple(recipes),
         selected_preferences=tuple(preferences),
-        description="Quota-controlled randomized single-user deployment stream. It guarantees requested support for adaptation, cross-recipe transfer, direct retrieval, and re-entry while preserving randomized feasible ordering.",
+        description="Random variable-subgroup phase ladder. Each rung samples 3--15 recipes and random effective preferences from the full fifteen-preference pool, then randomly reuses only that rung's pairs in a 2--2.5x settled block. One eligible settled repeat is a tagged delayed-recurrence probe: a just-updated pair with at least two older conflicting recipe variants, first revisited only after its full-system, recipe-specific grace horizon and pruning ticks are satisfied without increasing the block budget. It has no common-preference or Latin-square constraint.",
+    )
+
+
+def _build_holdout_ladder(
+    config: EvaluationConfig,
+    seed: int,
+    *,
+    scenario: str,
+    source_preferences: Sequence[str],
+    heldout_preferences: Sequence[str],
+    holdout_kind: str,
+) -> ScenarioPlan:
+    """Build one independent source-progression and holdout-adaptation arm."""
+    rng = random.Random(f"{scenario}|{int(seed)}")
+    recipe_builders = _sampled_recipe_builders(config, seed + 307)
+    recipes = [recipe for recipe, _builder in recipe_builders]
+    preferences = tuple(source_preferences) + tuple(heldout_preferences)
+    matrix = {
+        recipe: _effective_pairs_by_preference(recipe, builder, preferences)
+        for recipe, builder in recipe_builders
+    }
+    events: List[ScenarioEvent] = []
+
+    for rung, preference_name in enumerate(preferences):
+        partition = "source" if preference_name in source_preferences else "heldout"
+        phase_id = f"{partition}_{rung:02d}"
+        climb_pairs = [
+            matrix[recipe][preference_name]
+            for recipe in recipes
+            if preference_name in matrix[recipe]
+        ]
+        if not climb_pairs:
+            raise RuntimeError(
+                f"{scenario} rung {rung} ({preference_name}) has no effective recipe/preference pairs"
+            )
+        omitted_noop_count = len(recipes) - len(climb_pairs)
+        requested_mode = "observe" if partition == "source" else "assist"
+        phase_role = f"{partition}_climb"
+        for position, pair in enumerate(climb_pairs):
+            common = {
+                "rung_idx": rung,
+                "phase_id": phase_id,
+                "phase_role": phase_role,
+                "phase_position": position,
+                "subgroup_id": phase_id,
+                "subgroup_size": len(climb_pairs),
+                "climb_block_size": len(climb_pairs),
+                "recipe_position": position,
+                "ladder_structure": f"{holdout_kind}_holdout_progression",
+                "holdout_kind": holdout_kind,
+                "holdout_partition": partition,
+                "source_preference_count": len(source_preferences),
+                "heldout_preference_count": len(heldout_preferences),
+                "sampled_recipe_count": len(recipes),
+                "omitted_noop_recipe_count": omitted_noop_count,
+                "target_pair_seen_before": False,
+            }
+            tags = _scenario_tag(
+                config,
+                scenario,
+                event_type=(
+                    f"{holdout_kind}_source_progression_observation"
+                    if partition == "source" else f"{holdout_kind}_heldout_preference_adaptation"
+                ),
+                condition=(
+                    f"{holdout_kind}_source_progression"
+                    if partition == "source" else f"{holdout_kind}_heldout_adaptation"
+                ),
+                condition_family=("holdout_source_progression" if partition == "source" else "holdout_adaptation"),
+                evaluation_phase=("source" if partition == "source" else "heldout"),
+                primary_probe=bool(partition == "heldout"),
+                preference_non_default_axes=list(pair.non_default_axes),
+                hypothesis_tags=(
+                    ["source_preference_progression", holdout_kind]
+                    if partition == "source" else ["heldout_preference_adaptation", holdout_kind]
+                ),
+                **common,
+            )
+            events.append(ScenarioEvent(requested_mode, pair, tags))
+
+        settled_order = _randomized_settle_order(
+            climb_pairs,
+            _settle_block_size(config, len(climb_pairs), rng),
+            rng,
+        )
+        counts = _settle_counts(settled_order)
+        seen_settle_count: Counter[str] = Counter()
+        for position, pair in enumerate(settled_order):
+            seen_settle_count[pair.label] += 1
+            events.append(ScenarioEvent(requested_mode, pair, _scenario_tag(
+                config,
+                scenario,
+                event_type=(
+                    f"{holdout_kind}_source_settled_reuse"
+                    if partition == "source" else f"{holdout_kind}_heldout_settled_reuse"
+                ),
+                condition=("holdout_source_settled" if partition == "source" else "holdout_heldout_settled"),
+                condition_family=("holdout_source_progression" if partition == "source" else "holdout_adaptation"),
+                evaluation_phase=("source_settled" if partition == "source" else "heldout_settled"),
+                primary_probe=False,
+                rung_idx=rung,
+                phase_id=phase_id,
+                phase_role=f"{partition}_settled",
+                phase_position=position,
+                subgroup_id=phase_id,
+                subgroup_size=len(climb_pairs),
+                climb_block_size=len(climb_pairs),
+                settled_block_size=len(settled_order),
+                settle_repeat_idx=seen_settle_count[pair.label] - 1,
+                settle_repeat_count_for_pair=counts[pair.label],
+                ladder_structure=f"{holdout_kind}_holdout_progression",
+                holdout_kind=holdout_kind,
+                holdout_partition=partition,
+                source_preference_count=len(source_preferences),
+                heldout_preference_count=len(heldout_preferences),
+                sampled_recipe_count=len(recipes),
+                omitted_noop_recipe_count=omitted_noop_count,
+                hypothesis_tags=(
+                    ["source_preference_progression", "settled_phase_reuse", holdout_kind]
+                    if partition == "source" else ["heldout_preference_adaptation", "settled_phase_reuse", holdout_kind]
+                ),
+                preference_non_default_axes=list(pair.non_default_axes),
+            )))
+
+    return ScenarioPlan(
+        scenario=scenario,
+        seed=seed,
+        events=tuple(events),
+        eval_pairs=tuple(
+            pair
+            for recipe in recipes
+            for pair in matrix[recipe].values()
+        ),
+        selected_recipes=tuple(recipes),
+        selected_preferences=tuple(preferences),
+        description=(
+            f"Fifteen-recipe {holdout_kind} holdout ladder. Source preferences are shown naturally in observation "
+            f"rungs, then held-out preferences are tested in assistive climb/settled rungs. Non-identity no-op "
+            f"recipe/preference pairs are omitted only from their own rung."
+        ),
+    )
+
+
+def build_axis_holdout(config: EvaluationConfig, seed: int) -> ScenarioPlan:
+    """Four observed isolated axes followed by four held-out isolated axes."""
+    return _build_holdout_ladder(
+        config,
+        seed,
+        scenario=SCENARIO_AXIS_HOLDOUT,
+        source_preferences=(
+            "p1_mise_en_place",
+            "p2_equipment_just_in_time",
+            "p3_frontload_serving_setup",
+            "p4_load_just_in_time",
+        ),
+        heldout_preferences=(
+            "p5_shutdown_late",
+            "p6_deferred_cook_start",
+            "p7_clean_eager",
+            "p8_cleanup_before_serve",
+        ),
+        holdout_kind="axis",
+    )
+
+
+def build_preference_holdout(config: EvaluationConfig, seed: int) -> ScenarioPlan:
+    """Seven observed preferences covering all axes, then eight held preferences."""
+    return _build_holdout_ladder(
+        config,
+        seed,
+        scenario=SCENARIO_PREFERENCE_HOLDOUT,
+        source_preferences=(
+            "identity",
+            "p5_shutdown_late",
+            "p6_deferred_cook_start",
+            "p8_cleanup_before_serve",
+            "p9_equipment_jit_frontload_serving",
+            "p10_mise_en_place_clean",
+            "p12_multi_stage_reorganization",
+        ),
+        heldout_preferences=(
+            "p1_mise_en_place",
+            "p2_equipment_just_in_time",
+            "p3_frontload_serving_setup",
+            "p4_load_just_in_time",
+            "p7_clean_eager",
+            "p11_mise_en_place_serving_clean",
+            "p13_equipment_jit_clean",
+            "p14_mise_load_clean",
+        ),
+        holdout_kind="preference",
     )
 
 
@@ -1025,6 +1341,10 @@ def build_scenario_plan(scenario: str, config: EvaluationConfig, seed: int) -> S
         return build_ladder_homogeneous(config, seed)
     if scenario == SCENARIO_DEPLOYMENT_RANDOM:
         return build_deployment_random(config, seed)
+    if scenario == SCENARIO_AXIS_HOLDOUT:
+        return build_axis_holdout(config, seed)
+    if scenario == SCENARIO_PREFERENCE_HOLDOUT:
+        return build_preference_holdout(config, seed)
     raise KeyError(f"unknown scenario {scenario!r}; available={SCENARIOS}")
 
 
@@ -1164,6 +1484,60 @@ def _recipe_has_active_variant(
     return bool(rid and any(recipe_id == rid for recipe_id, _ in _active_keys(agent)))
 
 
+def _delayed_recurrence_memory_audit_tags(
+    agent: AdaptiveHRCAgent,
+    pair: RecipePreferencePair,
+    name_to_rid: Mapping[str, str],
+    target_key: Optional[VariantKey],
+    tags: Mapping[str, Any],
+    pairs_by_label: Mapping[str, RecipePreferencePair],
+) -> Dict[str, Any]:
+    """Record whether a tagged recurrence actually engaged memory removal.
+
+    The scheduler uses a full-system clock mirror, but a deployed agent can
+    still decline a commit or route an event differently. These evaluator-only
+    diagnostics make that distinction reportable instead of silently assuming
+    that a nominally long delay caused forgetting.
+    """
+    if not bool(tags.get("delayed_recurrence_probe")):
+        return {}
+    conflict_labels = tuple(str(label) for label in (
+        tags.get("delayed_recurrence_historical_conflicting_pair_labels") or ()
+    ))
+    active = _active_keys(agent)
+    pruned = _pruned_keys(agent)
+    conflict_keys = [
+        _pair_key(agent, pairs_by_label[label], name_to_rid)
+        for label in conflict_labels
+        if label in pairs_by_label
+    ]
+    known_conflict_keys = [key for key in conflict_keys if key is not None]
+    recipe_id = name_to_rid.get(pair.recipe_name)
+    horizon = (
+        float(agent.decay.horizon_for(target_key))
+        if target_key is not None else None
+    )
+    target_is_latest = bool(
+        target_key is not None
+        and recipe_id is not None
+        and getattr(agent.decay, "latest_by_recipe", {}).get(recipe_id) == target_key[1]
+    )
+    active_count = sum(key in active for key in known_conflict_keys)
+    pruned_count = sum(key in pruned for key in known_conflict_keys)
+    return {
+        "delayed_recurrence_target_active_before": bool(target_key and target_key in active),
+        "delayed_recurrence_target_is_latest_before": target_is_latest,
+        "delayed_recurrence_actual_grace_horizon_before": horizon,
+        "delayed_recurrence_agent_session_before": int(getattr(agent, "session_counter", 0)),
+        "delayed_recurrence_known_conflicting_variant_count_before": len(known_conflict_keys),
+        "delayed_recurrence_conflicting_active_count_before": int(active_count),
+        "delayed_recurrence_conflicting_pruned_count_before": int(pruned_count),
+        "delayed_recurrence_all_known_conflicts_pruned_before": bool(
+            known_conflict_keys and pruned_count == len(known_conflict_keys)
+        ),
+    }
+
+
 def _memory_state(
     agent: AdaptiveHRCAgent,
     pair: RecipePreferencePair,
@@ -1181,16 +1555,6 @@ def _memory_state(
     return "no_memory"
 
 
-def _pref_id_for_pair(
-    agent: AdaptiveHRCAgent,
-    pair: RecipePreferencePair,
-    name_to_rid: Mapping[str, str],
-    hint: Optional[str],
-) -> Optional[str]:
-    if hint is not None:
-        return hint
-    key = _pair_key(agent, pair, name_to_rid)
-    return getattr(agent, "variant_pref_ids", {}).get(key) if key else None
 
 
 def _time_fields(
@@ -1242,8 +1606,6 @@ def observe_episode(
     pair: RecipePreferencePair,
     name_to_rid: Optional[Dict[str, str]],
 ) -> Dict[str, Any]:
-    if isinstance(agent, OracleCeilingAgent):
-        agent.set_oracle_target(pair.actions)
     n_steps = len(pair.actions)
     human_only = float(n_steps * DEFAULT_HRC_TIMING.human_action_time)
     total_time = human_only + float(n_steps * OBSERVATION_MODE_EXTRA_TIME_PER_STEP)
@@ -1278,7 +1640,6 @@ def observe_episode(
         "hrc_human_shadow_turn_count": 0,
         "hrc_human_shadow_correct_count": 0,
         "hrc_human_shadow_topk_hit_count": 0,
-        "committed_latent_pref_id": getattr(agent, "last_pref_id", None),
         "commit_attempted": False,
         "_turn_records": [],
         "human_effort_time": human_only,
@@ -1300,7 +1661,6 @@ def assist_episode(
     *,
     config: EvaluationConfig,
     commit: bool = True,
-    true_preference_id: Optional[str] = None,
     observed_pairs: Optional[set[str]] = None,
     observed_recipes: Optional[set[str]] = None,
     memory_state_before: Optional[str] = None,
@@ -1326,12 +1686,9 @@ def assist_episode(
         pre_observed_pairs,
         pre_observed_recipes,
     )
-    true_pref_id = _pref_id_for_pair(agent, pair, name_to_rid, true_preference_id)
     observations = observations_from_actions(pair.actions)
     actual_tokens = _evaluator_tokens_from_observations(agent, observations)
     actual_labels = tuple(_opaque_observation_label(obs) for obs in observations)
-    if isinstance(agent, OracleCeilingAgent):
-        agent.set_oracle_target(actual_tokens)
 
     def predict(prefix: Sequence[str]) -> Mapping[str, float]:
         return agent.predict_next_tokens(list(prefix))
@@ -1341,14 +1698,6 @@ def assist_episode(
         # own prior distribution. Ground-truth recipe/preference labels remain
         # evaluator-only metadata.
         agent.observe_observation(obs, precomputed_distribution=distribution)
-
-    def robot_feedback(context: Any) -> None:
-        agent.record_robot_feedback(
-            prefix=context.prefix,
-            predicted=context.predicted,
-            actual=context.actual,
-            correct_top1=context.correct_top1,
-        )
 
     def robot_metadata(context: Any) -> Mapping[str, Any]:
         stats = agent.action_policy_stats()
@@ -1370,7 +1719,6 @@ def assist_episode(
         prob_floor=float(agent.cfg.prob_floor),
         timing=DEFAULT_HRC_TIMING,
         capture_robot_metadata=robot_metadata,
-        on_robot_feedback=robot_feedback,
     )
     cls = agent.end_demo() if commit else None
     if commit and isinstance(name_to_rid, dict) and cls is not None and cls.recipe_id is not None:
@@ -1429,12 +1777,9 @@ def assist_episode(
         "pair": pair.label,
         "recipe": pair.recipe_name,
         "preference": pair.preference_name,
-        "true_preference_id": true_pref_id,
         "mode": "assist",
-        # ``memory_state_gt`` is retained as a backward-compatible alias for
-        # the pre-episode state. Never use the post-commit state to stratify
-        # first-pass forgetting or re-entry performance.
-        "memory_state_gt": pre_memory_state,
+        # Always stratify first-pass forgetting and re-entry performance by
+        # the pre-episode state, never the post-commit state.
         "memory_state_before": pre_memory_state,
         "memory_state_after": post_memory_state,
         "classification_kind": getattr(cls, "kind", None),
@@ -1466,7 +1811,6 @@ def assist_episode(
         "wrong_prediction_future_valid_rate": _safe_div(summary.future_valid_wrong_count, summary.robot_wrong_count),
         "observation_mode_episode": 0.0,
         "user_observation_required": 1.0 if getattr(agent, "_needs_observation", False) else 0.0,
-        "committed_latent_pref_id": getattr(agent, "last_pref_id", None) if commit else None,
         "commit_attempted": bool(commit),
         "_turn_records": turn_records,
         **_adaptation_recovery([t.correct_top1 for t in robot_turns], summary.first_mismatch_robot_turn),
@@ -1531,7 +1875,7 @@ def frozen_eval(
                 "top1": float(metrics.get("live_top1", 0.0)),
                 "topk": float(metrics.get("live_topk", 0.0)),
                 "human_correction_rate": float(metrics.get("human_correction_rate", 0.0)),
-                "memory_state_gt": metrics.get("memory_state_gt"),
+                "memory_state_before": metrics.get("memory_state_before"),
             })
             agent.restore_from(checkpoint_state)
             restore_required = False
@@ -1578,10 +1922,6 @@ def memory_snapshot(agent: AdaptiveHRCAgent, wall_s: float = 0.0) -> Dict[str, A
         "training_build_wall_s": float(sum(build_times)),
         "training_retrain_count": int(len(total_times)),
         "training_skipped_retrain_count": int(getattr(agent, "retrain_skipped_count", 0)),
-        # ``training_estimated_flops`` is retained as a backward-compatible
-        # alias.  New analyses should use the explicitly scoped name below
-        # and pair it only with ``training_fit_wall_s``.
-        "training_estimated_flops": estimated_fit_flops,
         "training_estimated_fit_flops": estimated_fit_flops,
         "training_flop_accounting_scope": "fit_only_model_specific_arithmetic",
         "training_flop_cross_model_comparable": False,
@@ -1601,6 +1941,7 @@ def memory_snapshot(agent: AdaptiveHRCAgent, wall_s: float = 0.0) -> Dict[str, A
         ("_latest_fit_stats", "fit_stats"),
         ("replay_buffer_metadata", "replay_buffer"),
         ("baseline_memory_metadata", "baseline_model_memory"),
+        ("offline_pretraining_metadata", "offline_pretraining"),
     ):
         method = getattr(agent, method_name, None)
         if callable(method):
@@ -1608,29 +1949,15 @@ def memory_snapshot(agent: AdaptiveHRCAgent, wall_s: float = 0.0) -> Dict[str, A
                 out[key] = method()
             except Exception:
                 pass
+    offline_pretraining = out.get("offline_pretraining")
+    if isinstance(offline_pretraining, Mapping):
+        # Keep the nested record for provenance while exposing the fields in
+        # diagnostics.jsonl/CSV exports for direct efficiency comparisons.
+        for key, value in offline_pretraining.items():
+            out.setdefault(str(key), value)
     return out
 
 
-def _prototype_rows(
-    agent: AdaptiveHRCAgent,
-    context: Mapping[str, Any],
-    before_count: int,
-) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for idx, event in enumerate((getattr(agent, "prototype_events", []) or [])[before_count:]):
-        rows.append({
-            **dict(context),
-            "diagnostic_type": "prototype_stability",
-            "prototype_event_idx": int(before_count + idx),
-            "prototype_event": event.get("event"),
-            "prototype_new_count": len(event.get("prototype_new", []) or []),
-            "prototype_retired_count": len(event.get("prototype_retired", []) or []),
-            "prototype_persisted_count": len(event.get("prototype_persisted", []) or []),
-            "prototype_split_count": int(event.get("prototype_split_count", 0) or 0),
-            "prototype_merge_count": int(event.get("prototype_merge_count", 0) or 0),
-            "prototype_stability_ari": event.get("prototype_stability_ari"),
-        })
-    return rows
 
 
 def _active_only_audit_row(
@@ -1652,12 +1979,12 @@ def _active_only_audit_row(
             max_prefixes=int(config.active_only_audit_max_prefixes),
             tolerance=float(config.active_only_audit_tolerance),
         ))
-        primary = result.get("live_prediction_passed", result.get("passed"))
+        primary = result.get("passed")
         return {
             **row,
             **result,
             "audit_available": True,
-            "primary_active_only_contract": "live_prediction_excludes_pruned_registry",
+            "primary_active_only_contract": "fitted_policy_matches_active_replay_reference",
             "primary_active_only_contract_passed": bool(primary) if primary is not None else None,
         }
     except Exception as exc:
@@ -1665,7 +1992,7 @@ def _active_only_audit_row(
             **row,
             "audit_available": False,
             "passed": False,
-            "primary_active_only_contract": "live_prediction_excludes_pruned_registry",
+            "primary_active_only_contract": "fitted_policy_matches_active_replay_reference",
             "primary_active_only_contract_passed": False,
             "error": f"{type(exc).__name__}: {exc}",
         }
@@ -1691,11 +2018,6 @@ def _sync_latest_after_clairvoyant_prune(agent: AdaptiveHRCAgent) -> None:
         newest = max(entries, key=lambda e: (int(getattr(e, "last_seen_step", -1)), str(getattr(e, "variant_hash", ""))))
         agent.memory.latest[rid] = newest.variant_hash
         agent.decay.mark_latest(rid, newest.variant_hash)
-
-    remap = getattr(agent, "_remap_preference_ids_after_rebuild", None)
-    if callable(remap):
-        remap()
-
 
 def _apply_clairvoyant_memory_pruning(
     agent: AdaptiveHRCAgent,
@@ -1771,16 +2093,23 @@ def _record_observed(
 
 
 def _is_preference_rung_boundary(plan: ScenarioPlan, event_idx: int) -> bool:
-    """Whether ``event_idx`` closes a non-onboarding ladder rung.
+    """Whether ``event_idx`` closes a completed settled ladder rung.
 
     This is deliberately tag-based rather than a fixed event interval: the
-    number of recipes and settling repeats may change, while every completed
-    homogeneous preference rung should still receive exactly one full-grid
-    frozen evaluation.
+    number of recipes and random settled repeats may change, while each
+    completed phase still receives exactly one full-grid frozen evaluation.
     """
     if event_idx < 0 or event_idx >= len(plan.events):
         return False
-    rung = plan.events[event_idx].tags.get("rung_idx")
+    tags = plan.events[event_idx].tags
+    if tags.get("phase_role") is not None:
+        if tags.get("phase_role") != "settled":
+            return False
+        phase_id = tags.get("phase_id")
+        if event_idx == len(plan.events) - 1:
+            return True
+        return plan.events[event_idx + 1].tags.get("phase_id") != phase_id
+    rung = tags.get("rung_idx")
     if not isinstance(rung, int) or rung <= 0:
         return False
     if event_idx == len(plan.events) - 1:
@@ -1795,17 +2124,19 @@ def _should_run_periodic_frozen_eval(
 ) -> bool:
     """Return whether to run a full evaluation-grid frozen sweep.
 
-    The three paper scenarios intentionally use different diagnostic cadence:
-    homogeneous learning is summarized at rung completion, heterogeneous
-    learning every five events, and randomized deployment has only its
-    event-local pre-interaction probe.  This changes diagnostic timing only;
-    it never changes live interaction or model updates.
+    Full-grid frozen evaluations are rung-level diagnostics for both structured
+    ladders. Randomized phases use matched climb probes only, avoiding a large
+    diagnostic multiplier on the deliberately repeated settled events. This
+    changes diagnostic timing only; it never changes live interaction or model
+    updates.
     """
-    if plan.scenario == SCENARIO_LADDER_HOMOGENEOUS:
+    if plan.scenario in {
+        SCENARIO_LADDER_HOMOGENEOUS,
+        SCENARIO_LADDER_HETEROGENEOUS,
+        SCENARIO_AXIS_HOLDOUT,
+        SCENARIO_PREFERENCE_HOLDOUT,
+    }:
         return _is_preference_rung_boundary(plan, event_idx)
-    if plan.scenario == SCENARIO_LADDER_HETEROGENEOUS:
-        period = int(config.frozen_eval_period)
-        return period > 0 and (event_idx + 1) % period == 0
     if plan.scenario == SCENARIO_DEPLOYMENT_RANDOM:
         return False
     return False
@@ -1821,28 +2152,194 @@ def _should_run_pre_event_frozen_probe(
     """Select matched, single-pair pre-interaction probes.
 
     New recipes routed to observation have no deployable assistive prediction,
-    so they are excluded.  Every routed assist event in randomized deployment
-    is measured; ladders retain their explicitly tagged primary probes only.
+    so they are excluded. In every phase ladder, only primary climb events
+    receive a matched frozen probe; settled-block performance is the actual
+    deployed, post-commit outcome rather than a diagnostic replay.
     """
     if not bool(config.pre_event_frozen_probes) or requested_mode != "assist" or executed_mode != "assist":
         return False
-    if plan.scenario == SCENARIO_DEPLOYMENT_RANDOM:
-        return True
     return bool(tags.get("primary_probe", False))
+
+
+def _offline_pretraining_subset(
+    values: Sequence[str],
+    fraction: float,
+    *,
+    seed: int,
+    axis: str,
+) -> Tuple[str, ...]:
+    """Choose a reproducible 40--50% style offline-training subset."""
+    if not 0.0 < float(fraction) <= 1.0:
+        raise ValueError(f"offline-pretrained {axis} fraction must be in (0, 1], got {fraction!r}")
+    candidates = sorted({str(value) for value in values})
+    if not candidates:
+        raise ValueError(f"cannot pretrain offline baseline: scenario has no {axis}s")
+    # floor(0.5 * 5) = 2 gives 40%, keeping the requested 40--50% coverage
+    # when an odd number of preferences is available.
+    n_selected = max(1, min(len(candidates), int(math.floor(float(fraction) * len(candidates)))))
+    rng = random.Random(f"offline_pretrained_frozen|{axis}|{int(seed)}")
+    return tuple(sorted(rng.sample(candidates, n_selected)))
+
+
+def _fit_and_lock_offline_frozen_agent(
+    agent: AdaptiveHRCAgent,
+    *,
+    recipe_names: Sequence[str],
+    preference_names: Sequence[str],
+    metadata: Mapping[str, Any],
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Fit an offline reference before deployment without exposing labels to it."""
+    lock_deployment = getattr(agent, "lock_deployment", None)
+    if not callable(lock_deployment):
+        raise TypeError("offline frozen registry entry must implement lock_deployment()")
+    library = gen.recipe_library()
+    pairs = [
+        materialize_pair(recipe_name, preference_name, library[recipe_name])
+        for recipe_name in recipe_names
+        for preference_name in preference_names
+    ]
+    name_to_rid: Dict[str, str] = {}
+    pretraining_t0 = time.perf_counter()
+    for pair in pairs:
+        # ``observe_episode`` supplies only anonymous transition observations
+        # to the learner. Recipe/preference labels stay in evaluator metadata.
+        observe_episode(agent, pair, name_to_rid)
+    locked_metadata = lock_deployment({
+        **dict(metadata),
+        "offline_training_recipe_count": int(len(recipe_names)),
+        "offline_training_preference_count": int(len(preference_names)),
+        "offline_training_pair_count": int(len(pairs)),
+        "offline_training_recipe_names": list(sorted(recipe_names)),
+        "offline_training_preference_names": list(sorted(preference_names)),
+        "offline_pretraining_end_to_end_wall_s": float(time.perf_counter() - pretraining_t0),
+    })
+    return name_to_rid, dict(locked_metadata)
+
+
+def _prepare_offline_pretrained_frozen_agent(
+    agent: AdaptiveHRCAgent,
+    plan: ScenarioPlan,
+    config: EvaluationConfig,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Pretrain on paired 40--50% recipe and preference subsets, then lock."""
+    recipe_names = _offline_pretraining_subset(
+        plan.selected_recipes,
+        config.offline_pretrained_recipe_fraction,
+        seed=plan.seed,
+        axis="recipe",
+    )
+    preference_names = _offline_pretraining_subset(
+        plan.selected_preferences,
+        config.offline_pretrained_preference_fraction,
+        seed=plan.seed,
+        axis="preference",
+    )
+    return _fit_and_lock_offline_frozen_agent(
+        agent,
+        recipe_names=recipe_names,
+        preference_names=preference_names,
+        metadata={
+            "offline_training_design": "subset_recipes_subset_preferences",
+            "offline_training_recipe_fraction_requested": float(config.offline_pretrained_recipe_fraction),
+            "offline_training_preference_fraction_requested": float(config.offline_pretrained_preference_fraction),
+        },
+    )
+
+
+def _prepare_offline_all_recipes_identity_frozen_agent(
+    agent: AdaptiveHRCAgent,
+    plan: ScenarioPlan,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Pretrain every evaluated recipe on the identity preference only, then lock."""
+    recipe_names = tuple(sorted({str(recipe_name) for recipe_name in plan.selected_recipes}))
+    if not recipe_names:
+        raise ValueError("cannot pretrain all-recipes identity baseline: scenario has no recipes")
+    return _fit_and_lock_offline_frozen_agent(
+        agent,
+        recipe_names=recipe_names,
+        preference_names=("identity",),
+        metadata={
+            "offline_training_design": "all_selected_recipes_identity_only",
+            "offline_training_recipe_fraction_requested": 1.0,
+            "offline_training_recipe_scope": "all_selected_scenario_recipes",
+            "offline_training_preference_scope": "identity_only",
+        },
+    )
+
+
+def _prepare_holdout_source_matched_frozen_agent(
+    agent: AdaptiveHRCAgent,
+    plan: ScenarioPlan,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Fit a frozen control on the exact observation-only source progression.
+
+    The holdout arms compare adaptation after a common source curriculum.  An
+    online method receives that curriculum during its source rungs; a frozen
+    method must receive the same ordered demonstrations before deployment and
+    then be locked.  Replaying the actual source events (including their
+    unequal settled repeats) avoids turning either frozen control into a
+    broader, differently distributed pretraining advantage.
+    """
+    lock_deployment = getattr(agent, "lock_deployment", None)
+    if not callable(lock_deployment):
+        raise TypeError("holdout frozen registry entry must implement lock_deployment()")
+    source_events = [
+        event for event in plan.events
+        if str(event.tags.get("holdout_partition")) == "source"
+    ]
+    if not source_events:
+        raise ValueError(f"{plan.scenario} has no source progression to pretrain a frozen control")
+    if any(event.mode != "observe" for event in source_events):
+        raise ValueError("holdout source progression must remain observation-only")
+
+    name_to_rid: Dict[str, str] = {}
+    pretraining_t0 = time.perf_counter()
+    for event in source_events:
+        # Labels stay evaluator-side; the learner receives the same anonymous
+        # action observations it would receive online during a source rung.
+        observe_episode(agent, event.pair, name_to_rid)
+    unique_pairs = {event.pair.label for event in source_events}
+    source_recipes = {event.pair.recipe_name for event in source_events}
+    source_preferences = {event.pair.preference_name for event in source_events}
+    locked_metadata = lock_deployment({
+        "offline_training_design": "matched_holdout_source_progression",
+        "offline_training_scope": "exact_ordered_source_climb_and_settled_events",
+        "offline_training_event_count": int(len(source_events)),
+        "offline_training_unique_pair_count": int(len(unique_pairs)),
+        "offline_training_recipe_count": int(len(source_recipes)),
+        "offline_training_preference_count": int(len(source_preferences)),
+        "offline_training_recipe_names": sorted(source_recipes),
+        "offline_training_preference_names": sorted(source_preferences),
+        "offline_pretraining_end_to_end_wall_s": float(time.perf_counter() - pretraining_t0),
+        "holdout_source_progression_matched": True,
+        "heldout_deployment_updates_allowed": False,
+    })
+    return name_to_rid, dict(locked_metadata)
 
 
 def run_event_stream_for_baseline(
     baseline: str,
     plan: ScenarioPlan,
     config: EvaluationConfig,
+    *,
+    execution_mode_schedule: Optional[Sequence[str]] = None,
+    mode_schedule_policy: str = "baseline_local",
 ) -> EventStreamRun:
+    if execution_mode_schedule is not None:
+        if len(execution_mode_schedule) != len(plan.events):
+            raise ValueError(
+                "execution_mode_schedule must contain exactly one mode per scenario event; "
+                f"got {len(execution_mode_schedule)} for {len(plan.events)} events"
+            )
+        invalid_modes = sorted({str(mode) for mode in execution_mode_schedule if mode not in {"assist", "observe"}})
+        if invalid_modes:
+            raise ValueError(f"execution_mode_schedule has invalid modes: {invalid_modes}")
     is_clairvoyant = baseline == CLAIRVOYANT_MEMORY_ORACLE
     agent = make_agent("full" if is_clairvoyant else baseline, base_config(plan.seed, config))
     name_to_rid: Dict[str, str] = {}
     episode_rows: List[Dict[str, Any]] = []
     frozen_rows: List[Dict[str, Any]] = []
     memory_rows: List[Dict[str, Any]] = []
-    prototype_rows: List[Dict[str, Any]] = []
     audit_rows: List[Dict[str, Any]] = []
     oracle_rows: List[Dict[str, Any]] = []
     turn_rows: List[Dict[str, Any]] = []
@@ -1851,9 +2348,23 @@ def run_event_stream_for_baseline(
     observed_pairs: set[str] = set()
     preferences_by_recipe: Dict[str, set[str]] = defaultdict(set)
     axis_values_by_recipe: Dict[str, set[str]] = defaultdict(set)
-    pref_to_pid: Dict[str, Optional[str]] = {}
     last_global_frozen_event_idx: Optional[int] = None
     t0 = time.perf_counter()
+    baseline_context: Dict[str, Any] = {}
+    holdout_scenario = plan.scenario in {SCENARIO_AXIS_HOLDOUT, SCENARIO_PREFERENCE_HOLDOUT}
+    if holdout_scenario and baseline in {
+        "offline_pretrained_frozen",
+        "offline_all_recipes_identity_frozen",
+    }:
+        name_to_rid, baseline_context = _prepare_holdout_source_matched_frozen_agent(agent, plan)
+    elif baseline == "offline_pretrained_frozen":
+        name_to_rid, baseline_context = _prepare_offline_pretrained_frozen_agent(agent, plan, config)
+    elif baseline == "offline_all_recipes_identity_frozen":
+        name_to_rid, baseline_context = _prepare_offline_all_recipes_identity_frozen_agent(agent, plan)
+    # Keep offline/pre-deployment work out of individual online phases. The
+    # initial snapshot is separately reported in the phase-cost schema.
+    initial_memory = memory_snapshot(agent)
+    pairs_by_label = {event.pair.label: event.pair for event in plan.events}
 
     for event_idx, event in enumerate(plan.events):
         pair = event.pair
@@ -1883,8 +2394,8 @@ def run_event_stream_for_baseline(
             ),
         }
         requested_mode = event.mode
-        executed_mode = requested_mode
-        route_reason = "user_selected"
+        natural_executed_mode = requested_mode
+        natural_route_reason = "user_selected"
         # Evaluator-only pre-episode label. It is captured before routing,
         # observations, or commits, and is never supplied to the agent.
         memory_state_before = _memory_state(
@@ -1905,9 +2416,39 @@ def run_event_stream_for_baseline(
             and config.route_absent_recipe_assists_to_observe
             and not _recipe_has_active_variant(agent, pair, name_to_rid)
         ):
-            executed_mode = "observe"
-            route_reason = "assist_routed_to_observe_recipe_absent_from_active_memory"
-        tags.update({"requested_mode": requested_mode, "executed_mode": executed_mode, "mode_route_reason": route_reason})
+            natural_executed_mode = "observe"
+            natural_route_reason = "assist_routed_to_observe_recipe_absent_from_active_memory"
+        full_execution_mode = (
+            str(execution_mode_schedule[event_idx])
+            if execution_mode_schedule is not None else None
+        )
+        executed_mode = full_execution_mode or natural_executed_mode
+        route_reason = (
+            "matched_full_realized_execution_schedule"
+            if full_execution_mode is not None and executed_mode != natural_executed_mode
+            else natural_route_reason
+        )
+        tags.update({
+            "requested_mode": requested_mode,
+            "executed_mode": executed_mode,
+            "mode_route_reason": route_reason,
+            "natural_executed_mode": natural_executed_mode,
+            "natural_mode_route_reason": natural_route_reason,
+            "full_realized_execution_mode": full_execution_mode,
+            "mode_schedule_policy": mode_schedule_policy,
+            "mode_matches_full_schedule": (
+                bool(executed_mode == full_execution_mode)
+                if full_execution_mode is not None else None
+            ),
+        })
+        tags.update(_delayed_recurrence_memory_audit_tags(
+            agent,
+            pair,
+            name_to_rid,
+            target_key_before,
+            tags,
+            pairs_by_label,
+        ))
         if is_clairvoyant:
             tags.update({
                 "oracle_reference": CLAIRVOYANT_MEMORY_ORACLE,
@@ -1916,11 +2457,13 @@ def run_event_stream_for_baseline(
                 "oracle_retention_policy": "future_recipe_support",
             })
 
-        context = _event_context(baseline, plan, event_idx, requested_mode, executed_mode, pair, tags)
+        context = {
+            **_event_context(baseline, plan, event_idx, requested_mode, executed_mode, pair, tags),
+            **baseline_context,
+        }
         active_before = _active_keys(agent)
         pruned_before = _pruned_keys(agent)
         retrain_before = len(getattr(agent, "retrain_events", []) or [])
-        proto_before = len(getattr(agent, "prototype_events", []) or [])
 
         # A matched frozen probe evaluates the same pre-event memory state for
         # every baseline without changing the real interaction route or its
@@ -1955,7 +2498,6 @@ def run_event_stream_for_baseline(
             post_observed_pairs = set(observed_pairs) | {pair.label}
             post_observed_recipes = set(observed_recipes) | {pair.recipe_name}
             row.update({
-                "memory_state_gt": memory_state_before,
                 "memory_state_before": memory_state_before,
                 "memory_state_after": _memory_state(
                     agent,
@@ -1965,7 +2507,6 @@ def run_event_stream_for_baseline(
                     post_observed_recipes,
                 ),
             })
-            pref_to_pid[pair.preference_name] = getattr(agent, "last_pref_id", None)
         else:
             row = assist_episode(
                 agent,
@@ -1973,14 +2514,10 @@ def run_event_stream_for_baseline(
                 name_to_rid,
                 config=config,
                 commit=True,
-                true_preference_id=pref_to_pid.get(pair.preference_name),
                 observed_pairs=observed_pairs,
                 observed_recipes=observed_recipes,
                 memory_state_before=memory_state_before,
             )
-            latest_pid = getattr(agent, "last_pref_id", None)
-            if latest_pid is not None:
-                pref_to_pid[pair.preference_name] = latest_pid
         row.update(context)
         target_key_after = _pair_key(agent, pair, name_to_rid)
         target_recipe_id_after = name_to_rid.get(pair.recipe_name)
@@ -2065,7 +2602,6 @@ def run_event_stream_for_baseline(
             "retrain_event_count_delta": len((getattr(agent, "retrain_events", []) or [])[retrain_before:]),
             "post_event_oracle_pruned_active_variants": after_prune.get("oracle_pruned_active_variants"),
         })
-        prototype_rows.extend(_prototype_rows(agent, context, proto_before))
 
         if config.active_only_audit_period > 0 and (event_idx + 1) % int(config.active_only_audit_period) == 0:
             audit_rows.append(_active_only_audit_row(agent, {**context, "audit_checkpoint": f"event_{event_idx}"}, config))
@@ -2078,13 +2614,23 @@ def run_event_stream_for_baseline(
                 config=config,
                 checkpoint=f"event_{event_idx}",
                 event_idx=event_idx,
-                context={"baseline": baseline, "scenario": plan.scenario, "seed": int(plan.seed)},
+                context={
+                    "baseline": baseline,
+                    "scenario": plan.scenario,
+                    "seed": int(plan.seed),
+                    **baseline_context,
+                },
                 observed_pairs=observed_pairs,
                 observed_recipes=observed_recipes,
             ))
             last_global_frozen_event_idx = event_idx
 
-    final_context = {"baseline": baseline, "scenario": plan.scenario, "seed": int(plan.seed)}
+    final_context = {
+        "baseline": baseline,
+        "scenario": plan.scenario,
+        "seed": int(plan.seed),
+        **baseline_context,
+    }
     # Do not duplicate the final full-grid sweep when the final event already
     # closes a homogeneous rung or lands on the heterogeneous five-event
     # cadence.  Random deployment has no periodic full-grid sweeps, so it
@@ -2116,19 +2662,47 @@ def run_event_stream_for_baseline(
         episode_rows=episode_rows,
         frozen_rows=frozen_rows,
         memory_rows=memory_rows,
-        prototype_rows=prototype_rows,
         active_audit_rows=audit_rows,
         oracle_pruning_rows=oracle_rows,
         turn_rows=turn_rows,
+        initial_memory=initial_memory,
         wall_s=float(time.perf_counter() - t0),
     )
 
 
 def aggregate_episode_metrics(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     if not rows:
-        return {"n_episodes": 0.0, "n_steps": 0.0, "live_top1": 0.0, "live_topk": 0.0}
+        return {
+            "status": "not_run",
+            "n_episodes": 0.0,
+            "n_steps": 0.0,
+            "n_recipe_steps": 0.0,
+            "live_top1": None,
+            "live_topk": None,
+            "robot_wrong_rate": None,
+            "human_correction_rate": None,
+            "testing_total_action_time": 0.0,
+            "testing_human_only_action_time": 0.0,
+            "testing_human_effort_time": 0.0,
+            "testing_episode_wall_s": 0.0,
+            "testing_normalized_interaction_cost": None,
+            "human_effort_time": 0.0,
+            "mean_nll_per_robot_turn": None,
+            "mean_prediction_wall_s": None,
+            "human_shadow_top1": None,
+            "human_shadow_topk": None,
+            "n_human_shadow_turns": 0.0,
+            "future_valid_wrong_rate": None,
+            "observation_mode_rate": None,
+            "user_observation_required_rate": None,
+            "primary_prediction_metric": "live_top1",
+            "primary_prediction_metric_value": None,
+            "primary_hrc_metric": "human_correction_rate",
+            "primary_hrc_metric_value": None,
+        }
     robot_turns = sum(_numeric(row, "hrc_robot_turn_count") for row in rows)
     out = {
+        "status": "completed",
         "n_episodes": float(len(rows)),
         "n_steps": float(sum(_numeric(row, "n_steps") for row in rows)),
         "n_recipe_steps": float(sum(_numeric(row, "n_recipe_steps") for row in rows)),
@@ -2139,6 +2713,7 @@ def aggregate_episode_metrics(rows: Sequence[Mapping[str, Any]]) -> Dict[str, An
         "testing_total_action_time": float(sum(_numeric(row, "testing_total_action_time") for row in rows)),
         "testing_human_only_action_time": float(sum(_numeric(row, "testing_human_only_action_time") for row in rows)),
         "testing_human_effort_time": float(sum(_numeric(row, "testing_human_effort_time") for row in rows)),
+        "testing_episode_wall_s": float(sum(_numeric(row, "episode_wall_s") for row in rows)),
         "testing_normalized_interaction_cost": _safe_div(
             sum(_numeric(row, "testing_total_action_time") for row in rows),
             sum(_numeric(row, "testing_human_only_action_time") for row in rows),
@@ -2185,12 +2760,104 @@ def _group_metrics(rows: Sequence[Mapping[str, Any]], key: str) -> Dict[str, Any
     return {group: aggregate_episode_metrics(vals) for group, vals in sorted(grouped.items())}
 
 
+def _phase_rung_metrics(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Aggregate the explicit climb/settled blocks without interleaving them."""
+    grouped: Dict[str, Dict[str, List[Mapping[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        phase_role = str(row.get("phase_role") or "unphased")
+        rung = row.get("rung_idx")
+        rung_label = f"rung_{int(rung):02d}" if isinstance(rung, int) else "rung_unknown"
+        grouped[phase_role][rung_label].append(row)
+    return {
+        phase_role: {
+            rung_label: aggregate_episode_metrics(group_rows)
+            for rung_label, group_rows in sorted(by_rung.items())
+        }
+        for phase_role, by_rung in sorted(grouped.items())
+    }
+
+
+_PHASE_TRAINING_FIELDS = (
+    "training_total_retrain_wall_s",
+    "training_fit_wall_s",
+    "training_build_wall_s",
+    "training_estimated_fit_flops",
+    "training_retrain_count",
+)
+
+
+def _phase_training_costs(
+    memory_rows: Sequence[Mapping[str, Any]],
+    initial_memory: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Attribute *online* retraining deltas to each logged phase and rung.
+
+    Snapshots are cumulative.  Differencing them is necessary to avoid
+    charging a late settled phase for all prior fitting, and starting from the
+    post-pretraining snapshot keeps offline frozen baselines' initial fit
+    separate from deployment adaptation.  FLOPs remain model-specific fit-only
+    estimates and therefore must not be compared across model families.
+    """
+    zero = {f"online_{field}": 0.0 for field in _PHASE_TRAINING_FIELDS}
+    previous = {field: _numeric(initial_memory, field) for field in _PHASE_TRAINING_FIELDS}
+    by_phase: Dict[str, Dict[str, float]] = defaultdict(lambda: dict(zero))
+    by_phase_rung: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: dict(zero))
+    )
+    for row in sorted(memory_rows, key=lambda item: _numeric(item, "event_idx", -1.0)):
+        phase_role = str(row.get("phase_role") or "unphased")
+        rung = row.get("rung_idx")
+        rung_label = f"rung_{int(rung):02d}" if isinstance(rung, int) else "rung_unknown"
+        for field in _PHASE_TRAINING_FIELDS:
+            current = _numeric(row, field)
+            delta = max(0.0, current - previous[field])
+            previous[field] = current
+            by_phase[phase_role][f"online_{field}"] = by_phase[phase_role].get(f"online_{field}", 0.0) + delta
+            phase_rung = by_phase_rung[phase_role][rung_label]
+            phase_rung[f"online_{field}"] = phase_rung.get(f"online_{field}", 0.0) + delta
+    offline = {
+        f"upfront_{field}": _numeric(initial_memory, field)
+        for field in _PHASE_TRAINING_FIELDS
+    }
+    return {
+        "definition": (
+            "Online training cost is the non-negative event-to-event delta of cumulative retraining snapshots; "
+            "upfront cost is pre-deployment work and is not allocated to a phase. FLOPs are fit-only, model-specific estimates."
+        ),
+        "upfront_training": offline,
+        "per_phase_role": {phase: dict(values) for phase, values in sorted(by_phase.items())},
+        "per_phase_rung": {
+            phase: {rung: dict(values) for rung, values in sorted(by_rung.items())}
+            for phase, by_rung in sorted(by_phase_rung.items())
+        },
+    }
+
+
+def _add_phase_training_costs(metrics: Dict[str, Any], costs: Mapping[str, Any]) -> Dict[str, Any]:
+    """Attach phase-attributed online training costs to phase metric tables."""
+    merged = {phase: dict(values) for phase, values in metrics.items()}
+    for phase, values in (costs.get("per_phase_role") or {}).items():
+        merged.setdefault(str(phase), {}).update(dict(values))
+    return merged
+
+
+def _add_phase_rung_training_costs(metrics: Dict[str, Dict[str, Any]], costs: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Attach rung-attributed online training costs without dropping empty assist cells."""
+    merged = {
+        phase: {rung: dict(values) for rung, values in by_rung.items()}
+        for phase, by_rung in metrics.items()
+    }
+    for phase, by_rung in (costs.get("per_phase_rung") or {}).items():
+        target = merged.setdefault(str(phase), {})
+        for rung, values in by_rung.items():
+            target.setdefault(str(rung), {}).update(dict(values))
+    return merged
+
+
 def frozen_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     """Summarize frozen probes without treating an omitted audit as success.
 
-    ``checkpoints`` is the canonical schema.  Completed summaries also retain
-    checkpoint names at the top level for compatibility with early consumers
-    that accessed, for example, ``summary[\"final\"]`` directly.
+    ``checkpoints`` is the sole summary schema.
     """
     if not rows:
         return {
@@ -2218,18 +2885,69 @@ def frozen_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "n_checkpoints": len(checkpoints),
         "n_rows": len(rows),
         "checkpoints": checkpoints,
-        # Backward-compatible direct checkpoint access.
-        **checkpoints,
+    }
+
+
+def frozen_summary_by(
+    rows: Sequence[Mapping[str, Any]],
+    field: str,
+) -> Dict[str, Dict[str, Any]]:
+    """Summarize frozen probes by an evaluator tag while retaining support."""
+    grouped: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        value = row.get(field)
+        if value is not None:
+            grouped[str(value)].append(row)
+    return {
+        value: frozen_summary(group_rows)
+        for value, group_rows in sorted(grouped.items())
+    }
+
+
+def delayed_recurrence_audit_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Summarize whether the planned recurrence condition engaged forgetting."""
+    probes = [row for row in rows if bool(row.get("delayed_recurrence_probe"))]
+    if not probes:
+        return {
+            "definition": "Pre-event memory state for horizon-calibrated delayed-recurrence probes.",
+            "status": "not_run",
+            "n_probes": 0,
+        }
+
+    def rate(field: str) -> Optional[float]:
+        values = [row.get(field) for row in probes if isinstance(row.get(field), bool)]
+        return _mean(1.0 if value else 0.0 for value in values) if values else None
+
+    return {
+        "definition": "Pre-event memory state for horizon-calibrated delayed-recurrence probes. A Full probe engages the intended removal mechanism when the target is active/latest and all known historical conflicts are pruned.",
+        "status": "completed",
+        "n_probes": len(probes),
+        "target_active_before_rate": rate("delayed_recurrence_target_active_before"),
+        "target_latest_before_rate": rate("delayed_recurrence_target_is_latest_before"),
+        "all_known_conflicts_pruned_before_rate": rate("delayed_recurrence_all_known_conflicts_pruned_before"),
+        "mean_known_conflicting_variant_count_before": _mean(
+            row.get("delayed_recurrence_known_conflicting_variant_count_before") for row in probes
+        ),
+        "mean_conflicting_active_count_before": _mean(
+            row.get("delayed_recurrence_conflicting_active_count_before") for row in probes
+        ),
+        "mean_conflicting_pruned_count_before": _mean(
+            row.get("delayed_recurrence_conflicting_pruned_count_before") for row in probes
+        ),
+        "mean_intervening_event_count": _mean(
+            row.get("delayed_recurrence_intervening_event_count") for row in probes
+        ),
+        "mean_required_intervening_event_count": _mean(
+            row.get("delayed_recurrence_required_intervening_event_count") for row in probes
+        ),
+        "mean_actual_grace_horizon_before": _mean(
+            row.get("delayed_recurrence_actual_grace_horizon_before") for row in probes
+        ),
     }
 
 
 def policy_calibration_summary(turn_rows: Sequence[Mapping[str, Any]], n_bins: int = 10) -> Dict[str, Any]:
-    """Calibration and arbitration diagnostics from actual robot decisions.
-
-    This is a diagnostic of the deployed policy, not a post-hoc threshold
-    selector.  Its input is limited to turn metadata emitted before the human
-    correction is observed.
-    """
+    """Top-1 confidence calibration for the deployed ensemble policy."""
     rows = [
         row for row in turn_rows
         if row.get("turn_kind") == "robot"
@@ -2238,49 +2956,36 @@ def policy_calibration_summary(turn_rows: Sequence[Mapping[str, Any]], n_bins: i
     ]
     if not rows:
         return {
-            "definition": "Top-1 confidence calibration and structural/local expert arbitration on robot turns.",
+            "definition": "Top-1 confidence calibration on robot turns.",
             "status": "not_run",
             "n_robot_turns": 0,
             "ece": None,
             "top1_brier": None,
-            "expert_disagreement_count": 0,
         }
     bins: Dict[int, List[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
         confidence = max(0.0, min(1.0, float(row["final_action_confidence"])))
-        idx = min(max(0, int(n_bins) - 1), int(confidence * max(1, int(n_bins))))
-        bins[idx].append(row)
+        bins[min(max(0, int(n_bins) - 1), int(confidence * max(1, int(n_bins))))].append(row)
     ece = 0.0
     bin_rows: List[Dict[str, Any]] = []
     for idx in range(max(1, int(n_bins))):
-        vals = bins.get(idx, [])
-        if not vals:
+        values = bins.get(idx, [])
+        if not values:
             continue
-        confidence = _mean(float(row["final_action_confidence"]) for row in vals)
-        accuracy = _mean(1.0 if row["correct_top1"] else 0.0 for row in vals)
-        ece += (len(vals) / len(rows)) * abs(accuracy - confidence)
-        bin_rows.append({"bin": idx, "n": len(vals), "mean_confidence": confidence, "accuracy": accuracy})
-    brier = _mean(
-        (float(row["final_action_confidence"]) - (1.0 if row["correct_top1"] else 0.0)) ** 2
-        for row in rows
-    )
-    disagreements = [
-        row for row in rows
-        if row.get("conditioned_top_token") is not None
-        and row.get("ensemble_top_token") is not None
-        and row.get("conditioned_top_token") != row.get("ensemble_top_token")
-    ]
+        confidence = _mean(float(row["final_action_confidence"]) for row in values)
+        accuracy = _mean(1.0 if row["correct_top1"] else 0.0 for row in values)
+        ece += (len(values) / len(rows)) * abs(accuracy - confidence)
+        bin_rows.append({"bin": idx, "n": len(values), "mean_confidence": confidence, "accuracy": accuracy})
     return {
-        "definition": "Top-1 confidence calibration and structural/local expert arbitration on robot turns.",
+        "definition": "Top-1 confidence calibration on robot turns.",
         "status": "completed",
         "n_robot_turns": len(rows),
         "ece": float(ece),
-        "top1_brier": float(brier),
+        "top1_brier": _mean(
+            (float(row["final_action_confidence"]) - (1.0 if row["correct_top1"] else 0.0)) ** 2
+            for row in rows
+        ),
         "bins": bin_rows,
-        "expert_disagreement_count": len(disagreements),
-        "expert_disagreement_rate": _safe_div(len(disagreements), len(rows)),
-        "accuracy_when_experts_disagree": _mean(1.0 if row["correct_top1"] else 0.0 for row in disagreements),
-        "mean_structural_blend_when_disagree": _mean(row.get("blend_strength") for row in disagreements),
     }
 
 
@@ -2351,31 +3056,18 @@ def axis_value_transfer_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, 
     }
 
 
-def prototype_stability_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    return {
-        "definition": "Latent preference prototype rebuild stability; splits/merges indicate semantic ID instability.",
-        "n_events": len(rows),
-        "n_split_events": sum(1 for row in rows if _numeric(row, "prototype_split_count") > 0),
-        "n_merge_events": sum(1 for row in rows if _numeric(row, "prototype_merge_count") > 0),
-        "mean_split_count": _mean(row.get("prototype_split_count") for row in rows),
-        "mean_merge_count": _mean(row.get("prototype_merge_count") for row in rows),
-        "mean_prototype_stability_ari": _mean(row.get("prototype_stability_ari") for row in rows),
-        "mean_new_count": _mean(row.get("prototype_new_count") for row in rows),
-        "mean_retired_count": _mean(row.get("prototype_retired_count") for row in rows),
-    }
 
 
 def active_only_audit_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {
-            "definition": "Checks whether live prediction matches an active-only memory view after pruning.",
+            "definition": "Checks whether the fitted deployable policy matches a fresh active-replay reference.",
             "status": "not_run",
             "n_audits": 0,
             "n_available": 0,
-            "n_primary_contract_failed": None,
-            "primary_contract_failure_rate": None,
-            "live_prediction_max_l1": None,
-            "active_head_max_l1": None,
+            "n_failed": None,
+            "failure_rate": None,
+            "max_l1": None,
             "mean_active_variants": None,
             "mean_pruned_variants": None,
             "failed_checkpoints": [],
@@ -2383,14 +3075,13 @@ def active_only_audit_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, An
     available = [row for row in rows if row.get("audit_available")]
     failed = [row for row in available if row.get("primary_active_only_contract_passed") is False]
     return {
-        "definition": "Checks whether live prediction matches an active-only memory view after pruning.",
+        "definition": "Checks whether the fitted deployable policy matches a fresh active-replay reference.",
         "status": "completed" if available else "unavailable",
         "n_audits": len(rows),
         "n_available": len(available),
-        "n_primary_contract_failed": len(failed),
-        "primary_contract_failure_rate": _safe_div(len(failed), len(available)),
-        "live_prediction_max_l1": max(_finite(row.get("live_prediction_max_l1") for row in available), default=0.0),
-        "active_head_max_l1": max(_finite(row.get("active_head_max_l1") for row in available), default=0.0),
+        "n_failed": len(failed),
+        "failure_rate": _safe_div(len(failed), len(available)),
+        "max_l1": max(_finite(row.get("max_l1") for row in available), default=0.0),
         "mean_active_variants": _mean(row.get("active_variants") for row in rows),
         "mean_pruned_variants": _mean(row.get("pruned_variants") for row in rows),
         "failed_checkpoints": [
@@ -2400,67 +3091,6 @@ def active_only_audit_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, An
     }
 
 
-def _adjusted_rand_index_labels(labels_a: Sequence[str], labels_b: Sequence[str]) -> Optional[float]:
-    if len(labels_a) != len(labels_b):
-        raise ValueError("ARI inputs must have equal length")
-    n = len(labels_a)
-    if n < 2:
-        return None
-
-    def comb2(value: int) -> float:
-        return float(value * (value - 1) / 2)
-
-    counts_a: Counter = Counter(labels_a)
-    counts_b: Counter = Counter(labels_b)
-    table: Counter = Counter(zip(labels_a, labels_b))
-    observed = sum(comb2(count) for count in table.values())
-    expected = sum(comb2(count) for count in counts_a.values()) * sum(comb2(count) for count in counts_b.values()) / comb2(n)
-    maximum = 0.5 * (sum(comb2(count) for count in counts_a.values()) + sum(comb2(count) for count in counts_b.values()))
-    denom = maximum - expected
-    return 1.0 if abs(denom) <= 1e-12 else max(-1.0, min(1.0, (observed - expected) / denom))
-
-
-def preference_prototype_semantics(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    labelled = [
-        row for row in rows
-        if row.get("committed_latent_pref_id") is not None and row.get("preference") is not None
-    ]
-    if not labelled:
-        return {
-            "definition": "Agreement of learned latent preference IDs with evaluator-only preference labels; reported as a diagnostic, not supplied to the agent.",
-            "n_labelled_episodes": 0,
-            "adjusted_rand_index": None,
-            "cluster_purity": None,
-            "preference_identity_recovery_rate": None,
-            "coverage": 0.0,
-        }
-    labels = [str(row["preference"]) for row in labelled]
-    prototype_ids = [str(row["committed_latent_pref_id"]) for row in labelled]
-    by_prototype: Dict[str, List[str]] = defaultdict(list)
-    by_preference: Dict[str, List[str]] = defaultdict(list)
-    for label, prototype_id in zip(labels, prototype_ids):
-        by_prototype[prototype_id].append(label)
-        by_preference[label].append(prototype_id)
-    purity_hits = sum(max(Counter(values).values()) for values in by_prototype.values())
-    recovery_eligible = 0
-    recovery_hits = 0
-    for values in by_preference.values():
-        if len(values) < 2:
-            continue
-        reference = values[0]
-        recovery_eligible += len(values) - 1
-        recovery_hits += sum(value == reference for value in values[1:])
-    return {
-        "definition": "Agreement of learned latent preference IDs with evaluator-only preference labels; reported as a diagnostic, not supplied to the agent.",
-        "n_labelled_episodes": len(labelled),
-        "n_ground_truth_preferences": len(by_preference),
-        "n_learned_prototypes": len(by_prototype),
-        "adjusted_rand_index": _adjusted_rand_index_labels(labels, prototype_ids),
-        "cluster_purity": _safe_div(purity_hits, len(labelled)),
-        "preference_identity_recovery_rate": _safe_div(recovery_hits, recovery_eligible) if recovery_eligible else None,
-        "preference_identity_recovery_eligible": recovery_eligible,
-        "coverage": _safe_div(len(labelled), len(rows)),
-    }
 
 
 def online_commit_safety_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -2579,7 +3209,7 @@ def oracle_gap_rows(per_baseline: Mapping[str, Any], oracle_reference: str = CLA
         for scope in ("assist_only", "all_episode_workload"):
             if isinstance(summary.get(scope), Mapping) and isinstance(oracle.get(scope), Mapping):
                 add(baseline, scope, "all", summary[scope], oracle[scope])
-        for scope in ("per_hypothesis", "per_transfer_cell", "per_memory_state", "per_event_type"):
+        for scope in ("per_hypothesis", "per_transfer_cell", "per_memory_state", "per_event_type", "per_phase_role"):
             base_groups = summary.get(scope, {})
             oracle_groups = oracle.get(scope, {})
             if not isinstance(base_groups, Mapping) or not isinstance(oracle_groups, Mapping):
@@ -2638,6 +3268,19 @@ def oracle_gap_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
 def summarize_stream(stream: EventStreamRun) -> Dict[str, Any]:
     assist_rows = [row for row in stream.episode_rows if row.get("mode") == "assist"]
     reentry = reentry_stratification_summary(stream.episode_rows)
+    phase_training = _phase_training_costs(stream.memory_rows, stream.initial_memory)
+    phase_role_assist = _add_phase_training_costs(
+        _group_metrics(assist_rows, "phase_role"), phase_training,
+    )
+    phase_rung_assist = _add_phase_rung_training_costs(
+        _phase_rung_metrics(assist_rows), phase_training,
+    )
+    phase_role_all = _add_phase_training_costs(
+        _group_metrics(stream.episode_rows, "phase_role"), phase_training,
+    )
+    phase_rung_all = _add_phase_rung_training_costs(
+        _phase_rung_metrics(stream.episode_rows), phase_training,
+    )
     metrics = {
         "baseline": stream.baseline,
         "scenario": stream.scenario,
@@ -2650,21 +3293,30 @@ def summarize_stream(stream: EventStreamRun) -> Dict[str, Any]:
         "per_event_type": _group_metrics(assist_rows, "event_type"),
         "per_condition": _group_metrics(assist_rows, "condition"),
         "per_hypothesis": _group_metrics(assist_rows, "hypothesis_tags"),
+        "per_phase_role": phase_role_assist,
+        "per_phase_rung": phase_rung_assist,
         "per_event_type_all_episodes": _group_metrics(stream.episode_rows, "event_type"),
         "per_hypothesis_all_episodes": _group_metrics(stream.episode_rows, "hypothesis_tags"),
+        "per_phase_role_all_episodes": phase_role_all,
+        "per_phase_rung_all_episodes": phase_rung_all,
+        "phase_training_cost": phase_training,
         "per_transfer_cell": _group_metrics(assist_rows, "transfer_cell_before"),
-        "per_memory_state": _group_metrics(assist_rows, "memory_state_gt"),
+        "per_memory_state": _group_metrics(assist_rows, "memory_state_before"),
         "per_rung_effectiveness": _group_metrics(assist_rows, "no_op_or_duplicate_rung"),
         "per_rung": _group_metrics(stream.episode_rows, "rung_idx"),
         "frozen_eval": frozen_summary(stream.frozen_rows),
+        "pre_event_frozen_by_condition": frozen_summary_by(
+            [row for row in stream.frozen_rows if row.get("probe_phase") == "pre_event"],
+            "condition",
+        ),
+        "delayed_recurrence_audit": delayed_recurrence_audit_summary(stream.episode_rows),
         "policy_calibration": policy_calibration_summary(stream.turn_rows),
         "memory": memory_snapshot(stream.agent),
         "compute": memory_snapshot(stream.agent, stream.wall_s),
         "axis_value_transfer": axis_value_transfer_summary(assist_rows),
-        "prototype_stability": prototype_stability_summary(stream.prototype_rows),
+        "mode_schedule": _mode_schedule_summary(stream.episode_rows),
         "active_only_pruned_influence_audit": active_only_audit_summary(stream.active_audit_rows),
         "online_commit_safety": online_commit_safety_summary(stream.episode_rows),
-        "preference_prototype_semantics": preference_prototype_semantics(stream.episode_rows),
         "reentry_stratification": reentry,
     }
     metrics["paper_hypothesis_views"] = {
@@ -2673,6 +3325,21 @@ def summarize_stream(stream: EventStreamRun) -> Dict[str, Any]:
         "emergent_axis_composition": metrics["per_hypothesis"].get("emergent_axis_composition", {}),
         "selective_forgetting_reentry": metrics["reentry_stratification"]["confirmed_reentry_from_pruned"],
         "direct_retrieval_control": metrics["per_hypothesis"].get("direct_retrieval_control", {}),
+        "delayed_recurrence_interference": metrics["per_condition"].get(
+            "random_ladder_delayed_recurrence_interference", {}
+        ),
+        "delayed_recurrence_pre_event_frozen": metrics["pre_event_frozen_by_condition"].get(
+            "random_ladder_delayed_recurrence_interference", {}
+        ),
+        "delayed_recurrence_memory_audit": metrics["delayed_recurrence_audit"],
+        "climb_phase": metrics["per_phase_role"].get("climb", {}),
+        "settled_phase": metrics["per_phase_role"].get("settled", {}),
+        "holdout_heldout_climb_phase": metrics["per_phase_role"].get("heldout_climb", {}),
+        "holdout_heldout_settled_phase": metrics["per_phase_role"].get("heldout_settled", {}),
+        "holdout_source_progression_workload": {
+            "climb": metrics["per_phase_role_all_episodes"].get("source_climb", {}),
+            "settled": metrics["per_phase_role_all_episodes"].get("source_settled", {}),
+        },
     }
     return metrics
 
@@ -2681,9 +3348,39 @@ def _support_counts(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     return {
         "modes": dict(Counter(str(row.get("mode", "unknown")) for row in rows)),
         "event_types": dict(Counter(str(row.get("event_type", "unknown")) for row in rows)),
+        "phase_role": dict(Counter(str(row.get("phase_role", "unphased")) for row in rows)),
+        "rung_idx": dict(Counter(str(row.get("rung_idx", "unknown")) for row in rows)),
         "transfer_cell": dict(Counter(str(row.get("transfer_cell_before", "unknown")) for row in rows)),
         "axis_transfer_cell": dict(Counter(str(row.get("axis_transfer_cell_before", "unknown")) for row in rows)),
         "no_op_or_duplicate_rung": dict(Counter(str(row.get("no_op_or_duplicate_rung", "unknown")) for row in rows)),
+    }
+
+
+def _mode_schedule_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Audit whether a baseline received exactly the full interaction route."""
+    if not rows:
+        return {
+            "status": "not_run",
+            "n_events": 0,
+            "executed_mode_counts": {},
+            "n_full_schedule_mismatches": 0,
+            "n_extra_observations_prevented": 0,
+        }
+    matched_rows = [row for row in rows if row.get("full_realized_execution_mode") is not None]
+    return {
+        "status": "completed",
+        "policy": sorted({str(row.get("mode_schedule_policy", "unknown")) for row in rows}),
+        "n_events": len(rows),
+        "executed_mode_counts": dict(Counter(str(row.get("mode", "unknown")) for row in rows)),
+        "natural_mode_counts": dict(Counter(str(row.get("natural_executed_mode", row.get("mode", "unknown"))) for row in rows)),
+        "n_full_schedule_constrained_events": len(matched_rows),
+        "n_full_schedule_mismatches": sum(
+            1 for row in matched_rows if row.get("mode_matches_full_schedule") is not True
+        ),
+        "n_extra_observations_prevented": sum(
+            1 for row in matched_rows
+            if row.get("natural_executed_mode") == "observe" and row.get("mode") == "assist"
+        ),
     }
 
 
@@ -2712,17 +3409,59 @@ def run_plan(plan: ScenarioPlan, config: EvaluationConfig, out_dir: Path) -> Dic
     all_turn_rows: List[Dict[str, Any]] = []
 
     baselines = [b for b in config.baselines if b != CLAIRVOYANT_MEMORY_ORACLE]
-    for baseline in baselines:
-        stream = run_event_stream_for_baseline(baseline, plan, config)
+    if config.match_baseline_execution_modes_to_full and "full" not in baselines:
+        raise ValueError(
+            "match_baseline_execution_modes_to_full=True requires the deployable 'full' system "
+            "to be included in EvaluationConfig.baselines"
+        )
+    canonical_full_modes: Optional[Tuple[str, ...]] = None
+    ordered_baselines = list(baselines)
+    if config.match_baseline_execution_modes_to_full:
+        ordered_baselines = ["full", *[baseline for baseline in baselines if baseline != "full"]]
+
+    for baseline in ordered_baselines:
+        # LCS caches are pure but can otherwise warm a later baseline in a
+        # sequential run.  Reset only at stream boundaries, retaining cache
+        # benefits within a baseline's own deployment trajectory.
+        clear_all_module_caches()
+        if baseline == "full" and config.match_baseline_execution_modes_to_full:
+            stream = run_event_stream_for_baseline(
+                baseline,
+                plan,
+                config,
+                mode_schedule_policy="full_realized_canonical",
+            )
+            canonical_full_modes = tuple(str(row.get("mode")) for row in stream.episode_rows)
+        else:
+            stream = run_event_stream_for_baseline(
+                baseline,
+                plan,
+                config,
+                execution_mode_schedule=canonical_full_modes,
+                mode_schedule_policy=(
+                    "matched_full_realized_execution_schedule"
+                    if canonical_full_modes is not None else "baseline_local"
+                ),
+            )
         per_baseline[baseline] = summarize_stream(stream)
         all_episode_rows.extend(stream.episode_rows)
         all_frozen_rows.extend(stream.frozen_rows)
-        all_diagnostic_rows.extend(stream.memory_rows + stream.prototype_rows + stream.active_audit_rows + stream.oracle_pruning_rows)
+        all_diagnostic_rows.extend(stream.memory_rows + stream.active_audit_rows + stream.oracle_pruning_rows)
         all_turn_rows.extend(stream.turn_rows)
 
     oracle_summary: Optional[Dict[str, Any]] = None
     if config.include_clairvoyant_oracle:
-        stream = run_event_stream_for_baseline(CLAIRVOYANT_MEMORY_ORACLE, plan, config)
+        clear_all_module_caches()
+        stream = run_event_stream_for_baseline(
+            CLAIRVOYANT_MEMORY_ORACLE,
+            plan,
+            config,
+            execution_mode_schedule=canonical_full_modes,
+            mode_schedule_policy=(
+                "matched_full_realized_execution_schedule"
+                if canonical_full_modes is not None else "oracle_local"
+            ),
+        )
         oracle_summary = summarize_stream(stream)
         oracle_summary.update({
             "oracle_reference": CLAIRVOYANT_MEMORY_ORACLE,
@@ -2737,7 +3476,7 @@ def run_plan(plan: ScenarioPlan, config: EvaluationConfig, out_dir: Path) -> Dic
         per_baseline[CLAIRVOYANT_MEMORY_ORACLE] = oracle_summary
         all_episode_rows.extend(stream.episode_rows)
         all_frozen_rows.extend(stream.frozen_rows)
-        all_diagnostic_rows.extend(stream.memory_rows + stream.prototype_rows + stream.active_audit_rows + stream.oracle_pruning_rows)
+        all_diagnostic_rows.extend(stream.memory_rows + stream.active_audit_rows + stream.oracle_pruning_rows)
         all_turn_rows.extend(stream.turn_rows)
 
     axis_rows = axis_value_transfer_rows(all_episode_rows)
@@ -2749,7 +3488,8 @@ def run_plan(plan: ScenarioPlan, config: EvaluationConfig, out_dir: Path) -> Dic
     _append_jsonl(out_dir / "axis_value_transfer_rows.jsonl", axis_rows)
     _append_jsonl(out_dir / "oracle_gap_rows.jsonl", oracle_rows)
 
-    support_source = [row for row in all_episode_rows if baselines and row.get("baseline") == baselines[0]]
+    support_baseline = "full" if "full" in baselines else (baselines[0] if baselines else None)
+    support_source = [row for row in all_episode_rows if support_baseline and row.get("baseline") == support_baseline]
     if not support_source:
         support_source = [row for row in all_episode_rows if row.get("baseline") == CLAIRVOYANT_MEMORY_ORACLE]
 
@@ -2762,11 +3502,23 @@ def run_plan(plan: ScenarioPlan, config: EvaluationConfig, out_dir: Path) -> Dic
         "selected_recipes": list(plan.selected_recipes),
         "selected_preferences": list(plan.selected_preferences),
         "support_counts": _support_counts(support_source),
+        "mode_schedule": {
+            "policy": (
+                "full_realized_shared_across_all_baselines"
+                if config.match_baseline_execution_modes_to_full else "baseline_local_routing"
+            ),
+            "canonical_full_mode_counts": (
+                dict(Counter(canonical_full_modes)) if canonical_full_modes is not None else None
+            ),
+            "per_baseline": {
+                baseline: summary.get("mode_schedule", {})
+                for baseline, summary in sorted(per_baseline.items())
+            },
+        },
         "n_turn_metric_rows": len(all_turn_rows),
         "per_baseline": per_baseline,
         "oracle_reference": oracle_summary,
         "axis_value_transfer_summary": axis_value_transfer_summary(all_episode_rows),
-        "prototype_stability_summary": prototype_stability_summary([r for r in all_diagnostic_rows if r.get("diagnostic_type") == "prototype_stability"]),
         "active_only_pruned_influence_audit_summary": active_only_audit_summary([r for r in all_diagnostic_rows if r.get("diagnostic_type") == "active_only_pruned_influence_audit"]),
         "oracle_gap_summary": oracle_gap_summary(oracle_rows),
         "wall_s": float(time.perf_counter() - t0),
@@ -3014,6 +3766,7 @@ def run_suite(config: EvaluationConfig) -> Dict[str, Any]:
     root = Path(config.output_dir)
     root.mkdir(parents=True, exist_ok=True)
     suite: Dict[str, Any] = {
+        "experiment_label": config.experiment_label,
         "config": asdict(config),
         "execution": {
             "parallelism": "processes",
@@ -3097,21 +3850,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> EvaluationConfig:
     parser.add_argument("--seeds", default=",".join(str(seed) for seed in PAPER_SEEDS))
     parser.add_argument("--scenarios", default=",".join(SCENARIOS))
     parser.add_argument("--baselines", default=",".join(DEFAULT_BASELINES))
+    parser.add_argument("--offline-pretrained-recipe-fraction", type=float, default=0.50)
+    parser.add_argument("--offline-pretrained-preference-fraction", type=float, default=0.50)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--native-threads-per-worker", type=int, default=DEFAULT_NATIVE_THREADS_PER_WORKER)
     parser.add_argument("--no-eta", action="store_true")
     parser.add_argument("--no-clairvoyant-oracle", action="store_true")
-    parser.add_argument("--n-recipes", type=int, default=6)
-    parser.add_argument("--ladder-rungs", type=int, default=5)
-    parser.add_argument("--allow-repeated-ladder-orderings", action="store_true")
-    parser.add_argument("--strict-distinct-ladder-orderings", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--min-distinct-ladder-orderings", type=int, default=2)
-    parser.add_argument("--deployment-events", type=int, default=80)
+    parser.add_argument("--n-recipes", type=int, default=15)
+    parser.add_argument("--ladder-rungs", type=int, default=9)
+    parser.add_argument("--settle-repeat-multiplier-min", type=float, default=2.0)
+    parser.add_argument("--settle-repeat-multiplier-max", type=float, default=2.5)
+    parser.add_argument("--random-ladder-min-recipes-per-rung", type=int, default=3)
+    parser.add_argument("--random-ladder-recurrence-min-prior-conflicts", type=int, default=2)
+    parser.add_argument("--random-ladder-recurrence-min-intervening-events", type=int, default=4)
     parser.add_argument("--frozen-eval-period", type=int, default=4)
     parser.add_argument("--frozen-eval-max-pairs", type=int, default=48)
     parser.add_argument("--active-only-audit-period", type=int, default=2)
     parser.add_argument("--active-only-audit-max-prefixes", type=int, default=16)
     parser.add_argument("--active-only-audit-tolerance", type=float, default=5e-2)
+    parser.add_argument(
+        "--baseline-local-routing",
+        action="store_true",
+        help="Disable the default full-realized shared interaction schedule (diagnostic only; not comparable headline evaluation).",
+    )
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--commit-sensitivity", action="store_true", help="Run the opt-in H3 online-commit sensitivity audit after the main suite.")
@@ -3123,7 +3884,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> EvaluationConfig:
         overrides = {
             "maxent_iters_cold": 1,
             "maxent_iters_warm": 1,
-            "maxent_mc_rollouts": 1,
             "bc_epochs_cold": 1,
             "bc_epochs_warm": 1,
         }
@@ -3131,6 +3891,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> EvaluationConfig:
         seeds=tuple(int(seed) for seed in _parse_csv(args.seeds)),
         scenarios=_parse_csv(args.scenarios),
         baselines=_parse_csv(args.baselines),
+        offline_pretrained_recipe_fraction=float(args.offline_pretrained_recipe_fraction),
+        offline_pretrained_preference_fraction=float(args.offline_pretrained_preference_fraction),
         output_dir=str(args.output_dir),
         workers=int(args.workers),
         native_threads_per_worker=_positive_int(args.native_threads_per_worker, DEFAULT_NATIVE_THREADS_PER_WORKER),
@@ -3138,14 +3900,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> EvaluationConfig:
         include_clairvoyant_oracle=not bool(args.no_clairvoyant_oracle),
         n_recipes=int(args.n_recipes),
         ladder_rungs=int(args.ladder_rungs),
-        allow_repeated_ladder_orderings=bool(args.allow_repeated_ladder_orderings) and not bool(args.strict_distinct_ladder_orderings),
-        min_distinct_ladder_orderings=int(args.min_distinct_ladder_orderings),
-        deployment_events=int(args.deployment_events),
+        settle_repeat_multiplier_min=float(args.settle_repeat_multiplier_min),
+        settle_repeat_multiplier_max=float(args.settle_repeat_multiplier_max),
+        random_ladder_min_recipes_per_rung=int(args.random_ladder_min_recipes_per_rung),
+        random_ladder_recurrence_min_prior_conflicts=int(args.random_ladder_recurrence_min_prior_conflicts),
+        random_ladder_recurrence_min_intervening_events=int(args.random_ladder_recurrence_min_intervening_events),
         frozen_eval_period=int(args.frozen_eval_period),
         frozen_eval_max_pairs=int(args.frozen_eval_max_pairs),
         active_only_audit_period=int(args.active_only_audit_period),
         active_only_audit_max_prefixes=int(args.active_only_audit_max_prefixes),
         active_only_audit_tolerance=float(args.active_only_audit_tolerance),
+        match_baseline_execution_modes_to_full=not bool(args.baseline_local_routing),
         topk=int(args.topk),
         profile=bool(args.profile),
         run_commit_sensitivity=bool(args.commit_sensitivity),

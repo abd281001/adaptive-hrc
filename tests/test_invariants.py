@@ -19,9 +19,6 @@ def _fast_config(**overrides):
         "seed": 42,
         "maxent_iters_cold": 2,
         "maxent_iters_warm": 1,
-        "maxent_mc_rollouts": 2,
-        "bc_epochs_cold": 2,
-        "bc_epochs_warm": 1,
     }
     values.update(overrides)
     return Config(**values)
@@ -29,13 +26,9 @@ def _fast_config(**overrides):
 
 def _fast_decay_config(**overrides):
     values = {
-        "decay_init": 0.5,
-        "decay_horizon_init": 2,
+        "decay_horizon_init": 0,
+        "decay_after_grace_steps": 1,
         "prune_threshold": 0.6,
-        "size_rescale_exponent": 0.0,
-        "max_global_rate": 1.0,
-        "min_global_rate": 0.0,
-        "max_decay_horizon": 0,
     }
     values.update(overrides)
     return _fast_config(**values)
@@ -118,23 +111,11 @@ def _advance_until_pruned(agent, key, max_sessions=50):
     raise AssertionError(f"{key} did not prune within {max_sessions} sessions")
 
 
-def _novel_recipe_requiring_observation(agent):
-    min_len = max(int(agent.cfg.online_new_recipe_min_prefix) + 1, 6)
-    for name, make_recipe in RECIPE_LIBRARY.items():
-        if name == BASE_RECIPE_NAME:
-            continue
-        actions = make_recipe()
-        tokens = _tokens_for(agent, actions)
-        prefix = tokens[:min(len(tokens), min_len)]
-        with agent.frozen():
-            if agent._prefix_needs_observation(prefix):
-                return name, actions, prefix
-    raise AssertionError("no novel recipe produced an observation-required prefix")
 
 
 class AdaptiveInvariantTests(unittest.TestCase):
     def test_latest_keys_invariant_over_stream(self):
-        agent = AdaptiveHRCAgent(_fast_config(max_variants_per_recipe=4))
+        agent = AdaptiveHRCAgent(_fast_config())
         soup_variants = _material_preference_variants(BASE_RECIPE)
         stream = [
             ("observe", soup_variants[0], BASE_RECIPE_NAME),
@@ -151,49 +132,10 @@ class AdaptiveInvariantTests(unittest.TestCase):
                 run_online_episode(agent, actions, recipe_name)
             assert_latest_pin_invariant(agent)
 
-    def test_known_recipe_never_needs_observation(self):
-        agent = AdaptiveHRCAgent(_fast_config(max_variants_per_recipe=16))
-        observe_episode(agent, BASE_RECIPE)
-        min_len = int(agent.cfg.online_new_recipe_min_prefix)
 
-        for actions in _material_preference_variants(BASE_RECIPE):
-            tokens = _tokens_for(agent, actions)
-            with agent.frozen():
-                for end in range(min_len, len(tokens) + 1):
-                    prefix = tokens[:end]
-                    self.assertFalse(
-                        agent._prefix_needs_observation(prefix),
-                        f"known recipe suppressed on prefix {prefix}",
-                    )
-            cls = run_online_episode(agent, actions, BASE_RECIPE_NAME)
-            self.assertNotEqual(cls.kind, "needs_observation")
-            assert_latest_pin_invariant(agent)
-
-    def test_novel_recipe_requires_observation_with_nonempty_memory(self):
-        agent = AdaptiveHRCAgent(_fast_config())
-        cls0 = observe_episode(agent, BASE_RECIPE)
-        known_rid = cls0.recipe_id
-        before_variants = {
-            rid: set(slot)
-            for rid, slot in agent.memory.variants.items()
-        }
-        before_active = set(agent.decay.active)
-        before_session = agent.session_counter
-
-        novel_name, novel_actions, prefix = _novel_recipe_requiring_observation(agent)
-        with agent.frozen():
-            self.assertTrue(agent._prefix_needs_observation(prefix))
-
-        cls = run_online_episode(agent, novel_actions, novel_name)
-        self.assertEqual(cls.kind, "needs_observation")
-        self.assertEqual(agent.session_counter, before_session)
-        self.assertEqual({rid: set(slot) for rid, slot in agent.memory.variants.items()}, before_variants)
-        self.assertEqual(set(agent.decay.active), before_active)
-        self.assertEqual(set(agent.memory.variants), {known_rid})
-        assert_latest_pin_invariant(agent)
 
     def test_pruned_variant_recognized_and_restored(self):
-        agent = AdaptiveHRCAgent(_fast_decay_config(max_variants_per_recipe=2))
+        agent = AdaptiveHRCAgent(_fast_decay_config())
         p1, p2 = _material_preference_variants(BASE_RECIPE)[:2]
         cls0 = observe_episode(agent, p1)
         rid = cls0.recipe_id
@@ -207,6 +149,13 @@ class AdaptiveInvariantTests(unittest.TestCase):
         self.assertIn(p1_key, agent.decay.pruned)
         self.assertIn(p1_hash, agent.memory.variants[rid])
 
+        # Membership removal—not weight drift—must rebuild the deployed heads
+        # from active entries only. The full registry retains archived variants
+        # solely for re-entry bookkeeping.
+        agent.refresh_model_from_memory()
+        audit = agent.pruned_influence_audit(max_prefixes=8)
+        self.assertTrue(audit["passed"])
+
         cls = run_online_episode(agent, p1, BASE_RECIPE_NAME)
         self.assertEqual(cls.kind, "reentry_from_pruned")
         self.assertIn(p1_key, agent.decay.active)
@@ -214,8 +163,8 @@ class AdaptiveInvariantTests(unittest.TestCase):
         self.assertAlmostEqual(agent.decay.active[p1_key].weight, 1.0)
         assert_latest_pin_invariant(agent)
 
-    def test_variant_cap_does_not_destroy_archive(self):
-        agent = AdaptiveHRCAgent(_fast_decay_config(max_variants_per_recipe=2))
+    def test_multiple_variants_remain_active_before_temporal_decay(self):
+        agent = AdaptiveHRCAgent(_fast_config())
         variants = _material_preference_variants(BASE_RECIPE)[:3]
         expected_hashes = []
         rid = None
@@ -226,13 +175,13 @@ class AdaptiveInvariantTests(unittest.TestCase):
             expected_hashes.append(_hash_for(agent, actions))
 
         self.assertEqual(len(set(expected_hashes)), 3)
-        self.assertLessEqual(len(agent.decay.active_entries_for(rid)), 2)
+        self.assertEqual(len(agent.decay.active_entries_for(rid)), 3)
         for variant_hash in expected_hashes:
             self.assertIn(variant_hash, agent.memory.variants[rid])
         assert_latest_pin_invariant(agent)
 
-    def test_latest_pin_survives_cap_and_decay(self):
-        agent = AdaptiveHRCAgent(_fast_decay_config(max_variants_per_recipe=2))
+    def test_latest_pin_survives_decay(self):
+        agent = AdaptiveHRCAgent(_fast_decay_config())
         variants = _material_preference_variants(BASE_RECIPE)[:3]
         rid = None
         latest_hash = None

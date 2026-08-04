@@ -1,4 +1,4 @@
-"""Ablation baselines and comparison agents for the publication benchmark."""
+"""Runnable comparison baselines for the publication benchmark."""
 from __future__ import annotations
 from dataclasses import replace
 import math
@@ -7,10 +7,10 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
-from .adaptive_agent import AdaptiveHRCAgent, MODE_ONLINE
-from .memory import Classification, DecayManager, DemoTransition, Entry, VariantKey, variant_hash
+from .adaptive_agent import AdaptiveHRCAgent, MODE_ONLINE, StepResult
+from .memory import Classification, DecayManager, DemoTransition, Entry, VariantKey
 from .models import (Config,    DEFAULT_CONFIG,     Trajectory,     WelfordFeatureNormalizer,       create_feature_matrix_2_0,      create_state_action_mappings)
-from .posterior import MemoryPrior, PreferencePrototypeLearner, RecipePrototypeLearner
+from .representations import ActionObservation, ActionVector
 State = Tuple[int, ...]
 
 
@@ -287,145 +287,185 @@ class AdaptiveDecayAgent(AdaptiveHRCAgent):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
 
 
-class NoReplayAgent(AdaptiveHRCAgent):
-    """Strict no-replay baseline: only the newest committed demo survives."""
+
+
+
+
+class OfflinePretrainedFrozenAgent(AdaptiveHRCAgent):
+    """Offline-trained reference with a fixed deployment policy.
+
+    This is a training-regime control inspired by the offline/deployment split
+    used in TALENTS, not a reproduction of that method.  It deliberately uses
+    the same IRL+n-gram learner as ``full`` during its evaluator-supplied
+    offline phase, then permits only episode-local prediction state at
+    deployment.  In particular, deployment observations cannot change the
+    codebook, memory, decay weights, model heads, or retraining statistics.
+    """
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
+        super().__init__(cfg=cfg, **kw)
+        self._deployment_locked = False
+        self._deployment_prefix_vectors: Dict[str, ActionVector] = {}
+        self._deployment_vector_tokens: Dict[ActionVector, str] = {}
+        self._deployment_step = 0
+        self._deployment_action_policy: Dict[str, Any] = {}
+        self._offline_pretraining_metadata: Dict[str, Any] = {}
 
-    def _clear_memory(self) -> None:
-        self.memory.variants.clear()
-        self.memory.latest.clear()
-        self.decay.active.clear()
-        self.decay.pruned.clear()
-        self.decay.latest_by_recipe.clear()
-        self.decay.latest_keys.clear()
-        # Clear action codebooks so the IRL feature matrix cannot see tokens from cleared recipes. Without this, states from pruned recipes remain in the state_to_idx table and influence feature normalization on the next retrain.
-        self.action_vector_to_token.clear()
-        self.token_to_action_vector.clear()
-        self.token_to_role.clear()
-        self.demo_transition_traces.clear()
-        
-        self.decay.reuse_gaps.clear()
-        self.decay.reuse_gap_events.clear()
-        self.decay.reentry_events.clear()
-        self.decay._reuse_gap_window.clear()
-        self.decay._recipe_gap_window.clear()
-        self.decay._recipe_last_seen_step.clear()
-        self.decay._last_logged_weight_by_key.clear()
-        self.decay.post_grace_decay_rate = 1.0 / max(1, int(getattr(self.cfg, "decay_after_grace_steps", 3)))
-        self.recipe_prototypes = RecipePrototypeLearner(self.cfg)
-        self.preference_prototypes = PreferencePrototypeLearner(cfg=self.cfg)
-        self.task_signatures.clear()
-        self.preference_signatures.clear()
-        self.last_pref_id = None
-        self.inferred_recipe = None
-        self.inferred_variant_hash = None
-        self.inferred_latent_pref_id = None
-        self.posterior.reset()
-        self._last_fit_fingerprint = None
-
-    def _replace_memory(
-        self,
-        recipe_id: str,
-        seq: List[str],
-        transitions: Optional[Sequence[DemoTransition]] = None,
-    ) -> None:
-        self._clear_memory()
-        self._register_if_live(recipe_id, seq, self.step_counter, transitions=transitions)
-
-    def _end_observe_demo(self, apply_decay: bool = False) -> Classification:
-        seq = list(self.pending_demo)
-        transition_trace = list(self.pending_demo_transitions)
-        active_keys = self._active_keys()
-        active_lib = self.memory.library(allowed_keys=active_keys)
-        cls = self.disambig.classify(seq, active_lib)
-        self.classification_events.append((self.step_counter, cls))
-        if cls.kind == "new_recipe":
-            rid = f"R{self._next_recipe_idx}"
-            self._next_recipe_idx += 1
-            cls.recipe_id = rid
-        else:
-            if cls.recipe_id is None: raise RuntimeError(f"disambiguator returned {cls.kind} without a recipe_id")
-            rid = cls.recipe_id
-        self._replace_memory(rid, seq, transitions=transition_trace)
+    def _clear_deployment_episode_state(self) -> None:
+        """Discard only transient deployment state; learned state stays fixed."""
         self.mode = MODE_ONLINE
         self.pending_demo = []
         self.pending_demo_transitions = []
-        if apply_decay: self.decay.step(self.session_counter, self.retrain_cycle)
-        self._retrain()
-        return cls
-
-    def _end_online_session(self, commit_cls: Classification, reentry_from_pruned: bool = False, apply_decay: bool = False) -> Classification:
-        prefix = list(self.current_prefix)
-        transition_trace = list(self.current_transition_trace)
-        if not prefix:
-            self.current_prefix = []
-            self.current_transition_trace = []
-            self.inferred_recipe = None
-            self.inferred_variant_hash = None
-            self.inferred_latent_pref_id = None
-            return Classification("known", None, None, 0.0, 0.0)
-        if commit_cls.kind == "new_recipe" or commit_cls.recipe_id is None: raise RuntimeError("online new-recipe commit reached mutating path")
-
-        rid = commit_cls.recipe_id
-        self._replace_memory(rid, prefix, transitions=transition_trace)
-        cls_kind = "known" if commit_cls.kind == "known" else "preference_shift"
-        cls = Classification(cls_kind, rid, variant_hash(prefix), commit_cls.jaccard, commit_cls.order_distance)
-        if apply_decay: self.decay.step(self.session_counter, self.retrain_cycle)
-        self._retrain()
-        self.classification_events.append((self.step_counter, cls))
+        self.pending_demo_identity = []
         self.current_prefix = []
         self.current_transition_trace = []
-        self.inferred_recipe = None
-        self.inferred_variant_hash = None
-        self.inferred_latent_pref_id = None
-        return cls
+        self.current_identity_prefix = []
+        self._online_policy_history = []
+        self._deployment_prefix_vectors = {}
+        self._deployment_vector_tokens = {}
+        self._deployment_step = 0
+        self._deployment_action_policy = {}
+
+    def lock_deployment(self, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Freeze the learned offline policy before the deployment stream."""
+        if self._deployment_locked:
+            return self.offline_pretraining_metadata()
+        fit_times = [float(value) for value in self.retrain_fit_wall_times]
+        total_times = [float(value) for value in self.retrain_total_wall_times]
+        build_times = [float(value) for value in self.retrain_build_wall_times]
+        flops = [float(value) for value in self.retrain_flop_estimates]
+        self._deployment_locked = True
+        self._offline_pretraining_metadata = {
+            "training_regime": "offline_pretraining_then_frozen_deployment",
+            "talents_comparison_scope": "training_regime_reference_not_method_replication",
+            "deployment_updates_allowed": False,
+            "offline_training_retrain_count": int(len(total_times)),
+            "offline_training_total_retrain_wall_s": float(sum(total_times)),
+            "offline_training_fit_wall_s": float(sum(fit_times)),
+            "offline_training_build_wall_s": float(sum(build_times)),
+            "offline_training_estimated_fit_flops": float(sum(flops)),
+            "offline_training_active_variants": int(len(self.decay.active)),
+            "offline_training_active_action_steps": int(
+                sum(len(entry.ordering) for entry in self.decay.active.values())
+            ),
+            **dict(metadata or {}),
+        }
+        self._clear_deployment_episode_state()
+        return self.offline_pretraining_metadata()
+
+    def offline_pretraining_metadata(self) -> Dict[str, Any]:
+        return dict(self._offline_pretraining_metadata)
+
+    def _deployment_token_for_vector(self, vector: ActionVector) -> str:
+        known = self.action_vector_to_token.get(vector)
+        if known is not None:
+            return known
+        token = self._deployment_vector_tokens.get(vector)
+        if token is None:
+            # Deterministic anonymous OOV token.  It lives only until the
+            # current episode ends and is never added to the learned codebook.
+            token = "deployment_oov_" + "_".join(str(int(value)) for value in vector)
+            self._deployment_vector_tokens[vector] = token
+            self._deployment_prefix_vectors[token] = vector
+        return token
+
+    def _vector_for_token(self, token: str) -> Optional[ActionVector]:
+        vector = super()._vector_for_token(token)
+        if vector is not None:
+            return vector
+        return self._deployment_prefix_vectors.get(token)
+
+    def _set_action_policy_stats(
+        self,
+        confidence: Optional[float],
+        support_normalized_entropy: Optional[float],
+        reason: str,
+        *,
+        margin: Optional[float] = None,
+        source: Optional[str] = None,
+    ) -> None:
+        if not self._deployment_locked:
+            super()._set_action_policy_stats(
+                confidence,
+                support_normalized_entropy,
+                reason,
+                margin=margin,
+                source=source,
+            )
+            return
+        # The evaluator reads these fields while an episode is running.  Keep
+        # them episode-local so deployment telemetry never becomes model state.
+        self._deployment_action_policy = {
+            "robot_action_mandatory": True,
+            "action_confidence": confidence,
+            "raw_action_confidence": confidence,
+            "action_margin": margin,
+            "action_support_normalized_entropy": support_normalized_entropy,
+            "action_entropy_normalization": "prediction_support",
+            "policy_source": source or "irl_markov_ensemble",
+            "final_action_confidence": confidence,
+            "final_action_margin": margin,
+            "final_action_support_normalized_entropy": support_normalized_entropy,
+            "reason": reason,
+        }
+
+    def action_policy_stats(self) -> Dict[str, Any]:
+        if self._deployment_locked:
+            return dict(self._deployment_action_policy)
+        return super().action_policy_stats()
+
+    def start_demo(self) -> None:
+        if not self._deployment_locked:
+            super().start_demo()
+            return
+        self._clear_deployment_episode_state()
+
+    def observe_observation(
+        self,
+        observation: ActionObservation,
+        ground_truth_recipe: Optional[str] = None,
+        *,
+        precomputed_distribution: Optional[Dict[str, float]] = None,
+    ) -> StepResult:
+        if not self._deployment_locked:
+            return super().observe_observation(
+                observation,
+                ground_truth_recipe=ground_truth_recipe,
+                precomputed_distribution=precomputed_distribution,
+            )
+        self._deployment_step += 1
+        first_online_action = not self.current_prefix and precomputed_distribution is None
+        distribution = (
+            {} if first_online_action else
+            (dict(precomputed_distribution) if precomputed_distribution is not None else self.predict_next_tokens(self.current_prefix))
+        )
+        predicted = max(distribution, key=distribution.get) if distribution else None
+        action = self._deployment_token_for_vector(observation.action_vector)
+        self.current_prefix.append(action)
+        return StepResult(
+            step=self._deployment_step,
+            predicted=self._display_token(predicted),
+            actual=self._display_token(action) or action,
+            correct=predicted == action,
+            mode=MODE_ONLINE,
+            event="offline_frozen_deployment",
+        )
+
+    def end_demo(self) -> Classification:
+        if not self._deployment_locked:
+            return super().end_demo()
+        self._clear_deployment_episode_state()
+        return Classification("offline_frozen", None, None, 0.0, 0.0)
 
     def _retrain(self) -> None:
-        if self._frozen: return
-        retrain_t0 = time.perf_counter()
-        self.retrain_cycle += 1
-        entries = self.decay.active_entries()
-        if not entries:
-            self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
-            self._reset_heads()
+        if self._deployment_locked:
             return
-        latest = max(entries, key=lambda e: e.last_seen_step)
-        build_t0 = time.perf_counter()
-        trajectories, dropped_total = self._build_trajectories([latest])
-        build_wall_s = time.perf_counter() - build_t0
-        self._prepare_retrain_fit()
-        fit_t0 = time.perf_counter()
-        self._fit_heads(trajectories, self._length_normalized_demo_weights([latest], [1.0]))
-        fit_wall_s = time.perf_counter() - fit_t0
-        self._record_retrain_event(dropped_actions=dropped_total, active_demos=1, total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
+        super()._retrain()
 
-
-class UniformWeightAgent(AdaptiveHRCAgent):
-    """Rehearsal weights are ignored at training time (all demos weight 1)."""
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-
-    def _retrain(self) -> None:
-        if self._frozen: return
-        retrain_t0 = time.perf_counter()
-        self.retrain_cycle += 1
-        entries = self.decay.active_entries()
-        if not entries:
-            self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
-            self._reset_heads()
+    def refresh_model_from_memory(self) -> None:
+        if self._deployment_locked:
             return
-        build_t0 = time.perf_counter()
-        trajectories, dropped_total = self._build_trajectories(entries)
-        build_wall_s = time.perf_counter() - build_t0
-        self._prepare_retrain_fit()
-        fit_t0 = time.perf_counter()
-        weights = self._length_normalized_demo_weights(entries, [1.0] * len(entries))
-        self._fit_heads(trajectories, weights)
-        fit_wall_s = time.perf_counter() - fit_t0
-        self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(entries), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
+        super().refresh_model_from_memory()
 
 
 class FixedDecayAgent(AdaptiveHRCAgent):
@@ -468,22 +508,6 @@ class LatestOnlyPreferenceAgent(AdaptiveDecayAgent):
         return variant
 
 
-class L2AnchorAgent(AdaptiveHRCAgent):
-    """True L2 anchor on IRL theta: at each retrain, penalise drift from the snapshot of the last successful theta. Implemented as EWC with a uniform Fisher (i.e. a quadratic penalty `lambda * ||theta - theta_star||^2`) routed through `MaxEntIRL2.fit`'s existing EWC plumbing."""
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, anchor_lambda: Optional[float] = None, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-        # If not specified, reuse the EWC lambda knob — treating L2 anchor as a constant-curvature special case of EWC.
-        self._anchor_lambda = float(cfg.ewc_lambda if anchor_lambda is None else anchor_lambda)
-        self._prev_theta: Optional[np.ndarray] = None
-
-    def _fit_heads(self, trajectories, weights) -> None:
-        ewc_theta_star = self._prev_theta
-        ewc_fisher = (np.ones_like(self._prev_theta) if self._prev_theta is not None else None)
-        self.irl.fit(trajectories, weights, ewc_theta_star=ewc_theta_star, ewc_fisher=ewc_fisher)
-        self.markov.fit(trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
-        # Snapshot the new theta for next anchor.
-        self._prev_theta = None if self.irl.theta is None else self.irl.theta.copy()
 
 
 class BehaviorCloningAgent(AdaptiveHRCAgent):
@@ -563,32 +587,6 @@ class BehaviorCloningAgent(AdaptiveHRCAgent):
         return dist
 
 
-class ProgressiveAnchorEWCAgent(AdaptiveHRCAgent):
-    """Single-task-anchor EWC (sliding variant).
-
-    After each refit the consolidation point is overwritten with the most
-    recently completed task's theta and Fisher.  Only the LAST task boundary
-    is protected — earlier tasks receive no penalty once a new snapshot is
-    taken.  Fisher is replaced (not accumulated), so this is NOT the original
-    Kirkpatrick et al. 2017 formulation.
-
-    Retained as a lightweight ablation: it answers "how much does the proposed
-    agent benefit from protecting the latest task alone?"  For the full
-    multi-task Kirkpatrick formulation see EWCAgent.
-    """
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-        self._ewc_theta_star: Optional[np.ndarray] = None
-        self._ewc_fisher: Optional[np.ndarray] = None
-
-    def _fit_heads(self, trajectories, weights) -> None:
-        self.irl.fit(trajectories, weights, ewc_theta_star=self._ewc_theta_star, ewc_fisher=self._ewc_fisher)
-        self.markov.fit(trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
-        # Overwrite anchor with THIS task's optimum.
-        if self.irl.theta is not None:
-            self._ewc_theta_star = self.irl.theta.copy()
-            self._ewc_fisher = self.irl.fisher_diagonal(trajectories, weights)
 
 
 class EWCAgent(AdaptiveHRCAgent):
@@ -856,409 +854,13 @@ class ExperienceReplayAgent(BehaviorCloningAgent):
         self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(demos), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
 
 
-class RecencyPrioritizedReplayAgent(ExperienceReplayAgent):
-    """BC replay baseline with the same nominal buffer as ER, but sampled by recency. The buffer stores one record per observed variant: `(ordering, last_seen_session, seen_count)`. Sampling uses p_i proportional to `(sessions_since_seen_i + 1)^(-alpha)` mixed with a
-    small uniform component. This is a stronger memory-policy comparator than a uniform reservoir because it answers whether adaptive selective forgetting still helps against a fair recency replay policy."""
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=cfg, **kw)
-        self._recency_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        self._buffer = []
-        self._last_replay_metadata = self.replay_buffer_metadata()
-
-    def _refresh_buffer_view(self) -> None:
-        ordered = sorted(self._recency_records.values(), key=lambda r: (int(r.get("last_seen_session", 0)), tuple(r.get("ordering", ()))), reverse=True)
-        self._buffer = [dict(r) for r in ordered]
-
-    def _upsert_ordering_record(
-        self,
-        key: Tuple[str, str],
-        ordering: Sequence[str],
-        last_seen_session: int,
-        source_mode: str = "",
-        transitions: Sequence[DemoTransition] = (),
-    ) -> None:
-        cap = max(1, int(self.cfg.er_buffer_size))
-        existing = self._recency_records.get(key)
-        if existing is None and len(self._recency_records) >= cap:
-            evict_key = min(
-                self._recency_records,
-                key=lambda k: (int(self._recency_records[k].get("last_seen_session", 0)), int(self._recency_records[k].get("seen_count", 0)), k))
-            self._recency_records.pop(evict_key, None)
-        rec = self._recency_records.setdefault(key, {"ordering": list(ordering), "last_seen_session": int(last_seen_session), "seen_count": 0, "source_mode": source_mode, "transitions": tuple(transitions)})
-        rec["ordering"] = list(ordering)
-        rec["last_seen_session"] = int(last_seen_session)
-        rec["seen_count"] = int(rec.get("seen_count", 0)) + 1
-        rec["source_mode"] = source_mode or str(rec.get("source_mode", ""))
-        if transitions:
-            rec["transitions"] = tuple(transitions)
-
-    def _upsert_record(self, entry) -> None:
-        self._upsert_ordering_record(entry.key, entry.ordering, int(entry.last_seen_step), getattr(entry, "source_mode", ""), getattr(entry, "transitions", ()))
-
-    def _record_committed_replay_demo(
-        self,
-        recipe_id: str,
-        variant_hash_: str,
-        ordering: Tuple[str, ...],
-        *,
-        transitions: Tuple[DemoTransition, ...] = (),
-        session_step: int,
-        action_step: int,
-        source_mode: str,
-        entry: Optional[Entry] = None,
-    ) -> None:
-        self._upsert_ordering_record((recipe_id, variant_hash_), ordering, int(session_step), source_mode, transitions)
-
-    def _sample_records(self, k: int) -> List[Dict[str, Any]]:
-        records = list(self._recency_records.values())
-        if not records or k <= 0: return []
-        now = max([int(r.get("last_seen_session", 0)) for r in records] + [int(self.session_counter)])
-        alpha = max(0.0, float(self.cfg.er_recency_alpha))
-        mix = min(max(float(self.cfg.er_uniform_mix), 0.0), 1.0)
-        raw = np.asarray([(max(0, now - int(r.get("last_seen_session", 0))) + 1.0) ** (-alpha) for r in records], dtype=np.float64)
-        total_raw = float(raw.sum())
-        probs = raw / total_raw if total_raw > 0.0 else np.ones(len(records), dtype=np.float64) / len(records)
-        probs = (1.0 - mix) * probs + mix * (np.ones(len(records), dtype=np.float64) / len(records))
-        probs = probs / max(float(probs.sum()), 1e-12)
-        n = min(k, len(records))
-        rng = np.random.default_rng(self._rng.randrange(0, 2**32))
-        indices = rng.choice(len(records), size=n, replace=False, p=probs)
-        return [records[int(i)] for i in indices]
-
-    def replay_buffer_metadata(self) -> Dict[str, Any]:
-        records = list(getattr(self, "_recency_records", {}).values())
-        footprint = sum(len(r.get("ordering", ())) for r in records)
-        return { "policy": "recency_prioritized",       "alpha": float(self.cfg.er_recency_alpha),      "uniform_mix": float(self.cfg.er_uniform_mix),      "er_buffer_size": int(self.cfg.er_buffer_size),     "er_batch_size": int(self.cfg.er_batch_size),
-                "n_buffered": int(len(records)),        "replay_memory_footprint": int(footprint),      "replay_memory_steps": int(footprint)}
-
-    def _retrain(self) -> None:
-        if self._frozen: return
-        retrain_t0 = time.perf_counter()
-        self.retrain_cycle += 1
-        self._refresh_buffer_view()
-        if not self._recency_records:
-            self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
-            self._reset_heads()
-            return
-        batch_size = max(1, int(self.cfg.er_batch_size))
-        sampled = self._sample_records(batch_size)
-        demos: List[List[str]] = []
-        seen_keys: set = set()
-        for record in sampled:
-            demo = list(record.get("ordering", ()))
-            key = tuple(demo)
-            if not demo or key in seen_keys: continue
-            seen_keys.add(key)
-            demos.append(record)
-        if not demos:
-            self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
-            self._reset_heads()
-            return
-        self._last_replay_metadata = {**self.replay_buffer_metadata(), "n_sampled": int(len(demos)), "sampler": "recency_prioritized_without_replacement"}
-        build_t0 = time.perf_counter()
-        trajectories, dropped_total = self._build_trajectories(demos)
-        build_wall_s = time.perf_counter() - build_t0
-        weights = self._length_normalized_demo_weights(demos, [1.0] * len(demos))
-        self._reset_heads()
-        fit_t0 = time.perf_counter()
-        self._fit_heads(trajectories, weights)
-        fit_wall_s = time.perf_counter() - fit_t0
-        self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(demos), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
 
 
-class _IRLReplayAgentBase(AdaptiveHRCAgent):
-    """Replay-data baseline that keeps the full IRL/Markov/posterior predictor."""
-
-    replay_policy_name = "replay"
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-        self._replay_prediction_entries: List[Entry] = []
-        self._last_replay_metadata: Dict[str, Any] = {}
-
-    def _copy_entry(self, entry: Entry) -> Entry:
-        return Entry(
-            recipe_id=entry.recipe_id,
-            variant_hash=entry.variant_hash,
-            ordering=tuple(entry.ordering),
-            weight=1.0,
-            added_step=int(entry.added_step),
-            added_cycle=int(entry.added_cycle),
-            last_seen_step=int(entry.last_seen_step),
-            seen_count=int(getattr(entry, "seen_count", 1)),
-            source_mode=str(getattr(entry, "source_mode", "")),
-            transitions=tuple(getattr(entry, "transitions", ())),
-            identity_ordering=tuple(getattr(entry, "identity_ordering", ())),
-        )
-
-    def _make_replay_entry(
-        self,
-        recipe_id: str,
-        variant_hash_: str,
-        ordering: Sequence[str],
-        *,
-        session_step: int,
-        source_mode: str,
-        seen_count: int = 1,
-        transitions: Sequence[DemoTransition] = (),
-    ) -> Entry:
-        return Entry(
-            recipe_id=recipe_id,
-            variant_hash=variant_hash_,
-            ordering=tuple(ordering),
-            weight=1.0,
-            added_step=int(session_step),
-            added_cycle=int(self.retrain_cycle),
-            last_seen_step=int(session_step),
-            seen_count=int(seen_count),
-            source_mode=str(source_mode),
-            transitions=tuple(transitions),
-            identity_ordering=tuple(ordering),
-        )
-
-    def _set_replay_prediction_entries(self, entries: Sequence[Entry]) -> None:
-        self._replay_prediction_entries = [self._copy_entry(e) for e in entries]
-
-    def _active_keys(self) -> set:
-        return {entry.key for entry in self._replay_prediction_entries}
-
-    def _memory_state_for_recipe(self, rid: str) -> MemoryPrior:
-        entries = [entry for entry in self._replay_prediction_entries if entry.recipe_id == rid]
-        if entries:
-            return MemoryPrior(state="active", active_weight=max(float(e.weight) for e in entries))
-        return MemoryPrior("absent")
-
-    def _replay_fit_stats(self) -> Dict[str, object]:
-        return {
-            "predictor_family": "irl_markov_posterior",
-            "replay_data_policy": self.replay_policy_name,
-        }
-
-    def _fit_replay_entries(self, entries: Sequence[Entry], retrain_t0: float, sampler: str) -> None:
-        sampled_entries = [self._copy_entry(e) for e in entries]
-        if not sampled_entries:
-            self._last_replay_metadata = {**self.replay_buffer_metadata(), "n_sampled": 0, "sampler": sampler, "predictor_family": "irl_markov_posterior"}
-            self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
-            self._reset_heads()
-            self._set_replay_prediction_entries([])
-            self._rebuild_active_prototypes([])
-            self._last_fit_fingerprint = None
-            return
-        self._last_replay_metadata = {**self.replay_buffer_metadata(), "n_sampled": int(len(sampled_entries)), "sampler": sampler, "predictor_family": "irl_markov_posterior"}
-        build_t0 = time.perf_counter()
-        trajectories, dropped_total = self._build_trajectories(sampled_entries)
-        build_wall_s = time.perf_counter() - build_t0
-        weights = self._length_normalized_demo_weights(sampled_entries, [1.0] * len(sampled_entries))
-        self._reset_heads()
-        self._custom_fit_stats = self._replay_fit_stats()
-        fit_t0 = time.perf_counter()
-        self._fit_heads(trajectories, weights)
-        fit_wall_s = time.perf_counter() - fit_t0
-        self._set_replay_prediction_entries(sampled_entries)
-        self._rebuild_active_prototypes(sampled_entries)
-        self._last_fit_fingerprint = None
-        self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(sampled_entries), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
-
-
-class IRLExperienceReplayAgent(_IRLReplayAgentBase):
-    """Uniform reservoir replay with the same IRL/Markov/posterior predictor as the full system.
-
-    This isolates memory/data management: the predictor family stays fixed, but
-    training and live prototype state are rebuilt from a uniform replay sample
-    instead of the adaptive decay active set.
-    """
-
-    replay_policy_name = "uniform_reservoir"
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=cfg, **kw)
-        self._buffer: List[Entry] = []
-        self._seen: int = 0
-        self._rng = random.Random(getattr(cfg, "seed", 1337))
-        self._last_replay_metadata = self.replay_buffer_metadata()
-
-    def _buffer_add(self, entry: Entry) -> None:
-        cap = max(1, int(self.cfg.er_buffer_size))
-        self._seen += 1
-        copied = self._copy_entry(entry)
-        if len(self._buffer) < cap:
-            self._buffer.append(copied)
-            return
-        j = self._rng.randrange(self._seen)
-        if j < cap:
-            self._buffer[j] = copied
-
-    def replay_buffer_metadata(self) -> Dict[str, Any]:
-        footprint = sum(len(entry.ordering) for entry in getattr(self, "_buffer", []))
-        return {
-            "policy": str(getattr(self, "replay_policy_name", "uniform_reservoir")),
-            "predictor_family": "irl_markov_posterior",
-            "er_buffer_size": int(self.cfg.er_buffer_size),
-            "er_batch_size": int(self.cfg.er_batch_size),
-            "n_buffered": int(len(getattr(self, "_buffer", []))),
-            "n_seen": int(getattr(self, "_seen", 0)),
-            "replay_memory_footprint": int(footprint),
-            "replay_memory_steps": int(footprint),
-        }
-
-    def _record_committed_replay_demo(
-        self,
-        recipe_id: str,
-        variant_hash_: str,
-        ordering: Tuple[str, ...],
-        *,
-        transitions: Tuple[DemoTransition, ...] = (),
-        session_step: int,
-        action_step: int,
-        source_mode: str,
-        entry: Optional[Entry] = None,
-    ) -> None:
-        replay_entry = self._make_replay_entry(recipe_id, variant_hash_, ordering, session_step=session_step, source_mode=source_mode, transitions=transitions)
-        self._buffer_add(replay_entry)
-
-    def _retrain(self) -> None:
-        if self._frozen:
-            return
-        retrain_t0 = time.perf_counter()
-        self.retrain_cycle += 1
-        if not self._buffer:
-            self._fit_replay_entries([], retrain_t0, "uniform_without_replacement")
-            return
-        batch_size = max(1, int(self.cfg.er_batch_size))
-        sampled = self._rng.sample(self._buffer, min(batch_size, len(self._buffer)))
-        self._fit_replay_entries(sampled, retrain_t0, "uniform_without_replacement")
-
-
-class BudgetMatchedUniformReplayAgent(IRLExperienceReplayAgent):
-    """Legacy explicit-budget uniform replay with the full predictor.
-
-    Per-recipe capacity is intentionally absent from the system.  This class
-    therefore uses the explicit global ``er_buffer_size`` configured for the
-    replay baseline rather than deriving a budget from adaptive-agent memory.
-    """
-
-    replay_policy_name = "budget_matched_uniform_replay"
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=cfg, **kw)
-
-    def replay_buffer_metadata(self) -> Dict[str, Any]:
-        meta = super().replay_buffer_metadata()
-        meta.update({
-            "policy": self.replay_policy_name,
-            "budget_match_reference": "explicit_er_buffer_size",
-            "explicit_replay_budget": int(self.cfg.er_buffer_size),
-            "uses_adaptive_decay_weights": False,
-        })
-        return meta
-
-
-class IRLRecencyPrioritizedReplayAgent(_IRLReplayAgentBase):
-    """Recency-prioritized replay with the full IRL/Markov/posterior predictor."""
-
-    replay_policy_name = "recency_prioritized"
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=cfg, **kw)
-        self._recency_records: Dict[Tuple[str, str], Entry] = {}
-        self._buffer: List[Entry] = []
-        self._rng = random.Random(getattr(cfg, "seed", 1337))
-        self._last_replay_metadata = self.replay_buffer_metadata()
-
-    def _refresh_buffer_view(self) -> None:
-        self._buffer = sorted(
-            [self._copy_entry(e) for e in self._recency_records.values()],
-            key=lambda e: (int(e.last_seen_step), e.recipe_id, e.variant_hash),
-            reverse=True,
-        )
-
-    def _upsert_record(self, entry: Entry) -> None:
-        cap = max(1, int(self.cfg.er_buffer_size))
-        key = entry.key
-        copied = self._copy_entry(entry)
-        existing = self._recency_records.get(key)
-        if existing is None and len(self._recency_records) >= cap:
-            evict_key = min(
-                self._recency_records,
-                key=lambda k: (
-                    int(self._recency_records[k].last_seen_step),
-                    int(self._recency_records[k].added_step),
-                    k,
-                ),
-            )
-            self._recency_records.pop(evict_key, None)
-        elif existing is not None:
-            copied.added_step = existing.added_step
-            copied.added_cycle = existing.added_cycle
-            copied.seen_count = int(getattr(existing, "seen_count", 1)) + 1
-        else:
-            copied.seen_count = max(1, int(getattr(copied, "seen_count", 1)))
-        self._recency_records[key] = copied
-
-    def _record_committed_replay_demo(
-        self,
-        recipe_id: str,
-        variant_hash_: str,
-        ordering: Tuple[str, ...],
-        *,
-        transitions: Tuple[DemoTransition, ...] = (),
-        session_step: int,
-        action_step: int,
-        source_mode: str,
-        entry: Optional[Entry] = None,
-    ) -> None:
-        replay_entry = self._make_replay_entry(recipe_id, variant_hash_, ordering, session_step=session_step, source_mode=source_mode, transitions=transitions)
-        self._upsert_record(replay_entry)
-
-    def _sample_records(self, k: int) -> List[Entry]:
-        records = list(self._recency_records.values())
-        if not records or k <= 0:
-            return []
-        now = max([int(r.last_seen_step) for r in records] + [int(self.session_counter)])
-        alpha = max(0.0, float(self.cfg.er_recency_alpha))
-        mix = min(max(float(self.cfg.er_uniform_mix), 0.0), 1.0)
-        raw = np.asarray([(max(0, now - int(r.last_seen_step)) + 1.0) ** (-alpha) for r in records], dtype=np.float64)
-        total_raw = float(raw.sum())
-        probs = raw / total_raw if total_raw > 0.0 else np.ones(len(records), dtype=np.float64) / len(records)
-        probs = (1.0 - mix) * probs + mix * (np.ones(len(records), dtype=np.float64) / len(records))
-        probs = probs / max(float(probs.sum()), 1e-12)
-        n = min(k, len(records))
-        rng = np.random.default_rng(self._rng.randrange(0, 2**32))
-        indices = rng.choice(len(records), size=n, replace=False, p=probs)
-        return [self._copy_entry(records[int(i)]) for i in indices]
-
-    def replay_buffer_metadata(self) -> Dict[str, Any]:
-        records = list(getattr(self, "_recency_records", {}).values())
-        footprint = sum(len(entry.ordering) for entry in records)
-        return {
-            "policy": "recency_prioritized",
-            "predictor_family": "irl_markov_posterior",
-            "alpha": float(self.cfg.er_recency_alpha),
-            "uniform_mix": float(self.cfg.er_uniform_mix),
-            "er_buffer_size": int(self.cfg.er_buffer_size),
-            "er_batch_size": int(self.cfg.er_batch_size),
-            "n_buffered": int(len(records)),
-            "replay_memory_footprint": int(footprint),
-            "replay_memory_steps": int(footprint),
-        }
-
-    def _retrain(self) -> None:
-        if self._frozen:
-            return
-        retrain_t0 = time.perf_counter()
-        self.retrain_cycle += 1
-        self._refresh_buffer_view()
-        if not self._recency_records:
-            self._fit_replay_entries([], retrain_t0, "recency_prioritized_without_replacement")
-            return
-        sampled = self._sample_records(max(1, int(self.cfg.er_batch_size)))
-        self._fit_replay_entries(sampled, retrain_t0, "recency_prioritized_without_replacement")
 
 
 class BigramOnlyAgent(AdaptiveHRCAgent):
     """True bigram floor: a fresh `Counter[(prev_token, next_token)] -> Categorical`.
-    Does NOT inherit the parent's state-conditional N-gram head. Predict reads from this agent's own bigram counter, populated on each retrain from the active set with unit counts. The predict path completely ignores IRL and posterior signals; the baseline answers "what does a vanilla last-token Markov chain give?"."""
+    Does NOT inherit the parent's state-conditional N-gram head. Predict reads from this agent's own bigram counter, populated on each retrain from the active set with unit counts. The predict path completely ignores IRL; the baseline answers "what does a vanilla last-token Markov chain give?"."""
 
     def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
         super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
@@ -1335,145 +937,12 @@ class BigramOnlyAgent(AdaptiveHRCAgent):
         self._set_action_policy_stats(conf, ent, "baseline_policy")
 
 
-class FrequencyConditionedBigramAgent(AdaptiveHRCAgent):
-    """Weighted active-memory next-action frequency conditioned on the current token."""
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-
-    def _fit_heads(self, trajectories, weights) -> None:
-        self._reset_heads()
-        self._custom_fit_stats = _symbolic_fit_stats("frequency_conditioned_bigram", trajectories, estimated_flops=0.0)
-
-    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
-        prefix = list(prefix) if prefix is not None else list(self.current_prefix)
-        prefix = self._coerce_prefix_tokens(prefix)
-        counts: Dict[str, float] = {}
-        for entry in self.decay.active_entries():
-            ordering = list(entry.ordering)
-            weight = float(entry.weight)
-            if not prefix:
-                if ordering: counts[ordering[0]] = counts.get(ordering[0], 0.0) + weight
-                continue
-            prev = prefix[-1]
-            for i in range(len(ordering) - 1):
-                if ordering[i] == prev:
-                    nxt = ordering[i + 1]
-                    counts[nxt] = counts.get(nxt, 0.0) + weight
-        if not counts:
-            for entry in self.decay.active_entries():
-                for action in entry.ordering: counts[action] = counts.get(action, 0.0) + float(entry.weight)
-        total = float(sum(counts.values()))
-        if total <= 0:
-            self._set_action_policy_stats(None, None, "baseline_empty")
-            return {}
-        dist = {action: count / total for action, count in counts.items()}
-        conf = max(dist.values())
-        ent = 0.0
-        for p in dist.values():
-            if p > 0: ent -= float(p) * math.log(float(p))
-        if len(dist) > 1: ent /= math.log(len(dist))
-        self._set_action_policy_stats(conf, ent, "baseline_policy")
-        return dist
-
-
-class OracleCeilingAgent(AdaptiveHRCAgent):
-    """Oracle ceiling: at predict time, reads the next action directly from the simulator's ground-truth ordering. NOT deployable.
-    The harness sets the current target via `set_oracle_target(actions)` immediately before each evaluation/online demo. The agent tracks its own step counter via the StepResult-emitting predict path: each call to `predict_next_tokens` consumes one position. On `start_demo`/`end_demo` the counter resets.
-    This is the only "baseline" that has access to the ground-truth pair; it bounds what any (recipe, pref)-conditioned policy could achieve."""
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-        self._oracle_target: Optional[List[str]] = None
-        self._oracle_step: int = 0
-
-    def _fit_heads(self, trajectories, weights) -> None:
-        self._reset_heads()
-        self._custom_fit_stats = _symbolic_fit_stats("oracle_ceiling", trajectories, estimated_flops=0.0)
-
-    def set_oracle_target(self, actions: Sequence[str]) -> None:
-        """Harness hook: tell the oracle which (recipe, pref) ordering is next."""
-        self._oracle_target = list(actions)
-        self._oracle_step = 0
-
-    def start_demo(self) -> None:
-        super().start_demo()
-        self._oracle_step = 0
-
-    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
-        if self._oracle_target is None: return {}
-        prefix = list(prefix) if prefix is not None else list(self.current_prefix)
-        idx = len(prefix)  # position to predict
-        if idx >= len(self._oracle_target): return {}
-        return {self._oracle_target[idx]: 1.0}
-
-
-class OnlineEWCAgent(ProgressiveAnchorEWCAgent):
-    """Online EWC (Schwarz et al. 2018 Progress & Compress, EWC++ variant).
-
-    Inherits from ProgressiveAnchorEWCAgent (single sliding anchor) and
-    replaces its hard-overwrite update with exponential moving averages:
-
-        theta_star ← gamma_theta * theta_star_prev + (1-gamma_theta) * theta_i*
-        fisher     ← gamma_fisher * fisher_prev     + (1-gamma_fisher) * F_i
-
-    With gamma → 1 the history is long; gamma = 0 reduces to ProgressiveAnchorEWCAgent.
-    Unlike the cumulative-Fisher EWCAgent, old tasks are gradually down-weighted,
-    making this suitable for non-stationary streams where old recipes become irrelevant.
-
-    Note: parent class field names (_ewc_theta_star, _ewc_fisher) are reused;
-    EMA is applied in-place after super()._fit_heads() updates them.
-    """
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, gamma_fisher: float = 0.95, gamma_theta: float = 0.95, **kw):
-        super().__init__(cfg=cfg, **kw)
-        self._gamma_fisher = float(gamma_fisher)
-        self._gamma_theta = float(gamma_theta)
-
-    def _fit_heads(self, trajectories, weights) -> None:
-        # Capture previous snapshots before parent overwrites them.
-        prev_theta = None if self._ewc_theta_star is None else self._ewc_theta_star.copy()
-        prev_fisher = None if self._ewc_fisher is None else self._ewc_fisher.copy()
-        # Parent writes this task's theta_star and fisher to self._ewc_*.
-        super()._fit_heads(trajectories, weights)
-        # EMA-blend: move slowly toward the new task's anchor.
-        if (prev_theta is not None and self._ewc_theta_star is not None
-                and prev_theta.shape == self._ewc_theta_star.shape):
-            self._ewc_theta_star = (
-                self._gamma_theta * prev_theta
-                + (1.0 - self._gamma_theta) * self._ewc_theta_star
-            ).astype(np.float32)
-        if (prev_fisher is not None and self._ewc_fisher is not None
-                and prev_fisher.shape == self._ewc_fisher.shape):
-            self._ewc_fisher = (
-                self._gamma_fisher * prev_fisher
-                + (1.0 - self._gamma_fisher) * self._ewc_fisher
-            ).astype(np.float32)
-
-
-class MostFrequentNextAgent(AdaptiveHRCAgent):
-    """Predicts the marginally most frequent next action across all active demos. No state conditioning; this is a simple frequency baseline / floor."""
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, **kw):
-        super().__init__(cfg=_without_latest_preference_protection(cfg), **kw)
-
-    def _fit_heads(self, trajectories, weights) -> None:
-        self._reset_heads()
-        self._custom_fit_stats = _symbolic_fit_stats("most_frequent", trajectories, estimated_flops=0.0)
-
-    def predict_next_tokens(self, prefix=None) -> Dict[str, float]:
-        prefix = list(prefix) if prefix is not None else list(self.current_prefix)
-        counts: Dict[str, float] = {}
-        for e in self.decay.active_entries():
-            ordering = list(e.ordering)
-            # Count each action as a "next action" at every position
-            for a in ordering: counts[a] = counts.get(a, 0.0) + e.weight
-        total = sum(counts.values())
-        if not total: return {}
-        return {a: c / total for a, c in counts.items()}
 
 
 BASELINE_AGENTS = {
+    "offline_pretrained_frozen": OfflinePretrainedFrozenAgent,
+    "offline_all_recipes_identity_frozen": OfflinePretrainedFrozenAgent,
+    "adaptive_decay": AdaptiveDecayAgent,
     "latest_only": LatestOnlyPreferenceAgent,
     "fixed_decay": FixedDecayAgent,
     "no_decay": NoDecayAgent,
