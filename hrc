@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+NORMAL_PYTHON="$PROJECT_ROOT/venv/bin/python"
+LLM_PYTHON="$PROJECT_ROOT/.venv-llm/bin/python"
+
+usage() {
+    cat <<'EOF'
+Usage: ./hrc COMMAND [ARGS]
+
+Commands:
+  setup       Create venv for HRC.ipynb, normal experiments, and tests
+  setup-llm   Create .venv-llm for the GPU LLM baseline
+  kernel      Register venv as the HRC Jupyter kernel
+  test        Run the test suite
+  run         Run the full normal evaluation
+  ablation    Run an ablation suite; pass --suite matcher|routing|latent
+  llm [scope] Run paired Full + LLM; scope: homogeneous|heterogeneous|holdout
+  doctor      Check the normal and LLM runtimes without starting an experiment
+EOF
+}
+
+ensure_normal_python() {
+    if [[ ! -x "$NORMAL_PYTHON" ]]; then
+        echo "Missing $NORMAL_PYTHON. Run ./hrc setup first." >&2
+        exit 1
+    fi
+}
+
+ensure_llm_python() {
+    if [[ ! -x "$LLM_PYTHON" ]]; then
+        echo "Missing $LLM_PYTHON. Run ./hrc setup-llm first." >&2
+        exit 1
+    fi
+}
+
+command="${1:-help}"
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+
+cd "$PROJECT_ROOT"
+
+case "$command" in
+    setup)
+        if [[ ! -x "$NORMAL_PYTHON" ]]; then
+            "${HRC_BOOTSTRAP_PYTHON:-python3.13}" -m venv venv
+        fi
+        "$NORMAL_PYTHON" -m pip install -r requirements.txt
+        ;;
+    setup-llm)
+        if [[ ! -x "$LLM_PYTHON" ]]; then
+            "${HRC_LLM_BOOTSTRAP_PYTHON:-/usr/bin/python3.12}" -m venv .venv-llm
+        fi
+        "$LLM_PYTHON" -m pip install -r requirements-llm.txt
+        ;;
+    kernel)
+        ensure_normal_python
+        "$NORMAL_PYTHON" -m ipykernel install --user \
+            --name adaptive-hrc \
+            --display-name "Python (adaptive-hrc)"
+        ;;
+    test)
+        ensure_normal_python
+        exec "$NORMAL_PYTHON" -m pytest "$@"
+        ;;
+    run)
+        ensure_normal_python
+        exec "$NORMAL_PYTHON" -X faulthandler -m src.evaluation \
+            --workers 1 \
+            --output eval_results \
+            "$@"
+        ;;
+    ablation)
+        ensure_normal_python
+        exec "$NORMAL_PYTHON" -X faulthandler -m src.ablations "$@"
+        ;;
+    llm)
+        ensure_llm_python
+        llm_scenario_args=()
+        case "${1:-}" in
+            homogeneous|homo)
+                shift
+                llm_scenario_args=(--scenarios homogeneous)
+                ;;
+            heterogeneous|hetero)
+                shift
+                llm_scenario_args=(--scenarios heterogeneous)
+                ;;
+            holdout|axis|axis-holdout)
+                shift
+                llm_scenario_args=(--scenarios holdout)
+                ;;
+            all)
+                shift
+                ;;
+        esac
+        export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+        export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+        export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+        export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+        export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+        exec "$LLM_PYTHON" -X faulthandler -m src.llm_baseline \
+            --workers 1 \
+            --threads 1 \
+            --output eval_results/llm_runs \
+            "${llm_scenario_args[@]}" \
+            "$@"
+        ;;
+    doctor)
+        ensure_normal_python
+        ensure_llm_python
+        "$NORMAL_PYTHON" -c 'import matplotlib, numpy, pytest; print("normal runtime: OK")'
+        "$LLM_PYTHON" -c 'from src.llm_baseline import preflight_llm_runtime; print("LLM runtime:", preflight_llm_runtime())'
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $command" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

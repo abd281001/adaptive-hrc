@@ -1,15 +1,15 @@
 import unittest
 
-from src.adaptive_agent import AdaptiveHRCAgent
-from src.environment import gen
-from src.memory import variant_hash
-from src.models import Config
-from src.preferences import PRESET_PREFERENCES, WorkflowPreferenceModifier
-from src.representations import observations_from_actions
+from src.adaptive_agent import AdaptiveAgent
+from src.environment import recipe_builders
+from src.memory import make_variant_id
+from src.models import Settings
+from src.preferences import PREFERENCES, apply_preference
+from src.representations import observe_actions
 
 
-RECIPE_LIBRARY = gen.recipe_library()
-BASE_RECIPE_NAME = "tomato_onion_soup_v1"
+RECIPE_LIBRARY = recipe_builders()
+BASE_RECIPE_NAME = "tomato_onion_soup"
 BASE_RECIPE = RECIPE_LIBRARY[BASE_RECIPE_NAME]()
 
 
@@ -17,17 +17,17 @@ def _fast_config(**overrides):
     values = {
         "verbose": False,
         "seed": 42,
-        "maxent_iters_cold": 2,
-        "maxent_iters_warm": 1,
+        "irl_cold_steps": 2,
+        "irl_warm_steps": 1,
     }
     values.update(overrides)
-    return Config(**values)
+    return Settings(**values)
 
 
 def _fast_decay_config(**overrides):
     values = {
-        "decay_horizon_init": 0,
-        "decay_after_grace_steps": 1,
+        "initial_grace": 0,
+        "prune_delay": 1,
         "prune_threshold": 0.6,
     }
     values.update(overrides)
@@ -35,12 +35,11 @@ def _fast_decay_config(**overrides):
 
 
 def _material_preference_variants(actions):
-    modifier = WorkflowPreferenceModifier()
     variants = []
     seen = set()
     candidates = [list(actions)] + [
-        modifier.modify_recipe(actions, pref)
-        for pref in PRESET_PREFERENCES.values()
+        apply_preference(actions, pref).actions
+        for pref in PREFERENCES.values()
     ]
     for seq in candidates:
         key = tuple(seq)
@@ -51,16 +50,16 @@ def _material_preference_variants(actions):
     return variants
 
 
-def observe_episode(agent, actions):
+def observe_demo(agent, actions):
     agent.start_demo()
-    for obs in observations_from_actions(actions):
-        agent.observe_observation(obs)
+    for obs in observe_actions(actions):
+        agent.observe(obs)
     return agent.end_demo()
 
 
 def run_online_episode(agent, actions, ground_truth_recipe=BASE_RECIPE_NAME):
-    for obs in observations_from_actions(actions):
-        agent.observe_observation(obs, ground_truth_recipe=ground_truth_recipe)
+    for obs in observe_actions(actions):
+        agent.observe(obs, ground_truth_recipe=ground_truth_recipe)
     return agent.end_demo()
 
 
@@ -69,53 +68,46 @@ def assert_latest_pin_invariant(agent):
         if not condition:
             raise AssertionError(message)
 
-    recipes = {rid for rid, slot in agent.memory.variants.items() if slot}
-    require(set(agent.memory.latest) == recipes, "memory.latest must cover every recipe with variants")
-    require(set(agent.decay.latest_by_recipe) == recipes, "decay.latest_by_recipe must match memory recipes")
-    for rid in recipes:
-        latest_hash = agent.memory.latest[rid]
-        key = (rid, latest_hash)
-        require(agent.decay.latest_by_recipe[rid] == latest_hash, f"{rid}: decay latest must equal memory latest")
-        require(latest_hash in agent.memory.variants[rid], f"{rid}: latest hash missing from full registry")
-        require(key in agent.decay.active, f"{rid}: latest key missing from active replay")
-        require(key not in agent.decay.pruned, f"{rid}: latest key must not be pruned")
-        require(agent.decay.active[key].weight == 1.0, f"{rid}: latest key must have unit weight")
-    expected = {(rid, agent.memory.latest[rid]) for rid in recipes}
-    require(agent.decay.latest_keys == expected, "decay.latest_keys must equal the memory latest set")
-    agent._assert_latest_pin_invariant()
+    recipes = {recipe_id for recipe_id, slot in agent.library.variants.items() if slot}
+    require(set(agent.library.latest) == recipes, "memory.latest must cover every recipe with variants")
+    require(set(agent.replay.latest_by_recipe) == recipes, "decay.latest_by_recipe must match memory recipes")
+    for recipe_id in recipes:
+        latest_hash = agent.library.latest[recipe_id]
+        key = (recipe_id, latest_hash)
+        require(agent.replay.latest_by_recipe[recipe_id] == latest_hash, f"{recipe_id}: decay latest must equal memory latest")
+        require(latest_hash in agent.library.variants[recipe_id], f"{recipe_id}: latest hash missing from full registry")
+        require(key in agent.replay.active, f"{recipe_id}: latest key missing from active replay")
+        require(key not in agent.replay.pruned, f"{recipe_id}: latest key must not be pruned")
+        require(agent.replay.active[key].weight == 1.0, f"{recipe_id}: latest key must have unit weight")
+    expected = {(recipe_id, agent.library.latest[recipe_id]) for recipe_id in recipes}
+    require(agent.replay.latest_keys == expected, "decay.latest_keys must equal the memory latest set")
+    agent._check_latest()
 
 
-def _tokens_for(agent, actions):
-    return agent._tokens_from_action_labels(actions)
+def _hash_for(actions):
+    return make_variant_id(actions)
 
 
-def _hash_for(agent, actions):
-    return variant_hash(_tokens_for(agent, actions))
-
-
-def _advance_sessions(agent, n):
+def _advance_demos(agent, n):
     for _ in range(n):
-        agent.session_counter += 1
-        agent.decay.step(agent.session_counter, agent.retrain_cycle)
+        agent.demo_counter += 1
+        agent.replay.step(agent.demo_counter, agent.retrain_cycle)
 
 
-def _advance_until_pruned(agent, key, max_sessions=50):
-    if key in agent.decay.pruned:
+def _advance_until_pruned(agent, key, max_demos=50):
+    if key in agent.replay.pruned:
         return
-    for _ in range(max_sessions):
-        agent.session_counter += 1
-        agent.decay.step(agent.session_counter, agent.retrain_cycle)
-        if key in agent.decay.pruned:
-            agent.refresh_model_from_memory()
+    for _ in range(max_demos):
+        agent.demo_counter += 1
+        agent.replay.step(agent.demo_counter, agent.retrain_cycle)
+        if key in agent.replay.pruned:
+            agent.refresh()
             return
-    raise AssertionError(f"{key} did not prune within {max_sessions} sessions")
-
-
-
+    raise AssertionError(f"{key} did not prune within {max_demos} demonstrations")
 
 class AdaptiveInvariantTests(unittest.TestCase):
     def test_latest_keys_invariant_over_stream(self):
-        agent = AdaptiveHRCAgent(_fast_config())
+        agent = AdaptiveAgent(_fast_config())
         soup_variants = _material_preference_variants(BASE_RECIPE)
         stream = [
             ("observe", soup_variants[0], BASE_RECIPE_NAME),
@@ -127,77 +119,75 @@ class AdaptiveInvariantTests(unittest.TestCase):
 
         for mode, actions, recipe_name in stream:
             if mode == "observe":
-                observe_episode(agent, actions)
+                observe_demo(agent, actions)
             else:
                 run_online_episode(agent, actions, recipe_name)
             assert_latest_pin_invariant(agent)
 
-
-
     def test_pruned_variant_recognized_and_restored(self):
-        agent = AdaptiveHRCAgent(_fast_decay_config())
-        p1, p2 = _material_preference_variants(BASE_RECIPE)[:2]
-        cls0 = observe_episode(agent, p1)
-        rid = cls0.recipe_id
-        p1_hash = _hash_for(agent, p1)
-        observe_episode(agent, p2)
-        p1_key = (rid, p1_hash)
+        agent = AdaptiveAgent(_fast_decay_config())
+        first_actions, second_actions = _material_preference_variants(
+            BASE_RECIPE,
+        )[:2]
+        cls0 = observe_demo(agent, first_actions)
+        recipe_id = cls0.recipe_id
+        first_variant_id = _hash_for(first_actions)
+        observe_demo(agent, second_actions)
+        first_key = (recipe_id, first_variant_id)
 
-        _advance_until_pruned(agent, p1_key)
+        _advance_until_pruned(agent, first_key)
 
-        self.assertNotIn(p1_key, agent.decay.active)
-        self.assertIn(p1_key, agent.decay.pruned)
-        self.assertIn(p1_hash, agent.memory.variants[rid])
+        self.assertNotIn(first_key, agent.replay.active)
+        self.assertIn(first_key, agent.replay.pruned)
+        self.assertIn(first_variant_id, agent.library.variants[recipe_id])
 
-        # Membership removal—not weight drift—must rebuild the deployed heads
-        # from active entries only. The full registry retains archived variants
-        # solely for re-entry bookkeeping.
-        agent.refresh_model_from_memory()
-        audit = agent.pruned_influence_audit(max_prefixes=8)
+        # Membership removal rebuilds predictors; the registry only supports reentry.
+        agent.refresh()
+        audit = agent.audit_pruning(max_prefixes=8)
         self.assertTrue(audit["passed"])
 
-        cls = run_online_episode(agent, p1, BASE_RECIPE_NAME)
+        cls = run_online_episode(agent, first_actions, BASE_RECIPE_NAME)
         self.assertEqual(cls.kind, "reentry_from_pruned")
-        self.assertIn(p1_key, agent.decay.active)
-        self.assertNotIn(p1_key, agent.decay.pruned)
-        self.assertAlmostEqual(agent.decay.active[p1_key].weight, 1.0)
+        self.assertIn(first_key, agent.replay.active)
+        self.assertNotIn(first_key, agent.replay.pruned)
+        self.assertAlmostEqual(agent.replay.active[first_key].weight, 1.0)
         assert_latest_pin_invariant(agent)
 
     def test_multiple_variants_remain_active_before_temporal_decay(self):
-        agent = AdaptiveHRCAgent(_fast_config())
+        agent = AdaptiveAgent(_fast_config())
         variants = _material_preference_variants(BASE_RECIPE)[:3]
         expected_hashes = []
-        rid = None
+        recipe_id = None
 
         for actions in variants:
-            cls = observe_episode(agent, actions)
-            rid = rid or cls.recipe_id
-            expected_hashes.append(_hash_for(agent, actions))
+            cls = observe_demo(agent, actions)
+            recipe_id = recipe_id or cls.recipe_id
+            expected_hashes.append(_hash_for(actions))
 
         self.assertEqual(len(set(expected_hashes)), 3)
-        self.assertEqual(len(agent.decay.active_entries_for(rid)), 3)
-        for variant_hash in expected_hashes:
-            self.assertIn(variant_hash, agent.memory.variants[rid])
+        self.assertEqual(len(agent.replay.recipe_items(recipe_id)), 3)
+        for variant_id in expected_hashes:
+            self.assertIn(variant_id, agent.library.variants[recipe_id])
         assert_latest_pin_invariant(agent)
 
     def test_latest_pin_survives_decay(self):
-        agent = AdaptiveHRCAgent(_fast_decay_config())
+        agent = AdaptiveAgent(_fast_decay_config())
         variants = _material_preference_variants(BASE_RECIPE)[:3]
-        rid = None
+        recipe_id = None
         latest_hash = None
 
         for actions in variants:
-            cls = observe_episode(agent, actions)
-            rid = rid or cls.recipe_id
-            latest_hash = _hash_for(agent, actions)
+            cls = observe_demo(agent, actions)
+            recipe_id = recipe_id or cls.recipe_id
+            latest_hash = _hash_for(actions)
 
-        latest_key = (rid, latest_hash)
-        _advance_sessions(agent, 50)
+        latest_key = (recipe_id, latest_hash)
+        _advance_demos(agent, 50)
 
-        self.assertIn(latest_key, agent.decay.latest_keys)
-        self.assertIn(latest_key, agent.decay.active)
-        self.assertAlmostEqual(agent.decay.active[latest_key].weight, 1.0)
-        self.assertIn(latest_hash, agent.memory.variants[rid])
+        self.assertIn(latest_key, agent.replay.latest_keys)
+        self.assertIn(latest_key, agent.replay.active)
+        self.assertAlmostEqual(agent.replay.active[latest_key].weight, 1.0)
+        self.assertIn(latest_hash, agent.library.variants[recipe_id])
         assert_latest_pin_invariant(agent)
 
 

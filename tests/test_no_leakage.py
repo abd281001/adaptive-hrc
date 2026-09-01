@@ -1,58 +1,45 @@
-"""Phase 0B static leakage tests + Phase 6 behavioral leakage tests.
-
-Static checks prevent preference labels, modifier identity, or precomputed
-target variants from entering learner-facing call paths.  Behavioral checks
-exercise the deployed assistance path without exposing test labels.
-"""
+"""Static and behavioral checks for simulator-label leakage."""
 from __future__ import annotations
 
 import inspect
 import re
 import unittest
 
-from src.adaptive_agent import AdaptiveHRCAgent
-from src.environment import gen
-from src.evaluation import EvaluationConfig, assist_episode, make_agent, materialize_pair, observe_episode
-from src.memory import variant_hash
-from src.models import Config
+from src.adaptive_agent import AdaptiveAgent
+from src.environment import recipe_builders
+from src.evaluation import EvalSettings, assist_demo, build_task, observe_demo
+from src.memory import make_variant_id
+from src.models import Settings
+from src.representations import observe_actions
 
 
 _PREF_LABEL_PATTERN = re.compile(r"^pref(erence)?_(name|label|id_human|set)$", re.IGNORECASE)
-_VARIANT_HANDLE_NAMES = {"variant_hash"}
+_VARIANT_HANDLE_NAMES = {"variant_id"}
 
 
 def _is_preference_label_param(name: str) -> bool:
-    """Return True only for parameter names that look like SIMULATOR-side labels.
-
-    `variant_hash` is an exact-memory handle and is legitimately exposed on
-    agent APIs. What is forbidden is the simulator-side preference name.
-    """
+    """Identify simulator preference labels, excluding exact-memory handles."""
     if name in _VARIANT_HANDLE_NAMES:
         return False
     return bool(_PREF_LABEL_PATTERN.match(name))
 
 
 class NoPreferenceLabelInLearnerSignatures(unittest.TestCase):
-    """test_no_preference_label_in_learner_signatures.
-
-    Inspect AdaptiveHRCAgent's public, learner-facing methods. None of their
-    parameter names may match the simulator-side preference label pattern.
-    """
+    """Reject simulator-label parameters on learner-facing methods."""
 
     LEARNER_METHODS = (
         "start_demo",
         "end_demo",
-        "observe_observation",
-        "predict_next_tokens",
-        "predict_next",
-        "evaluate_autonomous_tokens",
-        "refresh_model_from_memory",
+        "observe",
+        "predict_actions",
+        "evaluate_actions",
+        "refresh",
     )
 
     def test_no_preference_label_param(self):
         offenders = []
         for name in self.LEARNER_METHODS:
-            method = getattr(AdaptiveHRCAgent, name, None)
+            method = getattr(AdaptiveAgent, name, None)
             if method is None:
                 continue
             sig = inspect.signature(method)
@@ -68,81 +55,62 @@ class NoPreferenceLabelInLearnerSignatures(unittest.TestCase):
 
 
 class NoPrecomputedTargetVariantAtDeploy(unittest.TestCase):
-    """test_no_precomputed_target_variants_at_deploy.
-
-    At the start of an online assistive episode, the agent's variant memory
-    must NOT already contain the (recipe, preference) tuple that the deploy
-    target represents — otherwise the apparent "online assistance" is just
-    replay of a precomputed variant.
-
-    For the Phase 0A baseline regime we relax this to a different rule that
-    captures the same intent: the test target's (recipe_id, variant_hash) must
-    not appear in memory until the test demo is actually run.
-    """
+    """Ensure deploy targets enter memory only after their online episode."""
 
     def test_deploy_target_not_in_memory_before_episode(self):
-        agent = AdaptiveHRCAgent(cfg=Config(verbose=False))
-        library = list(gen.recipe_library().items())
+        agent = AdaptiveAgent(settings=Settings(verbose=False))
+        library = list(recipe_builders().items())
         rname, fn = library[0]
-        train = materialize_pair(rname, "identity", fn)
-        target = materialize_pair(rname, "p1_mise_en_place", fn)
-        observe_episode(agent, train, None)
-        # Now the agent has seen rname/identity. Verify rname/wash_asap is NOT
-        # in memory yet — the exact deploy target.
-        target_tokens = agent._tokens_from_action_labels(list(target.actions))
-        target_h = variant_hash(target_tokens)
-        # Find the rid (one cluster).
-        rid = next(iter(agent.memory.variants))
-        self.assertNotIn(target_h, agent.memory.variants[rid],
+        train = build_task(rname, "default", fn)
+        target = build_task(rname, "prep_first", fn)
+        observe_demo(agent, train, None)
+        target_h = make_variant_id(target.actions)
+        recipe_id = next(iter(agent.library.variants))
+        self.assertNotIn(target_h, agent.library.variants[recipe_id],
                          "deploy target preference variant was precomputed in memory")
 
-
-
-
-class ObservedTransitionTraceNoLeakage(unittest.TestCase):
-    def test_observations_and_codebook_do_not_carry_action_strings(self):
-        from src.representations import observations_from_actions
-
-        agent = AdaptiveHRCAgent(
-            cfg=Config(verbose=False, maxent_iters_cold=2, maxent_iters_warm=1)
+class SemanticActionObservationTests(unittest.TestCase):
+    def test_observations_and_memory_carry_actions_but_not_task_labels(self):
+        agent = AdaptiveAgent(
+            settings=Settings(verbose=False, irl_cold_steps=2, irl_warm_steps=1)
         )
-        recipe_name, builder = next(iter(gen.recipe_library().items()))
-        pair = materialize_pair(recipe_name, "identity", builder)
-        observations = observations_from_actions(pair.actions)
+        recipe_name, builder = next(iter(recipe_builders().items()))
+        pair = build_task(recipe_name, "default", builder)
+        observations = observe_actions(pair.actions)
         self.assertTrue(observations)
-        self.assertTrue(all(not hasattr(obs, "action_str") for obs in observations))
+        self.assertEqual(
+            tuple(observation.action for observation in observations),
+            pair.actions,
+        )
+        self.assertTrue(all(not hasattr(obs, "recipe_name") for obs in observations))
+        self.assertTrue(all(not hasattr(obs, "preference_name") for obs in observations))
 
         agent.start_demo()
         for obs in observations:
-            agent.observe_observation(obs)
+            agent.observe(obs)
         agent.end_demo()
 
-        codebook = agent.save_codebook()
-        self.assertNotIn("token_to_action_string", codebook)
-        self.assertEqual(set(codebook), {"token_to_vector", "vector_to_token", "n_tokens"})
-        entry = next(iter(agent.decay.active_entries()))
+        entry = next(iter(agent.replay.active_items()))
         self.assertTrue(entry.transitions)
         self.assertEqual(tuple(t[1] for t in entry.transitions), entry.ordering)
 
     def test_validated_preference_trace_has_no_observed_self_loops(self):
-        from src.representations import observations_from_actions
-
-        agent = AdaptiveHRCAgent(
-            cfg=Config(verbose=False, maxent_iters_cold=2, maxent_iters_warm=1)
+        agent = AdaptiveAgent(
+            settings=Settings(verbose=False, irl_cold_steps=2, irl_warm_steps=1)
         )
-        builder = gen.recipe_library()["tomato_soup"]
-        pair = materialize_pair("tomato_soup", "p12_multi_stage_reorganization", builder)
+        builder = recipe_builders()["tomato_soup"]
+        pair = build_task("tomato_soup", "prep_loading_serving_cleanup", builder)
         agent.start_demo()
-        for obs in observations_from_actions(pair.actions):
-            agent.observe_observation(obs)
+        for obs in observe_actions(pair.actions):
+            agent.observe(obs)
         agent.end_demo()
 
-        entry = max(agent.decay.active_entries(), key=lambda e: e.last_seen_step)
-        trajectories, dropped = agent._build_trajectories([entry])
+        entry = max(agent.replay.active_items(), key=lambda e: e.last_seen_step)
+        trajectories, dropped = agent._build_demos([entry])
         self.assertEqual(dropped, 0)
         self.assertFalse([
-            (idx, action)
-            for idx, ((before, action), (after, _next_action)) in enumerate(zip(trajectories[0], trajectories[0][1:]))
+            (index, action)
+            for index, ((before, action), (after, _next_action)) in enumerate(zip(trajectories[0], trajectories[0][1:]))
             if action != "stop" and before == after
         ])
 
@@ -151,35 +119,27 @@ class AssistiveEpisodeLeakageTests(unittest.TestCase):
     """Verify the deployed assistance path completes without test-label input."""
 
     def _train(self, agent):
-        from src.environment import gen
-        library = list(gen.recipe_library().items())[:1]
-        rname, fn = library[0]
-        a = materialize_pair(rname, "identity", fn)
-        b = materialize_pair(rname, "p1_mise_en_place", fn)
-        name_to_rid = {}
-        observe_episode(agent, a, name_to_rid)
-        return rname, a, b, name_to_rid
+        rname, fn = next(iter(recipe_builders().items()))
+        a = build_task(rname, "default", fn)
+        b = build_task(rname, "prep_first", fn)
+        recipe_ids = {}
+        observe_demo(agent, a, recipe_ids)
+        return rname, a, b, recipe_ids
 
     def test_assist_episode_emits_robot_turns(self):
-        full = AdaptiveHRCAgent(cfg=Config(verbose=False))
-        rname, a, b, name_to_rid = self._train(full)
-        metrics = assist_episode(
+        full = AdaptiveAgent(settings=Settings(verbose=False))
+        rname, a, b, recipe_ids = self._train(full)
+        metrics = assist_demo(
             full,
             b,
-            name_to_rid,
-            config=EvaluationConfig(topk=3),
+            recipe_ids,
+            config=EvalSettings(top_k=3),
             observed_pairs={a.label},
             observed_recipes={rname},
         )
-        # The deployed system must complete and emit robot-turn records.
         robot_turns = [turn for turn in metrics["_turn_records"] if turn["turn_kind"] == "robot"]
         self.assertEqual(len(robot_turns), int(metrics["n_steps"]))
         self.assertGreater(len(robot_turns), 0)
-
-
-
-
-
 
 if __name__ == "__main__":
     unittest.main()

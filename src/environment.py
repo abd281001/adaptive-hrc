@@ -1,82 +1,187 @@
-"""Kitchen-domain environment: vocabulary, state tracker, and recipe library.
+"""Symbolic kitchen state, action grammar, semantics, and reference recipes."""
+from __future__ import annotations
 
-This module owns the *symbolic* side of the HRC benchmark:
-  * A fixed vocabulary (containers, ingredients, locations, appliances, etc.) from which every feature name and every action symbol is derived.
-  * `StateTracker` — a PDDL-style world model that maintains a fixed-width binary feature vector and applies parsed action strings with precondition checks.
-  * `RecipeGenerator` — hand-written reference recipes used as teacher demonstrations.
+from dataclasses import dataclass
+import re
+from typing import Mapping
 
-The feature-vector layout is built exactly once at class level (see `StateTracker._build_feature_map`) and exported as the module-level `_FEAT` dict so state-feature learners can index raw states without reconstructing a tracker.
-"""
 import numpy as np
 
-#  Kitchen-domain vocabulary
-# Every feature name, every action argument, and every preference hook in the whole codebase is derived from these lists. Adding a new ingredient or location here automatically enlarges the raw state vector (and therefore the IRL feature space) in a consistent way.
 
-CONTAINERS         = ["pot", "pan", "plate", "bowl", "glass", "measuring_cup"]
-LIQUID_INGREDIENTS = ["milk", "oil"]
-SOLID_INGREDIENTS  = [
-    "tomato", "garlic", "onion", "mushroom", "lettuce",
-    "cheese", "rice", "yoghurt", "strawberries", "banana",
-    "egg", "fish", "chicken", "meat",
+CONTAINERS = ("pot", "pan", "plate", "bowl", "glass", "measuring_cup")
+LIQUID_INGREDIENTS = ("milk", "oil")
+SOLID_INGREDIENTS = (
+    "tomato", "garlic", "onion", "mushroom", "lettuce", "cheese", "rice",
+    "yoghurt", "strawberries", "banana", "egg", "fish", "chicken", "meat",
     "salt", "spice1", "spice2", "mixture",
-]
+)
 INGREDIENTS = LIQUID_INGREDIENTS + SOLID_INGREDIENTS
-ITEMS       = CONTAINERS + INGREDIENTS
+ITEMS = CONTAINERS + INGREDIENTS
+CUTTABLES = (
+    "tomato", "onion", "mushroom", "lettuce", "banana", "strawberries",
+    "chicken", "fish", "cheese",
+)
+GRATABLE = ("cheese",)
+COOKABLES = (
+    "meat", "egg", "rice", "tomato", "onion", "mushroom", "chicken", "fish",
+    "mixture",
+)
+SEASONINGS = ("salt", "spice1", "spice2", "garlic")
+LOCATIONS = (
+    "storage", "prep_station", "cooking_station", "plating_station",
+    "serving_station", "washing_station", "blending_station",
+)
+TOOLS = ("stove", "sink", "blender")
 
-# Per-operation subsets — used both for precondition checks in `apply_action` and for engineered-feature construction in `irl.py`.
-CUTTABLES   = ["tomato", "onion", "mushroom", "lettuce", "banana", "strawberries", "chicken", "fish", "cheese"]
-GRATABLE    = ["cheese"]
-COOKABLES   = ["meat", "egg", "rice", "tomato", "onion", "mushroom", "chicken", "fish", "mixture"]
-SEASONINGS  = ["salt", "spice1", "spice2", "garlic"]
+ACTION_ARGUMENTS: Mapping[str, tuple[str, ...]] = {
+    "transfer": ("item", "from", "to"),
+    "load": ("item", "container", "location"),
+    "unload": ("item", "container", "location"),
+    "move_container": ("container", "from", "to"),
+    "cut": ("item", "location"),
+    "grate": ("item", "location"),
+    "cook": ("item", "container", "location"),
+    "cook_contents": ("container", "location"),
+    "combine": ("container", "location"),
+    "season_container": ("container", "seasoning", "location"),
+    "season": ("item", "seasoning", "location"),
+    "pour": ("liquid", "from_container", "to_container", "location"),
+    "turn_on": ("tool",),
+    "turn_off": ("tool",),
+    "blend": ("container", "location"),
+    "serve": ("vessel", "location"),
+    "wash": ("item", "location"),
+}
 
-LOCATIONS   = ["storage", "prep_station", "cooking_station", "plating_station", "serving_station", "washing_station", "blending_station"]
+# Reference trajectories ground appliance actions at a location, whereas the
+# structured LLM interface needs only the tool name. The simulator accepts both.
+ACTION_LABEL_ARGUMENTS: Mapping[str, tuple[str, ...]] = {
+    **ACTION_ARGUMENTS,
+    "turn_on": ("tool", "location"),
+    "turn_off": ("tool", "location"),
+}
+_ACTION_PATTERN = re.compile(r"^\s*([a-z_]+)\s*\((.*)\)\s*$")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  StateTracker — fixed-width binary world state + action semantics
-# ═════════════════════════════════════════════════════════════════════════════
+class ActionSyntaxError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class Action:
+    verb: str
+    args: Mapping[str, str]
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        return self.args.get(key, default)
+
+
+def parse_action_label(label: str) -> Action:
+    match = _ACTION_PATTERN.fullmatch(label)
+    if match is None:
+        raise ActionSyntaxError(f"invalid action syntax: {label!r}")
+    verb, body = match.groups()
+    names = ACTION_LABEL_ARGUMENTS.get(verb)
+    if names is None:
+        raise ActionSyntaxError(f"unknown action: {verb}")
+    tokens = [part.strip() for part in body.split(",") if part.strip()]
+    if len(tokens) > len(names):
+        raise ActionSyntaxError(f"too many arguments for {verb}")
+    values: dict[str, str] = {}
+    for index, token in enumerate(tokens):
+        if "=" in token:
+            key, value = (part.strip() for part in token.split("=", 1))
+            if key not in names:
+                raise ActionSyntaxError(f"unknown {verb} argument: {key}")
+        else:
+            key, value = names[index], token
+        if key in values:
+            raise ActionSyntaxError(f"duplicate {verb} argument: {key}")
+        values[key] = value
+    return Action(verb, values)
+
+
+def _validate_argument(action: str, key: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise ActionSyntaxError(f"argument_{key}_must_be_string")
+    domains = {
+        "from": LOCATIONS, "to": LOCATIONS, "location": LOCATIONS,
+        "container": CONTAINERS, "from_container": CONTAINERS,
+        "to_container": CONTAINERS, "tool": TOOLS, "seasoning": SEASONINGS,
+        "liquid": LIQUID_INGREDIENTS, "vessel": ("plate", "glass"),
+        "item": ITEMS,
+    }
+    if key in domains and value not in domains[key]:
+        raise ActionSyntaxError(f"invalid_{key}:{value}")
+    if action in {"load", "unload", "season"} and key == "item" and value not in INGREDIENTS:
+        raise ActionSyntaxError(f"{action}_requires_ingredient:{value}")
+    return value
+
+
+def canonical_action(action: str, args: Mapping[str, object]) -> str:
+    names = ACTION_ARGUMENTS.get(action)
+    if names is None:
+        raise ActionSyntaxError(f"unknown_action:{action}")
+    if set(args) != set(names):
+        raise ActionSyntaxError(f"wrong_argument_keys_for:{action}")
+    values = {key: _validate_argument(action, key, args[key]) for key in names}
+    if action in {"transfer", "move_container"}:
+        first = "item" if action == "transfer" else "container"
+        return f"{action} ({values[first]}, from={values['from']}, to={values['to']})"
+    return f"{action} ({', '.join(values[key] for key in names)})"
+
+
+_TOOL_FEATURE = {tool: f"{tool}_on" for tool in TOOLS}
 class StateTracker:
-    """PDDL-style kitchen simulator with a class-shared feature map. 
-    Feature names are systematic e.g. `tomato_at_prep_station`, `pot_contains_rice`, `chicken_cooked`, `stove_on`, .. so the feature dimension is fully determined by the vocabulary constants above. This keeps the state representation stable for any caller that intentionally preserves model parameters across fits.
-    """
+    """PDDL-style kitchen simulator with a shared fixed-width feature map."""
 
-    # Shared across all instances — built lazily on first __init__.
     _CLASS_FEATURE_MAP = None
 
     @classmethod
     def _build_feature_map(cls):
         """Build the systematic feature layout once and memoize it."""
-        if cls._CLASS_FEATURE_MAP is not None: return cls._CLASS_FEATURE_MAP
+        if cls._CLASS_FEATURE_MAP is not None:
+            return cls._CLASS_FEATURE_MAP
 
-        fm, idx = {}, 0
-        # Location features:   <item>_at_<location>
+        feature_map, index = {}, 0
         for item in ITEMS:
-            for loc in LOCATIONS:           fm[f"{item}_at_{loc}"] = idx; idx += 1
-        # Containment:         <container>_contains_<ingredient>
+            for location in LOCATIONS:
+                feature_map[f"{item}_at_{location}"] = index
+                index += 1
         for container in CONTAINERS:
-            for ingredient in INGREDIENTS:  fm[f"{container}_contains_{ingredient}"] = idx; idx += 1
-        # Processing flags
-        for item in CUTTABLES:              fm[f"{item}_cut"]     = idx; idx += 1
-        for item in GRATABLE:               fm[f"{item}_grated"]  = idx; idx += 1
-        for item in COOKABLES:              fm[f"{item}_cooked"]  = idx; idx += 1
-        for item in INGREDIENTS:            fm[f"{item}_seasoned"]= idx; idx += 1
-        for item in ITEMS:                  fm[f"{item}_washed"]  = idx; idx += 1
-        # Global tool state and dish-delivered flag. A dish may be served in
-        # either a plate or a glass (smoothies), hence this deliberately does
-        # not encode a vessel type in its name.
-        fm["stove_on"]     = idx; idx += 1
-        fm["sink_on"]      = idx; idx += 1
-        fm["blender_on"]   = idx; idx += 1
-        fm["dish_served"]  = idx; idx += 1
-        # Mixture membership (excluding "mixture" itself)
+            for ingredient in INGREDIENTS:
+                feature_map[f"{container}_contains_{ingredient}"] = index
+                index += 1
+        for item in CUTTABLES:
+            feature_map[f"{item}_cut"] = index
+            index += 1
+        for item in GRATABLE:
+            feature_map[f"{item}_grated"] = index
+            index += 1
+        for item in COOKABLES:
+            feature_map[f"{item}_cooked"] = index
+            index += 1
+        for item in INGREDIENTS:
+            feature_map[f"{item}_seasoned"] = index
+            index += 1
+        for item in ITEMS:
+            feature_map[f"{item}_washed"] = index
+            index += 1
+        # Serving is vessel-agnostic because plates and glasses are valid.
+        for feature in ("stove_on", "sink_on", "blender_on", "dish_served"):
+            feature_map[feature] = index
+            index += 1
         for ingredient in INGREDIENTS:
-            if ingredient != "mixture":     fm[f"{ingredient}_in_mixture"] = idx; idx += 1
-        # Seasoning crossed with ingredient (preserves which spice went where)
+            if ingredient != "mixture":
+                feature_map[f"{ingredient}_in_mixture"] = index
+                index += 1
         for seasoning in SEASONINGS:
-            for item in INGREDIENTS:        fm[f"{item}_seasoned_with_{seasoning}"] = idx; idx += 1
+            for item in INGREDIENTS:
+                feature_map[f"{item}_seasoned_with_{seasoning}"] = index
+                index += 1
 
-        cls._CLASS_FEATURE_MAP = fm
-        return fm
+        cls._CLASS_FEATURE_MAP = feature_map
+        return feature_map
 
     def __init__(self):
         self.feature_map = self.__class__._build_feature_map()
@@ -90,7 +195,6 @@ class StateTracker:
             if item != "mixture":   # "mixture" only exists once ingredients are combined
                 self.set_feature(f"{item}_at_storage", 1)
 
-    # raw feature accessors
     def set_feature(self, key, value):
         if key in self.feature_map:
             self.current_state[self.feature_map[key]] = value
@@ -115,93 +219,59 @@ class StateTracker:
                 return container
         return None
 
-    # ─── action dispatch ─────────────────────────────────────────────────────
     def apply_action(self, action_str, *, enforce_preconditions: bool = False):
-        """Parse and apply an action like ``transfer (tomato, from=storage, to=prep_station)``.
-
-        By default this is a simulation replay operator: precondition failures
-        do not create no-op transitions, so preference-reordered demonstrations
-        still produce learner-facing state changes.  Callers that validate a
-        candidate ordering should pass ``enforce_preconditions=True``.
-        """
-        action_str = action_str.strip()
-
-        # Local parsers: `parts` = comma-split args inside `(...)`; `_loc` strips an optional "from="/"to=" prefix.
-        def _parse(s):
-            content = s[s.find("(") + 1 : s.find(")")]
-            return [p.strip() for p in content.split(",")]
-
-        def _loc(part):
-            return part.split("=")[1] if "=" in part else part
+        """Apply an action, optionally enforcing symbolic preconditions."""
+        action = parse_action_label(action_str)
+        verb, args = action.verb, action.args
 
         def _require(condition, msg):
             if enforce_preconditions and not condition:
                 raise ValueError(msg)
 
-        # ── transfer (item, from=L1, to=L2) — move a free item between locations
-        if action_str.startswith("transfer"):
-            parts    = _parse(action_str)
-            item     = parts[0]
-            from_loc = _loc(parts[1])
-            to_loc   = _loc(parts[2])
+        if verb == "transfer":
+            item, from_loc, to_loc = args["item"], args["from"], args["to"]
             _require(self.get_feature(f"{item}_at_{from_loc}") == 1, f"Precondition failed: {item} not at {from_loc}")
             _require(not self.is_contained(item), f"Precondition failed: {item} is contained")
             self.set_feature(f"{item}_at_{from_loc}", 0)
             self.set_feature(f"{item}_at_{to_loc}",   1)
 
-        # ── load (item, container, location) — put item into a co-located container
-        elif action_str.startswith("load"):
-            parts     = _parse(action_str)
-            item      = parts[0]; container = parts[1]; location = parts[2]
+        elif verb == "load":
+            item, container, location = args["item"], args["container"], args["location"]
             _require(self.get_feature(f"{item}_at_{location}") == 1, f"Precondition failed: {item} not at {location}")
             _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
             _require(not self.is_contained(item), f"Precondition failed: {item} already contained")
             self.set_feature(f"{item}_at_{location}", 0)
             self.set_feature(f"{container}_contains_{item}", 1)
 
-        # ── unload (item, container, location) — take item out of container at L
-        elif action_str.startswith("unload"):
-            parts     = _parse(action_str)
-            item      = parts[0]; container = parts[1]; location = parts[2]
+        elif verb == "unload":
+            item, container, location = args["item"], args["container"], args["location"]
             _require(self.get_feature(f"{container}_contains_{item}") == 1, f"Precondition failed: {item} not in {container}")
             _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
             self.set_feature(f"{container}_contains_{item}", 0)
             self.set_feature(f"{item}_at_{location}", 1)
 
-        # ── move_container (container, from=L1, to=L2)
-        elif action_str.startswith("move_container"):
-            parts     = _parse(action_str)
-            container = parts[0]; from_loc = _loc(parts[1]); to_loc = _loc(parts[2])
+        elif verb == "move_container":
+            container, from_loc, to_loc = args["container"], args["from"], args["to"]
             _require(self.get_feature(f"{container}_at_{from_loc}") == 1, f"Precondition failed: {container} not at {from_loc}")
             self.set_feature(f"{container}_at_{from_loc}", 0)
             self.set_feature(f"{container}_at_{to_loc}", 1)
 
-        # ── cut (item, location=prep_station)
-        elif action_str.startswith("cut"):
-            parts    = _parse(action_str)
-            item     = parts[0]
-            location = parts[1] if len(parts) > 1 else "prep_station"
+        elif verb == "cut":
+            item, location = args["item"], args.get("location", "prep_station")
             _require(item in CUTTABLES, f"Precondition failed: {item} is not cuttable")
             _require(self.get_feature(f"{item}_at_{location}") == 1, f"Precondition failed: {item} not at {location}")
             self.set_feature(f"{item}_cut", 1)
 
-        # ── grate (item, location=prep_station)
-        elif action_str.startswith("grate"):
-            parts    = _parse(action_str)
-            item     = parts[0]
-            location = parts[1] if len(parts) > 1 else "prep_station"
+        elif verb == "grate":
+            item, location = args["item"], args.get("location", "prep_station")
             _require(item in GRATABLE, f"Precondition failed: {item} is not gratable")
             _require(self.get_feature(f"{item}_at_{location}") == 1, f"Precondition failed: {item} not at {location}")
             self.set_feature(f"{item}_grated", 1)
 
-        # ── cook (item, container=pot|pan, location=cooking_station) —
-        # single-item cook. Both "cook " and "cook(" prefixes are accepted
-        # so we don't collide with cook_contents.
-        elif action_str.startswith("cook ") or action_str.startswith("cook("):
-            parts     = _parse(action_str)
-            item      = parts[0]
-            container = parts[1] if len(parts) > 1 else "pot"
-            location  = parts[2] if len(parts) > 2 else "cooking_station"
+        elif verb == "cook":
+            item = args["item"]
+            container = args.get("container", "pot")
+            location = args.get("location", "cooking_station")
             _require(item in COOKABLES, f"Precondition failed: {item} is not cookable")
             _require(container in {"pot", "pan"}, f"Precondition failed: {container} is not cook-safe")
             _require(self.get_feature(f"{container}_contains_{item}") == 1, f"Precondition failed: {item} not in {container}")
@@ -209,11 +279,9 @@ class StateTracker:
             _require(location != "cooking_station" or self.get_feature("stove_on") == 1, "Precondition failed: stove not on")
             self.set_feature(f"{item}_cooked", 1)
 
-        # ── cook_contents (container, location) — cook every cookable ingredient inside
-        elif action_str.startswith("cook_contents"):
-            parts     = _parse(action_str)
-            container = parts[0]
-            location  = parts[1] if len(parts) > 1 else "cooking_station"
+        elif verb == "cook_contents":
+            container = args["container"]
+            location = args.get("location", "cooking_station")
             _require(container in {"pot", "pan"}, f"Precondition failed: {container} is not cook-safe")
             _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
             _require(location != "cooking_station" or self.get_feature("stove_on") == 1, "Precondition failed: stove not on")
@@ -228,11 +296,8 @@ class StateTracker:
             for ingredient in INGREDIENTS:
                 if (self.get_feature(f"{container}_contains_{ingredient}") == 1 and ingredient in COOKABLES): self.set_feature(f"{ingredient}_cooked", 1)
 
-        # ── combine (container, location?) — merge ≥2 ingredients into "mixture"
-        elif action_str.startswith("combine"):
-            parts     = _parse(action_str)
-            container = parts[0]
-            location  = parts[1] if len(parts) > 1 else None
+        elif verb == "combine":
+            container, location = args["container"], args.get("location")
             _require(not location or self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
             contained = [ing for ing in INGREDIENTS if ing != "mixture" and self.get_feature(f"{container}_contains_{ing}") == 1]
             _require(len(contained) >= 2, f"combine requires >=2 ingredients in {container}")
@@ -241,12 +306,9 @@ class StateTracker:
                 self.set_feature(f"{ing}_in_mixture", 1)
             self.set_feature(f"{container}_contains_mixture", 1)
 
-        # ── season_container (container, seasoning, location) — apply
-        # seasoning to every ingredient currently inside a grounded container.
-        elif action_str.startswith("season_container"):
-            parts     = _parse(action_str)
-            container = parts[0]; seasoning = parts[1]
-            location  = parts[2] if len(parts) > 2 else None
+        elif verb == "season_container":
+            container, seasoning = args["container"], args["seasoning"]
+            location = args.get("location")
             _require(seasoning in SEASONINGS, f"{seasoning} is not a seasoning")
             _require(location is not None, "season_container requires an explicit location")
             _require(self.get_feature(f"{container}_at_{location}") == 1, f"{container} not at {location}")
@@ -259,13 +321,9 @@ class StateTracker:
                     self.set_feature(f"{ing}_seasoned", 1)
                     self.set_feature(f"{ing}_seasoned_with_{seasoning}", 1)
 
-        # ── season (target, seasoning, location) — single-item seasoning.
-        # The explicit grounded location prevents remote seasoning of an item
-        # that is elsewhere or contained in an unrelated vessel.
-        elif action_str.startswith("season"):
-            parts     = _parse(action_str)
-            target    = parts[0]; seasoning = parts[1]
-            location  = parts[2] if len(parts) > 2 else None
+        elif verb == "season":
+            target, seasoning = args["item"], args["seasoning"]
+            location = args.get("location")
             _require(target in INGREDIENTS, f"{target} is not an ingredient")
             _require(seasoning in SEASONINGS, f"{seasoning} is not a seasoning")
             _require(location is not None, "season requires an explicit location")
@@ -273,11 +331,10 @@ class StateTracker:
             self.set_feature(f"{target}_seasoned", 1)
             self.set_feature(f"{target}_seasoned_with_{seasoning}", 1)
 
-        # ── pour (liquid, from_container, to_container, location?)
-        elif action_str.startswith("pour"):
-            parts    = _parse(action_str)
-            liquid   = parts[0]; from_c = parts[1]; to_c = parts[2]
-            location = parts[3] if len(parts) > 3 else None
+        elif verb == "pour":
+            liquid = args["liquid"]
+            from_c, to_c = args["from_container"], args["to_container"]
+            location = args.get("location")
             _require(liquid in LIQUID_INGREDIENTS, f"{liquid} is not a liquid")
             _require(self.get_feature(f"{from_c}_contains_{liquid}") == 1, f"{liquid} not in {from_c}")
             if location:
@@ -286,25 +343,15 @@ class StateTracker:
             self.set_feature(f"{from_c}_contains_{liquid}", 0)
             self.set_feature(f"{to_c}_contains_{liquid}", 1)
 
-        # ── turn_on / turn_off (tool)
-        elif action_str.startswith("turn_on"):
-            tool = _parse(action_str)[0]
-            _require(tool in {"stove", "sink", "blender"}, f"Precondition failed: unknown tool {tool}")
-            if   tool == "stove":   self.set_feature("stove_on",   1)
-            elif tool == "sink":    self.set_feature("sink_on",    1)
-            elif tool == "blender": self.set_feature("blender_on", 1)
-        elif action_str.startswith("turn_off"):
-            tool = _parse(action_str)[0]
-            _require(tool in {"stove", "sink", "blender"}, f"Precondition failed: unknown tool {tool}")
-            if   tool == "stove":   self.set_feature("stove_on",   0)
-            elif tool == "sink":    self.set_feature("sink_on",    0)
-            elif tool == "blender": self.set_feature("blender_on", 0)
+        elif verb in {"turn_on", "turn_off"}:
+            tool = args["tool"]
+            _require(tool in TOOLS, f"Precondition failed: unknown tool {tool}")
+            if tool in _TOOL_FEATURE:
+                self.set_feature(_TOOL_FEATURE[tool], int(verb == "turn_on"))
 
-        # ── blend (container, location=blending_station) — liquefy ≥1 ingredient
-        elif action_str.startswith("blend"):
-            parts     = _parse(action_str)
-            container = parts[0]
-            location  = parts[1] if len(parts) > 1 else "blending_station"
+        elif verb == "blend":
+            container = args["container"]
+            location = args.get("location", "blending_station")
             _require(self.get_feature(f"{container}_at_{location}") == 1, f"{container} not at {location}")
             _require(self.get_feature("blender_on") == 1, "blender not on")
             contained = [ing for ing in INGREDIENTS if ing != "mixture" and self.get_feature(f"{container}_contains_{ing}") == 1]
@@ -314,12 +361,9 @@ class StateTracker:
                 self.set_feature(f"{ing}_in_mixture", 1)
             self.set_feature(f"{container}_contains_mixture", 1)
 
-        # ── serve (vessel, serving_station) — accepts a completed plated dish
-        # or smoothie glass, never an empty vessel or a plating-station proxy.
-        elif action_str.startswith("serve"):
-            parts    = _parse(action_str)
-            vessel   = parts[0]
-            location = parts[1] if len(parts) > 1 else "serving_station"
+        elif verb == "serve":
+            vessel = args["vessel"]
+            location = args.get("location", "serving_station")
             _require(vessel in {"plate", "glass"}, f"Precondition failed: {vessel} is not a serving vessel")
             _require(location == "serving_station", "serve requires serving_station")
             _require(self.get_feature(f"{vessel}_at_{location}") == 1, f"{vessel} not at {location}")
@@ -329,18 +373,14 @@ class StateTracker:
             )
             self.set_feature("dish_served", 1)
 
-        # ── wash (item, location=washing_station)
-        elif action_str.startswith("wash"):
-            parts    = _parse(action_str)
-            item     = parts[0]
-            location = parts[1] if len(parts) > 1 else "washing_station"
+        elif verb == "wash":
+            item = args["item"]
+            location = args.get("location", "washing_station")
             _require(self.get_feature(f"{item}_at_{location}") == 1, f"{item} not at {location}")
             self.set_feature(f"{item}_washed", 1)
 
-        else:                                                                           raise ValueError(f"Unknown action: {action_str}")
 
-
-# Exported module-level feature map `irl.py` reads columns through this dict, avoiding a throw-away StateTracker allocation per lookup.
+# Shared feature lookup avoids per-access tracker allocation.
 _FEAT = StateTracker._build_feature_map()
 
 
@@ -354,14 +394,7 @@ _GOAL_FEATURE_INDICES = tuple(
 
 
 def replay_validated_actions(actions):
-    """Strictly replay a task and return its final symbolic state.
-
-    Dataset construction is the one place where the simulator may validate a
-    symbolic action list.  A candidate is invalid if an action violates a
-    precondition *or* leaves the state unchanged.  The latter catches actions
-    such as cooking an empty container, which otherwise create spurious
-    preference variants under permissive replay.
-    """
+    """Replay a task strictly, rejecting invalid or no-effect actions."""
     tracker = StateTracker()
     for action in actions:
         before = tuple(tracker.get_state_vector().astype(int).tolist())
@@ -373,13 +406,7 @@ def replay_validated_actions(actions):
 
 
 def task_goal_signature(actions):
-    """Return the preference-invariant task outcome for dataset validation.
-
-    Locations, cleaned flags, and appliance switches encode workflow choices;
-    all remaining symbolic predicates encode the delivered task outcome.
-    This is evaluator-only validation metadata and is never passed to the
-    learner or used for online identity inference.
-    """
+    """Return task outcomes after excluding workflow-dependent state."""
     final_state = replay_validated_actions(actions)
     return tuple(final_state[index] for index in _GOAL_FEATURE_INDICES)
 
@@ -392,819 +419,720 @@ def validate_ordering(actions, *, expected_goal=None):
         return False
     return expected_goal is None or tuple(goal) == tuple(expected_goal)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  RecipeGenerator — hand-written "teacher" demonstrations
-# ═════════════════════════════════════════════════════════════════════════════
-class RecipeGenerator:
-    """Library of reference recipes."""
-
-    # Hand-written recipe generators. These action sequences are the "ground-truth" demonstrations the IRL learner sees; preferences can transform them into reordered variants.
-    def generate_grilled_steak(self): return [
-        "transfer (pan, from=storage, to=cooking_station)",
-        "load (meat, bowl, storage)",
-        "move_container (bowl, from=storage, to=cooking_station)",
-        "unload (meat, bowl, cooking_station)",
-        "load (meat, pan, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (meat, pan, cooking_station)",
-        "load (meat, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (meat, bowl, plating_station)",
-        "load (meat, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_boiled_eggs(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "load (egg, bowl, storage)",
-        "move_container (bowl, from=storage, to=cooking_station)",
-        "unload (egg, bowl, cooking_station)",
-        "load (egg, pot, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (pot, from=cooking_station, to=plating_station)",
-        "unload (egg, pot, plating_station)",
-        "load (egg, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pot, from=plating_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=cooking_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_boiled_rice(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "load (rice, bowl, storage)",
-        "move_container (bowl, from=storage, to=cooking_station)",
-        "unload (rice, bowl, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "load (rice, pot, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (rice, pot, cooking_station)",
-        "load (rice, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (rice, bowl, plating_station)",
-        "load (rice, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pot, from=cooking_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_simple_salad(self): return [
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (lettuce, from=storage, to=prep_station)",
-        "transfer (onion, from=storage, to=prep_station)",
-        "cut (lettuce, prep_station)",
-        "load (lettuce, bowl, prep_station)",
-        "cut (onion, prep_station)",
-        "load (onion, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (bowl, from=prep_station, to=plating_station)",
-        "unload (mixture, bowl, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (plate, from=serving_station, to=washing_station)",
-        "wash (plate, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_burger(self): return [
-        "transfer (pan, from=storage, to=cooking_station)",
-        "load (meat, bowl, storage)",
-        "move_container (bowl, from=storage, to=cooking_station)",
-        "unload (meat, bowl, cooking_station)",
-        "load (meat, pan, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (meat, pan, cooking_station)",
-        "load (meat, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (meat, bowl, plating_station)",
-        "load (meat, plate, plating_station)",
-        "transfer (lettuce, from=storage, to=prep_station)",
-        "move_container (bowl, from=plating_station, to=prep_station)",
-        "cut (lettuce, prep_station)",
-        "load (lettuce, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=plating_station)",
-        "unload (lettuce, bowl, plating_station)",
-        "load (lettuce, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_tomato_soup(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "turn_on (stove, cooking_station)",
-        "transfer (tomato, from=storage, to=prep_station)",
-        "cut (tomato, prep_station)",
-        "load (tomato, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (tomato, bowl, cooking_station)",
-        "load (tomato, pot, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (tomato, pot, cooking_station)",
-        "load (tomato, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (tomato, bowl, plating_station)",
-        "load (tomato, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pot, from=cooking_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_tomato_onion_soup_v1(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (tomato, from=storage, to=prep_station)",
-        "cut (tomato, prep_station)",
-        "load (tomato, bowl, prep_station)",
-        "transfer (onion, from=storage, to=prep_station)",
-        "cut (onion, prep_station)",
-        "load (onion, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (mixture, bowl, cooking_station)",
-        "load (mixture, pot, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (pot, from=cooking_station, to=plating_station)",
-        "unload (mixture, pot, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (pot, from=plating_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=cooking_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_mushroom_soup(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (mushroom, from=storage, to=prep_station)",
-        "cut (mushroom, prep_station)",
-        "load (mushroom, bowl, prep_station)",
-        "transfer (onion, from=storage, to=prep_station)",
-        "cut (onion, prep_station)",
-        "load (onion, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (mixture, bowl, cooking_station)",
-        "load (mixture, pot, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (pot, from=cooking_station, to=plating_station)",
-        "unload (mixture, pot, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (pot, from=plating_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=cooking_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_seasoned_chicken(self): return [
-        "transfer (pan, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (chicken, from=storage, to=prep_station)",
-        "season (chicken, salt, prep_station)",
-        "season (chicken, spice1, prep_station)",
-        "load (chicken, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (chicken, bowl, cooking_station)",
-        "load (chicken, pan, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (chicken, pan, cooking_station)",
-        "load (chicken, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (chicken, bowl, plating_station)",
-        "load (chicken, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_garlic_fish(self): return [
-        "transfer (pan, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (fish, from=storage, to=prep_station)",
-        "season (fish, garlic, prep_station)",
-        "season (fish, spice2, prep_station)",
-        "load (fish, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (fish, bowl, cooking_station)",
-        "load (fish, pan, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (fish, pan, cooking_station)",
-        "load (fish, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (fish, bowl, plating_station)",
-        "load (fish, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_seasoned_mixture_soup(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (tomato, from=storage, to=prep_station)",
-        "cut (tomato, prep_station)",
-        "load (tomato, bowl, prep_station)",
-        "transfer (onion, from=storage, to=prep_station)",
-        "cut (onion, prep_station)",
-        "load (onion, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "season_container (bowl, salt, prep_station)",
-        "season_container (bowl, spice1, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (mixture, bowl, cooking_station)",
-        "load (mixture, pot, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (pot, from=cooking_station, to=plating_station)",
-        "unload (mixture, pot, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (pot, from=plating_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=cooking_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_grated_cheese_salad(self): return [
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (lettuce, from=storage, to=prep_station)",
-        "transfer (cheese, from=storage, to=prep_station)",
-        "cut (lettuce, prep_station)",
-        "load (lettuce, bowl, prep_station)",
-        "grate (cheese, prep_station)",
-        "load (cheese, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (bowl, from=prep_station, to=plating_station)",
-        "unload (mixture, bowl, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (plate, from=serving_station, to=washing_station)",
-        "wash (plate, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_smoothie(self): return [
-        "transfer (banana, from=storage, to=prep_station)",
-        "transfer (strawberries, from=storage, to=prep_station)",
-        "cut (banana, prep_station)",
-        "transfer (banana, from=prep_station, to=blending_station)",
-        "cut (strawberries, prep_station)",
-        "transfer (strawberries, from=prep_station, to=blending_station)",
-        "transfer (milk, from=storage, to=blending_station)",
-        "transfer (glass, from=storage, to=blending_station)",
-        "transfer (measuring_cup, from=storage, to=blending_station)",
-        "load (milk, measuring_cup, blending_station)",
-        "pour (milk, measuring_cup, glass, blending_station)",
-        "load (banana, glass, blending_station)",
-        "load (strawberries, glass, blending_station)",
-        "turn_on (blender, blending_station)",
-        "blend (glass, blending_station)",
-        "turn_off (blender, blending_station)",
-        "transfer (glass, from=blending_station, to=serving_station)",
-        "serve (glass, serving_station)",
-        "transfer (measuring_cup, from=blending_station, to=washing_station)",
-        "wash (measuring_cup, washing_station)"]
-
-    def generate_yoghurt_smoothie(self): return [
-        "transfer (banana, from=storage, to=prep_station)",
-        "transfer (yoghurt, from=storage, to=blending_station)",
-        "cut (banana, prep_station)",
-        "transfer (banana, from=prep_station, to=blending_station)",
-        "transfer (glass, from=storage, to=blending_station)",
-        "load (yoghurt, glass, blending_station)",
-        "transfer (milk, from=storage, to=blending_station)",
-        "transfer (measuring_cup, from=storage, to=blending_station)",
-        "load (milk, measuring_cup, blending_station)",
-        "pour (milk, measuring_cup, glass, blending_station)",
-        "load (banana, glass, blending_station)",
-        "turn_on (blender, blending_station)",
-        "blend (glass, blending_station)",
-        "turn_off (blender, blending_station)",
-        "transfer (glass, from=blending_station, to=serving_station)",
-        "serve (glass, serving_station)",
-        "transfer (measuring_cup, from=blending_station, to=washing_station)",
-        "wash (measuring_cup, washing_station)"]
-
-
-
-    def generate_tomato_garlic_soup(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (tomato, from=storage, to=prep_station)",
-        "cut (tomato, prep_station)",
-        "season (tomato, garlic, prep_station)",
-        "load (tomato, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (tomato, bowl, cooking_station)",
-        "load (tomato, pot, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (tomato, pot, cooking_station)",
-        "load (tomato, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (tomato, bowl, plating_station)",
-        "load (tomato, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pot, from=cooking_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_mushroom_garlic_soup(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (mushroom, from=storage, to=prep_station)",
-        "cut (mushroom, prep_station)",
-        "season (mushroom, garlic, prep_station)",
-        "load (mushroom, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (mushroom, bowl, cooking_station)",
-        "load (mushroom, pot, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (mushroom, pot, cooking_station)",
-        "load (mushroom, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (mushroom, bowl, plating_station)",
-        "load (mushroom, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pot, from=cooking_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_tomato_mushroom_soup(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (tomato, from=storage, to=prep_station)",
-        "cut (tomato, prep_station)",
-        "load (tomato, bowl, prep_station)",
-        "transfer (mushroom, from=storage, to=prep_station)",
-        "cut (mushroom, prep_station)",
-        "load (mushroom, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (mixture, bowl, cooking_station)",
-        "load (mixture, pot, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (pot, from=cooking_station, to=plating_station)",
-        "unload (mixture, pot, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (pot, from=plating_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=cooking_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_onion_rice_pot(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (rice, from=storage, to=prep_station)",
-        "load (rice, bowl, prep_station)",
-        "transfer (onion, from=storage, to=prep_station)",
-        "cut (onion, prep_station)",
-        "load (onion, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (mixture, bowl, cooking_station)",
-        "load (mixture, pot, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (pot, from=cooking_station, to=plating_station)",
-        "unload (mixture, pot, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (pot, from=plating_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=cooking_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_tomato_cheese_salad(self): return [
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (tomato, from=storage, to=prep_station)",
-        "transfer (cheese, from=storage, to=prep_station)",
-        "cut (tomato, prep_station)",
-        "load (tomato, bowl, prep_station)",
-        "grate (cheese, prep_station)",
-        "load (cheese, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (bowl, from=prep_station, to=plating_station)",
-        "unload (mixture, bowl, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (plate, from=serving_station, to=washing_station)",
-        "wash (plate, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_tomato_lettuce_salad(self): return [
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (tomato, from=storage, to=prep_station)",
-        "transfer (lettuce, from=storage, to=prep_station)",
-        "cut (tomato, prep_station)",
-        "load (tomato, bowl, prep_station)",
-        "cut (lettuce, prep_station)",
-        "load (lettuce, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (bowl, from=prep_station, to=plating_station)",
-        "unload (mixture, bowl, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (plate, from=serving_station, to=washing_station)",
-        "wash (plate, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_banana_strawberry_fruit_bowl(self): return [
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (banana, from=storage, to=prep_station)",
-        "transfer (strawberries, from=storage, to=prep_station)",
-        "cut (banana, prep_station)",
-        "load (banana, bowl, prep_station)",
-        "cut (strawberries, prep_station)",
-        "load (strawberries, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (bowl, from=prep_station, to=plating_station)",
-        "unload (mixture, bowl, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (plate, from=serving_station, to=washing_station)",
-        "wash (plate, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_oil_tomato_salad(self): return [
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (measuring_cup, from=storage, to=prep_station)",
-        "transfer (oil, from=storage, to=prep_station)",
-        "load (oil, measuring_cup, prep_station)",
-        "pour (oil, measuring_cup, bowl, prep_station)",
-        "transfer (tomato, from=storage, to=prep_station)",
-        "cut (tomato, prep_station)",
-        "load (tomato, bowl, prep_station)",
-        "transfer (lettuce, from=storage, to=prep_station)",
-        "cut (lettuce, prep_station)",
-        "load (lettuce, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (bowl, from=prep_station, to=plating_station)",
-        "unload (mixture, bowl, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (measuring_cup, from=prep_station, to=washing_station)",
-        "wash (measuring_cup, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_scrambled_eggs_pan(self): return [
-        "transfer (pan, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (egg, from=storage, to=prep_station)",
-        "season (egg, salt, prep_station)",
-        "load (egg, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (egg, bowl, cooking_station)",
-        "load (egg, pan, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (egg, pan, cooking_station)",
-        "load (egg, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (egg, bowl, plating_station)",
-        "load (egg, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_mushroom_omelette(self): return [
-        "transfer (pan, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (egg, from=storage, to=prep_station)",
-        "load (egg, bowl, prep_station)",
-        "transfer (mushroom, from=storage, to=prep_station)",
-        "cut (mushroom, prep_station)",
-        "load (mushroom, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (mixture, bowl, cooking_station)",
-        "load (mixture, pan, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (mixture, pan, cooking_station)",
-        "load (mixture, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (mixture, bowl, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_meat_mushroom_skillet(self): return [
-        "transfer (pan, from=storage, to=cooking_station)",
-        "load (meat, bowl, storage)",
-        "move_container (bowl, from=storage, to=cooking_station)",
-        "unload (meat, bowl, cooking_station)",
-        "load (meat, pan, cooking_station)",
-        "transfer (mushroom, from=storage, to=prep_station)",
-        "cut (mushroom, prep_station)",
-        "move_container (bowl, from=cooking_station, to=prep_station)",
-        "load (mushroom, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (mushroom, bowl, cooking_station)",
-        "load (mushroom, pan, cooking_station)",
-        "season_container (pan, spice1, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (meat, pan, cooking_station)",
-        "load (meat, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (meat, bowl, plating_station)",
-        "load (meat, plate, plating_station)",
-        "move_container (bowl, from=plating_station, to=cooking_station)",
-        "unload (mushroom, pan, cooking_station)",
-        "load (mushroom, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (mushroom, bowl, plating_station)",
-        "load (mushroom, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_garlic_chicken_salad(self): return [
-        "transfer (pan, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (chicken, from=storage, to=prep_station)",
-        "season (chicken, garlic, prep_station)",
-        "season (chicken, spice1, prep_station)",
-        "load (chicken, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (chicken, bowl, cooking_station)",
-        "load (chicken, pan, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (chicken, pan, cooking_station)",
-        "load (chicken, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (chicken, bowl, plating_station)",
-        "load (chicken, plate, plating_station)",
-        "transfer (lettuce, from=storage, to=prep_station)",
-        "move_container (bowl, from=plating_station, to=prep_station)",
-        "cut (lettuce, prep_station)",
-        "load (lettuce, bowl, prep_station)",
-        "move_container (bowl, from=prep_station, to=plating_station)",
-        "unload (lettuce, bowl, plating_station)",
-        "load (lettuce, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_chicken_rice_plate(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (pan, from=storage, to=cooking_station)",
-        "load (rice, bowl, storage)",
-        "move_container (bowl, from=storage, to=cooking_station)",
-        "unload (rice, bowl, cooking_station)",
-        "load (rice, pot, cooking_station)",
-        "transfer (chicken, from=storage, to=prep_station)",
-        "season (chicken, salt, prep_station)",
-        "transfer (chicken, from=prep_station, to=cooking_station)",
-        "load (chicken, pan, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (rice, pot, cooking_station)",
-        "load (rice, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (rice, bowl, plating_station)",
-        "load (rice, plate, plating_station)",
-        "move_container (bowl, from=plating_station, to=cooking_station)",
-        "unload (chicken, pan, cooking_station)",
-        "load (chicken, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (chicken, bowl, plating_station)",
-        "load (chicken, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pot, from=cooking_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_fish_rice_plate(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (pan, from=storage, to=cooking_station)",
-        "load (rice, bowl, storage)",
-        "move_container (bowl, from=storage, to=cooking_station)",
-        "unload (rice, bowl, cooking_station)",
-        "load (rice, pot, cooking_station)",
-        "transfer (fish, from=storage, to=prep_station)",
-        "season (fish, garlic, prep_station)",
-        "transfer (fish, from=prep_station, to=cooking_station)",
-        "load (fish, pan, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "cook_contents (pan, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "unload (rice, pot, cooking_station)",
-        "load (rice, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (rice, bowl, plating_station)",
-        "load (rice, plate, plating_station)",
-        "move_container (bowl, from=plating_station, to=cooking_station)",
-        "unload (fish, pan, cooking_station)",
-        "load (fish, bowl, cooking_station)",
-        "move_container (bowl, from=cooking_station, to=plating_station)",
-        "unload (fish, bowl, plating_station)",
-        "load (fish, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "transfer (pot, from=cooking_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (pan, from=cooking_station, to=washing_station)",
-        "wash (pan, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_yoghurt_fruit_bowl(self): return [
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (banana, from=storage, to=prep_station)",
-        "transfer (strawberries, from=storage, to=prep_station)",
-        "transfer (yoghurt, from=storage, to=prep_station)",
-        "cut (banana, prep_station)",
-        "load (banana, bowl, prep_station)",
-        "cut (strawberries, prep_station)",
-        "load (strawberries, bowl, prep_station)",
-        "load (yoghurt, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (bowl, from=prep_station, to=plating_station)",
-        "unload (mixture, bowl, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (plate, from=serving_station, to=washing_station)",
-        "wash (plate, washing_station)",
-        "transfer (bowl, from=plating_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
-
-    def generate_rice_mushroom_bowl(self): return [
-        "transfer (pot, from=storage, to=cooking_station)",
-        "transfer (bowl, from=storage, to=prep_station)",
-        "transfer (rice, from=storage, to=prep_station)",
-        "load (rice, bowl, prep_station)",
-        "transfer (mushroom, from=storage, to=prep_station)",
-        "cut (mushroom, prep_station)",
-        "load (mushroom, bowl, prep_station)",
-        "combine (bowl, prep_station)",
-        "season_container (bowl, spice2, prep_station)",
-        "move_container (bowl, from=prep_station, to=cooking_station)",
-        "unload (mixture, bowl, cooking_station)",
-        "load (mixture, pot, cooking_station)",
-        "turn_on (stove, cooking_station)",
-        "cook_contents (pot, cooking_station)",
-        "turn_off (stove, cooking_station)",
-        "transfer (plate, from=storage, to=plating_station)",
-        "move_container (pot, from=cooking_station, to=plating_station)",
-        "unload (mixture, pot, plating_station)",
-        "load (mixture, plate, plating_station)",
-        "move_container (plate, from=plating_station, to=serving_station)",
-        "serve (plate, serving_station)",
-        "move_container (pot, from=plating_station, to=washing_station)",
-        "wash (pot, washing_station)",
-        "transfer (bowl, from=cooking_station, to=washing_station)",
-        "wash (bowl, washing_station)"]
+RECIPES = {'tomato_onion_soup': ('transfer (pot, from=storage, to=cooking_station)',
+                          'transfer (bowl, from=storage, to=prep_station)',
+                          'transfer (tomato, from=storage, to=prep_station)',
+                          'cut (tomato, prep_station)',
+                          'load (tomato, bowl, prep_station)',
+                          'transfer (onion, from=storage, to=prep_station)',
+                          'cut (onion, prep_station)',
+                          'load (onion, bowl, prep_station)',
+                          'combine (bowl, prep_station)',
+                          'move_container (bowl, from=prep_station, to=cooking_station)',
+                          'unload (mixture, bowl, cooking_station)',
+                          'load (mixture, pot, cooking_station)',
+                          'turn_on (stove, cooking_station)',
+                          'cook_contents (pot, cooking_station)',
+                          'turn_off (stove, cooking_station)',
+                          'transfer (plate, from=storage, to=plating_station)',
+                          'move_container (pot, from=cooking_station, to=plating_station)',
+                          'unload (mixture, pot, plating_station)',
+                          'load (mixture, plate, plating_station)',
+                          'move_container (plate, from=plating_station, to=serving_station)',
+                          'serve (plate, serving_station)',
+                          'move_container (pot, from=plating_station, to=washing_station)',
+                          'wash (pot, washing_station)',
+                          'transfer (bowl, from=cooking_station, to=washing_station)',
+                          'wash (bowl, washing_station)'),
+ 'tomato_soup': ('transfer (pot, from=storage, to=cooking_station)',
+                 'transfer (bowl, from=storage, to=prep_station)',
+                 'turn_on (stove, cooking_station)',
+                 'transfer (tomato, from=storage, to=prep_station)',
+                 'cut (tomato, prep_station)',
+                 'load (tomato, bowl, prep_station)',
+                 'move_container (bowl, from=prep_station, to=cooking_station)',
+                 'unload (tomato, bowl, cooking_station)',
+                 'load (tomato, pot, cooking_station)',
+                 'cook_contents (pot, cooking_station)',
+                 'turn_off (stove, cooking_station)',
+                 'transfer (plate, from=storage, to=plating_station)',
+                 'unload (tomato, pot, cooking_station)',
+                 'load (tomato, bowl, cooking_station)',
+                 'move_container (bowl, from=cooking_station, to=plating_station)',
+                 'unload (tomato, bowl, plating_station)',
+                 'load (tomato, plate, plating_station)',
+                 'move_container (plate, from=plating_station, to=serving_station)',
+                 'serve (plate, serving_station)',
+                 'transfer (pot, from=cooking_station, to=washing_station)',
+                 'wash (pot, washing_station)',
+                 'transfer (bowl, from=plating_station, to=washing_station)',
+                 'wash (bowl, washing_station)'),
+ 'mushroom_soup': ('transfer (pot, from=storage, to=cooking_station)',
+                   'transfer (bowl, from=storage, to=prep_station)',
+                   'transfer (mushroom, from=storage, to=prep_station)',
+                   'cut (mushroom, prep_station)',
+                   'load (mushroom, bowl, prep_station)',
+                   'transfer (onion, from=storage, to=prep_station)',
+                   'cut (onion, prep_station)',
+                   'load (onion, bowl, prep_station)',
+                   'combine (bowl, prep_station)',
+                   'move_container (bowl, from=prep_station, to=cooking_station)',
+                   'unload (mixture, bowl, cooking_station)',
+                   'load (mixture, pot, cooking_station)',
+                   'turn_on (stove, cooking_station)',
+                   'cook_contents (pot, cooking_station)',
+                   'turn_off (stove, cooking_station)',
+                   'transfer (plate, from=storage, to=plating_station)',
+                   'move_container (pot, from=cooking_station, to=plating_station)',
+                   'unload (mixture, pot, plating_station)',
+                   'load (mixture, plate, plating_station)',
+                   'move_container (plate, from=plating_station, to=serving_station)',
+                   'serve (plate, serving_station)',
+                   'move_container (pot, from=plating_station, to=washing_station)',
+                   'wash (pot, washing_station)',
+                   'transfer (bowl, from=cooking_station, to=washing_station)',
+                   'wash (bowl, washing_station)'),
+ 'seasoned_mixture_soup': ('transfer (pot, from=storage, to=cooking_station)',
+                           'transfer (bowl, from=storage, to=prep_station)',
+                           'transfer (tomato, from=storage, to=prep_station)',
+                           'cut (tomato, prep_station)',
+                           'load (tomato, bowl, prep_station)',
+                           'transfer (onion, from=storage, to=prep_station)',
+                           'cut (onion, prep_station)',
+                           'load (onion, bowl, prep_station)',
+                           'combine (bowl, prep_station)',
+                           'season_container (bowl, salt, prep_station)',
+                           'season_container (bowl, spice1, prep_station)',
+                           'move_container (bowl, from=prep_station, to=cooking_station)',
+                           'unload (mixture, bowl, cooking_station)',
+                           'load (mixture, pot, cooking_station)',
+                           'turn_on (stove, cooking_station)',
+                           'cook_contents (pot, cooking_station)',
+                           'turn_off (stove, cooking_station)',
+                           'transfer (plate, from=storage, to=plating_station)',
+                           'move_container (pot, from=cooking_station, to=plating_station)',
+                           'unload (mixture, pot, plating_station)',
+                           'load (mixture, plate, plating_station)',
+                           'move_container (plate, from=plating_station, to=serving_station)',
+                           'serve (plate, serving_station)',
+                           'move_container (pot, from=plating_station, to=washing_station)',
+                           'wash (pot, washing_station)',
+                           'transfer (bowl, from=cooking_station, to=washing_station)',
+                           'wash (bowl, washing_station)'),
+ 'grilled_steak': ('transfer (pan, from=storage, to=cooking_station)',
+                   'load (meat, bowl, storage)',
+                   'move_container (bowl, from=storage, to=cooking_station)',
+                   'unload (meat, bowl, cooking_station)',
+                   'load (meat, pan, cooking_station)',
+                   'turn_on (stove, cooking_station)',
+                   'cook_contents (pan, cooking_station)',
+                   'turn_off (stove, cooking_station)',
+                   'transfer (plate, from=storage, to=plating_station)',
+                   'unload (meat, pan, cooking_station)',
+                   'load (meat, bowl, cooking_station)',
+                   'move_container (bowl, from=cooking_station, to=plating_station)',
+                   'unload (meat, bowl, plating_station)',
+                   'load (meat, plate, plating_station)',
+                   'move_container (plate, from=plating_station, to=serving_station)',
+                   'serve (plate, serving_station)',
+                   'transfer (pan, from=cooking_station, to=washing_station)',
+                   'wash (pan, washing_station)',
+                   'transfer (bowl, from=plating_station, to=washing_station)',
+                   'wash (bowl, washing_station)'),
+ 'burger': ('transfer (pan, from=storage, to=cooking_station)',
+            'load (meat, bowl, storage)',
+            'move_container (bowl, from=storage, to=cooking_station)',
+            'unload (meat, bowl, cooking_station)',
+            'load (meat, pan, cooking_station)',
+            'turn_on (stove, cooking_station)',
+            'cook_contents (pan, cooking_station)',
+            'turn_off (stove, cooking_station)',
+            'transfer (plate, from=storage, to=plating_station)',
+            'unload (meat, pan, cooking_station)',
+            'load (meat, bowl, cooking_station)',
+            'move_container (bowl, from=cooking_station, to=plating_station)',
+            'unload (meat, bowl, plating_station)',
+            'load (meat, plate, plating_station)',
+            'transfer (lettuce, from=storage, to=prep_station)',
+            'move_container (bowl, from=plating_station, to=prep_station)',
+            'cut (lettuce, prep_station)',
+            'load (lettuce, bowl, prep_station)',
+            'move_container (bowl, from=prep_station, to=plating_station)',
+            'unload (lettuce, bowl, plating_station)',
+            'load (lettuce, plate, plating_station)',
+            'move_container (plate, from=plating_station, to=serving_station)',
+            'serve (plate, serving_station)',
+            'transfer (pan, from=cooking_station, to=washing_station)',
+            'wash (pan, washing_station)',
+            'transfer (bowl, from=plating_station, to=washing_station)',
+            'wash (bowl, washing_station)'),
+ 'seasoned_chicken': ('transfer (pan, from=storage, to=cooking_station)',
+                      'transfer (bowl, from=storage, to=prep_station)',
+                      'transfer (chicken, from=storage, to=prep_station)',
+                      'season (chicken, salt, prep_station)',
+                      'season (chicken, spice1, prep_station)',
+                      'load (chicken, bowl, prep_station)',
+                      'move_container (bowl, from=prep_station, to=cooking_station)',
+                      'unload (chicken, bowl, cooking_station)',
+                      'load (chicken, pan, cooking_station)',
+                      'turn_on (stove, cooking_station)',
+                      'cook_contents (pan, cooking_station)',
+                      'turn_off (stove, cooking_station)',
+                      'transfer (plate, from=storage, to=plating_station)',
+                      'unload (chicken, pan, cooking_station)',
+                      'load (chicken, bowl, cooking_station)',
+                      'move_container (bowl, from=cooking_station, to=plating_station)',
+                      'unload (chicken, bowl, plating_station)',
+                      'load (chicken, plate, plating_station)',
+                      'move_container (plate, from=plating_station, to=serving_station)',
+                      'serve (plate, serving_station)',
+                      'transfer (pan, from=cooking_station, to=washing_station)',
+                      'wash (pan, washing_station)',
+                      'transfer (bowl, from=plating_station, to=washing_station)',
+                      'wash (bowl, washing_station)'),
+ 'garlic_fish': ('transfer (pan, from=storage, to=cooking_station)',
+                 'transfer (bowl, from=storage, to=prep_station)',
+                 'transfer (fish, from=storage, to=prep_station)',
+                 'season (fish, garlic, prep_station)',
+                 'season (fish, spice2, prep_station)',
+                 'load (fish, bowl, prep_station)',
+                 'move_container (bowl, from=prep_station, to=cooking_station)',
+                 'unload (fish, bowl, cooking_station)',
+                 'load (fish, pan, cooking_station)',
+                 'turn_on (stove, cooking_station)',
+                 'cook_contents (pan, cooking_station)',
+                 'turn_off (stove, cooking_station)',
+                 'transfer (plate, from=storage, to=plating_station)',
+                 'unload (fish, pan, cooking_station)',
+                 'load (fish, bowl, cooking_station)',
+                 'move_container (bowl, from=cooking_station, to=plating_station)',
+                 'unload (fish, bowl, plating_station)',
+                 'load (fish, plate, plating_station)',
+                 'move_container (plate, from=plating_station, to=serving_station)',
+                 'serve (plate, serving_station)',
+                 'transfer (pan, from=cooking_station, to=washing_station)',
+                 'wash (pan, washing_station)',
+                 'transfer (bowl, from=plating_station, to=washing_station)',
+                 'wash (bowl, washing_station)'),
+ 'simple_salad': ('transfer (bowl, from=storage, to=prep_station)',
+                  'transfer (lettuce, from=storage, to=prep_station)',
+                  'transfer (onion, from=storage, to=prep_station)',
+                  'cut (lettuce, prep_station)',
+                  'load (lettuce, bowl, prep_station)',
+                  'cut (onion, prep_station)',
+                  'load (onion, bowl, prep_station)',
+                  'combine (bowl, prep_station)',
+                  'transfer (plate, from=storage, to=plating_station)',
+                  'move_container (bowl, from=prep_station, to=plating_station)',
+                  'unload (mixture, bowl, plating_station)',
+                  'load (mixture, plate, plating_station)',
+                  'move_container (plate, from=plating_station, to=serving_station)',
+                  'serve (plate, serving_station)',
+                  'move_container (plate, from=serving_station, to=washing_station)',
+                  'wash (plate, washing_station)',
+                  'transfer (bowl, from=plating_station, to=washing_station)',
+                  'wash (bowl, washing_station)'),
+ 'grated_cheese_salad': ('transfer (bowl, from=storage, to=prep_station)',
+                         'transfer (lettuce, from=storage, to=prep_station)',
+                         'transfer (cheese, from=storage, to=prep_station)',
+                         'cut (lettuce, prep_station)',
+                         'load (lettuce, bowl, prep_station)',
+                         'grate (cheese, prep_station)',
+                         'load (cheese, bowl, prep_station)',
+                         'combine (bowl, prep_station)',
+                         'transfer (plate, from=storage, to=plating_station)',
+                         'move_container (bowl, from=prep_station, to=plating_station)',
+                         'unload (mixture, bowl, plating_station)',
+                         'load (mixture, plate, plating_station)',
+                         'move_container (plate, from=plating_station, to=serving_station)',
+                         'serve (plate, serving_station)',
+                         'move_container (plate, from=serving_station, to=washing_station)',
+                         'wash (plate, washing_station)',
+                         'transfer (bowl, from=plating_station, to=washing_station)',
+                         'wash (bowl, washing_station)'),
+ 'smoothie': ('transfer (banana, from=storage, to=prep_station)',
+              'transfer (strawberries, from=storage, to=prep_station)',
+              'cut (banana, prep_station)',
+              'transfer (banana, from=prep_station, to=blending_station)',
+              'cut (strawberries, prep_station)',
+              'transfer (strawberries, from=prep_station, to=blending_station)',
+              'transfer (milk, from=storage, to=blending_station)',
+              'transfer (glass, from=storage, to=blending_station)',
+              'transfer (measuring_cup, from=storage, to=blending_station)',
+              'load (milk, measuring_cup, blending_station)',
+              'pour (milk, measuring_cup, glass, blending_station)',
+              'load (banana, glass, blending_station)',
+              'load (strawberries, glass, blending_station)',
+              'turn_on (blender, blending_station)',
+              'blend (glass, blending_station)',
+              'turn_off (blender, blending_station)',
+              'transfer (glass, from=blending_station, to=serving_station)',
+              'serve (glass, serving_station)',
+              'transfer (measuring_cup, from=blending_station, to=washing_station)',
+              'wash (measuring_cup, washing_station)'),
+ 'yoghurt_smoothie': ('transfer (banana, from=storage, to=prep_station)',
+                      'transfer (yoghurt, from=storage, to=blending_station)',
+                      'cut (banana, prep_station)',
+                      'transfer (banana, from=prep_station, to=blending_station)',
+                      'transfer (glass, from=storage, to=blending_station)',
+                      'load (yoghurt, glass, blending_station)',
+                      'transfer (milk, from=storage, to=blending_station)',
+                      'transfer (measuring_cup, from=storage, to=blending_station)',
+                      'load (milk, measuring_cup, blending_station)',
+                      'pour (milk, measuring_cup, glass, blending_station)',
+                      'load (banana, glass, blending_station)',
+                      'turn_on (blender, blending_station)',
+                      'blend (glass, blending_station)',
+                      'turn_off (blender, blending_station)',
+                      'transfer (glass, from=blending_station, to=serving_station)',
+                      'serve (glass, serving_station)',
+                      'transfer (measuring_cup, from=blending_station, to=washing_station)',
+                      'wash (measuring_cup, washing_station)'),
+ 'boiled_eggs': ('transfer (pot, from=storage, to=cooking_station)',
+                 'load (egg, bowl, storage)',
+                 'move_container (bowl, from=storage, to=cooking_station)',
+                 'unload (egg, bowl, cooking_station)',
+                 'load (egg, pot, cooking_station)',
+                 'turn_on (stove, cooking_station)',
+                 'cook_contents (pot, cooking_station)',
+                 'turn_off (stove, cooking_station)',
+                 'transfer (plate, from=storage, to=plating_station)',
+                 'move_container (pot, from=cooking_station, to=plating_station)',
+                 'unload (egg, pot, plating_station)',
+                 'load (egg, plate, plating_station)',
+                 'move_container (plate, from=plating_station, to=serving_station)',
+                 'serve (plate, serving_station)',
+                 'transfer (pot, from=plating_station, to=washing_station)',
+                 'wash (pot, washing_station)',
+                 'transfer (bowl, from=cooking_station, to=washing_station)',
+                 'wash (bowl, washing_station)'),
+ 'boiled_rice': ('transfer (pot, from=storage, to=cooking_station)',
+                 'load (rice, bowl, storage)',
+                 'move_container (bowl, from=storage, to=cooking_station)',
+                 'unload (rice, bowl, cooking_station)',
+                 'turn_on (stove, cooking_station)',
+                 'load (rice, pot, cooking_station)',
+                 'cook_contents (pot, cooking_station)',
+                 'turn_off (stove, cooking_station)',
+                 'transfer (plate, from=storage, to=plating_station)',
+                 'unload (rice, pot, cooking_station)',
+                 'load (rice, bowl, cooking_station)',
+                 'move_container (bowl, from=cooking_station, to=plating_station)',
+                 'unload (rice, bowl, plating_station)',
+                 'load (rice, plate, plating_station)',
+                 'move_container (plate, from=plating_station, to=serving_station)',
+                 'serve (plate, serving_station)',
+                 'transfer (pot, from=cooking_station, to=washing_station)',
+                 'wash (pot, washing_station)',
+                 'transfer (bowl, from=plating_station, to=washing_station)',
+                 'wash (bowl, washing_station)'),
+ 'tomato_garlic_soup': ('transfer (pot, from=storage, to=cooking_station)',
+                        'transfer (bowl, from=storage, to=prep_station)',
+                        'transfer (tomato, from=storage, to=prep_station)',
+                        'cut (tomato, prep_station)',
+                        'season (tomato, garlic, prep_station)',
+                        'load (tomato, bowl, prep_station)',
+                        'move_container (bowl, from=prep_station, to=cooking_station)',
+                        'unload (tomato, bowl, cooking_station)',
+                        'load (tomato, pot, cooking_station)',
+                        'turn_on (stove, cooking_station)',
+                        'cook_contents (pot, cooking_station)',
+                        'turn_off (stove, cooking_station)',
+                        'transfer (plate, from=storage, to=plating_station)',
+                        'unload (tomato, pot, cooking_station)',
+                        'load (tomato, bowl, cooking_station)',
+                        'move_container (bowl, from=cooking_station, to=plating_station)',
+                        'unload (tomato, bowl, plating_station)',
+                        'load (tomato, plate, plating_station)',
+                        'move_container (plate, from=plating_station, to=serving_station)',
+                        'serve (plate, serving_station)',
+                        'transfer (pot, from=cooking_station, to=washing_station)',
+                        'wash (pot, washing_station)',
+                        'transfer (bowl, from=plating_station, to=washing_station)',
+                        'wash (bowl, washing_station)'),
+ 'mushroom_garlic_soup': ('transfer (pot, from=storage, to=cooking_station)',
+                          'transfer (bowl, from=storage, to=prep_station)',
+                          'transfer (mushroom, from=storage, to=prep_station)',
+                          'cut (mushroom, prep_station)',
+                          'season (mushroom, garlic, prep_station)',
+                          'load (mushroom, bowl, prep_station)',
+                          'move_container (bowl, from=prep_station, to=cooking_station)',
+                          'unload (mushroom, bowl, cooking_station)',
+                          'load (mushroom, pot, cooking_station)',
+                          'turn_on (stove, cooking_station)',
+                          'cook_contents (pot, cooking_station)',
+                          'turn_off (stove, cooking_station)',
+                          'transfer (plate, from=storage, to=plating_station)',
+                          'unload (mushroom, pot, cooking_station)',
+                          'load (mushroom, bowl, cooking_station)',
+                          'move_container (bowl, from=cooking_station, to=plating_station)',
+                          'unload (mushroom, bowl, plating_station)',
+                          'load (mushroom, plate, plating_station)',
+                          'move_container (plate, from=plating_station, to=serving_station)',
+                          'serve (plate, serving_station)',
+                          'transfer (pot, from=cooking_station, to=washing_station)',
+                          'wash (pot, washing_station)',
+                          'transfer (bowl, from=plating_station, to=washing_station)',
+                          'wash (bowl, washing_station)'),
+ 'tomato_mushroom_soup': ('transfer (pot, from=storage, to=cooking_station)',
+                          'transfer (bowl, from=storage, to=prep_station)',
+                          'transfer (tomato, from=storage, to=prep_station)',
+                          'cut (tomato, prep_station)',
+                          'load (tomato, bowl, prep_station)',
+                          'transfer (mushroom, from=storage, to=prep_station)',
+                          'cut (mushroom, prep_station)',
+                          'load (mushroom, bowl, prep_station)',
+                          'combine (bowl, prep_station)',
+                          'move_container (bowl, from=prep_station, to=cooking_station)',
+                          'unload (mixture, bowl, cooking_station)',
+                          'load (mixture, pot, cooking_station)',
+                          'turn_on (stove, cooking_station)',
+                          'cook_contents (pot, cooking_station)',
+                          'turn_off (stove, cooking_station)',
+                          'transfer (plate, from=storage, to=plating_station)',
+                          'move_container (pot, from=cooking_station, to=plating_station)',
+                          'unload (mixture, pot, plating_station)',
+                          'load (mixture, plate, plating_station)',
+                          'move_container (plate, from=plating_station, to=serving_station)',
+                          'serve (plate, serving_station)',
+                          'move_container (pot, from=plating_station, to=washing_station)',
+                          'wash (pot, washing_station)',
+                          'transfer (bowl, from=cooking_station, to=washing_station)',
+                          'wash (bowl, washing_station)'),
+ 'onion_rice_pot': ('transfer (pot, from=storage, to=cooking_station)',
+                    'transfer (bowl, from=storage, to=prep_station)',
+                    'transfer (rice, from=storage, to=prep_station)',
+                    'load (rice, bowl, prep_station)',
+                    'transfer (onion, from=storage, to=prep_station)',
+                    'cut (onion, prep_station)',
+                    'load (onion, bowl, prep_station)',
+                    'combine (bowl, prep_station)',
+                    'move_container (bowl, from=prep_station, to=cooking_station)',
+                    'unload (mixture, bowl, cooking_station)',
+                    'load (mixture, pot, cooking_station)',
+                    'turn_on (stove, cooking_station)',
+                    'cook_contents (pot, cooking_station)',
+                    'turn_off (stove, cooking_station)',
+                    'transfer (plate, from=storage, to=plating_station)',
+                    'move_container (pot, from=cooking_station, to=plating_station)',
+                    'unload (mixture, pot, plating_station)',
+                    'load (mixture, plate, plating_station)',
+                    'move_container (plate, from=plating_station, to=serving_station)',
+                    'serve (plate, serving_station)',
+                    'move_container (pot, from=plating_station, to=washing_station)',
+                    'wash (pot, washing_station)',
+                    'transfer (bowl, from=cooking_station, to=washing_station)',
+                    'wash (bowl, washing_station)'),
+ 'tomato_cheese_salad': ('transfer (bowl, from=storage, to=prep_station)',
+                         'transfer (tomato, from=storage, to=prep_station)',
+                         'transfer (cheese, from=storage, to=prep_station)',
+                         'cut (tomato, prep_station)',
+                         'load (tomato, bowl, prep_station)',
+                         'grate (cheese, prep_station)',
+                         'load (cheese, bowl, prep_station)',
+                         'combine (bowl, prep_station)',
+                         'transfer (plate, from=storage, to=plating_station)',
+                         'move_container (bowl, from=prep_station, to=plating_station)',
+                         'unload (mixture, bowl, plating_station)',
+                         'load (mixture, plate, plating_station)',
+                         'move_container (plate, from=plating_station, to=serving_station)',
+                         'serve (plate, serving_station)',
+                         'move_container (plate, from=serving_station, to=washing_station)',
+                         'wash (plate, washing_station)',
+                         'transfer (bowl, from=plating_station, to=washing_station)',
+                         'wash (bowl, washing_station)'),
+ 'tomato_lettuce_salad': ('transfer (bowl, from=storage, to=prep_station)',
+                          'transfer (tomato, from=storage, to=prep_station)',
+                          'transfer (lettuce, from=storage, to=prep_station)',
+                          'cut (tomato, prep_station)',
+                          'load (tomato, bowl, prep_station)',
+                          'cut (lettuce, prep_station)',
+                          'load (lettuce, bowl, prep_station)',
+                          'combine (bowl, prep_station)',
+                          'transfer (plate, from=storage, to=plating_station)',
+                          'move_container (bowl, from=prep_station, to=plating_station)',
+                          'unload (mixture, bowl, plating_station)',
+                          'load (mixture, plate, plating_station)',
+                          'move_container (plate, from=plating_station, to=serving_station)',
+                          'serve (plate, serving_station)',
+                          'move_container (plate, from=serving_station, to=washing_station)',
+                          'wash (plate, washing_station)',
+                          'transfer (bowl, from=plating_station, to=washing_station)',
+                          'wash (bowl, washing_station)'),
+ 'banana_strawberry_fruit_bowl': ('transfer (bowl, from=storage, to=prep_station)',
+                                  'transfer (banana, from=storage, to=prep_station)',
+                                  'transfer (strawberries, from=storage, to=prep_station)',
+                                  'cut (banana, prep_station)',
+                                  'load (banana, bowl, prep_station)',
+                                  'cut (strawberries, prep_station)',
+                                  'load (strawberries, bowl, prep_station)',
+                                  'combine (bowl, prep_station)',
+                                  'transfer (plate, from=storage, to=plating_station)',
+                                  'move_container (bowl, from=prep_station, to=plating_station)',
+                                  'unload (mixture, bowl, plating_station)',
+                                  'load (mixture, plate, plating_station)',
+                                  'move_container (plate, from=plating_station, '
+                                  'to=serving_station)',
+                                  'serve (plate, serving_station)',
+                                  'move_container (plate, from=serving_station, '
+                                  'to=washing_station)',
+                                  'wash (plate, washing_station)',
+                                  'transfer (bowl, from=plating_station, to=washing_station)',
+                                  'wash (bowl, washing_station)'),
+ 'oil_tomato_salad': ('transfer (bowl, from=storage, to=prep_station)',
+                      'transfer (measuring_cup, from=storage, to=prep_station)',
+                      'transfer (oil, from=storage, to=prep_station)',
+                      'load (oil, measuring_cup, prep_station)',
+                      'pour (oil, measuring_cup, bowl, prep_station)',
+                      'transfer (tomato, from=storage, to=prep_station)',
+                      'cut (tomato, prep_station)',
+                      'load (tomato, bowl, prep_station)',
+                      'transfer (lettuce, from=storage, to=prep_station)',
+                      'cut (lettuce, prep_station)',
+                      'load (lettuce, bowl, prep_station)',
+                      'combine (bowl, prep_station)',
+                      'transfer (plate, from=storage, to=plating_station)',
+                      'move_container (bowl, from=prep_station, to=plating_station)',
+                      'unload (mixture, bowl, plating_station)',
+                      'load (mixture, plate, plating_station)',
+                      'move_container (plate, from=plating_station, to=serving_station)',
+                      'serve (plate, serving_station)',
+                      'transfer (measuring_cup, from=prep_station, to=washing_station)',
+                      'wash (measuring_cup, washing_station)',
+                      'transfer (bowl, from=plating_station, to=washing_station)',
+                      'wash (bowl, washing_station)'),
+ 'scrambled_eggs_pan': ('transfer (pan, from=storage, to=cooking_station)',
+                        'transfer (bowl, from=storage, to=prep_station)',
+                        'transfer (egg, from=storage, to=prep_station)',
+                        'season (egg, salt, prep_station)',
+                        'load (egg, bowl, prep_station)',
+                        'move_container (bowl, from=prep_station, to=cooking_station)',
+                        'unload (egg, bowl, cooking_station)',
+                        'load (egg, pan, cooking_station)',
+                        'turn_on (stove, cooking_station)',
+                        'cook_contents (pan, cooking_station)',
+                        'turn_off (stove, cooking_station)',
+                        'transfer (plate, from=storage, to=plating_station)',
+                        'unload (egg, pan, cooking_station)',
+                        'load (egg, bowl, cooking_station)',
+                        'move_container (bowl, from=cooking_station, to=plating_station)',
+                        'unload (egg, bowl, plating_station)',
+                        'load (egg, plate, plating_station)',
+                        'move_container (plate, from=plating_station, to=serving_station)',
+                        'serve (plate, serving_station)',
+                        'transfer (pan, from=cooking_station, to=washing_station)',
+                        'wash (pan, washing_station)',
+                        'transfer (bowl, from=plating_station, to=washing_station)',
+                        'wash (bowl, washing_station)'),
+ 'mushroom_omelette': ('transfer (pan, from=storage, to=cooking_station)',
+                       'transfer (bowl, from=storage, to=prep_station)',
+                       'transfer (egg, from=storage, to=prep_station)',
+                       'load (egg, bowl, prep_station)',
+                       'transfer (mushroom, from=storage, to=prep_station)',
+                       'cut (mushroom, prep_station)',
+                       'load (mushroom, bowl, prep_station)',
+                       'combine (bowl, prep_station)',
+                       'move_container (bowl, from=prep_station, to=cooking_station)',
+                       'unload (mixture, bowl, cooking_station)',
+                       'load (mixture, pan, cooking_station)',
+                       'turn_on (stove, cooking_station)',
+                       'cook_contents (pan, cooking_station)',
+                       'turn_off (stove, cooking_station)',
+                       'transfer (plate, from=storage, to=plating_station)',
+                       'unload (mixture, pan, cooking_station)',
+                       'load (mixture, bowl, cooking_station)',
+                       'move_container (bowl, from=cooking_station, to=plating_station)',
+                       'unload (mixture, bowl, plating_station)',
+                       'load (mixture, plate, plating_station)',
+                       'move_container (plate, from=plating_station, to=serving_station)',
+                       'serve (plate, serving_station)',
+                       'transfer (pan, from=cooking_station, to=washing_station)',
+                       'wash (pan, washing_station)',
+                       'transfer (bowl, from=plating_station, to=washing_station)',
+                       'wash (bowl, washing_station)'),
+ 'meat_mushroom_skillet': ('transfer (pan, from=storage, to=cooking_station)',
+                           'load (meat, bowl, storage)',
+                           'move_container (bowl, from=storage, to=cooking_station)',
+                           'unload (meat, bowl, cooking_station)',
+                           'load (meat, pan, cooking_station)',
+                           'transfer (mushroom, from=storage, to=prep_station)',
+                           'cut (mushroom, prep_station)',
+                           'move_container (bowl, from=cooking_station, to=prep_station)',
+                           'load (mushroom, bowl, prep_station)',
+                           'move_container (bowl, from=prep_station, to=cooking_station)',
+                           'unload (mushroom, bowl, cooking_station)',
+                           'load (mushroom, pan, cooking_station)',
+                           'season_container (pan, spice1, cooking_station)',
+                           'turn_on (stove, cooking_station)',
+                           'cook_contents (pan, cooking_station)',
+                           'turn_off (stove, cooking_station)',
+                           'transfer (plate, from=storage, to=plating_station)',
+                           'unload (meat, pan, cooking_station)',
+                           'load (meat, bowl, cooking_station)',
+                           'move_container (bowl, from=cooking_station, to=plating_station)',
+                           'unload (meat, bowl, plating_station)',
+                           'load (meat, plate, plating_station)',
+                           'move_container (bowl, from=plating_station, to=cooking_station)',
+                           'unload (mushroom, pan, cooking_station)',
+                           'load (mushroom, bowl, cooking_station)',
+                           'move_container (bowl, from=cooking_station, to=plating_station)',
+                           'unload (mushroom, bowl, plating_station)',
+                           'load (mushroom, plate, plating_station)',
+                           'move_container (plate, from=plating_station, to=serving_station)',
+                           'serve (plate, serving_station)',
+                           'transfer (pan, from=cooking_station, to=washing_station)',
+                           'wash (pan, washing_station)',
+                           'transfer (bowl, from=plating_station, to=washing_station)',
+                           'wash (bowl, washing_station)'),
+ 'garlic_chicken_salad': ('transfer (pan, from=storage, to=cooking_station)',
+                          'transfer (bowl, from=storage, to=prep_station)',
+                          'transfer (chicken, from=storage, to=prep_station)',
+                          'season (chicken, garlic, prep_station)',
+                          'season (chicken, spice1, prep_station)',
+                          'load (chicken, bowl, prep_station)',
+                          'move_container (bowl, from=prep_station, to=cooking_station)',
+                          'unload (chicken, bowl, cooking_station)',
+                          'load (chicken, pan, cooking_station)',
+                          'turn_on (stove, cooking_station)',
+                          'cook_contents (pan, cooking_station)',
+                          'turn_off (stove, cooking_station)',
+                          'transfer (plate, from=storage, to=plating_station)',
+                          'unload (chicken, pan, cooking_station)',
+                          'load (chicken, bowl, cooking_station)',
+                          'move_container (bowl, from=cooking_station, to=plating_station)',
+                          'unload (chicken, bowl, plating_station)',
+                          'load (chicken, plate, plating_station)',
+                          'transfer (lettuce, from=storage, to=prep_station)',
+                          'move_container (bowl, from=plating_station, to=prep_station)',
+                          'cut (lettuce, prep_station)',
+                          'load (lettuce, bowl, prep_station)',
+                          'move_container (bowl, from=prep_station, to=plating_station)',
+                          'unload (lettuce, bowl, plating_station)',
+                          'load (lettuce, plate, plating_station)',
+                          'move_container (plate, from=plating_station, to=serving_station)',
+                          'serve (plate, serving_station)',
+                          'transfer (pan, from=cooking_station, to=washing_station)',
+                          'wash (pan, washing_station)',
+                          'transfer (bowl, from=plating_station, to=washing_station)',
+                          'wash (bowl, washing_station)'),
+ 'chicken_rice_plate': ('transfer (pot, from=storage, to=cooking_station)',
+                        'transfer (pan, from=storage, to=cooking_station)',
+                        'load (rice, bowl, storage)',
+                        'move_container (bowl, from=storage, to=cooking_station)',
+                        'unload (rice, bowl, cooking_station)',
+                        'load (rice, pot, cooking_station)',
+                        'transfer (chicken, from=storage, to=prep_station)',
+                        'season (chicken, salt, prep_station)',
+                        'transfer (chicken, from=prep_station, to=cooking_station)',
+                        'load (chicken, pan, cooking_station)',
+                        'turn_on (stove, cooking_station)',
+                        'cook_contents (pot, cooking_station)',
+                        'cook_contents (pan, cooking_station)',
+                        'turn_off (stove, cooking_station)',
+                        'transfer (plate, from=storage, to=plating_station)',
+                        'unload (rice, pot, cooking_station)',
+                        'load (rice, bowl, cooking_station)',
+                        'move_container (bowl, from=cooking_station, to=plating_station)',
+                        'unload (rice, bowl, plating_station)',
+                        'load (rice, plate, plating_station)',
+                        'move_container (bowl, from=plating_station, to=cooking_station)',
+                        'unload (chicken, pan, cooking_station)',
+                        'load (chicken, bowl, cooking_station)',
+                        'move_container (bowl, from=cooking_station, to=plating_station)',
+                        'unload (chicken, bowl, plating_station)',
+                        'load (chicken, plate, plating_station)',
+                        'move_container (plate, from=plating_station, to=serving_station)',
+                        'serve (plate, serving_station)',
+                        'transfer (pot, from=cooking_station, to=washing_station)',
+                        'wash (pot, washing_station)',
+                        'transfer (pan, from=cooking_station, to=washing_station)',
+                        'wash (pan, washing_station)',
+                        'transfer (bowl, from=plating_station, to=washing_station)',
+                        'wash (bowl, washing_station)'),
+ 'fish_rice_plate': ('transfer (pot, from=storage, to=cooking_station)',
+                     'transfer (pan, from=storage, to=cooking_station)',
+                     'load (rice, bowl, storage)',
+                     'move_container (bowl, from=storage, to=cooking_station)',
+                     'unload (rice, bowl, cooking_station)',
+                     'load (rice, pot, cooking_station)',
+                     'transfer (fish, from=storage, to=prep_station)',
+                     'season (fish, garlic, prep_station)',
+                     'transfer (fish, from=prep_station, to=cooking_station)',
+                     'load (fish, pan, cooking_station)',
+                     'turn_on (stove, cooking_station)',
+                     'cook_contents (pot, cooking_station)',
+                     'cook_contents (pan, cooking_station)',
+                     'turn_off (stove, cooking_station)',
+                     'transfer (plate, from=storage, to=plating_station)',
+                     'unload (rice, pot, cooking_station)',
+                     'load (rice, bowl, cooking_station)',
+                     'move_container (bowl, from=cooking_station, to=plating_station)',
+                     'unload (rice, bowl, plating_station)',
+                     'load (rice, plate, plating_station)',
+                     'move_container (bowl, from=plating_station, to=cooking_station)',
+                     'unload (fish, pan, cooking_station)',
+                     'load (fish, bowl, cooking_station)',
+                     'move_container (bowl, from=cooking_station, to=plating_station)',
+                     'unload (fish, bowl, plating_station)',
+                     'load (fish, plate, plating_station)',
+                     'move_container (plate, from=plating_station, to=serving_station)',
+                     'serve (plate, serving_station)',
+                     'transfer (pot, from=cooking_station, to=washing_station)',
+                     'wash (pot, washing_station)',
+                     'transfer (pan, from=cooking_station, to=washing_station)',
+                     'wash (pan, washing_station)',
+                     'transfer (bowl, from=plating_station, to=washing_station)',
+                     'wash (bowl, washing_station)'),
+ 'yoghurt_fruit_bowl': ('transfer (bowl, from=storage, to=prep_station)',
+                        'transfer (banana, from=storage, to=prep_station)',
+                        'transfer (strawberries, from=storage, to=prep_station)',
+                        'transfer (yoghurt, from=storage, to=prep_station)',
+                        'cut (banana, prep_station)',
+                        'load (banana, bowl, prep_station)',
+                        'cut (strawberries, prep_station)',
+                        'load (strawberries, bowl, prep_station)',
+                        'load (yoghurt, bowl, prep_station)',
+                        'combine (bowl, prep_station)',
+                        'transfer (plate, from=storage, to=plating_station)',
+                        'move_container (bowl, from=prep_station, to=plating_station)',
+                        'unload (mixture, bowl, plating_station)',
+                        'load (mixture, plate, plating_station)',
+                        'move_container (plate, from=plating_station, to=serving_station)',
+                        'serve (plate, serving_station)',
+                        'move_container (plate, from=serving_station, to=washing_station)',
+                        'wash (plate, washing_station)',
+                        'transfer (bowl, from=plating_station, to=washing_station)',
+                        'wash (bowl, washing_station)'),
+ 'rice_mushroom_bowl': ('transfer (pot, from=storage, to=cooking_station)',
+                        'transfer (bowl, from=storage, to=prep_station)',
+                        'transfer (rice, from=storage, to=prep_station)',
+                        'load (rice, bowl, prep_station)',
+                        'transfer (mushroom, from=storage, to=prep_station)',
+                        'cut (mushroom, prep_station)',
+                        'load (mushroom, bowl, prep_station)',
+                        'combine (bowl, prep_station)',
+                        'season_container (bowl, spice2, prep_station)',
+                        'move_container (bowl, from=prep_station, to=cooking_station)',
+                        'unload (mixture, bowl, cooking_station)',
+                        'load (mixture, pot, cooking_station)',
+                        'turn_on (stove, cooking_station)',
+                        'cook_contents (pot, cooking_station)',
+                        'turn_off (stove, cooking_station)',
+                        'transfer (plate, from=storage, to=plating_station)',
+                        'move_container (pot, from=cooking_station, to=plating_station)',
+                        'unload (mixture, pot, plating_station)',
+                        'load (mixture, plate, plating_station)',
+                        'move_container (plate, from=plating_station, to=serving_station)',
+                        'serve (plate, serving_station)',
+                        'move_container (pot, from=plating_station, to=washing_station)',
+                        'wash (pot, washing_station)',
+                        'transfer (bowl, from=cooking_station, to=washing_station)',
+                        'wash (bowl, washing_station)')}
 
 
-
-    def recipe_library(self):
-        """Ordered mapping of canonical recipe names to generator methods. Single source of truth for canonical recipe names used by the harness, evaluation code, and tests.
-        """
-        return {
-            "tomato_onion_soup_v1": self.generate_tomato_onion_soup_v1,
-            "tomato_soup": self.generate_tomato_soup,
-            "mushroom_soup": self.generate_mushroom_soup,
-            "seasoned_mixture_soup": self.generate_seasoned_mixture_soup,
-            "grilled_steak": self.generate_grilled_steak,
-            "burger": self.generate_burger,
-            "seasoned_chicken": self.generate_seasoned_chicken,
-            "garlic_fish": self.generate_garlic_fish,
-            "simple_salad": self.generate_simple_salad,
-            "grated_cheese_salad": self.generate_grated_cheese_salad,
-            "smoothie": self.generate_smoothie,
-            "yoghurt_smoothie": self.generate_yoghurt_smoothie,
-            "boiled_eggs": self.generate_boiled_eggs,
-            "boiled_rice": self.generate_boiled_rice,
-
-            "tomato_garlic_soup": self.generate_tomato_garlic_soup,
-            "mushroom_garlic_soup": self.generate_mushroom_garlic_soup,
-            "tomato_mushroom_soup": self.generate_tomato_mushroom_soup,
-            "onion_rice_pot": self.generate_onion_rice_pot,
-            "tomato_cheese_salad": self.generate_tomato_cheese_salad,
-            "tomato_lettuce_salad": self.generate_tomato_lettuce_salad,
-            "banana_strawberry_fruit_bowl": self.generate_banana_strawberry_fruit_bowl,
-            "oil_tomato_salad": self.generate_oil_tomato_salad,
-            "scrambled_eggs_pan": self.generate_scrambled_eggs_pan,
-            "mushroom_omelette": self.generate_mushroom_omelette,
-            "meat_mushroom_skillet": self.generate_meat_mushroom_skillet,
-            "garlic_chicken_salad": self.generate_garlic_chicken_salad,
-            "chicken_rice_plate": self.generate_chicken_rice_plate,
-            "fish_rice_plate": self.generate_fish_rice_plate,
-            "yoghurt_fruit_bowl": self.generate_yoghurt_fruit_bowl,
-            "rice_mushroom_bowl": self.generate_rice_mushroom_bowl,
-        }
-gen = RecipeGenerator()
+def recipe_builders():
+    """Return ordered builders that create fresh action lists."""
+    return {
+        name: (lambda actions=actions: list(actions))
+        for name, actions in RECIPES.items()
+    }

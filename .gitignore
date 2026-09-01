@@ -1,22 +1,19 @@
-.codex
-
+# Local tools and data
+.codex/
 prompts/
-venv/
 talents-zsc/
 eval_results/
 
-src/__pycache__
-tests/__pycache__
-# Virtual environments
-.venv/
+# Python environments and caches
+.venv-llm/
 .venv-*/
+.llm-*/
 venv/
 env/
-
-# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
+
 # Local cache/output
 .cache/
 results/

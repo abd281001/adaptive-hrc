@@ -1,14 +1,7 @@
-"""Environment sanity checks.
-
-These are intentionally light: the refactor moves the research
-contributions (decay, memory, disambiguation, agent) above the PDDL
-layer, so the environment is only required to (a) build a
-StateTracker, (b) expose a recipe generator, (c) apply a handful of
-actions without raising.
-"""
+"""Environment construction, transition, and recipe-validation checks."""
 import unittest
 
-from src.environment import StateTracker, gen, validate_ordering
+from src.environment import RECIPES, StateTracker, recipe_builders, validate_ordering
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -16,9 +9,12 @@ class EnvironmentTests(unittest.TestCase):
         tracker = StateTracker()
         self.assertGreater(tracker.n_features, 0)
 
-    def test_recipe_generator_has_recipes(self):
-        recipe_methods = [name for name in dir(gen) if name.startswith("generate_")]
-        self.assertGreaterEqual(len(recipe_methods), 10)
+    def test_recipe_catalog_has_fresh_builders(self):
+        builders = recipe_builders()
+        self.assertEqual(tuple(builders), tuple(RECIPES))
+        self.assertGreaterEqual(len(builders), 10)
+        first = next(iter(builders.values()))
+        self.assertIsNot(first(), first())
 
     def test_state_tracker_applies_basic_actions(self):
         tracker = StateTracker()

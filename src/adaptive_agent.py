@@ -1,14 +1,4 @@
-"""Adaptive HRC agent state machine.
-
-Modes:
-    MODE_OBSERVE:   The human is showing a brand-new recipe. The agent buffers actions silently until ``end_demo()`` is called, then classifies the buffer against existing variants. The disambiguator decides whether to create a new recipe or treat the demo as a new preference variant.
-
-    MODE_ONLINE:    Default mode. The agent predicts at every step. If the human action disagrees with top-1, the agent uses partial disambiguation to track the best-matching known variant for session-boundary commit. Prediction remains in the IRL and state-aware n-gram heads. On `end_demo()`, the matched variant is
-    promoted to latest and its rehearsal weight is reset to 1.0. Retraining is requested after each end_demo() or online preference commit, but the expensive fit is gated on active replay membership changes. Each executed ordinary retrain rebuilds predictors from the active replay set so pruned demos cannot survive through stale fitted parameters or feature-normalizer statistics.
-
-Terminology:         "Adaptive rehearsal weighting" operates on per-demo replay weights `w_i`. The full agent refits the IRL head from active memory rather than decaying or carrying forward `theta`. Online fine-tuning is supervised next-action imitation over weighted active rehearsal; observed human actions are the ground-truth labels.
-Freeze mode (set_frozen / frozen context manager):      When frozen, all mutating paths are no-ops. Predictions and logging still work so probes produce per-step data. `frozen()` raises AssertionError on exit if any state was accidentally mutated.
-"""
+"""Adaptive HRC state machine with observation, online, and frozen modes."""
 from __future__ import annotations
 
 import contextlib
@@ -17,18 +7,37 @@ import math
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+import numpy as np
 
 from .environment import StateTracker
-from .memory import (Classification,    DecayManager,       DemoTransition, Disambiguator,  Entry,          Variant,        VariantKey,                 VariantMemory,      variant_hash)
-from .models import (Config,            DEFAULT_CONFIG,     MaxEntIRL2,     NGramMarkov,       ensemble_predict,   top_k)
-from .representations import (ActionObservation,    ActionVector,   apply_transition_vector,    identity_token_from_observation, observations_from_actions)
+from .memory import (
+    MatchResult,
+    ReplayMemory,
+    StateTransition,
+    RecipeMatcher,
+    MemoryItem,
+    Variant,
+    VariantKey,
+    VariantLibrary,
+    make_variant_id,
+)
+from .models import (
+    Settings,
+    DEFAULT_SETTINGS,
+    MaxEntIrl,
+    feasible_actions,
+    top_actions,
+)
+from .representations import (
+    Observation,
+)
 
 MODE_OBSERVE = "observe"
 MODE_ONLINE = "online"
 
 
 def _silent_narrate(_msg: str) -> None:
-    """Module-level no-op narrator. Picklable; replaces the previous lambda default so agents can survive ProcessPoolExecutor (spawn) and copy.deepcopy."""
+    """Picklable no-op narrator."""
     return None
 
 
@@ -42,126 +51,154 @@ class StepResult:
     event: str = ""   # free-form tag for the narrator
 
 
-class AdaptiveHRCAgent:
+@dataclass(frozen=True)
+class TrainPolicy:
+    """Select cold starts from cumulative replay-membership alterations."""
+    cold_after: int = 3
+    warm_on_weight_change: bool = False
+
+    def decide(
+        self, membership_changes: int, weight_changed: bool, since_cold: int,
+    ) -> Tuple[str, str, int]:
+        projected = int(since_cold) + int(membership_changes)
+        if membership_changes > 0:
+            if projected >= max(1, int(self.cold_after)):
+                return "cold", "cumulative_membership_threshold_reached", projected
+            return "warm", "cumulative_membership_below_threshold", projected
+        if weight_changed:
+            return (
+                ("warm", "weight_only_change", projected)
+                if self.warm_on_weight_change
+                else ("skip", "weight_only_change_skipped", projected)
+            )
+        return "skip", "replay_unchanged", projected
+
+
+FULL_TRAIN_POLICY = TrainPolicy()
+# Shared-agent comparisons use the same warm/cold schedule so their memory or
+# predictor policy remains the experimental difference.
+BASELINE_TRAIN_POLICY = FULL_TRAIN_POLICY
+
+
+class AdaptiveAgent:
     """End-to-end continual-learning HRC agent."""
 
-    def __init__(self, cfg: Config = DEFAULT_CONFIG, narrate: Optional[Callable[[str], None]] = None):
-        self.cfg = cfg
-        self.decay = DecayManager(cfg)
-        self.memory = VariantMemory(cfg)
-        self.disambig = Disambiguator(cfg)
-        self.online_commit_events: List[Dict[str, Any]] = []
+    RETRAIN_POLICY = FULL_TRAIN_POLICY
 
-        self.irl = MaxEntIRL2(cfg=cfg)
-        self.markov = NGramMarkov(
-            order=cfg.markov_order,
-            prob_floor=cfg.prob_floor,
-            state_log_weight=cfg.ngram_state_log_weight,
-            prefix_log_weight=cfg.ngram_prefix_log_weight,
-        )
+    def __init__(self, settings: Settings = DEFAULT_SETTINGS, narrate: Optional[Callable[[str], None]] = None, retrain_policy: Optional[TrainPolicy] = None):
+        self.settings = settings
+        self.retrain_policy = retrain_policy or self.RETRAIN_POLICY
+        self.replay = ReplayMemory(settings)
+        self.library = VariantLibrary()
+        self.matcher = RecipeMatcher(settings)
+        self.commit_events: List[Dict[str, Any]] = []
+        self.last_commit_stats: Dict[str, Any] = {}
+
+        self.maxent = MaxEntIrl(settings=settings)
+        # Keep action-selection randomness separate from MaxEnt optimization so
+        # a prediction tie cannot alter future model initialization or fitting.
+        tie_seed = np.random.SeedSequence([
+            int(settings.seed) & 0xFFFFFFFF,
+            0x544945,
+        ])
+        self._tie_break_rng = np.random.default_rng(tie_seed)
+        self._last_action_mask_stats: Dict[str, Any] = {}
 
         self.mode = MODE_ONLINE
         self.pending_demo: List[str] = []
-        self.pending_demo_transitions: List[DemoTransition] = []
-        self.pending_demo_identity: List[str] = []
-        # Online state
+        self.pending_trace: List[StateTransition] = []
         self.current_prefix: List[str] = []
-        self.current_transition_trace: List[DemoTransition] = []
-        self.current_identity_prefix: List[str] = []
+        self.current_trace: List[StateTransition] = []
         self._needs_observation: bool = False
-        self._online_unknown_streak: int = 0
-        self._online_step_status: str = "known_confident"
-        self._online_policy_history: List[Dict[str, Any]] = []
-        self.provisional_commits: Dict[VariantKey, Dict[str, Any]] = {}
-        self._last_action_policy: Dict[str, Any] = {
-            "robot_action_mandatory": True,
-            "action_confidence": None,
-            "raw_action_confidence": None,
-            "action_margin": None,
-            "action_support_normalized_entropy": None,
-            "action_entropy_normalization": "prediction_support",
-            "policy_source": None,
-            "final_action_confidence": None,
-            "final_action_margin": None,
-            "final_action_support_normalized_entropy": None,
+        self._policy_history: List[Dict[str, Any]] = []
+        self._prediction_mismatch_count: int = 0
+        self._latent_strategy_confirmed: bool = False
+        self.provisional: Dict[VariantKey, Dict[str, Any]] = {}
+        self._policy_stats: Dict[str, Any] = {
+            "action_required": True,
+            "confidence": None,
+            "raw_confidence": None,
+            "margin": None,
+            "entropy": None,
+            "entropy_basis": "prediction_support",
+            "predictor": None,
+            "final_confidence": None,
+            "final_margin": None,
+            "final_entropy": None,
             "reason": "cold_start",
         }
-        # Anonymous action codebook.  The learner sees action vectors; the strings here are stable internal IDs, not symbolic kitchen actions.
-        self.action_vector_to_token: Dict[ActionVector, str] = {}
-        self.token_to_action_vector: Dict[str, ActionVector] = {}
-        # Exact observed transition traces keyed by anonymous token sequence. Values are (state_before, token, state_after) tuples, never symbolic simulator action strings.
-        self.demo_transition_traces: Dict[Tuple[str, ...], Tuple[DemoTransition, ...]] = {}
-        self._next_recipe_idx = 1
-        # Bookkeeping
+        # Semantic action sequence -> exact observed state-transition trace.
+        self.demo_traces: Dict[Tuple[str, ...], Tuple[StateTransition, ...]] = {}
+        self._next_recipe_index = 1
         self.step_counter = 0       # actions observed
-        self.session_counter = 0    # completed demos (decay tick rate)
+        self.demo_counter = 0       # completed non-empty demonstrations
         self.retrain_cycle = 0
-        self.observation_mode_entries = 0
         self.narrate = narrate or _silent_narrate
-        # Metrics for the paper
         self.step_log: List[StepResult] = []
         self.accuracy_events: List[Tuple[int, str, bool]] = []  # (step,recipe,correct)
-        # Each entry records retrain timing and the number of no-op action transitions detected while converting active demos into trajectories.
+        # Retrain timing and no-op transitions dropped during trajectory conversion.
         self.retrain_events: List[Dict[str, Any]] = []
         self.retrain_fit_wall_times: List[float] = []
         self.retrain_total_wall_times: List[float] = []
         self.retrain_build_wall_times: List[float] = []
         self.retrain_flop_estimates: List[float] = []
-        self.adaptation_latencies: List[Tuple[int, str, int]] = []  # (step,recipe,latency)
-        self.classification_events: List[Tuple[int, Classification]] = []
+        self.classification_events: List[Tuple[int, MatchResult]] = []
 
-        # Freeze state: gates all mutating paths when True.
         self._frozen: bool = False
         self._freeze_snapshot: Optional[Tuple] = None
 
-        # Diagnostic profile: populated only when cfg.profile is True. Maps event name -> (n_calls, total_wall_s). Negligible overhead when off.
+        # Optional event -> (calls, wall seconds) profile.
         self.profile: Dict[str, Tuple[int, float]] = {}
 
-        # Fingerprint of active replay membership at the last successful fit. Weight-only decay updates intentionally do not invalidate the fit; additions and removals do.
-        self._last_fit_fingerprint: Optional[frozenset] = None
-        # Public counter of how many _retrain calls hit the skip-fingerprint gate. Always tracked (not conditional on cfg.profile). Surfaced in memory_stats so reports can distinguish "n_retrains called" from "n_fits actually executed", which makes `retrain_count` interpretable.
-        self.retrain_skipped_count: int = 0
+        self._last_observed_replay_weights: Dict[Tuple[str, str], float] = {}
+        self.cold_change_count = 0
+        # Public so reports distinguish retrain requests from executed fits.
+        self.skipped_trains: int = 0
 
     @contextlib.contextmanager
     def _profile(self, event: str):
-        """No-cost context manager when cfg.profile is False."""
-        if not self.cfg.profile:
+        """No-cost context manager when settings.profile is False."""
+        if not self.settings.profile:
             yield
             return
-        t0 = time.perf_counter()
+        start_time = time.perf_counter()
         try:
             yield
         finally:
-            n, w = self.profile.get(event, (0, 0.0))
-            self.profile[event] = (n + 1, w + (time.perf_counter() - t0))
+            calls, wall_seconds = self.profile.get(event, (0, 0.0))
+            self.profile[event] = (
+                calls + 1,
+                wall_seconds + (time.perf_counter() - start_time),
+            )
 
-    ############### snapshot
-    def snapshot(self) -> "AdaptiveHRCAgent":
+    def snapshot(self) -> "AdaptiveAgent":
         """Deep-copy the agent for phase-A sweep reuse. Lossless and pure (no leakage between branches)."""
         if self._frozen: raise RuntimeError("snapshot called while frozen; release frozen first")
         return copy.deepcopy(self)
 
-    def restore_from(self, snapshot: "AdaptiveHRCAgent") -> None:
+    def restore_from(self, snapshot: "AdaptiveAgent") -> None:
         """Overwrite this agent's state from a previously-taken snapshot, in place."""
         if type(self) is not type(snapshot): raise TypeError(f"restore_from type mismatch: {type(self).__name__} vs {type(snapshot).__name__}")
         fresh = copy.deepcopy(snapshot)
         self.__dict__.clear()
         self.__dict__.update(fresh.__dict__)
 
-    ############### freeze (deepcopy-and-restore contract)
     def set_frozen(self, value: bool) -> None:
-        """Freeze or unfreeze the agent.
-        When freezing, deep-copy all instance state (excluding the snapshot pointer and the frozen flag) so that any mutation during the frozen window is rolled back at unfreeze. This is the safety contract for evaluation: the agent's externally-visible state at exit is guaranteed bit-identical to entry, 
-        so eval probes cannot leak into training.
-        """
+        """Freeze or restore all mutable state so evaluation cannot leak."""
         if value and not self._frozen:
-            with self._profile("freeze_snapshot_enter"): self._freeze_snapshot = copy.deepcopy({k: v for k, v in self.__dict__.items() if k not in ("_freeze_snapshot", "_frozen")})
+            with self._profile("freeze_snapshot_enter"):
+                self._freeze_snapshot = copy.deepcopy({
+                    key: item
+                    for key, item in self.__dict__.items()
+                    if key not in ("_freeze_snapshot", "_frozen")
+                })
             self._frozen = True
         elif not value and self._frozen:
-            snap = self._freeze_snapshot
-            if snap is not None:
+            frozen_state = self._freeze_snapshot
+            if frozen_state is not None:
                 with self._profile("freeze_snapshot_exit"):
-                    for k, v in snap.items(): self.__dict__[k] = v
+                    for key, item in frozen_state.items():
+                        self.__dict__[key] = item
             self._freeze_snapshot = None
             self._frozen = False
 
@@ -169,629 +206,607 @@ class AdaptiveHRCAgent:
         """Small diagnostic digest for state that must not change in frozen eval."""
         active = tuple(sorted(
             (
-                rid,
-                h,
-                tuple(e.ordering),
-                round(float(e.weight), 12),
-                int(e.added_step),
-                int(e.added_cycle),
-                int(e.last_seen_step),
-                tuple(e.transitions),
-                tuple(e.identity_ordering),
+                recipe_id,
+                variant_id,
+                tuple(entry.ordering),
+                round(float(entry.weight), 12),
+                int(entry.added_step),
+                int(entry.added_cycle),
+                int(entry.last_seen_step),
+                tuple(entry.transitions),
             )
-            for (rid, h), e in self.decay.active.items()
+            for (recipe_id, variant_id), entry in self.replay.active.items()
         ))
         pruned = tuple(sorted(
             (
-                rid,
-                h,
-                tuple(e.ordering),
-                int(e.added_step),
-                int(e.removed_step),
-                int(e.added_cycle),
-                int(e.removed_cycle),
-                int(e.last_seen_step),
-                tuple(e.transitions),
-                tuple(e.identity_ordering),
+                recipe_id,
+                variant_id,
+                tuple(entry.ordering),
+                int(entry.added_step),
+                int(entry.removed_step),
+                int(entry.added_cycle),
+                int(entry.removed_cycle),
+                int(entry.last_seen_step),
+                tuple(entry.transitions),
             )
-            for (rid, h), e in self.decay.pruned.items()
+            for (recipe_id, variant_id), entry in self.replay.pruned.items()
         ))
-        variant_keys = tuple(sorted((rid, h) for rid, slot in self.memory.variants.items() for h in slot))
+        variant_keys = tuple(sorted((recipe_id, variant_id) for recipe_id, slot in self.library.variants.items() for variant_id in slot))
         return {
             "mode": self.mode,
             "step_counter": int(self.step_counter),
-            "session_counter": int(self.session_counter),
+            "demo_counter": int(self.demo_counter),
             "retrain_cycle": int(self.retrain_cycle),
             "current_prefix": tuple(self.current_prefix),
-            "current_transition_trace": tuple(self.current_transition_trace),
-            "current_identity_prefix": tuple(self.current_identity_prefix),
+            "current_trace": tuple(self.current_trace),
             "pending_demo": tuple(self.pending_demo),
-            "pending_demo_transitions": tuple(self.pending_demo_transitions),
-            "pending_demo_identity": tuple(self.pending_demo_identity),
-            "demo_transition_traces": tuple(sorted(self.demo_transition_traces.items())),
+            "pending_trace": tuple(self.pending_trace),
+            "demo_traces": tuple(sorted(self.demo_traces.items())),
             "step_log_len": len(self.step_log),
             "classification_events_len": len(self.classification_events),
             "accuracy_events_len": len(self.accuracy_events),
             "retrain_events_len": len(self.retrain_events),
-            "online_commit_events_len": len(self.online_commit_events),
+            "online_commit_events_len": len(self.commit_events),
+            "prediction_mismatch_count": int(self._prediction_mismatch_count),
+            "latent_strategy_confirmed": bool(self._latent_strategy_confirmed),
             "active": active,
             "pruned": pruned,
             "variant_keys": variant_keys,
-            "memory_latest": tuple(sorted(self.memory.latest.items())),
-            "latest_by_recipe": tuple(sorted(self.decay.latest_by_recipe.items())),
-            "latest_keys": tuple(sorted(self.decay.latest_keys)),
-            "last_fit_fingerprint": tuple(sorted(self._last_fit_fingerprint)) if self._last_fit_fingerprint is not None else None,
+            "memory_latest": tuple(sorted(self.library.latest.items())),
+            "latest_by_recipe": tuple(sorted(self.replay.latest_by_recipe.items())),
+            "latest_keys": tuple(sorted(self.replay.latest_keys)),
+            "pair_gap_windows": tuple(sorted(
+                (key, tuple(gaps))
+                for key, gaps in self.replay._pair_gap_window.items()
+            )),
+            "pair_last_seen_steps": tuple(sorted(
+                self.replay._pair_last_seen_step.items()
+            )),
+            "recipe_gap_events": tuple(sorted(
+                (recipe_id, tuple(events))
+                for recipe_id, events in self.replay._recipe_gap_events.items()
+            )),
+            "global_gap_events": tuple(self.replay._global_gap_events),
+            "last_observed_replay_weights": tuple(sorted(self._last_observed_replay_weights.items())),
+            "membership_changes_since_cold": int(self.cold_change_count),
         }
 
     @contextlib.contextmanager
     def frozen(self):
         self.set_frozen(True)
-        _before = self._frozen_structural_digest()
+        state_before = self._frozen_structural_digest()
         try:
             yield self
         finally:
-            # Capture BEFORE restore so mutated state is still visible.
-            _after = self._frozen_structural_digest()
-            self.set_frozen(False)   # restores snapshot
-            if _before != _after:
-                changed = sorted(k for k in _before if _before.get(k) != _after.get(k))
+            # Digest before rollback so frozen mutations remain detectable.
+            state_after = self._frozen_structural_digest()
+            self.set_frozen(False)
+            if state_before != state_after:
+                changed = sorted(
+                    key
+                    for key in state_before
+                    if state_before.get(key) != state_after.get(key)
+                )
                 raise RuntimeError(f"frozen() invariant violated: structural state changed ({', '.join(changed)})")
 
-    # codebook serialisation
-    def save_codebook(self) -> Dict[str, Any]:
-        """Serialise the action codebook for checkpoint reproducibility.
-
-        The codebook maps anonymous token IDs (e.g. ``'act_0001'``) to the action
-        vectors seen during training.  Without it, per-action metrics saved to
-        ``result.json`` cannot be decoded back to symbolic kitchen actions after the
-        fact.  Include this alongside the agent state in any experiment checkpoint.
-
-        Returns a JSON-serialisable dict with keys:
-          ``token_to_vector``  – token_id -> list(action_vector)
-          ``vector_to_token``  – str(action_vector) -> token_id
-          ``n_tokens``         – total number of registered tokens
-        """
-        return {
-            "token_to_vector": {tok: list(vec) for tok, vec in self.token_to_action_vector.items()},
-            "vector_to_token": {str(list(vec)): tok for vec, tok in self.action_vector_to_token.items()},
-            "n_tokens": len(self.action_vector_to_token),
-        }
-
-    def load_codebook(self, codebook: Dict[str, Any]) -> None:
-        """Restore the action codebook from a previously saved dict.
-
-        Call **before** any ``observe_observation`` or ``step`` calls when loading
-        a checkpoint; otherwise the agent will allocate fresh token IDs that conflict
-        with those embedded in the saved memory/decay state.
-
-        Args:
-            codebook: A dict produced by a prior call to ``save_codebook()``.
-
-        Raises:
-            ValueError: If the codebook format is invalid.
-        """
-        if "token_to_vector" not in codebook:
-            raise ValueError("codebook must contain 'token_to_vector'; got: " + str(list(codebook)))
-        self.action_vector_to_token = {}
-        self.token_to_action_vector = {}
-        for tok, vec_list in codebook["token_to_vector"].items():
-            vec = tuple(vec_list)
-            self.token_to_action_vector[str(tok)] = vec
-            self.action_vector_to_token[vec] = str(tok)
-
-    # mode control
     def start_demo(self) -> None:
         """Human signals 'I am about to show a new recipe.'"""
         if self._frozen: return
         self.mode = MODE_OBSERVE
         self.pending_demo = []
-        self.pending_demo_transitions = []
-        self.pending_demo_identity = []
+        self.pending_trace = []
         self._needs_observation = False
-        self._online_unknown_streak = 0
-        self._online_step_status = "known_confident"
-        self._online_policy_history = []
-        self.observation_mode_entries += 1
+        self._policy_history = []
+        self._prediction_mismatch_count = 0
+        self._latent_strategy_confirmed = False
         self.narrate(f"[step {self.step_counter}] MODE -> OBSERVE (new-demo gate ON)")
 
-    def end_demo(self) -> Classification:
-        """End a demonstration or collaboration session and commit a known sequence."""
-        # When frozen, reset transient state and return without mutating anything.
-        if self._frozen: return Classification("frozen", None, None, 0.0, 0.0)
+    def _clear_online_session(self, *, needs_observation: bool = False) -> None:
+        self.current_prefix = []
+        self.current_trace = []
+        self._needs_observation = needs_observation
+        self._policy_history = []
+        self._prediction_mismatch_count = 0
+        self._latent_strategy_confirmed = False
 
-        # Guard against an empty-session end_demo: clicking end-demo without observing any actions should reset state cleanly, not register an empty variant or advance decay (which would erode memory on a noop).
+    def _log_commit(self, **fields: Any) -> None:
+        """Persist one auditable decision for the completed assist episode."""
+        event = {
+            "decision_id": f"assist_{self.demo_counter}_{self.step_counter}",
+            "demo_index": int(self.demo_counter),
+            "step": int(self.step_counter),
+            **fields,
+        }
+        self.last_commit_stats.update(event)
+        self.commit_events.append(dict(event))
+
+    def end_demo(self) -> MatchResult:
+        """End one demonstration, advance its clock, and commit when justified."""
+        if self._frozen: return MatchResult("frozen", None, None, 0.0, 0.0)
+
+        # Empty observation sessions reset without aging memory.
         if self.mode == MODE_OBSERVE and not self.pending_demo:
             self.narrate(f"[step {self.step_counter}] end_demo called in OBSERVE with empty buffer - no-op")
             self.mode = MODE_ONLINE
-            self.pending_demo_transitions = []
-            self.pending_demo_identity = []
-            return Classification("known", None, None, 0.0, 0.0)
+            self.pending_trace = []
+            return MatchResult("known", None, None, 0.0, 0.0)
         if self.mode == MODE_ONLINE and not self.current_prefix:
-            self.current_prefix = []
-            self.current_transition_trace = []
-            self.current_identity_prefix = []
-            self._needs_observation = False
-            self._online_unknown_streak = 0
-            self._online_step_status = "known_confident"
-            self._online_policy_history = []
-            return Classification("known", None, None, 0.0, 0.0)
+            self._clear_online_session()
+            return MatchResult("known", None, None, 0.0, 0.0)
+
+        # Every non-empty demonstration ages memory, regardless of its outcome.
+        self.demo_counter += 1
         if self.mode == MODE_OBSERVE:
-            self.session_counter += 1
-            return self._end_observe_demo(apply_decay=True)
+            return self._finish_observation(apply_decay=True)
 
-        commit_cls, reentry_from_pruned = self._classify_online_prefix(self.current_prefix)
-        if commit_cls.kind == "new_recipe":
-            cls = Classification("needs_observation", None, None, commit_cls.jaccard, commit_cls.order_distance)
-            self.classification_events.append((self.step_counter, cls))
-            self.current_prefix = []
-            self.current_identity_prefix = []
-            self._needs_observation = True
-            self._online_unknown_streak = int(getattr(self.cfg, "online_unknown_confirm_streak", 3))
-            self._online_step_status = "unknown_confirmed"
-            self._online_policy_history = []
-            self.narrate(f"[step {self.step_counter}] online sequence did not match known recipes; observation mode required")
-            return cls
+        self.last_commit_stats = {}
+        scored_before = self.matcher.variants_scored
+        classification_t0 = time.perf_counter()
+        prefix_match, reentry_from_pruned = self._match_prefix(self.current_prefix)
+        classification_wall_s = time.perf_counter() - classification_t0
+        active_keys = self._active_variants()
+        registry_variants = sum(len(slot) for slot in self.library.variants.values())
+        active_variants = sum(
+            (recipe_id, variant_id) in active_keys
+            for recipe_id, slot in self.library.variants.items() for variant_id in slot
+        )
+        self.last_commit_stats = {
+            "registry_size": registry_variants,
+            "active_variants": active_variants,
+            "archived_variants": registry_variants - active_variants,
+            "registry_recipes": sum(bool(slot) for slot in self.library.variants.values()),
+            "variants_scored": self.matcher.variants_scored - scored_before,
+            "classification_wall_s": float(classification_wall_s),
+            "scoring_wall_s": float(classification_wall_s),
+        }
+        # Assist is closed-set. Registration remains confidence-gated below.
+        return self._finish_session(prefix_match, reentry_from_pruned, apply_decay=True)
 
-        # Only known recipe/preference sessions advance decay and mutate memory. The currently-demonstrated variant is protected by the latest-pin in `decay.latest_keys` (set by `mark_latest`), so no extra protected_keys plumbing is needed here.
-        self.session_counter += 1
-        return self._end_online_session(commit_cls, reentry_from_pruned, apply_decay=True)
-
-    def _transition_from_observation(self, token: str, observation: ActionObservation) -> DemoTransition:
+    def _transition(self, action: str, observation: Observation) -> StateTransition:
         state = tuple(int(x) for x in observation.state)
         next_state = tuple(int(x) for x in observation.next_state)
-        return (state, token, next_state)
+        return (state, action, next_state)
 
-    def _normalize_transition_trace(
+    def _normalize_trace(
         self,
-        transitions: Optional[Sequence[DemoTransition]],
-    ) -> Tuple[DemoTransition, ...]:
+        transitions: Optional[Sequence[StateTransition]],
+    ) -> Tuple[StateTransition, ...]:
         if not transitions:
             return ()
-        out: List[DemoTransition] = []
-        for state, token, next_state in transitions:
-            out.append((
+        return tuple(
+            (
                 tuple(int(x) for x in state),
-                str(token),
+                str(action),
                 tuple(int(x) for x in next_state),
-            ))
-        return tuple(out)
+            )
+            for state, action, next_state in transitions
+        )
 
-    def _remember_transition_trace(
+    def _store_trace(
         self,
         ordering: Sequence[str],
-        transitions: Optional[Sequence[DemoTransition]],
-    ) -> Tuple[DemoTransition, ...]:
-        trace = self._normalize_transition_trace(transitions)
+        transitions: Optional[Sequence[StateTransition]],
+    ) -> Tuple[StateTransition, ...]:
+        trace = self._normalize_trace(transitions)
         ordering_tuple = tuple(str(t) for t in ordering)
         if trace and tuple(t[1] for t in trace) == ordering_tuple:
-            self.demo_transition_traces[ordering_tuple] = trace
+            self.demo_traces[ordering_tuple] = trace
             return trace
-        return self.demo_transition_traces.get(ordering_tuple, ())
+        return self.demo_traces.get(ordering_tuple, ())
 
-    def _trace_for_demo(self, demo: Any, tokens: Sequence[str]) -> Tuple[DemoTransition, ...]:
-        trace: Tuple[DemoTransition, ...] = ()
-        if isinstance(demo, Entry):
-            trace = self._normalize_transition_trace(getattr(demo, "transitions", ()))
-        elif isinstance(demo, Mapping):
-            trace = self._normalize_transition_trace(demo.get("transitions", ()))
+    def _get_trace(self, demo: Any, actions: Sequence[str]) -> Tuple[StateTransition, ...]:
+        if isinstance(demo, Mapping):
+            trace = self._normalize_trace(demo.get("transitions", ()))
+        else:
+            trace = self._normalize_trace(
+                getattr(demo, "transitions", ()),
+            )
         if not trace:
-            trace = self.demo_transition_traces.get(tuple(tokens), ())
-        if trace and tuple(t[1] for t in trace) == tuple(tokens):
+            trace = self.demo_traces.get(tuple(actions), ())
+        if trace and tuple(t[1] for t in trace) == tuple(actions):
             return trace
         return ()
 
     def _register_if_live(
         self,
-        rid: str,
-        seq: List[str],
+        recipe_id: str,
+        actions: List[str],
         step: int,
-        transitions: Optional[Sequence[DemoTransition]] = None,
-        identity_ordering: Optional[Sequence[str]] = None,
+        transitions: Optional[Sequence[StateTransition]] = None,
     ) -> Variant:
         """Register a completed demonstration in variant memory and decay state."""
-        identity = tuple(identity_ordering) if identity_ordering is not None else tuple(seq)
-        v = self.memory.register(rid, seq, step, identity_ordering=identity)
+        variant = self.library.register(recipe_id, actions, step)
         if not self._frozen:
-            transition_trace = self._remember_transition_trace(seq, transitions)
-            entry = self.decay.register(
-                rid,
-                v.variant_hash,
-                tuple(seq),
-                self.session_counter,
+            transition_trace = self._store_trace(actions, transitions)
+            entry = self.replay.register(
+                recipe_id,
+                variant.variant_id,
+                tuple(actions),
+                self.demo_counter,
                 self.retrain_cycle,
                 transitions=transition_trace,
-                identity_ordering=identity,
             )
-            self._record_committed_replay_demo(
-                rid,
-                v.variant_hash,
-                tuple(seq),
+            self._record_demo(
+                recipe_id,
+                variant.variant_id,
+                tuple(actions),
                 transitions=transition_trace,
-                session_step=self.session_counter,
+                demo_step=self.demo_counter,
                 action_step=step,
                 source_mode=self.mode,
                 entry=entry,
             )
-            self._assert_latest_pin_invariant(rid)
-        return v
+            self._check_latest(recipe_id)
+        return variant
 
-    def _record_committed_replay_demo(
+    def _record_demo(
         self,
         recipe_id: str,
-        variant_hash_: str,
+        variant_id: str,
         ordering: Tuple[str, ...],
         *,
-        transitions: Tuple[DemoTransition, ...] = (),
-        session_step: int,
+        transitions: Tuple[StateTransition, ...] = (),
+        demo_step: int,
         action_step: int,
         source_mode: str,
-        entry: Optional[Entry] = None,
+        entry: Optional[MemoryItem] = None,
     ) -> None:
         """Hook for replay baselines; the full agent trains from active memory."""
         return None
 
-    def _assert_latest_pin_invariant(self, rid: Optional[str] = None) -> None:
-        if self._frozen or not getattr(self.cfg, "protect_latest_preference", True): return
-        recipe_ids = [rid] if rid is not None else [r for r, slot in self.memory.variants.items() if slot]
+    def _check_latest(self, recipe_id: Optional[str] = None) -> None:
+        if self._frozen or not getattr(self.settings, "pin_latest", True): return
+        recipe_ids = (
+            [recipe_id]
+            if recipe_id is not None
+            else [
+                known_recipe_id
+                for known_recipe_id, variants in self.library.variants.items()
+                if variants
+            ]
+        )
         for recipe_id in recipe_ids:
-            slot = self.memory.variants.get(recipe_id, {})
+            slot = self.library.variants.get(recipe_id, {})
             if not slot: continue
-            latest = self.memory.latest.get(recipe_id)
-            key = (recipe_id, latest) if latest is not None else None
-            if latest is None or latest not in slot:                    raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: memory.latest missing from registry")
-            if self.decay.latest_by_recipe.get(recipe_id) != latest:    raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: decay latest does not match memory latest")
-            if key not in self.decay.latest_keys:       raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is not pinned")
-            if key not in self.decay.active:            raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is not active")
-            if key in self.decay.pruned:                raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is pruned")
-            if self.decay.active[key].weight != 1.0:    raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest weight is not 1.0")
+            latest_variant_id = self.library.latest.get(recipe_id)
+            latest_key = (
+                (recipe_id, latest_variant_id)
+                if latest_variant_id is not None else None
+            )
+            if latest_variant_id is None or latest_variant_id not in slot:
+                raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: memory.latest missing from registry")
+            if self.replay.latest_by_recipe.get(recipe_id) != latest_variant_id:
+                raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: replay latest does not match variant library")
+            if latest_key not in self.replay.latest_keys:
+                raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is not pinned")
+            if latest_key not in self.replay.active:
+                raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is not active")
+            if latest_key in self.replay.pruned:
+                raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is pruned")
+            if self.replay.active[latest_key].weight != 1.0:
+                raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest weight is not 1.0")
 
-    def _end_observe_demo(self, apply_decay: bool = False) -> Classification:
-        seq = list(self.pending_demo)
-        transition_trace = list(self.pending_demo_transitions)
-        identity_seq = list(self.pending_demo_identity)
-        active_keys = self._active_keys()
-        active_lib = self.memory.library(allowed_keys=active_keys)
-        cls = self.disambig.classify(seq, active_lib, identity_sequence=identity_seq)
-        # Pruned-reentry detection: when active-only says new_recipe, check the full library. If a pruned variant matches, restore it rather than creating a new recipe ID.
-        if cls.kind == "new_recipe" and active_keys:
-            full_lib = self.memory.library()
-            if len(full_lib) > len(active_lib):
-                archived_cls = self.disambig.classify(seq, full_lib, identity_sequence=identity_seq)
-                if archived_cls.kind != "new_recipe":
-                    cls = archived_cls          # restore under original recipe_id
-                    self.narrate(f"[step {self.step_counter}] observe-mode: restoring pruned variant of '{cls.recipe_id}'")
+    def _finish_observation(self, apply_decay: bool = False) -> MatchResult:
+        actions = list(self.pending_demo)
+        transition_trace = list(self.pending_trace)
+        active_keys = self._active_variants()
+        active_variants = self.library.known_variants(allowed_keys=active_keys)
+        match = self.matcher.classify(actions, active_variants)
+        # Check archived variants before allocating a new recipe ID.
+        if match.kind == "new_recipe" and active_keys:
+            all_variants = self.library.known_variants()
+            if len(all_variants) > len(active_variants):
+                archived_match = self.matcher.classify(actions, all_variants)
+                if archived_match.kind != "new_recipe":
+                    match = archived_match
+                    self.narrate(f"[step {self.step_counter}] observe-mode: restoring pruned variant of '{match.recipe_id}'")
 
-        self.classification_events.append((self.step_counter, cls))
-        # Register in memory + decay.
-        if cls.kind == "new_recipe":
-            rid = f"R{self._next_recipe_idx}"
-            self._next_recipe_idx += 1
-            self._register_if_live(rid, seq, self.step_counter, transitions=transition_trace, identity_ordering=identity_seq)
-            cls.recipe_id = rid
-            self.narrate(f"[step {self.step_counter}] classified NEW RECIPE '{rid}' (jaccard={cls.jaccard:.2f})")
+        self.classification_events.append((self.step_counter, match))
+        if match.kind == "new_recipe":
+            recipe_id = f"R{self._next_recipe_index}"
+            self._next_recipe_index += 1
+            self._register_if_live(recipe_id, actions, self.step_counter, transitions=transition_trace)
+            match.recipe_id = recipe_id
+            self.narrate(f"[step {self.step_counter}] classified NEW RECIPE '{recipe_id}' (jaccard={match.jaccard:.2f})")
         else:
-            if cls.recipe_id is None: raise RuntimeError(f"disambiguator returned {cls.kind} without a recipe_id")
-            rid = cls.recipe_id
-            self._register_if_live(rid, seq, self.step_counter, transitions=transition_trace, identity_ordering=identity_seq)
-            kind_msg = "KNOWN (re-demo)" if cls.kind == "known" else "PREFERENCE VARIANT"
-            self.narrate(f"[step {self.step_counter}] classified {kind_msg} of '{rid}' (jaccard={cls.jaccard:.2f}, tau={cls.order_distance:.2f})")
+            if match.recipe_id is None: raise RuntimeError(f"matcher returned {match.kind} without a recipe_id")
+            recipe_id = match.recipe_id
+            self._register_if_live(recipe_id, actions, self.step_counter, transitions=transition_trace)
+            kind_msg = "KNOWN (re-demo)" if match.kind == "known" else "PREFERENCE VARIANT"
+            self.narrate(f"[step {self.step_counter}] classified {kind_msg} of '{recipe_id}' (jaccard={match.jaccard:.2f}, tau={match.order_distance:.2f})")
         self.mode = MODE_ONLINE
         self.pending_demo = []
-        self.pending_demo_transitions = []
-        self.pending_demo_identity = []
+        self.pending_trace = []
         self._needs_observation = False
-        self._online_unknown_streak = 0
-        self._online_step_status = "known_confident"
-        self._online_policy_history = []
-        if apply_decay: self.decay.step(self.session_counter, self.retrain_cycle)
-        self._retrain()
-        return cls
+        self._policy_history = []
+        self._update(apply_decay)
+        return match
 
-    def _classify_online_prefix(self, prefix: Sequence[str]) -> Tuple[Classification, bool]:
-        active_keys = self._active_keys()
-        active_lib = self.memory.library(allowed_keys=active_keys)
-        identity_prefix = (
-            list(self.current_identity_prefix)
-            if tuple(prefix) == tuple(self.current_prefix)
-            and len(self.current_identity_prefix) == len(prefix)
-            else list(prefix)
+    def _match_prefix(self, prefix: Sequence[str]) -> Tuple[MatchResult, bool]:
+        active_keys = self._active_variants()
+        all_variants = self.library.known_variants()
+        prefix_match = self.matcher.match_known(prefix, all_variants)
+        if prefix_match.recipe_id is None:
+            return prefix_match, False
+        variant_id = make_variant_id(prefix)
+        exact_archived = (
+            variant_id in self.library.variants.get(prefix_match.recipe_id, {})
+            and (prefix_match.recipe_id, variant_id) not in active_keys
         )
-        # For short prefixes, score_partial is more reliable than full Jaccard because Jaccard(short_prefix, full_variant) is always near 0. The full classify() is used only when the prefix is long enough for Jaccard to be meaningful (controlled by min_classify_length in Config).
-        min_len = int(getattr(self.cfg, "min_classify_length", 6))
-        if len(prefix) < min_len:
-            # Use score_partial to get a ranked recipe list but wrap it as a Classification for the rest of the method to consume.
-            ranked = self.disambig.score_partial(identity_prefix, active_lib, identity=True)
-            if ranked and ranked[0][1] >= float(getattr(self.cfg, "online_new_recipe_partial_threshold", 0.30)):
-                best_v, best_score = ranked[0]
-                commit_cls = Classification("preference_shift", best_v.recipe_id, None, best_score, 0.0)
-            else: commit_cls = Classification("new_recipe", None, None, 0.0, 0.0)
-        else: commit_cls = self.disambig.classify(prefix, active_lib, identity_sequence=identity_prefix)
-        reentry_from_pruned = False
-        if prefix:
-            h = variant_hash(prefix)
-            for rid, slot in self.memory.variants.items():
-                if h in slot and (rid, h) not in active_keys: return Classification("known", rid, h, 1.0, 0.0), True
-        if commit_cls.kind == "new_recipe":
-            # No active match reached threshold. Consult the pruned-variant metadata/full registry so a forgotten known variant can be restored at commit time.
-            full_lib = self.memory.library()
-            if len(full_lib) > len(active_lib):
-                full_cls = self.disambig.classify(prefix, full_lib, identity_sequence=identity_prefix)
-                if full_cls.kind != "new_recipe":
-                    commit_cls = full_cls
-                    reentry_from_pruned = True
-        return commit_cls, reentry_from_pruned
+        recipe_has_active_variant = any(
+            recipe_id == prefix_match.recipe_id for recipe_id, _variant_id in active_keys
+        )
+        reentry_from_pruned = bool(exact_archived or not recipe_has_active_variant)
+        return prefix_match, reentry_from_pruned
 
-    def _end_online_session(self, commit_cls: Classification, reentry_from_pruned: bool = False, apply_decay: bool = False) -> Classification:
-        """Commit a complete known online sequence using disambiguator evidence."""
+    def _finish_session(self, prefix_match: MatchResult, reentry_from_pruned: bool = False, apply_decay: bool = False) -> MatchResult:
+        """Commit a complete known online sequence using matcher evidence."""
         prefix = list(self.current_prefix)
-        transition_trace = list(self.current_transition_trace)
-        identity_prefix = list(self.current_identity_prefix)
-
-        def clear_session(*, needs_observation: bool = False) -> None:
-            self.current_prefix = []
-            self.current_transition_trace = []
-            self.current_identity_prefix = []
-            self._needs_observation = needs_observation
-            self._online_unknown_streak = (
-                int(getattr(self.cfg, "online_unknown_confirm_streak", 3))
-                if needs_observation else 0
-            )
-            self._online_step_status = "unknown_confirmed" if needs_observation else "known_confident"
-            self._online_policy_history = []
+        transition_trace = list(self.current_trace)
 
         if not prefix:
-            clear_session()
-            return Classification("known", None, None, 0.0, 0.0)
-        if commit_cls.kind == "new_recipe" or commit_cls.recipe_id is None:
-            if apply_decay and self.session_counter > 0:
-                self.session_counter -= 1
-            cls = Classification("needs_observation", None, None, commit_cls.jaccard, commit_cls.order_distance)
-            self.classification_events.append((self.step_counter, cls))
-            clear_session(needs_observation=True)
-            return cls
+            self._clear_online_session()
+            return MatchResult("known", None, None, 0.0, 0.0)
+        if prefix_match.recipe_id is None:
+            match = MatchResult("assist_unavailable", None, None, prefix_match.jaccard, prefix_match.order_distance)
+            self.classification_events.append((self.step_counter, match))
+            self._log_commit(
+                event="assist_unavailable",
+                decision="none",
+                commit_applied=False,
+                reason="no_known_recipe_candidates",
+                confidence=None,
+                candidate_recipe_id=None,
+                candidate_variant_id=None,
+                latest_pinned=False,
+                promoted_from_tentative=False,
+            )
+            self._clear_online_session(needs_observation=False)
+            if apply_decay:
+                self._update(apply_decay=True)
+            return match
 
-        rid = commit_cls.recipe_id
-        h = variant_hash(prefix)
-        confidence, confidence_parts = self._online_commit_confidence(rid, prefix, commit_cls)
-        full_threshold = float(getattr(self.cfg, "online_commit_full_threshold", 0.75))
-        tentative_threshold = float(getattr(self.cfg, "online_commit_tentative_threshold", 0.45))
-        promotion_reasons = self._provisional_promotion_reasons(rid, h, confidence, confidence_parts)
+        recipe_id = prefix_match.recipe_id
+        variant_id = make_variant_id(prefix)
+        confidence, confidence_parts = self._commit_confidence(recipe_id, prefix, prefix_match)
+        provisional_before = self.provisional.get((recipe_id, variant_id))
+        full_threshold = self.settings.commit_threshold
+        tentative_threshold = self.settings.tentative_threshold
+        promotion_reasons = self._promotion_reasons(recipe_id, variant_id, confidence, confidence_parts)
         if promotion_reasons:
             confidence = max(confidence, full_threshold)
             confidence_parts["provisional_promotion"] = 1.0
 
         if confidence < tentative_threshold:
-            if apply_decay and self.session_counter > 0:
-                self.session_counter -= 1
-            cls = Classification("needs_observation", rid, None, commit_cls.jaccard, commit_cls.order_distance)
-            self.classification_events.append((self.step_counter, cls))
-            clear_session(needs_observation=True)
-            return cls
-
-        known_variant = h in self.memory.variants.get(rid, {})
-        if confidence < full_threshold and not known_variant:
-            weight = max(float(getattr(self.cfg, "provisional_commit_weight", 0.20)), min(0.75, confidence))
-            trace = self._remember_transition_trace(prefix, transition_trace)
-            self.decay.register(
-                rid, h, tuple(prefix), self.session_counter, self.retrain_cycle,
-                weight=weight, pin_latest=False, transitions=trace,
-                identity_ordering=identity_prefix,
+            match = MatchResult("known_recipe_uncertain", recipe_id, None, prefix_match.jaccard, prefix_match.order_distance)
+            self.classification_events.append((self.step_counter, match))
+            self._log_commit(
+                event="commit_abstained",
+                decision="none",
+                commit_applied=False,
+                reason="below_tentative_threshold",
+                confidence=float(confidence),
+                confidence_parts=dict(confidence_parts),
+                candidate_recipe_id=recipe_id,
+                candidate_variant_id=variant_id,
+                latest_pinned=False,
+                promoted_from_tentative=False,
             )
-            self.provisional_commits[(rid, h)] = {
-                "first_session": self.session_counter,
-                "last_session": self.session_counter,
+            self._clear_online_session(needs_observation=False)
+            if apply_decay:
+                self._update(apply_decay=True)
+            return match
+
+        known_variant = variant_id in self.library.variants.get(recipe_id, {})
+        if confidence < full_threshold and not known_variant:
+            weight = max(
+                self.settings.provisional_weight,
+                min(self.settings.provisional_cap, confidence),
+            )
+            trace = self._store_trace(prefix, transition_trace)
+            self.replay.register(
+                recipe_id, variant_id, tuple(prefix), self.demo_counter, self.retrain_cycle,
+                weight=weight, pin_latest=False, transitions=trace,
+            )
+            self.provisional[(recipe_id, variant_id)] = {
+                "first_demo": self.demo_counter,
+                "last_demo": self.demo_counter,
                 "weight": weight,
                 "confidence": confidence,
                 "parts": confidence_parts,
-                "promotion_eligible_until": self.session_counter + int(getattr(self.cfg, "provisional_confirm_window", 5)),
+                "promotion_eligible_until_demo": self.demo_counter + int(self.settings.confirm_window),
             }
-            cls = Classification("tentative_preference_shift", rid, h, commit_cls.jaccard, commit_cls.order_distance)
-            self.narrate(f"[step {self.step_counter}] tentative online variant for '{rid}' (confidence={confidence:.2f})")
+            match = MatchResult("tentative_preference_shift", recipe_id, variant_id, prefix_match.jaccard, prefix_match.order_distance)
+            decision = "tentative"
+            latest_pinned = False
+            self.narrate(f"[step {self.step_counter}] tentative online variant for '{recipe_id}' (confidence={confidence:.2f})")
         else:
             variant = self._register_if_live(
-                rid, prefix, self.step_counter, transitions=transition_trace,
-                identity_ordering=identity_prefix,
+                recipe_id, prefix, self.step_counter, transitions=transition_trace,
             )
             kind = "reentry_from_pruned" if reentry_from_pruned else (
                 "known" if known_variant else "preference_shift"
             )
-            cls = Classification(kind, rid, variant.variant_hash, commit_cls.jaccard, commit_cls.order_distance)
-            self.provisional_commits.pop((rid, variant.variant_hash), None)
-            if promotion_reasons:
-                self.online_commit_events.append({
-                    "step": self.step_counter,
-                    "event": "provisional_commit_promoted",
-                    "recipe_id": rid,
-                    "variant_hash": variant.variant_hash,
-                    "promotion_reasons": promotion_reasons,
-                    "commit_confidence": confidence,
-                    "commit_confidence_parts": dict(confidence_parts),
-                })
+            match = MatchResult(kind, recipe_id, variant.variant_id, prefix_match.jaccard, prefix_match.order_distance)
+            self.provisional.pop((recipe_id, variant.variant_id), None)
+            decision = "promotion" if promotion_reasons else (
+                "known_refresh" if known_variant else "full"
+            )
+            latest_pinned = True
 
-        if apply_decay:
-            self.decay.step(self.session_counter, self.retrain_cycle)
-        self._retrain()
-        self.classification_events.append((self.step_counter, cls))
-        clear_session()
-        return cls
+        self._update(apply_decay)
+        first_tentative_demo = (
+            int(provisional_before.get("first_demo"))
+            if provisional_before is not None else None
+        )
+        self._log_commit(
+            event=("provisional_commit_promoted" if promotion_reasons else "online_commit"),
+            decision=decision,
+            commit_applied=True,
+            reason=(";".join(promotion_reasons) if promotion_reasons else "confidence_gate_passed"),
+            confidence=float(confidence),
+            confidence_parts=dict(confidence_parts),
+            candidate_recipe_id=recipe_id,
+            candidate_variant_id=variant_id,
+            known_variant=bool(known_variant),
+            new_variant=not bool(known_variant),
+            latest_pinned=bool(latest_pinned),
+            promoted_from_tentative=bool(promotion_reasons),
+            tentative_first_demo=first_tentative_demo,
+            promotion_delay_demos=(
+                int(self.demo_counter - first_tentative_demo)
+                if promotion_reasons and first_tentative_demo is not None else None
+            ),
+            promotion_reasons=tuple(promotion_reasons),
+        )
+        self.classification_events.append((self.step_counter, match))
+        self._clear_online_session()
+        return match
 
-    def _late_window_prediction_agreement(self, prefix: Sequence[str]) -> float:
+    def _late_agreement(self, prefix: Sequence[str]) -> float:
         n = len(prefix)
         if n <= 0 or not self.step_log: return 0.0
         session_rows = self.step_log[-n:]
         if not session_rows:            return 0.0
-        width = max(1, int(math.ceil(len(session_rows) * 0.40)))
+        width = max(1, int(math.ceil(
+            len(session_rows) * self.settings.agreement_window,
+        )))
         late_rows = session_rows[-width:]
         usable = [row for row in late_rows if row.predicted is not None]
         if not usable:                  return 0.0
         return sum(1 for row in usable if row.predicted == row.actual) / max(1, len(usable))
 
-    def _provisional_promotion_reasons(
+    def _promotion_reasons(
         self,
-        rid: str,
-        variant_hash_: str,
+        recipe_id: str,
+        variant_id: str,
         confidence: float,
         confidence_parts: Dict[str, float],
     ) -> List[str]:
-        provisional = self.provisional_commits.get((rid, variant_hash_))
+        provisional = self.provisional.get((recipe_id, variant_id))
         if provisional is None:
             return []
-        window = int(getattr(self.cfg, "provisional_confirm_window", 5))
-        if self.session_counter - int(provisional.get("first_session", self.session_counter)) > window:
-            self.provisional_commits.pop((rid, variant_hash_), None)
+        window = int(self.settings.confirm_window)
+        if self.demo_counter - int(provisional.get("first_demo", self.demo_counter)) > window:
+            self.provisional.pop((recipe_id, variant_id), None)
             return []
-        reasons = ["same_variant_hash_recurred"]
-        if confidence >= float(getattr(self.cfg, "online_commit_full_threshold", 0.75)):
+        reasons = ["same_variant_recurred"]
+        if confidence >= self.settings.commit_threshold:
             reasons.append("commit_confidence_full_threshold")
         if (
             float(confidence_parts.get("late_window_prediction_agreement", 0.0))
-            >= float(getattr(self.cfg, "provisional_confirm_top1", 0.60))
+            >= self.settings.confirm_accuracy
             and float(confidence_parts.get("recipe_jaccard", 0.0))
-            >= float(getattr(self.cfg, "provisional_min_recipe_jaccard", 0.95))
+            >= self.settings.confirm_similarity
         ):
             reasons.append("late_window_prediction_alignment")
         provisional.update(
-            last_session=self.session_counter,
+            last_demo=self.demo_counter,
             last_confidence=confidence,
             last_parts=dict(confidence_parts),
         )
         return reasons
 
-    def _online_commit_confidence(
+    def _commit_confidence(
         self,
-        rid: str,
+        recipe_id: str,
         prefix: Sequence[str],
-        commit_cls: Classification,
+        prefix_match: MatchResult,
     ) -> Tuple[float, Dict[str, float]]:
         """Score a completed online sequence with deployable evidence only."""
-        active_lib = self.memory.library(allowed_keys=self._active_keys())
-        full_lib = self.memory.library()
-        identity_prefix = (
-            list(self.current_identity_prefix)
-            if tuple(prefix) == tuple(self.current_prefix)
-            and len(self.current_identity_prefix) == len(prefix)
-            else list(prefix)
-        )
-        scored = [
-            (
-                variant.recipe_id,
-                self.disambig.classify(prefix, [variant], identity_sequence=identity_prefix).jaccard,
-            )
-            for variant in full_lib
+        scoring_t0 = time.perf_counter()
+        scored_before = self.matcher.variants_scored
+        all_variants = self.library.known_variants()
+        active_keys = self._active_variants()
+        active_variants = [
+            variant for variant in all_variants
+            if (variant.recipe_id, variant.variant_id) in active_keys
         ]
-        best_for_rid = max(
-            (score for recipe_id, score in scored if recipe_id == rid),
-            default=float(commit_cls.jaccard or 0.0),
+        scored = self.matcher.score(prefix, all_variants)
+        recipe_score = float(
+            scored.get(recipe_id, (None, float(prefix_match.jaccard or 0.0), 0.0))[1]
         )
         second_jaccard = max(
-            (score for recipe_id, score in scored if recipe_id != rid),
+            (
+                score
+                for other_id, (_variant, score, _distance) in scored.items()
+                if other_id != recipe_id
+            ),
             default=0.0,
         )
-        jaccard_margin = max(0.0, best_for_rid - second_jaccard)
-        history = list(self._online_policy_history)
+        confidence_wall_s = time.perf_counter() - scoring_t0
+        classification_wall_s = float(
+            self.last_commit_stats.get("classification_wall_s", 0.0)
+        )
+        self.last_commit_stats.update({
+            "registry_size": len(all_variants),
+            "active_variants": len(active_variants),
+            "archived_variants": max(0, len(all_variants) - len(active_variants)),
+            "registry_recipes": len(scored),
+            "variants_scored": int(self.last_commit_stats.get("variants_scored", 0))
+            + self.matcher.variants_scored - scored_before,
+            "confidence_scoring_wall_s": float(confidence_wall_s),
+            "scoring_wall_s": classification_wall_s + float(confidence_wall_s),
+        })
+        jaccard_margin = max(0.0, recipe_score - second_jaccard)
+        history = list(self._policy_history)
         policy_confidence = (
-            sum(float(row.get("final_action_confidence") or row.get("action_confidence") or 0.0) for row in history)
+            sum(float(row.get("final_confidence") or row.get("confidence") or 0.0) for row in history)
             / len(history)
             if history else 0.0
         )
-        late_agreement = self._late_window_prediction_agreement(prefix)
-        margin_scale = max(float(getattr(self.cfg, "online_commit_identity_margin_scale", 0.25)), 1e-9)
+        late_agreement = self._late_agreement(prefix)
+        margin_scale = self.settings.margin_scale
         score = (
-            float(getattr(self.cfg, "online_commit_identity_weight", 0.46)) * min(1.0, best_for_rid)
-            + float(getattr(self.cfg, "online_commit_identity_margin_weight", 0.18))
+            self.settings.match_weight * min(1.0, recipe_score)
+            + self.settings.margin_weight
             * min(1.0, jaccard_margin / margin_scale)
-            + float(getattr(self.cfg, "online_commit_policy_confidence_weight", 0.04))
+            + self.settings.policy_weight
             * policy_confidence
         )
         score = min(
             1.0,
-            score + float(getattr(self.cfg, "online_commit_late_agreement_bonus", 0.06)) * late_agreement,
+            score + self.settings.agreement_bonus * late_agreement,
         )
         if (
-            commit_cls.kind == "known"
-            and best_for_rid >= float(getattr(self.cfg, "online_commit_known_identity_threshold", 0.99))
+            prefix_match.kind == "known"
+            and recipe_score >= self.settings.known_similarity
         ):
-            score = max(score, float(getattr(self.cfg, "online_commit_known_score_floor", 0.90)))
-        # An archived-only fuzzy match has no active evidence and should not
-        # self-commit merely because a one-item full library yields a large
-        # apparent margin. An exact known re-entry is independently decisive.
+            score = max(score, self.settings.known_score_floor)
+        # Archived-only fuzzy matches cannot self-commit on an artificial margin.
         if (
-            full_lib
-            and not active_lib
+            all_variants
+            and not active_variants
             and not (
-                commit_cls.kind == "known"
-                and best_for_rid >= float(getattr(self.cfg, "online_commit_known_identity_threshold", 0.99))
+                prefix_match.kind == "known"
+                and recipe_score >= self.settings.known_similarity
             )
         ):
-            score = min(score, float(getattr(self.cfg, "online_commit_empty_library_score_ceiling", 0.40)))
+            score = min(score, self.settings.empty_score_cap)
         parts = {
-            "recipe_jaccard": best_for_rid,
+            "recipe_jaccard": recipe_score,
             "recipe_jaccard_margin": jaccard_margin,
-            "recipe_identity_score": best_for_rid,
-            "recipe_identity_margin": jaccard_margin,
+            "recipe_score": recipe_score,
+            "recipe_margin": jaccard_margin,
             "online_policy_confidence": policy_confidence,
             "late_window_prediction_agreement": late_agreement,
         }
         return max(0.0, min(1.0, float(score))), parts
-    def _active_keys(self) -> Set[VariantKey]:
+    def _active_variants(self) -> Set[VariantKey]:
         """Current trainable memory keys. Pruned variants are excluded from online prediction."""
-        return {e.key for e in self.decay.active_entries()}
+        return {entry.key for entry in self.replay.active_items()}
 
-    def _token_for_vector(self, vector: ActionVector) -> str:
-        token = self.action_vector_to_token.get(vector)
-        if token is not None: return token
-        if self._frozen:
-            # Frozen prediction must not mutate the codebook. Unseen vectors map to a sentinel token that downstream predictors treat as OOV.
-            return "act_unseen"
-        token = f"act_{len(self.action_vector_to_token) + 1:04d}"
-        self.action_vector_to_token[vector] = token
-        self.token_to_action_vector[token] = vector
-        return token
+    def policy_stats(self) -> Dict[str, Any]:
+        return {
+            **dict(self._policy_stats),
+            **dict(self._last_action_mask_stats),
+            **dict(getattr(self.maxent, "last_prediction_stats", {}) or {}),
+        }
 
-    def _vector_for_token(self, token: str) -> Optional[ActionVector]:
-        return self.token_to_action_vector.get(token)
-
-    def _display_token(self, token: Optional[str]) -> Optional[str]:
-        # No more registry indirection: tokens are stable internal ids and the ground-truth string travels with the StepResult separately.
-        return token
-
-
-    def _decode_distribution(self, dist: Dict[str, float]) -> Dict[str, float]:
-        out: Dict[str, float] = {}
-        for token, prob in dist.items():
-            label = self._display_token(token) or token
-            out[label] = out.get(label, 0.0) + float(prob)
-        total = sum(out.values())
-        return {a: p / total for a, p in out.items()} if total > 0 else out
-
-    def _tokens_from_action_labels(self, actions: Sequence[str]) -> List[str]:
-        tokens: List[str] = []
-        for obs in observations_from_actions(actions): tokens.append(self.action_vector_to_token.get(obs.action_vector, "act_unseen"))
-        return tokens
-
-    def _identity_tokens_from_action_labels(self, actions: Sequence[str]) -> List[str]:
-        """Evaluator-only convenience mirror of the observed identity stream.
-
-        Production identity tokens are appended inside ``observe_observation``.
-        This helper lets offline audits reproduce that same representation from
-        their simulated observations without exposing action strings to the
-        classifier itself.
-        """
-        return [identity_token_from_observation(obs) for obs in observations_from_actions(actions)]
-
-    def _coerce_prefix_tokens(self, prefix: Sequence[str]) -> List[str]:
-        if not prefix: return []
-        if all(p in self.token_to_action_vector for p in prefix): return list(prefix)
-        if all("(" not in str(p) for p in prefix): return [str(p) for p in prefix]
-        return self._tokens_from_action_labels(prefix)
-
-    def action_policy_stats(self) -> Dict[str, Any]:
-        return dict(self._last_action_policy)
-
-    def _set_action_policy_stats(
+    def _set_policy_stats(
         self,
         confidence: Optional[float],
-        support_normalized_entropy: Optional[float],
+        entropy: Optional[float],
         reason: str,
         *,
         margin: Optional[float] = None,
@@ -799,84 +814,160 @@ class AdaptiveHRCAgent:
     ) -> None:
         if self._frozen:
             return
-        self._last_action_policy = {
-            "robot_action_mandatory": True,
-            "action_confidence": confidence,
-            "raw_action_confidence": confidence,
-            "action_margin": margin,
-            "action_support_normalized_entropy": support_normalized_entropy,
-            "action_entropy_normalization": "prediction_support",
-            "policy_source": source or "irl_markov_ensemble",
-            "final_action_confidence": confidence,
-            "final_action_margin": margin,
-            "final_action_support_normalized_entropy": support_normalized_entropy,
+        self._policy_stats = {
+            "action_required": True,
+            "confidence": confidence,
+            "raw_confidence": confidence,
+            "margin": margin,
+            "entropy": entropy,
+            "entropy_basis": "prediction_support",
+            "predictor": source or "configured_policy",
+            "final_confidence": confidence,
+            "final_margin": margin,
+            "final_entropy": entropy,
             "reason": reason,
         }
 
-    def _distribution_stats(self, dist: Dict[str, float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        if not dist: return None, None, None
-        vals = sorted((float(v) for v in dist.values()), reverse=True)
-        confidence = vals[0] if vals else None
-        margin = vals[0] - vals[1] if len(vals) >= 2 else (vals[0] if vals else None)
-        support_normalized_entropy = 0.0
-        for p in vals: 
-            if p > 0: support_normalized_entropy -= p * math.log(p)
-        if len(vals) > 1: support_normalized_entropy = support_normalized_entropy / math.log(len(vals))
-        return confidence, support_normalized_entropy, margin
+    def _prediction_stats(self, distribution: Dict[str, float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        if not distribution: return None, None, None
+        probabilities = sorted(
+            (float(value) for value in distribution.values()), reverse=True,
+        )
+        confidence = probabilities[0] if probabilities else None
+        margin = probabilities[0] - probabilities[1] if len(probabilities) >= 2 else (probabilities[0] if probabilities else None)
+        entropy = 0.0
+        for probability in probabilities:
+            if probability > 0:
+                entropy -= probability * math.log(probability)
+        if len(probabilities) > 1:
+            entropy = entropy / math.log(len(probabilities))
+        return confidence, entropy, margin
 
-
-
-    def _state_from_prefix(self, prefix: Sequence[str]) -> Tuple[int, ...]:
+    def _replay_prefix(self, prefix: Sequence[str]) -> Tuple[int, ...]:
         with self._profile("state_from_prefix"):
             tracker = StateTracker()
-            state = tuple(tracker.get_state_vector().astype(int).tolist())
-            for token in self._coerce_prefix_tokens(prefix):
-                vector = self._vector_for_token(token)
-                if vector is None: continue
-                state = apply_transition_vector(state, vector)
-            return state
+            for action in prefix:
+                tracker.apply_action(str(action))
+            return tuple(tracker.get_state_vector().astype(int).tolist())
 
-    def predict_next_tokens(self, prefix: Optional[Sequence[str]] = None) -> Dict[str, float]:
-        """Return the deployable IRL and state-aware n-gram ensemble policy."""
-        with self._profile("predict_next_tokens"):
-            prefix_tokens = self._coerce_prefix_tokens(prefix) if prefix is not None else list(self.current_prefix)
-            state = self._state_from_prefix(prefix_tokens)
-            p_irl = self.irl.predict(state)
-            p_ngram = self.markov.predict(state, prefix_tokens)
-            distribution = ensemble_predict(p_irl, p_ngram, cfg=self.cfg)
-            confidence, support_normalized_entropy, margin = self._distribution_stats(distribution)
-            self._set_action_policy_stats(
+    def _known_action_universe(self) -> Tuple[str, ...]:
+        """Union of grounded actions in active replay, without task routing."""
+        actions = {
+            action
+            for entry in self.replay.active_items()
+            for action in entry.ordering
+            if action != "stop"
+        }
+        return tuple(sorted(actions))
+
+    def _conditioned_actions(
+        self,
+        state: Tuple[int, ...],
+        action_universe: Optional[Sequence[str]] = None,
+    ) -> Tuple[str, ...]:
+        """Apply the shared mask using current-state preconditions only."""
+        known_actions = self._known_action_universe()
+        if action_universe is None:
+            candidates = known_actions
+        else:
+            universe = {str(action) for action in action_universe}
+            candidates = tuple(
+                action for action in known_actions if action in universe
+            )
+        conditioned = feasible_actions(tuple(state), candidates)
+        self._last_action_mask_stats = {
+            "action_mask": "shared_state_preconditions_only",
+            "action_mask_shared_across_predictors": True,
+            "action_mask_preference_neutral": True,
+            "action_mask_uses_recipe_hypothesis": False,
+            "action_universe_count": len(candidates),
+            "feasible_action_count": len(conditioned),
+        }
+        return conditioned
+
+    def _apply_shared_action_mask(
+        self,
+        state: Tuple[int, ...],
+        distribution: Mapping[str, float],
+    ) -> Dict[str, float]:
+        """Apply and renormalize the common state-only legality interface."""
+        legal = set(self._conditioned_actions(state, tuple(distribution)))
+        masked = {
+            str(action): max(0.0, float(probability))
+            for action, probability in distribution.items()
+            if str(action) in legal and math.isfinite(float(probability))
+        }
+        if not masked:
+            return {}
+        total = sum(masked.values())
+        if total <= 0.0:
+            probability = 1.0 / len(masked)
+            return {action: probability for action in masked}
+        return {
+            action: probability / total
+            for action, probability in masked.items()
+        }
+
+    def predict_actions(self, prefix: Optional[Sequence[str]] = None) -> Dict[str, float]:
+        """Return the MaxEnt IRL policy over feasible task actions."""
+        with self._profile("predict_actions"):
+            prefix_actions = list(prefix) if prefix is not None else list(self.current_prefix)
+            state = self._replay_prefix(prefix_actions)
+            candidates = self._conditioned_actions(state)
+            distribution = self.maxent.predict(
+                state, candidates, prefix=prefix_actions,
+                allow_latent_strategy=self._latent_strategy_confirmed,
+            )
+            confidence, entropy, margin = self._prediction_stats(distribution)
+            semantic_enabled = bool(self.settings.semantic_fallback_enabled)
+            latent_enabled = bool(self.settings.latent_strategy_enabled)
+            if semantic_enabled and latent_enabled:
+                source = "maxent_with_semantic_fallback_and_latent_strategy"
+            elif semantic_enabled:
+                source = "maxent_with_semantic_fallback"
+            elif latent_enabled:
+                source = "maxent_with_latent_strategy"
+            else:
+                source = "maxent_irl_only"
+            self._set_policy_stats(
                 confidence,
-                support_normalized_entropy,
-                "irl_markov_ensemble",
+                entropy,
+                source,
                 margin=margin,
-                source="irl_markov_ensemble",
+                source=source,
             )
             return distribution
 
+    def rank_actions(
+        self, distribution: Mapping[str, float], k: int = 1,
+    ) -> List[str]:
+        """Apply seeded Gaussian tie-breaking without changing probabilities."""
+        return top_actions(distribution, k=k, rng=self._tie_break_rng)
 
-    def predict_next(self, prefix: Optional[Sequence[str]] = None) -> Dict[str, float]:
-        return self._decode_distribution(self.predict_next_tokens(prefix))
-
-    def observe_observation(
+    def observe(
         self,
-        observation: ActionObservation,
+        observation: Observation,
         ground_truth_recipe: Optional[str] = None,
         *,
         precomputed_distribution: Optional[Mapping[str, float]] = None,
+        precomputed_prediction: Optional[str] = None,
     ) -> StepResult:
-        """Consume one observed human transition using anonymous action tokens."""
+        """Consume one observed semantic action and its state transition."""
         if self._frozen:
-            action = self.action_vector_to_token.get(observation.action_vector, "act_unseen")
+            action = observation.action
             distribution = (
                 dict(precomputed_distribution)
                 if precomputed_distribution is not None
-                else self.predict_next_tokens(self.current_prefix)
+                else self.predict_actions(self.current_prefix)
             )
-            predicted = top_k(distribution, k=1)[0] if distribution else None
+            predicted = (
+                precomputed_prediction
+                if precomputed_distribution is not None else
+                (self.rank_actions(distribution, k=1)[0] if distribution else None)
+            )
             return StepResult(
                 step=self.step_counter,
-                predicted=self._display_token(predicted),
+                predicted=predicted,
                 actual=action,
                 correct=predicted == action,
                 mode=self.mode,
@@ -885,14 +976,13 @@ class AdaptiveHRCAgent:
 
         self.step_counter += 1
         if self.mode == MODE_OBSERVE:
-            action = self._token_for_vector(observation.action_vector)
+            action = observation.action
             self.pending_demo.append(action)
-            self.pending_demo_transitions.append(self._transition_from_observation(action, observation))
-            self.pending_demo_identity.append(identity_token_from_observation(observation))
+            self.pending_trace.append(self._transition(action, observation))
             result = StepResult(
                 step=self.step_counter,
                 predicted=None,
-                actual=self._display_token(action) or action,
+                actual=action,
                 correct=False,
                 mode=self.mode,
                 event="observing",
@@ -900,28 +990,41 @@ class AdaptiveHRCAgent:
             self.step_log.append(result)
             return result
 
-        first_online_action = not self.current_prefix and precomputed_distribution is None
+        first_online_action = not self.current_prefix
         if first_online_action:
             distribution: Dict[str, float] = {}
         else:
             distribution = (
                 dict(precomputed_distribution)
                 if precomputed_distribution is not None
-                else self.predict_next_tokens(self.current_prefix)
+                else self.predict_actions(self.current_prefix)
             )
-            self._online_policy_history.append(dict(self._last_action_policy))
-        predicted = top_k(distribution, k=1)[0] if distribution else None
-        action = self.action_vector_to_token.get(observation.action_vector)
-        if action is None:
-            action = self._token_for_vector(observation.action_vector)
+            self._policy_history.append(dict(self._policy_stats))
+        predicted = (
+            None if first_online_action else
+            (
+                precomputed_prediction
+                if precomputed_distribution is not None else
+                (self.rank_actions(distribution, k=1)[0] if distribution else None)
+            )
+        )
+        action = observation.action
         correct = predicted == action
+        if predicted is not None and not correct:
+            self._prediction_mismatch_count += 1
+            if self.maxent.latent_supports_correction(
+                (*self.current_prefix, action),
+                tuple(distribution),
+                action,
+                predicted,
+            ):
+                self._latent_strategy_confirmed = True
         self.current_prefix.append(action)
-        self.current_transition_trace.append(self._transition_from_observation(action, observation))
-        self.current_identity_prefix.append(identity_token_from_observation(observation))
+        self.current_trace.append(self._transition(action, observation))
         result = StepResult(
             step=self.step_counter,
-            predicted=self._display_token(predicted),
-            actual=self._display_token(action) or action,
+            predicted=predicted,
+            actual=action,
             correct=correct,
             mode=self.mode,
         )
@@ -929,76 +1032,69 @@ class AdaptiveHRCAgent:
         self.accuracy_events.append((self.step_counter, ground_truth_recipe or "?", correct))
         return result
 
-    def evaluate_autonomous_tokens(
+    def evaluate_actions(
         self,
         ordering: Sequence[str],
-        topn: int = 3,
+        top_k: int = 3,
     ) -> Dict[str, float]:
         if not self._frozen:
             with self.frozen():
-                return self.evaluate_autonomous_tokens(ordering, topn=topn)
-        tokens = self._coerce_prefix_tokens(ordering)
-        total = len(tokens)
-        topn = max(1, int(topn))
+                return self.evaluate_actions(ordering, top_k=top_k)
+        actions = list(ordering)
+        total = len(actions)
+        rank_count = max(1, int(top_k))
         if total == 0:
             result = {
-                "top1": 0.0,
-                "topk": 0.0,
+                "top_1": 0.0,
+                "top_k": 0.0,
                 "prediction_available_rate": 0.0,
                 "empty_prediction_rate": 0.0,
                 "cross_entropy": 0.0,
             }
-            result[f"top{topn}"] = 0.0
+            result[f"top{rank_count}"] = 0.0
             return result
 
         prefix: List[str] = []
-        top1_hits = topk_hits = available = empty_predictions = 0
-        nll = 0.0
-        floor = max(float(self.cfg.prob_floor), 1e-12)
-        for actual in tokens:
-            distribution = self.predict_next_tokens(prefix)
-            ranked = top_k(distribution, k=topn) if distribution else []
+        top_1_hits = top_k_hits = available = empty_predictions = 0
+        log_loss = 0.0
+        floor = max(float(self.settings.min_probability), 1e-12)
+        for actual in actions:
+            distribution = self.predict_actions(prefix)
+            ranked = (
+                self.rank_actions(distribution, k=rank_count)
+                if distribution else []
+            )
             if distribution:
                 available += 1
-                top1_hits += int(ranked[0] == actual)
-                topk_hits += int(actual in ranked)
-                nll -= math.log(max(float(distribution.get(actual, floor)), floor))
+                top_1_hits += int(ranked[0] == actual)
+                top_k_hits += int(actual in ranked)
+                log_loss -= math.log(max(float(distribution.get(actual, floor)), floor))
             else:
                 empty_predictions += 1
-                nll -= math.log(floor)
+                log_loss -= math.log(floor)
             prefix.append(actual)
 
         result = {
-            "top1": top1_hits / total,
-            "topk": topk_hits / total,
+            "top_1": top_1_hits / total,
+            "top_k": top_k_hits / total,
             "prediction_available_rate": available / total,
             "empty_prediction_rate": empty_predictions / total,
-            "cross_entropy": nll / total,
+            "cross_entropy": log_loss / total,
         }
-        result[f"top{topn}"] = topk_hits / total
+        result[f"top{rank_count}"] = top_k_hits / total
         return result
 
-    def _build_trajectories(self, demos):
-        """Convert each demo into a trajectory in O(L) per demo.
-
-        Production demos carry observed transition traces:
-        ``(state_before, anonymous_token, state_after)``. These traces are the
-        learner's legitimate sensor stream and avoid replaying hidden symbolic
-        simulator action strings. Anonymous synthetic tests or old records that
-        lack traces fall back to transition-vector replay.
-        """
-        trajs = []
+    def _build_demos(self, records):
+        """Build O(L) trajectories from traces or semantic-action replay."""
+        trajectories = []
         dropped_total = 0
-        for demo in demos:
-            if isinstance(demo, Entry):
-                raw_tokens = list(demo.ordering)
-            elif isinstance(demo, Mapping):
-                raw_tokens = list(demo.get("ordering", ()))
+        for record in records:
+            if isinstance(record, Mapping):
+                actions = list(record.get("ordering", ()))
             else:
-                raw_tokens = list(demo)
-            tokens = self._coerce_prefix_tokens(raw_tokens)
-            traj = []
-            trace = self._trace_for_demo(demo, tokens)
+                actions = list(getattr(record, "ordering", record))
+            trajectory = []
+            trace = self._get_trace(record, actions)
             if trace:
                 state = trace[0][0]
                 for before, token, after in trace:
@@ -1006,221 +1102,313 @@ class AdaptiveHRCAgent:
                         dropped_total += 1
                         state = after
                         continue
-                    traj.append((before, token))
+                    trajectory.append((before, token))
                     state = after
             else:
-                # Fallback: no stored transition trace (anonymous test-fixture
-                # tokens).  Re-apply pre-computed vectors incrementally.
-                # Mirror the trace path exactly: skip (state, token) pairs where
-                # the vector produces no state change so the IRL never trains on
-                # self-loop transitions.  Unknown or mock length-mismatched
-                # vectors are kept because they represent anonymous test
-                # actions whose full environment effects are not catalogued.
+                # Semantic replay reconstructs exact states and drops self-loops.
                 tracker = StateTracker()
                 state = tuple(tracker.get_state_vector().astype(int).tolist())
-                for token in tokens:
-                    vector = self._vector_for_token(token)
-                    if vector is None or len(vector) != 2 * len(state):
-                        traj.append((state, token))
-                        continue
-                    new_state = apply_transition_vector(state, vector)
+                for action in actions:
+                    tracker.apply_action(action)
+                    new_state = tuple(
+                        tracker.get_state_vector().astype(int).tolist()
+                    )
                     if new_state == state:
                         dropped_total += 1
                         state = new_state
                         continue
-                    traj.append((state, token))
+                    trajectory.append((state, action))
                     state = new_state
-            traj.append((state, "stop"))
-            trajs.append(traj)
-        return trajs, dropped_total
+            trajectory.append((state, "stop"))
+            trajectories.append(trajectory)
+        return trajectories, dropped_total
 
-    def _record_retrain_event(self, dropped_actions: int, active_demos: int, *, total_wall_s: float = 0.0, build_wall_s: float = 0.0, fit_wall_s: float = 0.0, flop_estimate: float = 0.0, skipped: bool = False) -> None:
+    def _log_training(self, dropped_actions: int, active_demos: int, *, total_wall_s: float = 0.0, build_wall_s: float = 0.0, fit_wall_s: float = 0.0, flop_estimate: float = 0.0, skipped: bool = False) -> None:
         """Append a structured retrain event. All agent variants funnel through this."""
-        fit_stats = self._latest_fit_stats() if not skipped else {}
+        fit_stats = self._fit_stats() if not skipped else {}
+        recorded_flops = float(flop_estimate)
         if not skipped and float(flop_estimate) <= 0.0:
             estimate = fit_stats.get("estimated_flops") if isinstance(fit_stats, dict) else None
-            if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)): flop_estimate = float(estimate)
+            if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)):
+                recorded_flops = float(estimate)
         event = {"step": self.step_counter, "cycle": int(self.retrain_cycle), "dropped_actions": int(dropped_actions), "active_demos": int(active_demos), "total_wall_s": float(total_wall_s), "build_wall_s": float(build_wall_s),
-            "fit_wall_s": float(fit_wall_s), "flop_estimate": float(flop_estimate), "skipped": bool(skipped)}
+            "fit_wall_s": float(fit_wall_s), "flop_estimate": recorded_flops, "skipped": bool(skipped)}
         if fit_stats: event["fit_stats"] = fit_stats
         self.retrain_events.append(event)
         if not skipped:
             self.retrain_total_wall_times.append(float(total_wall_s))
             self.retrain_build_wall_times.append(float(build_wall_s))
             self.retrain_fit_wall_times.append(float(fit_wall_s))
-            self.retrain_flop_estimates.append(float(flop_estimate))
+            self.retrain_flop_estimates.append(recorded_flops)
 
-    def _latest_fit_stats(self) -> Dict[str, Any]:
-        """Return structured accounting from the model head fit that just ran."""
+    def _fit_stats(self) -> Dict[str, Any]:
+        """Return structured accounting from the model fit that just ran."""
         stats: Dict[str, Any] = {}
-        irl_stats = getattr(getattr(self, "irl", None), "last_fit_stats", None)
-        if isinstance(irl_stats, dict) and irl_stats:       stats.update(irl_stats)
-        bc_stats = getattr(getattr(self, "bc", None), "last_fit_stats", None)
-        if isinstance(bc_stats, dict) and bc_stats:         stats.update(bc_stats)
+        maxent_stats = getattr(getattr(self, "maxent", None), "last_fit_stats", None)
+        if (
+            self.settings.predictor == "maxent"
+            and isinstance(maxent_stats, dict) and maxent_stats
+        ):
+            stats.update(maxent_stats)
+        cloning_stats = getattr(
+            getattr(self, "cloner", None), "last_fit_stats", None,
+        )
+        if isinstance(cloning_stats, dict) and cloning_stats:         stats.update(cloning_stats)
         custom_stats = getattr(self, "_custom_fit_stats", None)
         if isinstance(custom_stats, dict) and custom_stats: stats.update(custom_stats)
+        if stats:
+            stats["predictor"] = self.predictor_name()
+            stats["irl_features"] = self.irl_feature_name()
         return stats
 
-    def _estimate_retrain_flops(self, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]]) -> float:
-        """Estimate fit FLOPs from the fitted head's actual accounting."""
-        stats = self._latest_fit_stats()
-        estimate = stats.get("estimated_flops") if isinstance(stats, dict) else None
-        if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)):
-            if stats.get("model_family") != "maxent_irl": return float(estimate)
-            n_transitions = sum(max(0, len(traj) - 1) for traj in trajectories)
-            count_head_flops = float(n_transitions * max(1, int(getattr(self.cfg, "markov_order", 1)) + 2))
-            return float(estimate) + count_head_flops
-        # Custom heads should expose last_fit_stats; this estimate is retained
-        # only for externally supplied heads that do not.
-        n_transitions = sum(max(0, len(traj) - 1) for traj in trajectories)
-        n_actions = max(1, len({action for traj in trajectories for _state, action in traj}))
-        feature_dim = len(trajectories[0][0][0]) if trajectories and trajectories[0] else 1
-        iters = int(getattr(self.cfg, "maxent_iters_warm", 1) if self.retrain_cycle > 1 else getattr(self.cfg, "maxent_iters_cold", 1))
-        return float(n_transitions * n_actions * feature_dim * max(1, iters))
+    def replay_stats(self) -> Dict[str, Any]:
+        return {}
 
-    # offline retrain on weighted active set
-    def _fit_heads(self, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]], weights: Sequence[float]) -> None:
-        self.irl.fit(trajectories, weights)
-        self.markov.fit(trajectories, weights, state_to_idx=self.irl.state_to_idx, idx_to_state=self.irl.idx_to_state, feature_matrix=self.irl.feature_matrix, col_min=self.irl.col_min, col_max=self.irl.col_max, normalizer=self.irl.normalizer)
+    def predictor_name(self) -> str:
+        """Return the predictor that actually produces action probabilities."""
+        return str(self.settings.predictor)
 
-    def _reset_heads(self) -> None:
-        self.irl = MaxEntIRL2(cfg=self.cfg)
-        self.markov = NGramMarkov(
-            order=self.cfg.markov_order,
-            prob_floor=self.cfg.prob_floor,
-            state_log_weight=self.cfg.ngram_state_log_weight,
-            prefix_log_weight=self.cfg.ngram_prefix_log_weight,
+    def irl_feature_name(self) -> str:
+        return (
+            str(self.settings.irl_features)
+            if self.settings.predictor == "maxent"
+            else "not_applicable"
         )
 
-    def _prepare_retrain_fit(self) -> None:
-        """Drop fitted predictor state before fitting the current active set."""
-        self._reset_heads()
+    def baseline_stats(self) -> Dict[str, Any]:
+        return {}
 
-    def _fit_fingerprint(self) -> Optional[frozenset]:
-        """Identity of active replay membership.
+    def training_stats(self) -> Dict[str, Any]:
+        return {}
 
-        None means the active set is empty. The fingerprint deliberately ignores
-        weights, timestamps, and transition traces so short decay ramps do not
-        trigger one fit per decay tick; only additions/removals do.
-        """
-        if not self.decay.active: return None
-        return frozenset(self.decay.active.keys())
+    def diagnostics(self) -> Dict[str, Any]:
+        """Return the model-specific sections required by evaluation."""
+        sections = {
+            "fit_stats": self._fit_stats(),
+            "replay_buffer": self.replay_stats(),
+            "baseline_model_memory": self.baseline_stats(),
+            "offline_pretraining": self.training_stats(),
+        }
+        return {name: value for name, value in sections.items() if value}
 
-    def _demo_weighting_length(self, demo: Any) -> int:
-        if isinstance(demo, Entry):
-            return max(1, len(demo.ordering))
+    def _estimate_flops(self, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]]) -> float:
+        """Estimate fit FLOPs from the fitted model's actual accounting."""
+        stats = self._fit_stats()
+        estimate = stats.get("estimated_flops") if isinstance(stats, dict) else None
+        if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)):
+            return float(estimate)
+        # Fallback for external predictors without fit statistics.
+        n_transitions = sum(max(0, len(demo) - 1) for demo in trajectories)
+        n_actions = max(1, len({action for demo in trajectories for _state, action in demo}))
+        feature_dim = len(trajectories[0][0][0]) if trajectories and trajectories[0] else 1
+        iters = int(getattr(self.settings, "irl_warm_steps", 1) if self.retrain_cycle > 1 else getattr(self.settings, "irl_cold_steps", 1))
+        return float(n_transitions * n_actions * feature_dim * max(1, iters))
+
+    def _fit_models(
+        self,
+        maxent: MaxEntIrl,
+        trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]],
+        weights: Sequence[float],
+        *,
+        warm_start: bool,
+        records: Optional[Sequence[Any]] = None,
+    ) -> None:
+        maxent.fit(trajectories, weights)
+
+    def _fit_predictors(self, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]], weights: Sequence[float], *, warm_start: bool, records: Optional[Sequence[Any]] = None) -> None:
+        self._fit_models(
+            self.maxent, trajectories, weights,
+            warm_start=warm_start, records=records,
+        )
+
+    def _predictors_ready(self) -> bool:
+        return self.maxent.reward_weights is not None
+
+    def _reset_predictors(self) -> None:
+        self.maxent = MaxEntIrl(settings=self.settings)
+
+    def _demo_length(self, demo: Any) -> int:
         if isinstance(demo, Mapping):
             ordering = demo.get("ordering", ())
+            return max(1, len(ordering))
+        ordering = getattr(demo, "ordering", None)
+        if ordering is not None:
             return max(1, len(ordering))
         if isinstance(demo, (list, tuple)):
             return max(1, len(demo))
         return 1
 
-    def _length_normalized_demo_weights(self, demos: Sequence[Any], base_weights: Sequence[float]) -> List[float]:
-        """Normalize per-demo training influence so longer recipes do not dominate.
-
-        The learner consumes per-demo weights but expands each demo into a
-        variable number of transitions. Dividing by demo length makes each
-        recipe/preference episode contribute comparable total mass, then
-        rescaling preserves the average decay/replay weight used by the
-        baseline.
-        """
-        bases = [float(w) for w in base_weights]
-        if not demos or not bases:
-            return bases
-        n = min(len(demos), len(bases))
-        demos = list(demos)[:n]
-        bases = bases[:n]
-        raw = [
-            float(weight) / float(self._demo_weighting_length(demo))
-            for demo, weight in zip(demos, bases)
+    def _demo_weights(self, demos: Sequence[Any], base_weights: Sequence[float]) -> List[float]:
+        """Equalize episode mass by length while preserving mean replay weight."""
+        replay_weights = [float(weight) for weight in base_weights]
+        if not demos or not replay_weights:
+            return replay_weights
+        count = min(len(demos), len(replay_weights))
+        selected_demos = demos[:count]
+        replay_weights = replay_weights[:count]
+        normalized_weights = [
+            float(weight) / float(self._demo_length(demo))
+            for demo, weight in zip(selected_demos, replay_weights)
         ]
-        raw_mean = sum(raw) / max(1, len(raw))
-        base_mean = sum(bases) / max(1, len(bases))
-        if raw_mean <= 0.0 or not math.isfinite(raw_mean):
-            return raw
-        scale = base_mean / raw_mean
-        return [float(w * scale) for w in raw]
+        normalized_mean = sum(normalized_weights) / max(
+            1, len(normalized_weights),
+        )
+        replay_mean = sum(replay_weights) / max(1, len(replay_weights))
+        if normalized_mean <= 0.0 or not math.isfinite(normalized_mean):
+            return normalized_weights
+        scale = replay_mean / normalized_mean
+        return [float(weight * scale) for weight in normalized_weights]
+
+    def _update(self, apply_decay: bool) -> None:
+        if apply_decay:
+            self.replay.step(self.demo_counter, self.retrain_cycle)
+        self._retrain()
 
     def _retrain(self) -> None:
         if self._frozen:
             return
-        retrain_t0 = time.perf_counter()
-        fp = self._fit_fingerprint()
-        if fp is not None and fp == self._last_fit_fingerprint:
-            # Active membership is identical to the last successful fit. Weight-only decay changes are deliberately absorbed without refitting; additions/removals still invalidate this gate.
-            with self._profile("retrain_skipped"):
-                self.retrain_cycle += 1
-                self.retrain_skipped_count += 1
-                self._record_retrain_event(dropped_actions=0, active_demos=len(self.decay.active), total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
-            return
-        with self._profile("retrain_total"):
-            self.retrain_cycle += 1
-            entries = self.decay.active_entries()
-            if not entries:
-                self._record_retrain_event(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
-                self._reset_heads()
-                self._last_fit_fingerprint = None
-                if self.cfg.verbose: self.narrate(f"[step {self.step_counter}] cleared predictors because active memory is empty (cycle {self.retrain_cycle})")
-                return
-            build_t0 = time.perf_counter()
-            with self._profile("retrain_build_trajectories"):   trajectories, dropped_total = self._build_trajectories(entries)
-            build_wall_s = time.perf_counter() - build_t0
-            weights = self._length_normalized_demo_weights(entries, [e.weight for e in entries])
-            self._prepare_retrain_fit()
-            fit_t0 = time.perf_counter()
-            with self._profile("retrain_fit_heads"):            self._fit_heads(trajectories, weights)
-            fit_wall_s = time.perf_counter() - fit_t0
-            self._record_retrain_event(dropped_actions=dropped_total, active_demos=len(entries), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_retrain_flops(trajectories))
-            self._last_fit_fingerprint = fp
-            if self.cfg.verbose:                                self.narrate(f"[step {self.step_counter}] retrained on {len(trajectories)} weighted demos (cycle {self.retrain_cycle}, post_grace_decay_rate={self.decay.post_grace_decay_rate:.6f}, dropped_actions={dropped_total})")
 
-    def refresh_model_from_memory(self) -> None:
+        retrain_t0 = time.perf_counter()
+        current = {
+            key: float(entry.weight)
+            for key, entry in self.replay.active.items()
+        }
+        previous = self._last_observed_replay_weights
+        added = set(current) - set(previous)
+        removed = set(previous) - set(current)
+        weight_changed = {
+            key
+            for key in set(current) & set(previous)
+            if not math.isclose(
+                current[key], previous[key], rel_tol=0.0, abs_tol=1e-12,
+            )
+        }
+        self._last_observed_replay_weights = dict(current)
+
+        alterations = len(added) + len(removed)
+        counter_before = self.cold_change_count
+        requested_start, trigger, projected = self.retrain_policy.decide(
+            alterations, bool(weight_changed), counter_before,
+        )
+
+        def audit(effective_start: str, counter_after: int) -> None:
+            self.retrain_events[-1].update({
+                "retrain_requested_start": requested_start,
+                "retrain_effective_start": effective_start,
+                "retrain_trigger": trigger,
+                "active_added_count": len(added),
+                "active_removed_count": len(removed),
+                "active_weight_changed_count": len(weight_changed),
+                "membership_changes_since_cold_before": counter_before,
+                "membership_changes_since_cold_projected": projected,
+                "membership_changes_since_cold_after": counter_after,
+            })
+
+        self.retrain_cycle += 1
+        if requested_start == "skip":
+            self.skipped_trains += 1
+            self._log_training(
+                dropped_actions=0,
+                active_demos=len(self.replay.active),
+                total_wall_s=time.perf_counter() - retrain_t0,
+                skipped=True,
+            )
+            audit("skipped", counter_before)
+            return
+
+        entries = self.replay.active_items()
+        if not entries:
+            self._reset_predictors()
+            self.cold_change_count = 0
+            self.skipped_trains += 1
+            self._log_training(
+                dropped_actions=0,
+                active_demos=0,
+                total_wall_s=time.perf_counter() - retrain_t0,
+                skipped=True,
+            )
+            audit("clear_empty", 0)
+            return
+
+        effective_start = requested_start
+        if requested_start == "cold":
+            self._reset_predictors()
+        elif not self._predictors_ready():
+            self._reset_predictors()
+            effective_start = "cold_fallback_no_model"
+
+        build_t0 = time.perf_counter()
+        with self._profile("retrain_build_trajectories"):
+            trajectories, dropped_total = self._build_demos(entries)
+        build_wall_s = time.perf_counter() - build_t0
+        weights = self._demo_weights(
+            entries, [entry.weight for entry in entries],
+        )
+        fit_t0 = time.perf_counter()
+        with self._profile("retrain_fit_predictors"):
+            self._fit_predictors(
+                trajectories,
+                weights,
+                warm_start=(effective_start == "warm"),
+                records=entries,
+            )
+        fit_wall_s = time.perf_counter() - fit_t0
+        self._log_training(
+            dropped_actions=dropped_total,
+            active_demos=len(entries),
+            total_wall_s=time.perf_counter() - retrain_t0,
+            build_wall_s=build_wall_s,
+            fit_wall_s=fit_wall_s,
+            flop_estimate=self._estimate_flops(trajectories),
+        )
+        if effective_start == "warm":
+            self.cold_change_count = projected
+        else:
+            self.cold_change_count = 0
+        audit(
+            effective_start,
+            self.cold_change_count,
+        )
+        if self.settings.verbose:
+            self.narrate(
+                f"[step {self.step_counter}] {effective_start} retrained on "
+                f"{len(trajectories)} weighted demos (cycle {self.retrain_cycle}, "
+                f"post_grace_decay_rate={self.replay.post_grace_decay_rate:.6f}, "
+                f"dropped_actions={dropped_total})"
+            )
+
+    def refresh(self) -> None:
         """Re-fit predictors against the current active memory without adding a demo."""
         self._retrain()
 
-    def pruned_influence_audit(self, max_prefixes: int = 24, tolerance: float = 5e-2) -> Dict[str, Any]:
-        """Verify that the fitted deployable heads use active replay only."""
-        entries = self.decay.active_entries()
-        if not entries:
-            return {
-                "max_l1": 0.0,
-                "mean_l1": 0.0,
-                "n_prefixes": 0,
-                "passed": True,
-                "tolerance": float(tolerance),
-                "audit_reference_seed": int(self.cfg.seed) + 1_000_003,
-            }
+    def discard(self, keys: Sequence[VariantKey]) -> None:
+        """Remove replay variants and repair both latest-variant indexes."""
+        recipe_ids = {recipe_id for recipe_id, _variant_id in keys}
+        for recipe_id, variant_id in keys:
+            self.replay.discard(recipe_id, variant_id, allow_latest=True)
+        for recipe_id in recipe_ids:
+            latest = self.replay.latest_by_recipe.get(recipe_id)
+            if latest is None:
+                self.library.latest.pop(recipe_id, None)
+            else:
+                self.library.latest[recipe_id] = latest
 
-        trajectories, _ = self._build_trajectories(entries)
-        weights = self._length_normalized_demo_weights(entries, [float(entry.weight) for entry in entries])
-        audit_seed = int(self.cfg.seed) + 1_000_003
-        audit_cfg = replace(self.cfg, seed=audit_seed)
-        fresh_irl = MaxEntIRL2(cfg=audit_cfg)
-        fresh_markov = NGramMarkov(
-            order=self.cfg.markov_order,
-            prob_floor=self.cfg.prob_floor,
-            state_log_weight=self.cfg.ngram_state_log_weight,
-            prefix_log_weight=self.cfg.ngram_prefix_log_weight,
-        )
-        fresh_irl.fit(trajectories, weights)
-        fresh_markov.fit(
-            trajectories,
-            weights,
-            state_to_idx=fresh_irl.state_to_idx,
-            idx_to_state=fresh_irl.idx_to_state,
-            feature_matrix=fresh_irl.feature_matrix,
-            col_min=fresh_irl.col_min,
-            col_max=fresh_irl.col_max,
-            normalizer=fresh_irl.normalizer,
-        )
-
+    def _compare_policies(
+        self,
+        entries: Sequence[MemoryItem],
+        current: Callable[[Tuple[int, ...], Tuple[str, ...]], Mapping[str, float]],
+        reference: Callable[[Tuple[int, ...], Tuple[str, ...]], Mapping[str, float]],
+        *,
+        max_prefixes: int,
+        tolerance: float,
+        **metadata: Any,
+    ) -> Dict[str, Any]:
         prefixes: List[Tuple[str, ...]] = []
         seen: Set[Tuple[str, ...]] = set()
         for entry in entries:
             sequence = tuple(entry.ordering)
-            for k in (0, min(len(sequence), 1), len(sequence) // 2, max(0, len(sequence) - 1)):
-                prefix = sequence[:k]
+            for length in (0, min(len(sequence), 1), len(sequence) // 2, max(0, len(sequence) - 1)):
+                prefix = sequence[:length]
                 if prefix not in seen:
                     prefixes.append(prefix)
                     seen.add(prefix)
@@ -1228,28 +1416,75 @@ class AdaptiveHRCAgent:
                     break
             if len(prefixes) >= max(1, int(max_prefixes)):
                 break
-
-        differences: List[float] = []
+        differences = []
         for prefix in prefixes:
-            state = self._state_from_prefix(prefix)
-            current_ngram = self.markov.predict(state, prefix)
-            reference_ngram = fresh_markov.predict(state, prefix)
-            current = ensemble_predict(self.irl.predict(state), current_ngram, cfg=self.cfg)
-            reference = ensemble_predict(fresh_irl.predict(state), reference_ngram, cfg=self.cfg)
-            tokens = set(current) | set(reference)
-            differences.append(sum(abs(float(current.get(token, 0.0)) - float(reference.get(token, 0.0))) for token in tokens))
-
-        max_l1 = max(differences, default=0.0)
-        mean_l1 = sum(differences) / max(1, len(differences))
+            state = self._replay_prefix(prefix)
+            deployed = current(state, prefix)
+            refit = reference(state, prefix)
+            tokens = sorted(set(deployed) | set(refit))
+            differences.append(sum(
+                abs(float(deployed.get(token, 0.0)) - float(refit.get(token, 0.0)))
+                for token in tokens
+            ))
+        maximum = max(differences, default=0.0)
         return {
-            "max_l1": float(max_l1),
-            "mean_l1": float(mean_l1),
+            "max_l1": float(maximum),
+            "mean_l1": float(sum(differences) / max(1, len(differences))),
             "n_prefixes": len(prefixes),
-            "passed": bool(max_l1 <= tolerance),
+            "passed": bool(maximum <= tolerance),
             "tolerance": float(tolerance),
-            "audit_reference_seed": audit_seed,
+            **metadata,
         }
-    def evaluate_sequence(self, ordering: Sequence[str]) -> float:
-        """Prefix-conditioned accuracy of the current ensemble on a reference ordering. Used for the held-out forgetting metric."""
+
+    def audit_pruning(self, max_prefixes: int = 24, tolerance: float = 5e-2) -> Dict[str, Any]:
+        """Verify that the fitted deployable predictors use active replay only."""
+        entries = self.replay.active_items()
+        if not entries:
+            return {
+                "max_l1": 0.0,
+                "mean_l1": 0.0,
+                "n_prefixes": 0,
+                "passed": True,
+                "tolerance": float(tolerance),
+                "audit_reference_seed": int(self.settings.seed),
+            }
+
+        trajectories, _ = self._build_demos(entries)
+        weights = self._demo_weights(entries, [float(entry.weight) for entry in entries])
+        # Hold optimization randomness fixed so this audit isolates replay
+        # membership rather than conflating it with a different initialization.
+        audit_seed = int(self.settings.seed)
+        audit_settings = replace(self.settings, seed=audit_seed)
+        fresh_maxent = MaxEntIrl(settings=audit_settings)
+        self._fit_models(
+            fresh_maxent,
+            trajectories,
+            weights,
+            warm_start=False,
+            records=entries,
+        )
+
+        def predict_with(
+            model: MaxEntIrl,
+            state: Tuple[int, ...],
+            prefix: Tuple[str, ...],
+        ) -> Mapping[str, float]:
+            candidates = self._conditioned_actions(state)
+            return model.predict(
+                state,
+                candidates,
+                prefix=prefix,
+            )
+
+        return self._compare_policies(
+            entries,
+            lambda state, prefix: predict_with(self.maxent, state, prefix),
+            lambda state, prefix: predict_with(fresh_maxent, state, prefix),
+            max_prefixes=max_prefixes,
+            tolerance=tolerance,
+            audit_reference_seed=audit_seed,
+        )
+    def evaluate(self, ordering: Sequence[str]) -> float:
+        """Prefix-conditioned accuracy of the configured predictor on one ordering."""
         if not ordering: return 0.0
-        return float(self.evaluate_autonomous_tokens(ordering, topn=1)["top1"])
+        return float(self.evaluate_actions(ordering, top_k=1)["top_1"])

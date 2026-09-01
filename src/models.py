@@ -1,170 +1,282 @@
-"""State-feature learning models: MaxEnt IRL 2.0, n-gram Markov 2.0, and log-linear fusion.
-
-This module uses the following state-aware learning design:
-    * fixed-dimensional engineered feature matrix from symbolic states      * discounted feature expectations               * demo-augmented MDP with virtual deviate action -> null state
-    * soft Bellman value iteration                                          * deterministic expected feature occupancy      * momentum ascent; callers may warm-start if they intentionally preserve theta
-"""
+"""Semantic MaxEnt IRL for personalized HRC."""
 from __future__ import annotations
 
-import random
 import math
-from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
-from .environment import (_FEAT, CONTAINERS, COOKABLES, CUTTABLES, GRATABLE, INGREDIENTS, ITEMS, LOCATIONS, SEASONINGS, StateTracker)
+from .environment import (
+    _FEAT,
+    CONTAINERS,
+    COOKABLES,
+    CUTTABLES,
+    GRATABLE,
+    INGREDIENTS,
+    ITEMS,
+    LOCATIONS,
+    SEASONINGS,
+    StateTracker,
+)
+from .latent_strategy import (
+    LatentStrategyResidual,
+    fuse_strategy_residual,
+)
 
-State = Tuple[int, ...]
-Trajectory = List[Tuple[State, str]]
-
-def _soft_value(q_vals: Sequence[float], temperature) -> float:
-    """Numerically stable soft value without per-state NumPy allocations."""
-    if len(q_vals) == 0: return 0.0
-    temp = max(float(temperature), 1e-8)
-    vals = [float(q) for q in q_vals]
-    max_q = max(vals)
-    z = sum(math.exp((q - max_q) / temp) for q in vals)
-    return max_q + temp * math.log(max(z, 1e-12))
+StateVector = Tuple[int, ...]
+Demonstration = List[Tuple[StateVector, str]]
 
 
-def _softmax_probs(q_vals: Sequence[float], temperature) -> List[float]:
-    """Numerically stable softmax without using NumPy's exp/reduction path."""
-    if len(q_vals) == 0: return []
-    temp = max(float(temperature), 1e-8)
-    vals = [float(q) for q in q_vals]
-    max_q = max(vals)
-    weights = [math.exp((q - max_q) / temp) for q in vals]
+def _soft_value(values: Sequence[float], temp: float) -> float:
+    if not values:
+        return 0.0
+    safe_temperature = max(float(temp), 1e-8)
+    peak = max(float(value) for value in values)
+    mass = sum(
+        math.exp((float(value) - peak) / safe_temperature)
+        for value in values
+    )
+    return peak + safe_temperature * math.log(max(mass, 1e-12))
+
+
+def _softmax_probs(values: Sequence[float], temp: float) -> List[float]:
+    if not values:
+        return []
+    safe_temperature = max(float(temp), 1e-8)
+    peak = max(float(value) for value in values)
+    weights = [
+        math.exp((float(value) - peak) / safe_temperature)
+        for value in values
+    ]
     total = sum(weights)
     if total <= 0.0 or not math.isfinite(total):
-        uniform = 1.0 / len(weights)
-        return [uniform] * len(weights)
-    return [w / total for w in weights]
-
+        return [1.0 / len(weights)] * len(weights)
+    return [weight / total for weight in weights]
 
 @dataclass
-class Config:
+class Settings:
     """Single source of truth for every tunable knob."""
-    # reproducibility
+
     seed: int = 1337
-    # decay manager
-    decay_init:         float = 0.1             # Fixed-rate baseline decrement.
-    decay_horizon_init: int   = 15              # Cold-start grace horizon before the recipe has a positive reuse-gap observation.
-    decay_horizon_floor: int  = 6               # Minimum grace horizon once a recipe has observed positive reuse gaps.
-    decay_after_grace_steps: int = 3            # Once the grace horizon is exceeded, unpinned variants decay linearly to prune over this many sessions.
-    decay_reuse_window: int = 3                 # Number of recent positive per-recipe reuse gaps whose maximum controls the grace horizon.
-    prune_threshold:    float = 1e-9
-    mwr_window:         int   = 30               # Diagnostic global reuse-gap trace length; adaptive logic uses decay_reuse_window per recipe.
-    protect_latest_preference:  bool  = True     # Experimental condition: protect the latest preference variant of each recipe from decay/pruning. This is enabled for the main adaptive agent only; baselines explicitly disable it.
-    # disambiguator
-    jaccard_threshold:          float = 0.96
-    identity_jaccard_threshold: float = 0.96  # Canonical-transition identity acceptance threshold.
-    identity_score_margin:      float = 0.03  # Reject near-ties between different known recipes.
-    ordering_unmatched_penalty: float = 0.5
-    # Sequence-disambiguation blend weights. Kept explicit so reported
-    # experiments do not hide decision-critical constants in implementation.
-    disambiguator_full_jaccard_weight: float = 0.70
-    disambiguator_type_jaccard_weight: float = 0.30
-    disambiguator_partial_overlap_weight: float = 0.60
-    disambiguator_partial_order_weight: float = 0.40
-    # ensemble
-    ensemble_alpha: float = 0.42
-    ensemble_beta:  float = 0.24
-    markov_order:   int   = 3
-    prob_floor:     float = 1e-6
-    ngram_state_log_weight:  float = 0.60
-    ngram_prefix_log_weight: float = 0.40
-    # MaxEnt IRL 2.0
-    maxent_gamma:           float = 0.9
-    maxent_temperature:     float = 0.5
-    maxent_learning_rate:   float = 0.05
-    maxent_l2:              float = 0.01
-    # Expected discounted features are computed by deterministic finite-horizon
-    # occupancy propagation, not Monte-Carlo rollout sampling.
-    maxent_dp_horizon:      int   = 45   # Must exceed the longest task trajectory.
-    maxent_iters_cold:      int   = 100
-    maxent_iters_warm:      int   = 40
-    maxent_valid_action_expansion: bool = False  # Keep direct Config() and experiment RunConfig defaults aligned; expansion must be explicitly enabled.
-    # agent / retraining
-    topk:       int     = 1
-    irl_weight: float   = 1.0
-    # EWC (model Fisher-diagonal) regularisation weight
-    ewc_lambda: float   = 0.4
-    ewc_fisher_clip: float = 100.0
+
+    # Replay memory.
+    fixed_decay: float = 0.1
+    initial_grace: int = 50
+    min_grace: int = 6
+    prune_delay: int = 3
+    pair_gap_window: int = 12
+    parent_weight_samples: int = 5
+    pair_prior_half_life: float = 3.0
+    gap_quantile: float = 0.90
+    gap_iqr_scale: float = 1.50
+    recipe_gap_window: int = 24
+    global_gap_window: int = 60
+    prune_threshold: float = 1e-9
+    diagnostic_gap_window: int = 30
+    pin_latest: bool = True
+
+    # Recipe matching.
+    match_threshold: float = 0.96
+    match_margin: float = 0.03
+    unmatched_penalty: float = 0.5
+    overlap_weight: float = 0.60
+    order_weight: float = 0.40
+
+    # Predictor probability floor.
+    min_probability: float = 1e-6
+
+    # MaxEnt IRL
+    irl_discount: float = 0.9
+    irl_temperature: float = 0.5
+    irl_learning_rate: float = 0.05
+    irl_l2: float = 0.01
+    # Engineered reward representation used by the MaxEnt policy.
+    irl_features: str = "engineered"
+    predictor: str = "maxent"
+    irl_horizon: int = 45
+    irl_cold_steps: int = 100
+    irl_warm_steps: int = 40
+    expand_actions: bool = False
+
+    # Semantic value interpolation is a separate out-of-support fallback; it
+    # does not change the MaxEnt reward representation above.
+    semantic_fallback_enabled: bool = True
+    semantic_knn: int = 3
+    # Raw 50-D semantic RMS: 0.20 admits at most two unit feature differences.
+    semantic_fallback_max_rms_distance: float = 0.20
+
+    # Lightweight episode-level strategy transfer.  This is a bounded
+    # residual on MaxEnt, not an independently fitted policy head.
+    latent_strategy_enabled: bool = True
+    latent_strategy_rank: int = 8
+    latent_strategy_knn: int = 3
+    latent_strategy_strength: float = 1.0
+    # Optional heavier masked-role trajectory alignment (zero = timing only).
+    latent_strategy_sequence_weight: float = 0.0
+
+    # Frozen in-context LLM baseline.
+    llm_model: str = ""
+    llm_context_tokens: int = 32768
+    llm_candidate_batch: int = 1
+
+    # Agent and retraining.
+    top_k: int = 1
+    # EWC
+    ewc_strength: float = 0.4
+    ewc_precision_floor: float = 1e-12
+    fisher_cap: float = 100.0
+
     # Behavior-cloning baselines
-    bc_learning_rate:   float = 0.1
-    bc_l2:              float = 1e-4
-    bc_history_len:     int   = 3
-    bc_history_bins:    int   = 64
-    bc_epochs_cold:     int   = 120
-    bc_epochs_warm:     int   = 60
-    bc_batch_size:      int   = 64
-    # Experience replay baselines
-    er_buffer_size: int = 256
-    er_batch_size:  int = 256
-    er_recency_alpha: float = 1.0
-    er_uniform_mix: float = 0.05
-    # narration
+    bc_learning_rate: float = 0.1
+    bc_l2: float = 1e-4
+    bc_history: int = 3
+    bc_cold_epochs: int = 120
+    bc_warm_epochs: int = 60
+    bc_batch: int = 64
+
+    # Experience replay.
+    replay_capacity: int = 64
+    replay_batch: int = 64
     verbose: bool = True
-    # diagnostic profiling: when True, the agent and disambiguator accumulate per-event call counts + wall_s into self.profile / self.disambig.profile. Off by default; negligible overhead when off (one bool check per wrap).
     profile: bool = False
-    online_new_recipe_min_prefix:   int     = 3
-    online_new_recipe_partial_threshold: float = 0.30
+
+    # Online classification and commit policy.
+    new_recipe_threshold: float = 0.30
     min_classify_length: int = 6
-    online_unknown_confirm_streak: int = 3
-    # A perfect identity match plus deployable policy evidence should promote
-    # directly at this threshold.
-    online_commit_full_threshold: float = 0.70
-    online_commit_tentative_threshold: float = 0.45
-    provisional_commit_weight: float = 0.20
-    provisional_confirm_window: int = 5
-    provisional_confirm_top1: float = 0.60
-    provisional_min_recipe_jaccard: float = 0.95
-    # Online self-training commit score. Named terms make the confidence rule
-    # auditable and allow sensitivity analyses without editing source code.
-    online_commit_identity_weight: float = 0.46
-    online_commit_identity_margin_weight: float = 0.18
-    online_commit_policy_confidence_weight: float = 0.04
-    online_commit_late_agreement_bonus: float = 0.06
-    online_commit_identity_margin_scale: float = 0.25
-    online_commit_known_identity_threshold: float = 0.99
-    online_commit_known_score_floor: float = 0.90
-    online_commit_empty_library_score_ceiling: float = 0.40
+    # Full default and policy evidence promote directly.
+    commit_threshold: float = 0.70
+    tentative_threshold: float = 0.45
+    provisional_weight: float = 0.20
+    provisional_cap: float = 0.75
+    confirm_window: int = 5
+    confirm_accuracy: float = 0.60
+    confirm_similarity: float = 0.95
+    # Auditable online self-training score.
+    match_weight: float = 0.46
+    margin_weight: float = 0.18
+    policy_weight: float = 0.04
+    agreement_bonus: float = 0.06
+    agreement_window: float = 0.40
+    margin_scale: float = 0.25
+    known_similarity: float = 0.99
+    known_score_floor: float = 0.90
+    empty_score_cap: float = 0.40
+
     def __post_init__(self) -> None:
-        # Per-instance RNGs derived from `seed`. Using these (instead of the `np.random` and `random` module globals) is the contract that makes parallel-seed runs reproducible: each Config gets its own bit-stream. Field-set bypass keeps the dataclass usable without `frozen=False` semantics.
-        object.__setattr__(self, "rng",  np.random.default_rng(int(self.seed)))
-        object.__setattr__(self, "prng", random.Random(int(self.seed)))
+        self.rng = np.random.default_rng(int(self.seed))
+        unit_fields = (
+            "match_threshold", "match_margin",
+            "overlap_weight", "order_weight",
+            "new_recipe_threshold", "commit_threshold",
+            "tentative_threshold", "provisional_weight",
+            "provisional_cap", "confirm_accuracy",
+            "confirm_similarity", "match_weight",
+            "margin_weight", "policy_weight",
+            "agreement_bonus", "agreement_window",
+            "known_similarity", "known_score_floor",
+            "empty_score_cap",
+        )
+        for name in unit_fields:
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be finite and within [0, 1]")
+        mixtures = (("matcher partial", self.overlap_weight, self.order_weight),)
+        for name, first, second in mixtures:
+            if not math.isclose(float(first) + float(second), 1.0, abs_tol=1e-9):
+                raise ValueError(f"{name} weights must sum to 1")
+        if self.tentative_threshold > self.commit_threshold:
+            raise ValueError("online commit tentative threshold cannot exceed the full threshold")
+        if self.known_score_floor < self.commit_threshold:
+            raise ValueError("known-score floor cannot be below the full commit threshold")
+        if not 0.0 < float(self.margin_scale):
+            raise ValueError("margin_scale must be positive")
+        if (
+            not math.isfinite(float(self.pair_prior_half_life))
+            or float(self.pair_prior_half_life) <= 0.0
+        ):
+            raise ValueError("pair_prior_half_life must be finite and positive")
+        if self.provisional_weight > self.provisional_cap:
+            raise ValueError("provisional commit weight cannot exceed its cap")
+        if self.irl_features not in {"semantic", "engineered", "raw_state"}:
+            raise ValueError(
+                "irl_features must be 'semantic', 'engineered', or 'raw_state'"
+            )
+        if self.predictor not in {"maxent", "in_context_llm"}:
+            raise ValueError(
+                "predictor must be 'maxent' or 'in_context_llm'"
+            )
+        if int(self.llm_context_tokens) < 0:
+            raise ValueError("llm_context_tokens cannot be negative")
+        if int(self.llm_candidate_batch) < 1:
+            raise ValueError("llm_candidate_batch must be positive")
+        for name in ("irl_cold_steps", "irl_warm_steps"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be positive")
+        if int(self.semantic_knn) < 1:
+            raise ValueError("semantic_knn must be positive")
+        if int(self.latent_strategy_rank) < 1:
+            raise ValueError("latent_strategy_rank must be positive")
+        if int(self.latent_strategy_knn) < 1:
+            raise ValueError("latent_strategy_knn must be positive")
+        if (
+            not math.isfinite(float(self.latent_strategy_strength))
+            or float(self.latent_strategy_strength) < 0.0
+        ):
+            raise ValueError(
+                "latent_strategy_strength must be finite and non-negative"
+            )
+        if not 0.0 <= float(self.latent_strategy_sequence_weight) <= 1.0:
+            raise ValueError("latent_strategy_sequence_weight must lie in [0, 1]")
+        if (
+            not math.isfinite(float(self.semantic_fallback_max_rms_distance))
+            or float(self.semantic_fallback_max_rms_distance) < 0.0
+        ):
+            raise ValueError(
+                "semantic_fallback_max_rms_distance must be finite and "
+                "non-negative"
+            )
+DEFAULT_SETTINGS = Settings()
 
 
-DEFAULT_CONFIG = Config()
+def index_demos(demonstrations: Sequence[Demonstration], unique_actions: Optional[Sequence[str]] = None):
+    """StateVector/action index maps shared by all predictors."""
+    state_ids: Dict[StateVector, int] = {}
+    for demo in demonstrations:
+        for state, _ in demo:
+            if state not in state_ids:   state_ids[state] = len(state_ids)
+    state_vectors = {index: state for state, index in state_ids.items()}
 
-
-def create_state_action_mappings(demonstrations: Sequence[Trajectory], unique_actions: Optional[Sequence[str]] = None):
-    """State/action index maps shared by all heads."""
-    state_to_idx: Dict[State, int] = {}
-    for traj in demonstrations:
-        for state, _ in traj:
-            if state not in state_to_idx:   state_to_idx[state] = len(state_to_idx)
-    idx_to_state = {idx: state for state, idx in state_to_idx.items()}
-
-    if unique_actions is None:              action_set = sorted({a for traj in demonstrations for _, a in traj})
+    if unique_actions is None:              action_set = sorted({a for demo in demonstrations for _, a in demo})
     else:                                   action_set = list(unique_actions)
-    action_to_idx = {action: idx for idx, action in enumerate(action_set)}
-    idx_to_action = {idx: action for action, idx in action_to_idx.items()}
-    return state_to_idx, idx_to_state, action_to_idx, idx_to_action
+    action_ids = {action: index for index, action in enumerate(action_set)}
+    action_labels = {index: action for action, index in action_ids.items()}
+    return state_ids, state_vectors, action_ids, action_labels
+
+
+def feasible_actions(
+    state: StateVector, actions: Sequence[str],
+) -> Tuple[str, ...]:
+    """Retain every effectful, precondition-valid action in the grounded task."""
+    return tuple(sorted({
+        str(action)
+        for action in actions
+        if action != "stop" and _apply_action(tuple(state), str(action)) is not None
+    }))
 
 
 def _safe_feat(state: np.ndarray, key: str) -> int:
-    return int(state[_FEAT[key]]) if key in _FEAT else 0
+    # Feature names are generated from the same canonical environment schema;
+    # fail loudly if that contract drifts instead of silently dropping a term.
+    return int(state[_FEAT[key]])
 
 
 @dataclass
-class WelfordFeatureNormalizer:
+class RunningScaler:
     """Streaming per-feature standardizer over observed symbolic states."""
 
     count: int = 0
     mean: Optional[np.ndarray] = None
-    m2: Optional[np.ndarray] = None
+    squared_deviation: Optional[np.ndarray] = None
 
     def update(self, batch: np.ndarray) -> None:
         if batch.size == 0:     return
@@ -173,23 +285,35 @@ class WelfordFeatureNormalizer:
         batch_count = int(x.shape[0])
         batch_mean = x.mean(axis=0)
         centered = x - batch_mean
-        batch_m2 = np.sum(centered * centered, axis=0)
-        if self.count == 0 or self.mean is None or self.m2 is None:
+        batch_squared_deviation = np.sum(centered * centered, axis=0)
+        if (
+            self.count == 0
+            or self.mean is None
+            or self.squared_deviation is None
+        ):
             self.count = batch_count
             self.mean = batch_mean.astype(np.float32)
-            self.m2 = batch_m2.astype(np.float32)
+            self.squared_deviation = batch_squared_deviation.astype(np.float32)
             return
         delta = batch_mean - self.mean
         total = self.count + batch_count
         self.mean = (self.mean + delta * (batch_count / max(total, 1))).astype(np.float32)
-        self.m2 = (self.m2 + batch_m2 + (delta * delta) * (self.count * batch_count / max(total, 1))).astype(np.float32)
+        self.squared_deviation = (
+            self.squared_deviation
+            + batch_squared_deviation
+            + (delta * delta) * (self.count * batch_count / max(total, 1))
+        ).astype(np.float32)
         self.count = total
 
     @property
     def variance(self) -> np.ndarray:
-        if self.mean is None or self.m2 is None:    return np.ones(0, dtype=np.float32)
-        if self.count < 2:                          return np.ones_like(self.mean, dtype=np.float32)
-        return np.maximum(self.m2 / float(self.count - 1), 1e-8).astype(np.float32)
+        if self.mean is None or self.squared_deviation is None:
+            return np.ones(0, dtype=np.float32)
+        if self.count < 2:
+            return np.ones_like(self.mean, dtype=np.float32)
+        return np.maximum(
+            self.squared_deviation / float(self.count - 1), 1e-8,
+        ).astype(np.float32)
 
     @property
     def scale(self) -> np.ndarray:
@@ -204,92 +328,214 @@ class WelfordFeatureNormalizer:
         return ((x - self.mean) / scale).astype(np.float32)
 
 
-def create_feature_matrix_2_0(idx_to_state: Dict[int, State], col_min_known: Optional[np.ndarray] = None, col_max_known: Optional[np.ndarray] = None, normalizer: Optional[WelfordFeatureNormalizer] = None, update_normalizer = False):
-    """Fixed-dimensional engineered feature matrix over symbolic states. `normalizer` uses streaming Welford statistics. When no normalizer is supplied, `col_min_known` and `col_max_known` are interpreted as mean/scale statistics."""
+def _normalize_feature_rows(
+    raw: np.ndarray,
+    known_mean: Optional[np.ndarray],
+    known_scale: Optional[np.ndarray],
+    normalizer: Optional[RunningScaler],
+    update_normalizer: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Normalize either engineered or full-state features through one contract."""
+    if raw.size == 0:
+        return raw, np.zeros(0, dtype=np.float32), np.ones(0, dtype=np.float32)
+    if normalizer is not None:
+        if update_normalizer:
+            normalizer.update(raw)
+        features = normalizer.transform(raw)
+        mean = normalizer.mean if normalizer.mean is not None else np.zeros(raw.shape[1], dtype=np.float32)
+        scale = normalizer.scale if normalizer.mean is not None else np.ones(raw.shape[1], dtype=np.float32)
+        return features.astype(np.float32), mean.astype(np.float32), scale.astype(np.float32)
+    if known_mean is None or known_scale is None:
+        local = RunningScaler()
+        local.update(raw)
+        features = local.transform(raw)
+        mean = local.mean if local.mean is not None else np.zeros(raw.shape[1], dtype=np.float32)
+        scale = local.scale if local.mean is not None else np.ones(raw.shape[1], dtype=np.float32)
+    else:
+        mean = np.asarray(known_mean, dtype=np.float32)
+        scale = np.asarray(known_scale, dtype=np.float32)
+        if mean.shape != (raw.shape[1],) or scale.shape != (raw.shape[1],):
+            raise ValueError("known feature statistics do not match feature dimension")
+        denom = np.where(np.abs(scale) > 1e-8, scale, 1.0)
+        features = (raw - mean) / denom
+    return features.astype(np.float32), mean.astype(np.float32), scale.astype(np.float32)
+
+
+def build_features(
+    state_vectors: Dict[int, StateVector],
+    known_mean: Optional[np.ndarray] = None,
+    known_scale: Optional[np.ndarray] = None,
+    normalizer: Optional[RunningScaler] = None,
+    update_normalizer: bool = False,
+    *,
+    feature_mode: str = "engineered",
+    normalize: bool = True,
+):
+    """Build identity-masked semantic, engineered, or raw state features."""
+    if feature_mode not in {"semantic", "engineered", "raw_state"}:
+        raise ValueError(
+            "feature_mode must be 'semantic', 'engineered', or 'raw_state'"
+        )
+    if feature_mode == "raw_state":
+        raw = np.asarray(
+            [state_vectors[index] for index in range(len(state_vectors))],
+            dtype=np.float32,
+        )
+        if not normalize:
+            width = raw.shape[1] if raw.ndim == 2 else 0
+            return raw, np.zeros(width, dtype=np.float32), np.ones(width, dtype=np.float32)
+        return _normalize_feature_rows(
+            raw, known_mean, known_scale, normalizer, update_normalizer,
+        )
+
     key_ingredients = ["tomato", "onion", "mushroom", "rice", "meat", "chicken", "fish", "egg", "banana", "strawberries", "lettuce", "cheese", "garlic", "yoghurt", "milk", "oil"]
     key_containers  = ["pot", "pan", "plate", "bowl"]
-    key_locs        = ["prep_station", "cooking_station", "plating_station", "blending_station"]
+    key_locations = [
+        "prep_station", "cooking_station", "plating_station",
+        "blending_station",
+    ]
 
-    feats = []
-    for idx in range(len(idx_to_state)):
-        s = np.asarray(idx_to_state[idx], dtype=np.int32)
-        f: List[float] = []
+    feature_rows = []
+    for index in range(len(state_vectors)):
+        state = np.asarray(state_vectors[index], dtype=np.int32)
+        row: List[float] = []
 
         # 1) Item density by location.
-        for loc in LOCATIONS:
-            f.append(sum(_safe_feat(s, f"{item}_at_{loc}") for item in ITEMS))
+        for location in LOCATIONS:
+            row.append(sum(
+                _safe_feat(state, f"{item}_at_{location}")
+                for item in ITEMS
+            ))
         # 2) Container-location anchors + composite counts.
-        for container, loc in [
+        container_anchors = [
             ("pot", "cooking_station"), ("pot", "washing_station"), ("pan", "cooking_station"), ("pan", "washing_station"),
             ("plate", "plating_station"), ("plate", "serving_station"), ("plate", "washing_station"),
             ("bowl", "prep_station"), ("bowl", "cooking_station"), ("bowl", "plating_station"), ("bowl", "washing_station"),
             ("glass", "blending_station"), ("glass", "serving_station"), ("glass", "washing_station"),
-            ("measuring_cup", "blending_station"), ("measuring_cup", "washing_station")]:  f.append(_safe_feat(s, f"{container}_at_{loc}"))
-        f.append(_safe_feat(s, "pot_at_cooking_station") + _safe_feat(s, "pan_at_cooking_station"))
-        f.append(sum(_safe_feat(s, f"{item}_at_prep_station") for item in ITEMS))
-        f.append(sum(_safe_feat(s, f"{item}_at_blending_station") for item in ITEMS))
+            ("measuring_cup", "blending_station"), ("measuring_cup", "washing_station"),
+        ]
+        for container, location in container_anchors:
+            row.append(_safe_feat(state, f"{container}_at_{location}"))
+        row.append(
+            _safe_feat(state, "pot_at_cooking_station")
+            + _safe_feat(state, "pan_at_cooking_station")
+        )
+        row.append(sum(
+            _safe_feat(state, f"{item}_at_prep_station") for item in ITEMS
+        ))
+        row.append(sum(
+            _safe_feat(state, f"{item}_at_blending_station")
+            for item in ITEMS
+        ))
         # 3) Containment aggregates.
-        total_contained = sum(_safe_feat(s, f"{c}_contains_{ing}") for c in CONTAINERS for ing in INGREDIENTS)
-        f.append(total_contained)
-        for c in CONTAINERS: f.append(sum(_safe_feat(s, f"{c}_contains_{ing}") for ing in INGREDIENTS))
-        f.append(sum(_safe_feat(s, f"{c}_contains_mixture") for c in CONTAINERS))
+        total_contained = sum(
+            _safe_feat(state, f"{container}_contains_{ingredient}")
+            for container in CONTAINERS
+            for ingredient in INGREDIENTS
+        )
+        row.append(total_contained)
+        for container in CONTAINERS:
+            row.append(sum(
+                _safe_feat(state, f"{container}_contains_{ingredient}")
+                for ingredient in INGREDIENTS
+            ))
+        row.append(sum(
+            _safe_feat(state, f"{container}_contains_mixture")
+            for container in CONTAINERS
+        ))
         # 4) Processing features.
-        cut_vals = [_safe_feat(s, f"{item}_cut") for item in CUTTABLES]
-        cooked_vals = [_safe_feat(s, f"{item}_cooked") for item in COOKABLES]
-        f.extend(cut_vals)
-        f.extend(cooked_vals)
-        total_cut = sum(cut_vals)
-        total_grated = sum(_safe_feat(s, f"{item}_grated") for item in GRATABLE)
-        total_cooked = sum(cooked_vals)
-        total_seasoned = sum(_safe_feat(s, f"{item}_seasoned") for item in INGREDIENTS)
-        total_washed = sum(_safe_feat(s, f"{item}_washed") for item in ITEMS)
-        f.extend([total_cut, total_grated, total_cooked, total_seasoned, total_washed])
-        for ing in ["chicken", "fish", "mixture"]:
-            f.append(_safe_feat(s, f"{ing}_seasoned"))
+        cut_values = [_safe_feat(state, f"{item}_cut") for item in CUTTABLES]
+        cooked_values = [
+            _safe_feat(state, f"{item}_cooked") for item in COOKABLES
+        ]
+        if feature_mode == "engineered":
+            row.extend(cut_values)
+            row.extend(cooked_values)
+        total_cut = sum(cut_values)
+        total_grated = sum(
+            _safe_feat(state, f"{item}_grated") for item in GRATABLE
+        )
+        total_cooked = sum(cooked_values)
+        total_seasoned = sum(
+            _safe_feat(state, f"{item}_seasoned") for item in INGREDIENTS
+        )
+        total_washed = sum(
+            _safe_feat(state, f"{item}_washed") for item in ITEMS
+        )
+        row.extend([
+            total_cut, total_grated, total_cooked,
+            total_seasoned, total_washed,
+        ])
+        if feature_mode == "engineered":
+            for ingredient in ["chicken", "fish", "mixture"]:
+                row.append(_safe_feat(state, f"{ingredient}_seasoned"))
         # 5) Tool and serving status.
-        for key in ["stove_on", "sink_on", "blender_on", "dish_served"]: f.append(_safe_feat(s, key))
-        # 6) Key ingredient x location grid.
-        for ing in key_ingredients:
-            for loc in key_locs: f.append(_safe_feat(s, f"{ing}_at_{loc}"))
-        # 7) Key ingredient containment in key containers.
-        for c in key_containers:
-            for ing in key_ingredients: f.append(_safe_feat(s, f"{c}_contains_{ing}"))
+        for key in ["stove_on", "sink_on", "blender_on", "dish_served"]:
+            row.append(_safe_feat(state, key))
+        # Literal identity is useful for the engineered representation but is
+        # deliberately absent from the transferable semantic reward.
+        if feature_mode == "engineered":
+            # 6) Key ingredient x location grid.
+            for ingredient in key_ingredients:
+                for location in key_locations:
+                    row.append(_safe_feat(state, f"{ingredient}_at_{location}"))
+            # 7) Key ingredient containment in key containers.
+            for container in key_containers:
+                for ingredient in key_ingredients:
+                    row.append(_safe_feat(
+                        state, f"{container}_contains_{ingredient}",
+                    ))
         # 8) Seasoning signatures.
-        for seasoning in SEASONINGS: f.append(sum(_safe_feat(s, f"{ing}_seasoned_with_{seasoning}") for ing in key_ingredients))
+        for seasoning in SEASONINGS:
+            row.append(sum(
+                _safe_feat(state, f"{ingredient}_seasoned_with_{seasoning}")
+                for ingredient in key_ingredients
+            ))
         # 9) Interaction composites.
-        f.append((_safe_feat(s, "stove_on")) * (_safe_feat(s, "pot_at_cooking_station") + _safe_feat(s, "pan_at_cooking_station")))
-        f.append((_safe_feat(s, "blender_on")) * _safe_feat(s, "glass_at_blending_station"))
-        f.append((_safe_feat(s, "sink_on")) * (_safe_feat(s, "plate_at_washing_station") + _safe_feat(s, "bowl_at_washing_station")))
-        feats.append(f)
+        row.append(
+            _safe_feat(state, "stove_on")
+            * (
+                _safe_feat(state, "pot_at_cooking_station")
+                + _safe_feat(state, "pan_at_cooking_station")
+            )
+        )
+        row.append(
+            _safe_feat(state, "blender_on")
+            * _safe_feat(state, "glass_at_blending_station")
+        )
+        row.append(
+            _safe_feat(state, "sink_on")
+            * (
+                _safe_feat(state, "plate_at_washing_station")
+                + _safe_feat(state, "bowl_at_washing_station")
+            )
+        )
+        feature_rows.append(row)
 
-    raw = np.asarray(feats, dtype=np.float32)
-    if raw.size == 0: return raw, np.zeros(0, dtype=np.float32), np.ones(0, dtype=np.float32)
-
-    if normalizer is not None:
-        if update_normalizer: normalizer.update(raw)
-        fm = normalizer.transform(raw)
-        mean = normalizer.mean if normalizer.mean is not None else np.zeros(raw.shape[1], dtype=np.float32)
-        scale = normalizer.scale if normalizer.mean is not None else np.ones(raw.shape[1], dtype=np.float32)
-        return fm.astype(np.float32), mean.astype(np.float32), scale.astype(np.float32)
-
-    if col_min_known is None or col_max_known is None:
-        local = WelfordFeatureNormalizer()
-        local.update(raw)
-        fm = local.transform(raw)
-        mean = local.mean if local.mean is not None else np.zeros(raw.shape[1], dtype=np.float32)
-        scale = local.scale if local.mean is not None else np.ones(raw.shape[1], dtype=np.float32)
-    else:
-        mean = np.asarray(col_min_known, dtype=np.float32)
-        scale = np.asarray(col_max_known, dtype=np.float32)
-        denom = np.where(np.abs(scale) > 1e-8, scale, 1.0)
-        fm = (raw - mean) / denom
-    return fm.astype(np.float32), mean.astype(np.float32), scale.astype(np.float32)
+    raw = np.asarray(feature_rows, dtype=np.float32)
+    if not normalize:
+        width = raw.shape[1] if raw.ndim == 2 else 0
+        return raw, np.zeros(width, dtype=np.float32), np.ones(width, dtype=np.float32)
+    return _normalize_feature_rows(
+        raw, known_mean, known_scale, normalizer, update_normalizer,
+    )
 
 
-def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarray, state_to_idx: Dict[State, int], action_to_idx: Dict[str, int], cfg: Config, init_weights: Optional[np.ndarray] = None, demo_weights: Optional[Sequence[float]] = None, ewc_theta_star: Optional[np.ndarray] = None, ewc_fisher: Optional[np.ndarray] = None, extra_transitions: Optional[Dict[Tuple[State, str], State]] = None):
-    """Importance-weighted MaxEnt IRL with demo-augmented MDP and optional EWC."""
-    n_states, n_features = feature_matrix.shape
-    n_actions = len(action_to_idx)
+def fit_maxent_irl(
+    demonstrations: Sequence[Demonstration],
+    features: np.ndarray,
+    state_ids: Dict[StateVector, int],
+    action_ids: Dict[str, int],
+    settings: Settings,
+    init_weights: Optional[np.ndarray] = None,
+    demo_weights: Optional[Sequence[float]] = None,
+    ewc_anchor: Optional[np.ndarray] = None,
+    ewc_fisher: Optional[np.ndarray] = None,
+    extra_transitions: Optional[Dict[Tuple[StateVector, str], StateVector]] = None,
+):
+    """Importance-weighted MaxEnt IRL on the demonstrated state graph."""
+    n_states, n_features = features.shape
+    n_actions = len(action_ids)
     if n_states == 0 or n_features == 0 or n_actions == 0:
         stats = {
             "model_family": "maxent_irl",
@@ -300,303 +546,336 @@ def max_ent_irl_2(demonstrations: Sequence[Trajectory], feature_matrix: np.ndarr
             "iterations_run": 0.0,
             "warm_start": 1.0 if init_weights is not None else 0.0,
         }
-        return np.zeros(n_features, dtype=np.float32), np.zeros(n_states), np.zeros(n_states), {}, {}, stats
+        return (
+            np.zeros(n_features, dtype=np.float32),
+            np.zeros(n_states),
+            np.zeros(n_states),
+            {},
+            {},
+            stats,
+        )
 
-    weights = np.ones(len(demonstrations), dtype=np.float32) if demo_weights is None else np.asarray(demo_weights, dtype=np.float32)
-    w_sum = float(weights.sum())
-    if w_sum <= 0:
+    weights = (
+        np.ones(len(demonstrations), dtype=np.float32)
+        if demo_weights is None
+        else np.asarray(demo_weights, dtype=np.float32)
+    )
+    if float(weights.sum()) <= 0.0:
         weights = np.ones(len(demonstrations), dtype=np.float32)
-        w_sum = float(weights.sum())
-    demo_probs = weights / max(w_sum, 1e-9)
 
-    if init_weights is not None and init_weights.shape[0] == n_features:    reward_weights = init_weights.astype(np.float32).copy()
-    else:                                                                   reward_weights = (cfg.rng.standard_normal(n_features).astype(np.float32) * 0.1)
-
-    # Build observed transition dynamics.
-    state_action_pairs = set()
-    transition_model: Dict[Tuple[int, int], int] = {}
-    s_to_actions: Dict[int, List[int]] = {}
-    for traj in demonstrations:
-        for i, (state, action) in enumerate(traj):
-            s_idx = state_to_idx[state]
-            a_idx = action_to_idx[action]
-            state_action_pairs.add((s_idx, a_idx))
-            s_to_actions.setdefault(s_idx, [])
-            if a_idx not in s_to_actions[s_idx]:    s_to_actions[s_idx].append(a_idx)
-            if i < len(traj) - 1:                   transition_model[(s_idx, a_idx)] = state_to_idx[traj[i + 1][0]]
-    for (state, action), ns in (extra_transitions or {}).items():
-        if state not in state_to_idx or ns not in state_to_idx or action not in action_to_idx or action == "stop": continue
-        s_idx = state_to_idx[state]
-        a_idx = action_to_idx[action]
-        ns_idx = state_to_idx[ns]
-        state_action_pairs.add((s_idx, a_idx))
-        transition_model[(s_idx, a_idx)] = ns_idx
-        s_to_actions.setdefault(s_idx, [])
-        if a_idx not in s_to_actions[s_idx]: s_to_actions[s_idx].append(a_idx)
-
-    # Demo-augmented MDP: virtual deviate action to null state.
-    deviate_a = n_actions
-    null_s = n_states
-    feat_aug = np.vstack([feature_matrix, np.zeros((1, n_features), dtype=np.float32)])
-    n_states_aug = n_states + 1
-    for s_idx in list(s_to_actions.keys()):
-        transition_model[(s_idx, deviate_a)] = null_s
-        s_to_actions[s_idx] = s_to_actions[s_idx] + [deviate_a]
-
-    # Weighted empirical discounted feature expectations. Normalising by the number of demonstrations (NOT by w_sum) means the gradient magnitude scales with the *absolute* weight scale: a demo at weight 0.5 contributes half as much to the gradient as one at weight 1.0.
-    # That is the "true loss weighting" contract; without this normalization change a uniform multiplicative rescaling of weights cancels out.
-    empirical_fe = np.zeros(n_features, dtype=np.float32)
-    demo_starts = [state_to_idx[traj[0][0]] for traj in demonstrations]
-    gamma = cfg.maxent_gamma
-    for i, traj in enumerate(demonstrations):
-        traj_fe = np.zeros(n_features, dtype=np.float32)
-        for t, (state, _) in enumerate(traj):   traj_fe += (gamma ** t) * feature_matrix[state_to_idx[state]]
-        empirical_fe += weights[i] * traj_fe
-    empirical_fe /= max(float(len(demonstrations)), 1.0)
-
-    temperature = cfg.maxent_temperature
-    learning_rate = cfg.maxent_learning_rate
-    l2 = cfg.maxent_l2
-    n_iterations = cfg.maxent_iters_warm if init_weights is not None else cfg.maxent_iters_cold
-
-    q_values: Dict[Tuple[int, int], float] = {}
-    rewards     = feat_aug @ reward_weights
-    values      = rewards.copy()
-    best_nll    = float("inf")
-    best_grad_norm = float("inf")
-    no_improve  = 0
-    best_weights    = reward_weights.copy()
-    momentum        = np.zeros(n_features, dtype=np.float32)
-    momentum_beta   = 0.9
-    iterations_run = 0
-    total_vi_sweeps = 0
-    occupancy_state_updates = 0
-
-    def demo_nll(policy_table: Dict[int, Tuple[List[int], List[float]]]) -> float:
-        total = 0.0
-        denom = 0.0
-        for traj, w in zip(demonstrations, weights):
-            wf = max(0.0, float(w))
-            if wf <= 0.0:
-                continue
-            for state, action in traj:
-                s_idx = state_to_idx[state]
-                a_idx = action_to_idx[action]
-                a_list, probs = policy_table.get(s_idx, ([], []))
-                p = 1e-12
-                for cand, prob in zip(a_list, probs):
-                    if cand == a_idx:
-                        p = max(float(prob), 1e-12)
-                        break
-                total -= wf * math.log(p)
-                denom += wf
-        return total / max(denom, 1e-9)
-
-    def expected_features_dp(policy_table: Dict[int, Tuple[List[int], List[float]]]) -> Tuple[np.ndarray, int]:
-        expected = np.zeros(n_features, dtype=np.float32)
-        updates = 0
-        normalizer = max(float(len(demonstrations)), 1.0)
-        for demo_idx, start in enumerate(demo_starts):
-            wf = max(0.0, float(weights[demo_idx])) / normalizer
-            if wf <= 0.0:
-                continue
-            dist: Dict[int, float] = {start: 1.0}
-            discount = 1.0
-            for _t in range(cfg.maxent_dp_horizon):
-                next_dist: Dict[int, float] = {}
-                for s_idx, mass in dist.items():
-                    if mass <= 0.0:
-                        continue
-                    updates += 1
-                    if s_idx < n_states:
-                        expected += (wf * discount * float(mass)) * feature_matrix[s_idx]
-                    if s_idx not in policy_table:
-                        continue
-                    a_list, probs = policy_table[s_idx]
-                    for a_idx, prob in zip(a_list, probs):
-                        if a_idx == deviate_a:
-                            continue
-                        ns = transition_model.get((s_idx, a_idx))
-                        if ns is None:
-                            continue
-                        next_dist[ns] = next_dist.get(ns, 0.0) + float(mass) * float(prob)
-                if not next_dist:
-                    break
-                dist = next_dist
-                discount *= gamma
-        return expected, updates
-    
-
-    for iteration in range(n_iterations):
-        iterations_run = iteration + 1
-        lr = learning_rate * (0.97 ** (no_improve // 20))
-        rewards = feat_aug @ reward_weights
-
-        # Soft Bellman VI.
-        for _ in range(50):
-            total_vi_sweeps += 1
-            new_values = rewards.copy()
-            for (s_idx, a_idx) in state_action_pairs:
-                ns = transition_model.get((s_idx, a_idx))
-                q_values[(s_idx, a_idx)] = rewards[s_idx] + (gamma * values[ns] if ns is not None else 0.0)
-            for s_idx in s_to_actions:
-                q_values[(s_idx, deviate_a)] = rewards[s_idx] + gamma * values[null_s]
-            for s_idx, a_list in s_to_actions.items():
-                avail = [q_values.get((s_idx, a), rewards[s_idx]) for a in a_list]
-                new_values[s_idx] = _soft_value(avail, temperature)
-            max_delta = max(abs(float(new_values[i]) - float(values[i])) for i in range(len(new_values)))
-            if max_delta < 1e-6:
-                values = new_values
-                break
-            values = new_values
-
-        # Policy table.
-        policy_table: Dict[int, Tuple[List[int], List[float]]] = {}
-        for s_idx, a_list in s_to_actions.items():
-            sq = [q_values.get((s_idx, a), rewards[s_idx]) for a in a_list]
-            probs = _softmax_probs(sq, temperature)
-            policy_table[s_idx] = (a_list, probs)
-
-        cur_nll = demo_nll(policy_table)
-        if cur_nll < best_nll:
-            best_nll = cur_nll
-            best_weights = reward_weights.copy()
-            no_improve = 0
-        else:
-            no_improve += 1
-
-        # Expected discounted features via deterministic finite-horizon occupancy.
-        expected_fc, updates = expected_features_dp(policy_table)
-        occupancy_state_updates += updates
-
-        gradient = empirical_fe - expected_fc
-        gradient -= l2 * reward_weights
-        if ewc_theta_star is not None and ewc_fisher is not None:
-            n = min(reward_weights.shape[0], int(ewc_theta_star.shape[0]), int(ewc_fisher.shape[0]))
-            if n > 0:
-                penalty = np.zeros_like(reward_weights)
-                penalty[:n] = float(cfg.ewc_lambda) * ewc_fisher[:n].astype(np.float32) * (reward_weights[:n] - ewc_theta_star[:n].astype(np.float32))
-                gradient -= penalty
-        grad_norm = float(np.linalg.norm(gradient))
-        best_grad_norm = min(best_grad_norm, grad_norm)
-        momentum = momentum_beta * momentum + (1.0 - momentum_beta) * gradient
-        reward_weights += lr * momentum
-
-        if no_improve > 60:     break
-
-    # Final VI with best weights for prediction.
-    best_rewards = feat_aug @ best_weights
-    best_values = best_rewards.copy()
-    best_q: Dict[Tuple[int, int], float] = {}
-    final_vi_sweeps = 0
-    for _ in range(50):
-        final_vi_sweeps += 1
-        new_vals = best_rewards.copy()
-        for (s_idx, a_idx) in state_action_pairs:
-            ns = transition_model.get((s_idx, a_idx))
-            best_q[(s_idx, a_idx)] = best_rewards[s_idx] + (gamma * best_values[ns] if ns is not None else 0.0)
-        for s_idx in s_to_actions:
-            best_q[(s_idx, deviate_a)] = best_rewards[s_idx] + gamma * best_values[null_s]
-        for s_idx, a_list in s_to_actions.items():
-            avail = [best_q.get((s_idx, a), best_rewards[s_idx]) for a in a_list]
-            new_vals[s_idx] = _soft_value(avail, temperature)
-        max_delta = max(abs(float(new_vals[i]) - float(best_values[i])) for i in range(len(new_vals)))
-        if max_delta < 1e-6:
-            best_values = new_vals
-            break
-        best_values = new_vals
-
-    clean_s_to_actions = {s: [a for a in a_list if a != deviate_a] for s, a_list in s_to_actions.items()}
-    best_q_clean = {(s, a): v for (s, a), v in best_q.items() if a != deviate_a}
-    deviate_margins: List[float] = []
-    for traj in demonstrations:
-        for state, action in traj:
-            if action == "stop" or state not in state_to_idx or action not in action_to_idx:
-                continue
-            s_idx = state_to_idx[state]
-            a_idx = action_to_idx[action]
-            demo_q = best_q.get((s_idx, a_idx))
-            dev_q = best_q.get((s_idx, deviate_a))
-            if demo_q is not None and dev_q is not None:
-                deviate_margins.append(float(demo_q) - float(dev_q))
-    if deviate_margins:
-        deviate_margin_min = float(min(deviate_margins))
-        deviate_margin_mean = float(sum(deviate_margins) / len(deviate_margins))
-        deviate_margin_negative_frac = float(sum(1 for m in deviate_margins if m < 0.0) / len(deviate_margins))
+    if init_weights is not None and init_weights.shape == (n_features,):
+        reward_weights = init_weights.astype(np.float32).copy()
     else:
-        deviate_margin_min = 0.0
-        deviate_margin_mean = 0.0
-        deviate_margin_negative_frac = 0.0
-    fit_stats = {
+        reward_weights = settings.rng.standard_normal(n_features).astype(np.float32) * 0.1
+
+    state_action_pairs: set[Tuple[int, int]] = set()
+    transitions: Dict[Tuple[int, int], int] = {}
+    action_ids_by_state: Dict[int, List[int]] = {}
+    for demo in demonstrations:
+        for index, (state, action) in enumerate(demo):
+            state_id = state_ids[state]
+            action_id = action_ids[action]
+            state_action_pairs.add((state_id, action_id))
+            action_ids_by_state.setdefault(state_id, [])
+            if action_id not in action_ids_by_state[state_id]:
+                action_ids_by_state[state_id].append(action_id)
+            if index + 1 < len(demo):
+                transitions[(state_id, action_id)] = state_ids[demo[index + 1][0]]
+    for (state, action), next_state in (extra_transitions or {}).items():
+        if (
+            state not in state_ids
+            or next_state not in state_ids
+            or action not in action_ids
+            or action == "stop"
+        ):
+            continue
+        state_id = state_ids[state]
+        action_id = action_ids[action]
+        state_action_pairs.add((state_id, action_id))
+        transitions[(state_id, action_id)] = state_ids[next_state]
+        action_ids_by_state.setdefault(state_id, [])
+        if action_id not in action_ids_by_state[state_id]:
+            action_ids_by_state[state_id].append(action_id)
+
+    deviation_action_id = n_actions
+    sink_state_id = n_states
+    features = np.vstack([
+        features,
+        np.zeros((1, n_features), dtype=np.float32),
+    ])
+    for state_id in tuple(action_ids_by_state):
+        transitions[(state_id, deviation_action_id)] = sink_state_id
+        action_ids_by_state[state_id].append(deviation_action_id)
+
+    empirical_features = np.zeros(n_features, dtype=np.float32)
+    start_states = [state_ids[demo[0][0]] for demo in demonstrations]
+    discount = float(settings.irl_discount)
+    for index, demo in enumerate(demonstrations):
+        for step, (state, _action) in enumerate(demo):
+            empirical_features += (
+                float(weights[index])
+                * (discount ** step)
+                * features[state_ids[state]]
+            )
+    empirical_features /= max(float(len(demonstrations)), 1.0)
+
+    def policy_loss(policy: Dict[int, Tuple[List[int], List[float]]]) -> float:
+        total = mass = 0.0
+        for demo, weight in zip(demonstrations, weights):
+            weight = max(0.0, float(weight))
+            if weight <= 0.0:
+                continue
+            for state, action in demo:
+                state_id = state_ids[state]
+                action_id = action_ids[action]
+                actions, probs = policy.get(state_id, ([], []))
+                probability = next(
+                    (
+                        max(float(prob), 1e-12)
+                        for candidate, prob in zip(actions, probs)
+                        if candidate == action_id
+                    ),
+                    1e-12,
+                )
+                total -= weight * math.log(probability)
+                mass += weight
+        return total / max(mass, 1e-9)
+
+    def expected_features(
+        policy: Dict[int, Tuple[List[int], List[float]]],
+    ) -> Tuple[np.ndarray, int]:
+        expected_features_vector = np.zeros(n_features, dtype=np.float32)
+        update_count = 0
+        normalizer = max(float(len(demonstrations)), 1.0)
+        for demo_index, start in enumerate(start_states):
+            weight = max(0.0, float(weights[demo_index])) / normalizer
+            if weight <= 0.0:
+                continue
+            occupancy: Dict[int, float] = {start: 1.0}
+            step_discount = 1.0
+            for _step in range(int(settings.irl_horizon)):
+                next_occupancy: Dict[int, float] = {}
+                for state_id, state_mass in occupancy.items():
+                    if state_mass <= 0.0:
+                        continue
+                    update_count += 1
+                    if state_id < n_states:
+                        expected_features_vector += (
+                            weight
+                            * step_discount
+                            * float(state_mass)
+                            * features[state_id]
+                        )
+                    actions, probs = policy.get(state_id, ([], []))
+                    for action_id, probability in zip(actions, probs):
+                        if action_id == deviation_action_id:
+                            continue
+                        next_state = transitions.get((state_id, action_id))
+                        if next_state is None:
+                            continue
+                        next_occupancy[next_state] = (
+                            next_occupancy.get(next_state, 0.0)
+                            + float(state_mass) * float(probability)
+                        )
+                if not next_occupancy:
+                    break
+                occupancy = next_occupancy
+                step_discount *= discount
+        return expected_features_vector, update_count
+
+    temperature = float(settings.irl_temperature)
+    iterations = int(
+        settings.irl_warm_steps if init_weights is not None else settings.irl_cold_steps
+    )
+    rewards = features @ reward_weights
+    values = rewards.copy()
+    q_values: Dict[Tuple[int, int], float] = {}
+    best_weights = reward_weights.copy()
+    best_loss = float("inf")
+    best_gradient_norm = float("inf")
+    stale_steps = 0
+    momentum = np.zeros(n_features, dtype=np.float32)
+    iterations_run = value_sweeps = occupancy_updates = 0
+
+    for iteration in range(iterations):
+        iterations_run = iteration + 1
+        learning_rate = float(settings.irl_learning_rate) * (0.97 ** (stale_steps // 20))
+        rewards = features @ reward_weights
+        for _sweep in range(50):
+            value_sweeps += 1
+            updated = rewards.copy()
+            for state_id, action_id in state_action_pairs:
+                next_state = transitions.get((state_id, action_id))
+                q_values[(state_id, action_id)] = float(rewards[state_id]) + (
+                    discount * float(values[next_state])
+                    if next_state is not None else 0.0
+                )
+            for state_id in action_ids_by_state:
+                q_values[(state_id, deviation_action_id)] = (
+                    float(rewards[state_id]) + discount * float(values[sink_state_id])
+                )
+            for state_id, actions in action_ids_by_state.items():
+                updated[state_id] = _soft_value(
+                    [q_values.get((state_id, action), rewards[state_id]) for action in actions],
+                    temperature,
+                )
+            value_gap = float(np.max(np.abs(updated - values)))
+            values = updated
+            if value_gap < 1e-6:
+                break
+
+        policy: Dict[int, Tuple[List[int], List[float]]] = {}
+        for state_id, actions in action_ids_by_state.items():
+            values_at_actions = [
+                q_values.get((state_id, action), rewards[state_id]) for action in actions
+            ]
+            policy[state_id] = (
+                actions,
+                _softmax_probs(values_at_actions, temperature),
+            )
+        current_loss = policy_loss(policy)
+        if current_loss < best_loss:
+            best_loss = current_loss
+            best_weights = reward_weights.copy()
+            stale_steps = 0
+        else:
+            stale_steps += 1
+
+        expected_features_vector, update_count = expected_features(policy)
+        occupancy_updates += update_count
+        gradient = empirical_features - expected_features_vector - float(settings.irl_l2) * reward_weights
+        if ewc_anchor is not None and ewc_fisher is not None:
+            size = min(len(reward_weights), len(ewc_anchor), len(ewc_fisher))
+            if size:
+                gradient[:size] -= (
+                    float(settings.ewc_strength)
+                    * ewc_fisher[:size].astype(np.float32)
+                    * (reward_weights[:size] - ewc_anchor[:size].astype(np.float32))
+                )
+        best_gradient_norm = min(best_gradient_norm, float(np.linalg.norm(gradient)))
+        momentum = 0.9 * momentum + 0.1 * gradient
+        reward_weights += learning_rate * momentum
+        if stale_steps > 60:
+            break
+
+    best_rewards = features @ best_weights
+    best_values = best_rewards.copy()
+    best_q_values: Dict[Tuple[int, int], float] = {}
+    final_value_sweeps = 0
+    for _sweep in range(50):
+        final_value_sweeps += 1
+        updated = best_rewards.copy()
+        for state_id, action_id in state_action_pairs:
+            next_state = transitions.get((state_id, action_id))
+            best_q_values[(state_id, action_id)] = float(best_rewards[state_id]) + (
+                discount * float(best_values[next_state])
+                if next_state is not None else 0.0
+            )
+        for state_id in action_ids_by_state:
+            best_q_values[(state_id, deviation_action_id)] = (
+                float(best_rewards[state_id]) + discount * float(best_values[sink_state_id])
+            )
+        for state_id, actions in action_ids_by_state.items():
+            updated[state_id] = _soft_value(
+                [best_q_values.get((state_id, action), best_rewards[state_id]) for action in actions],
+                temperature,
+            )
+        value_gap = float(np.max(np.abs(updated - best_values)))
+        best_values = updated
+        if value_gap < 1e-6:
+            break
+
+    policy_actions = {
+        state_id: [action for action in actions if action != deviation_action_id]
+        for state_id, actions in action_ids_by_state.items()
+    }
+    policy_q_values = {
+        key: value for key, value in best_q_values.items() if key[1] != deviation_action_id
+    }
+    deviation_margins: List[float] = []
+    for demo in demonstrations:
+        for state, action in demo:
+            if action == "stop":
+                continue
+            state_id = state_ids[state]
+            action_id = action_ids[action]
+            expert_q_value = best_q_values.get((state_id, action_id))
+            deviation_q_value = best_q_values.get((state_id, deviation_action_id))
+            if expert_q_value is not None and deviation_q_value is not None:
+                deviation_margins.append(float(expert_q_value) - float(deviation_q_value))
+    if deviation_margins:
+        deviation_margin_min = float(min(deviation_margins))
+        deviation_margin_mean = float(sum(deviation_margins) / len(deviation_margins))
+        deviation_margin_negative_frac = float(
+            sum(margin < 0.0 for margin in deviation_margins)
+            / len(deviation_margins)
+        )
+    else:
+        deviation_margin_min = 0.0
+        deviation_margin_mean = 0.0
+        deviation_margin_negative_frac = 0.0
+    stats = {
         "model_family": "maxent_irl",
-        # This is a partial arithmetic model for the fit loop, not a hardware
-        # cost model.  It intentionally does not convert Python/dictionary,
-        # allocation, or transcendental-call overhead into pseudo-FLOPs.
-        # Consumers must therefore not rank it against dense BLAS estimates.
         "flop_accounting_scope": "maxent_fit_partial_arithmetic_only",
         "flop_cross_model_comparable": False,
         "n_demonstrations": float(len(demonstrations)),
-        "n_demo_state_visits": float(sum(len(traj) for traj in demonstrations)),
+        "n_demo_state_visits": float(sum(len(demo) for demo in demonstrations)),
         "n_states": float(n_states),
-        "n_states_augmented": float(n_states_aug),
+        "n_states_augmented": float(n_states + 1),
         "n_features": float(n_features),
         "parameter_count": float(n_features),
         "n_actions": float(n_actions),
         "n_state_action_pairs": float(len(state_action_pairs)),
-        "n_policy_states": float(len(s_to_actions)),
-        "n_policy_state_actions": float(sum(len(v) for v in s_to_actions.values())),
-        "n_transition_edges": float(len(transition_model)),
+        "n_policy_states": float(len(action_ids_by_state)),
+        "n_policy_state_actions": float(sum(len(row) for row in action_ids_by_state.values())),
+        "n_transition_edges": float(len(transitions)),
         "n_extra_transition_edges": float(len(extra_transitions or {})),
-        "iterations_requested": float(n_iterations),
+        "iterations_requested": float(iterations),
         "iterations_run": float(iterations_run),
-        "vi_sweeps": float(total_vi_sweeps),
-        "final_vi_sweeps": float(final_vi_sweeps),
-        "dp_occupancy_state_updates": float(occupancy_state_updates),
-        "expected_feature_method": "dp_occupancy",
-        "best_demo_nll": float(best_nll),
-        "best_grad_norm": float(best_grad_norm),
-        "deviate_margin_n": float(len(deviate_margins)),
-        "deviate_margin_min": deviate_margin_min,
-        "deviate_margin_mean": deviate_margin_mean,
-        "deviate_margin_negative_frac": deviate_margin_negative_frac,
+        "value_sweeps": float(value_sweeps),
+        "final_value_sweeps": float(final_value_sweeps),
+        "occupancy_updates": float(occupancy_updates),
+        "occupancy_method": "finite_horizon_dp",
+        "best_demo_log_loss": float(best_loss),
+        "best_gradient_norm": float(best_gradient_norm),
+        "deviation_margin_n": float(len(deviation_margins)),
+        "deviation_margin_min": deviation_margin_min,
+        "deviation_margin_mean": deviation_margin_mean,
+        "deviation_margin_negative_frac": deviation_margin_negative_frac,
         "warm_start": 1.0 if init_weights is not None else 0.0,
-        "ewc_enabled": 1.0 if ewc_theta_star is not None and ewc_fisher is not None else 0.0,
+        "ewc_enabled": 1.0 if ewc_anchor is not None and ewc_fisher is not None else 0.0,
     }
-    fit_stats["estimated_flops"] = _maxent_fit_flop_estimate(fit_stats)
-    return best_weights, best_rewards[:n_states], best_values[:n_states], best_q_clean, clean_s_to_actions, fit_stats
+    stats["estimated_flops"] = _estimate_maxent_flops(stats)
+    return (
+        best_weights.astype(np.float32),
+        best_rewards[:n_states],
+        best_values[:n_states],
+        policy_q_values,
+        policy_actions,
+        stats,
+    )
 
 
-def predict_action_2(state: State, reward_weights: np.ndarray, feature_matrix: np.ndarray, state_to_idx: Dict[State, int], action_to_idx: Dict[str, int], idx_to_action: Dict[int, str], transition_model: Dict[Tuple[int, int], int], col_min: Optional[np.ndarray] = None, 
-                     col_max: Optional[np.ndarray] = None, normalizer: Optional[WelfordFeatureNormalizer] = None, temperature = 0.5, gamma = 0.9, q_table: Optional[Dict[Tuple[int, int], float]] = None, s_to_actions: Optional[Dict[int, List[int]]] = None, idx_to_state: Optional[Dict[int, State]] = None, raw_state_matrix: Optional[np.ndarray] = None):
-    """Predict next action and distribution from current symbolic state."""
-    if state not in state_to_idx:
-        s_idx_nn = _nearest_hamming_idx(tuple(state), idx_to_state or {}, raw_state_matrix)
-        s_idx = 0 if s_idx_nn is None else s_idx_nn
-    else:       s_idx = state_to_idx[state]
-
-    if q_table is not None and s_to_actions is not None and s_idx in s_to_actions:      candidates = [(a, q_table[(s_idx, a)]) for a in s_to_actions[s_idx] if (s_idx, a) in q_table]
-    elif q_table is not None:                                                           candidates = [(a, q_table[(s_idx, a)]) for a in range(len(action_to_idx)) if (s_idx, a) in q_table]
-    else: rewards = feature_matrix @ reward_weights;                                    candidates = [(a, float(rewards[s_idx]) + gamma * float(rewards[transition_model[(s_idx, a)]])) for a in range(len(action_to_idx)) if (s_idx, a) in transition_model]
-    if not candidates: return None, {}
-
-    valid_actions, q_vals = zip(*candidates)
-    probs = _softmax_probs(q_vals, temperature)
-    dist = {idx_to_action[a]: p for a, p in zip(valid_actions, probs)}
-    dist.pop("stop", None)
-    if not dist: return None, {}
-    pred = max(dist.items(), key=lambda kv: kv[1])[0]
-    return pred, dist
-
-
-def _normalise_dist(dist: Dict[str, float], floor) -> Dict[str, float]:
-    if not dist:        return {}
-    clipped = {a: max(float(p), floor) for a, p in dist.items() if a != "stop"}
-    if not clipped:     return {}
-    s = sum(clipped.values())
-    if s <= 0:
-        u = 1.0 / len(clipped)
-        return {a: u for a in clipped}
-    return {a: p / s for a, p in clipped.items()}
+def _normalize_probs(
+    distribution: Dict[str, float], floor: float,
+) -> Dict[str, float]:
+    if not distribution:
+        return {}
+    clipped = {
+        action: max(float(probability), floor)
+        for action, probability in distribution.items()
+        if action != "stop"
+    }
+    if not clipped:
+        return {}
+    total = sum(clipped.values())
+    if total <= 0:
+        uniform_probability = 1.0 / len(clipped)
+        return {action: uniform_probability for action in clipped}
+    return {
+        action: probability / total
+        for action, probability in clipped.items()
+    }
 
 
 _ENV_ACTION_PREFIXES = (
@@ -606,31 +885,8 @@ _ENV_ACTION_PREFIXES = (
 )
 
 
-def _raw_state_matrix(idx_to_state: Dict[int, State]) -> Optional[np.ndarray]:
-    if not idx_to_state:
-        return None
-    rows = [tuple(idx_to_state[i]) for i in range(len(idx_to_state)) if i in idx_to_state]
-    if len(rows) != len(idx_to_state):
-        return None
-    width = len(rows[0]) if rows else 0
-    if width <= 0 or any(len(row) != width for row in rows):
-        return None
-    return np.asarray(rows, dtype=np.int8)
-
-
-def _nearest_hamming_idx(state: State, idx_to_state: Dict[int, State], raw_states: Optional[np.ndarray]) -> Optional[int]:
-    query = np.asarray(tuple(state), dtype=np.int8)
-    if query.size == 0:
-        return None
-    matrix = raw_states if raw_states is not None else _raw_state_matrix(idx_to_state)
-    if matrix is None or matrix.size == 0 or matrix.ndim != 2 or matrix.shape[1] != query.shape[0]:
-        return None
-    distances = np.mean(matrix != query, axis=1)
-    return int(np.argmin(distances))
-
-
-def _valid_environment_transition(state: State, action: str) -> Optional[State]:
-    if action == "stop" or not any(str(action).startswith(prefix) for prefix in _ENV_ACTION_PREFIXES):
+def _apply_action(state: StateVector, action: str) -> Optional[StateVector]:
+    if action == "stop" or not str(action).startswith(_ENV_ACTION_PREFIXES):
         return None
     tracker = StateTracker()
     if len(state) != tracker.n_features:
@@ -639,307 +895,486 @@ def _valid_environment_transition(state: State, action: str) -> Optional[State]:
     before = tuple(tracker.get_state_vector().astype(int).tolist())
     try:
         tracker.apply_action(action, enforce_preconditions=True)
-    except (ValueError, IndexError):
+    except (IndexError, KeyError, ValueError):
         return None
     after = tuple(tracker.get_state_vector().astype(int).tolist())
     return after if after != before else None
 
 
-def _maxent_fit_flop_estimate(stats: Dict[str, Any]) -> float:
-    """Estimate scalar floating-point work from actual MaxEnt fit loop counts."""
-    n_features = float(stats.get("n_features", 0.0))
-    n_states_aug = float(stats.get("n_states_augmented", 0.0))
-    n_state_actions = float(stats.get("n_state_action_pairs", 0.0))
-    n_policy_edges = float(stats.get("n_policy_state_actions", 0.0))
-    n_demo_visits = float(stats.get("n_demo_state_visits", 0.0))
+def _estimate_maxent_flops(stats: Mapping[str, Any]) -> float:
+    features = float(stats.get("n_features", 0.0))
+    states = float(stats.get("n_states_augmented", 0.0))
+    state_action_pairs = float(stats.get("n_state_action_pairs", 0.0))
+    policy_edges = float(stats.get("n_policy_state_actions", 0.0))
+    visits = float(stats.get("n_demo_state_visits", 0.0))
     iterations = float(stats.get("iterations_run", 0.0))
-    vi_sweeps = float(stats.get("vi_sweeps", 0.0) + stats.get("final_vi_sweeps", 0.0))
-    dp_occupancy_state_updates = float(stats.get("dp_occupancy_state_updates", 0.0))
-    ewc_enabled = bool(stats.get("ewc_enabled", 0.0))
+    sweeps = float(stats.get("value_sweeps", 0.0)) + float(
+        stats.get("final_value_sweeps", 0.0)
+    )
+    occupancy = float(stats.get("occupancy_updates", 0.0))
+    empirical_work = 2.0 * visits * features
+    reward_work = 2.0 * states * features * max(1.0, iterations + 1.0)
+    bellman_work = sweeps * (4.0 * state_action_pairs + 8.0 * policy_edges)
+    policy_work = iterations * 8.0 * policy_edges
+    occupancy_work = 2.0 * occupancy * features
+    gradient_work = iterations * 8.0 * features
+    if bool(stats.get("ewc_enabled", 0.0)):
+        gradient_work += iterations * 4.0 * features
+    return float(
+        empirical_work + reward_work + bellman_work + policy_work
+        + occupancy_work + gradient_work
+    )
 
-    empirical_feature_work = 2.0 * n_demo_visits * n_features
-    reward_dot_work = 2.0 * n_states_aug * n_features * max(1.0, iterations + 1.0)
-    # Bellman and policy work is mostly scalar arithmetic plus exp/log calls.
-    # Count it separately from feature-vector work so the estimate is not
-    # multiplied by nonexistent dense action-feature products.
-    vi_scalar_work = vi_sweeps * ((4.0 * n_state_actions) + (8.0 * n_policy_edges))
-    policy_scalar_work = iterations * 8.0 * n_policy_edges
-    occupancy_feature_work = 2.0 * dp_occupancy_state_updates * n_features
-    gradient_work = iterations * (8.0 * n_features + (4.0 * n_features if ewc_enabled else 0.0))
-    return float(empirical_feature_work + reward_dot_work + vi_scalar_work + policy_scalar_work + occupancy_feature_work + gradient_work)
 
+class MaxEntIrl:
+    """Tested replay-weighted MaxEnt IRL on demonstrated transitions."""
 
-class MaxEntIRL2:
-    """State-feature MaxEnt IRL. It supports warm starts when callers preserve theta; the main adaptive agent intentionally resets heads before active-set refits."""
-
-    def __init__(self, cfg: Config = DEFAULT_CONFIG):
-        self.cfg = cfg
-        self.theta: Optional[np.ndarray] = None
-        self.feature_matrix: Optional[np.ndarray] = None
-        self.normalizer = WelfordFeatureNormalizer()
-        self.col_min: Optional[np.ndarray] = None  # Welford mean
-        self.col_max: Optional[np.ndarray] = None  # Welford scale
-        self.state_to_idx: Dict[State, int] = {}
-        self.idx_to_state: Dict[int, State] = {}
-        self.action_to_idx: Dict[str, int] = {}
-        self.idx_to_action: Dict[int, str] = {}
-        self.transition_model: Dict[Tuple[int, int], int] = {}
-        self.values: Optional[np.ndarray] = None
-        self.q_table: Dict[Tuple[int, int], float] = {}
-        self.s_to_actions: Dict[int, List[int]] = {}
-        self.raw_state_matrix: Optional[np.ndarray] = None
-        self._last_expansion_stats: Dict[str, float] = {}
-        self.last_fit_stats: Dict[str, Any] = {}
+    def __init__(self, settings: Settings = DEFAULT_SETTINGS):
+        self.settings = settings
+        self.reset()
 
     def reset(self) -> None:
-        self.theta = None
-        self.feature_matrix = None
-        self.normalizer = WelfordFeatureNormalizer()
-        self.col_min = None
-        self.col_max = None
-        self.state_to_idx = {}
-        self.idx_to_state = {}
-        self.action_to_idx = {}
-        self.idx_to_action = {}
-        self.transition_model = {}
-        self.values = None
-        self.q_table = {}
-        self.s_to_actions = {}
-        self.raw_state_matrix = None
-        self._last_expansion_stats = {}
-        self.last_fit_stats = {"model_family": "maxent_irl", "estimated_flops": 0.0, "flop_accounting_scope": "maxent_fit_partial_arithmetic_only", "flop_cross_model_comparable": False}
+        self.reward_weights: Optional[np.ndarray] = None
+        self.features: Optional[np.ndarray] = None
+        self.normalizer = RunningScaler()
+        self.feature_mean: Optional[np.ndarray] = None
+        self.feature_scale: Optional[np.ndarray] = None
+        self.semantic_features: Optional[np.ndarray] = None
+        self.state_ids: Dict[StateVector, int] = {}
+        self.state_vectors: Dict[int, StateVector] = {}
+        self.action_ids: Dict[str, int] = {}
+        self.values: Optional[np.ndarray] = None
+        self.q_values: Dict[Tuple[int, int], float] = {}
+        self.last_prediction_stats: Dict[str, Any] = {}
+        self._fallback_counts = (0, 0, 0)  # attempted, accepted, rejected
+        self._last_exact_learned_action_count = 0
+        self.latent_strategy = LatentStrategyResidual(self.settings)
+        self._last_expansion_stats: Dict[str, float] = {}
+        self.last_fit_stats: Dict[str, Any] = {
+            "model_family": "maxent_irl",
+            "estimated_flops": 0.0,
+            "flop_accounting_scope": "maxent_fit_partial_arithmetic_only",
+            "flop_cross_model_comparable": False,
+        }
 
-    def _expanded_state_actions(self, demonstrations: Sequence[Trajectory]) -> Dict[Tuple[State, str], State]:
-        """Add simulator-validated transitions over the current action vocabulary."""
-        enabled = bool(getattr(self.cfg, "maxent_valid_action_expansion", False))
-        if not enabled:
-            self._last_expansion_stats = {"enabled": 0.0, "candidate_states": 0.0, "candidate_actions": 0.0, "attempted": 0.0, "accepted": 0.0, "rejected": 0.0}
+    def _expand_actions(
+        self, demonstrations: Sequence[Demonstration],
+    ) -> Dict[Tuple[StateVector, str], StateVector]:
+        if not bool(self.settings.expand_actions):
+            self._last_expansion_stats = {
+                "enabled": 0.0,
+                "candidate_states": 0.0,
+                "candidate_actions": 0.0,
+                "attempted": 0.0,
+                "accepted": 0.0,
+                "rejected": 0.0,
+            }
             return {}
-        states = {state for traj in demonstrations for state, _action in traj}
-        actions = sorted({action for traj in demonstrations for _state, action in traj if action != "stop"})
-        out: Dict[Tuple[State, str], State] = {}
+        states = {state for demo in demonstrations for state, _action in demo}
+        actions = sorted({
+            action
+            for demo in demonstrations for _state, action in demo
+            if action != "stop"
+        })
+        expanded: Dict[Tuple[StateVector, str], StateVector] = {}
         attempted = 0
         for state in states:
             for action in actions:
                 attempted += 1
-                next_state = _valid_environment_transition(state, action)
+                next_state = _apply_action(state, action)
                 if next_state is not None:
-                    out[(state, action)] = next_state
+                    expanded[(state, action)] = next_state
         self._last_expansion_stats = {
             "enabled": 1.0,
             "candidate_states": float(len(states)),
             "candidate_actions": float(len(actions)),
             "attempted": float(attempted),
-            "accepted": float(len(out)),
-            "rejected": float(max(0, attempted - len(out))),
+            "accepted": float(len(expanded)),
+            "rejected": float(max(0, attempted - len(expanded))),
         }
-        return out
+        return expanded
 
-    def fit(self, demonstrations: Sequence[Trajectory], demo_weights: Optional[Sequence[float]] = None, ewc_theta_star: Optional[np.ndarray] = None, ewc_fisher: Optional[np.ndarray] = None) -> None:
-        if not demonstrations: 
+    def fit(
+        self,
+        demonstrations: Sequence[Demonstration],
+        demo_weights: Optional[Sequence[float]] = None,
+        ewc_anchor: Optional[np.ndarray] = None,
+        ewc_fisher: Optional[np.ndarray] = None,
+    ) -> None:
+        if not demonstrations:
             self.reset()
             return
-        unique_actions = sorted({a for traj in demonstrations for _, a in traj})
-        self.state_to_idx, self.idx_to_state, self.action_to_idx, self.idx_to_action = create_state_action_mappings(demonstrations, unique_actions=unique_actions)
-        extra_transitions = self._expanded_state_actions(demonstrations)
-        for ns in extra_transitions.values():
-            if ns not in self.state_to_idx:
-                idx = len(self.state_to_idx)
-                self.state_to_idx[ns] = idx
-                self.idx_to_state[idx] = ns
-        # Welford normalizer must be reset every fit. Cumulative means/scales across retrains let pruned-recipe states permanently bias the feature normalisation, which makes `pruned_influence_audit` a tautology (the active-only fit shares the same normalizer).
-        self.normalizer = WelfordFeatureNormalizer()
-        fm, col_min, col_max = create_feature_matrix_2_0(self.idx_to_state, normalizer=self.normalizer, update_normalizer=True)
-        init = self.theta if self.theta is not None and self.theta.shape[0] == fm.shape[1] else None
-        weights, _, values, q_table, s_to_actions, fit_stats = max_ent_irl_2(demonstrations, fm, self.state_to_idx, self.action_to_idx, cfg=self.cfg, init_weights=init, demo_weights=demo_weights, ewc_theta_star=ewc_theta_star, ewc_fisher=ewc_fisher, extra_transitions=extra_transitions)
-        # Deterministic transition table.
-        transition: Dict[Tuple[int, int], int] = {}
-        for traj in demonstrations:
-            for i in range(len(traj) - 1):
-                s, a = traj[i]
-                ns = traj[i + 1][0]
-                if s in self.state_to_idx and ns in self.state_to_idx and a in self.action_to_idx: transition[(self.state_to_idx[s], self.action_to_idx[a])] = self.state_to_idx[ns]
-        for (s, a), ns in extra_transitions.items():
-            if s in self.state_to_idx and ns in self.state_to_idx and a in self.action_to_idx: transition[(self.state_to_idx[s], self.action_to_idx[a])] = self.state_to_idx[ns]
+        actions = sorted({action for demo in demonstrations for _, action in demo})
+        (
+            self.state_ids,
+            self.state_vectors,
+            self.action_ids,
+            _action_labels,
+        ) = index_demos(demonstrations, unique_actions=actions)
+        extra_transitions = self._expand_actions(demonstrations)
+        for next_state in extra_transitions.values():
+            if next_state not in self.state_ids:
+                index = len(self.state_ids)
+                self.state_ids[next_state] = index
+                self.state_vectors[index] = next_state
 
-        self.theta = weights.astype(np.float32)
-        self.feature_matrix = fm
-        self.col_min = col_min
-        self.col_max = col_max
-        self.transition_model = transition
+        self.normalizer = RunningScaler()
+        features, mean, scale = build_features(
+            self.state_vectors,
+            normalizer=self.normalizer,
+            update_normalizer=True,
+            feature_mode=self.settings.irl_features,
+        )
+        # Raw identity-masked features measure fallback similarity only; they
+        # never enter reward learning or its normalization.
+        semantic_features: Optional[np.ndarray] = None
+        if self.settings.semantic_fallback_enabled:
+            semantic_features, _, _ = build_features(
+                self.state_vectors,
+                feature_mode="semantic",
+                normalize=False,
+            )
+        initial_weights = (
+            self.reward_weights
+            if self.reward_weights is not None and self.reward_weights.shape == (features.shape[1],)
+            else None
+        )
+        (
+            reward_weights,
+            _reward_values,
+            values,
+            q_values,
+            _action_ids_by_state,
+            stats,
+        ) = fit_maxent_irl(
+            demonstrations,
+            features,
+            self.state_ids,
+            self.action_ids,
+            self.settings,
+            init_weights=initial_weights,
+            demo_weights=demo_weights,
+            ewc_anchor=ewc_anchor,
+            ewc_fisher=ewc_fisher,
+            extra_transitions=extra_transitions,
+        )
+        self.reward_weights = reward_weights.astype(np.float32)
+        self.features = features
+        self.feature_mean = mean
+        self.feature_scale = scale
+        self.semantic_features = semantic_features
         self.values = values.astype(np.float32)
-        self.q_table = q_table
-        self.s_to_actions = s_to_actions
-        self.raw_state_matrix = _raw_state_matrix(self.idx_to_state)
-        fit_stats = dict(fit_stats)
-        fit_stats["model_family"] = "maxent_irl"
-        fit_stats["n_transitions"] = float(sum(max(0, len(traj) - 1) for traj in demonstrations))
-        fit_stats["valid_action_expansion"] = dict(self._last_expansion_stats)
-        self.last_fit_stats = fit_stats
+        self.q_values = q_values
+        self.latent_strategy.fit(demonstrations, demo_weights)
+        latent_stats = dict(self.latent_strategy.last_fit_stats)
+        latent_flops = float(latent_stats.get("latent_strategy_fit_flops", 0.0))
+        model_structure = (
+            "maxent_irl_with_latent_strategy_residual"
+            if self.settings.latent_strategy_enabled else "single_maxent_irl"
+        )
+        self.last_fit_stats = {
+            **dict(stats),
+            **latent_stats,
+            "model_family": "maxent_irl",
+            "model_structure": model_structure,
+            "feature_mode": self.settings.irl_features,
+            "irl_features": self.settings.irl_features,
+            "semantic_fallback_enabled": bool(
+                self.settings.semantic_fallback_enabled
+            ),
+            "semantic_fallback_similarity_features": (
+                "semantic_raw_rms"
+                if self.settings.semantic_fallback_enabled else "disabled"
+            ),
+            "semantic_fallback_max_rms_distance": float(
+                self.settings.semantic_fallback_max_rms_distance
+            ),
+            "n_transitions": float(sum(
+                max(0, len(demo) - 1) for demo in demonstrations
+            )),
+            "valid_action_expansion": dict(self._last_expansion_stats),
+        }
+        self.last_fit_stats["estimated_flops"] = float(
+            self.last_fit_stats.get("estimated_flops", 0.0)
+        ) + latent_flops
 
-    def predict(self, state: State) -> Dict[str, float]:
-        if self.theta is None or self.feature_matrix is None: return {}
-        _, dist = predict_action_2(state=tuple(state),  reward_weights=self.theta,  feature_matrix=self.feature_matrix, state_to_idx=self.state_to_idx, action_to_idx=self.action_to_idx,   idx_to_action=self.idx_to_action,   transition_model=self.transition_model, 
-                                   col_min=self.col_min, col_max=self.col_max,      normalizer=self.normalizer,         temperature=self.cfg.maxent_temperature,    gamma=self.cfg.maxent_gamma,    q_table=self.q_table,       s_to_actions=self.s_to_actions, idx_to_state=self.idx_to_state, raw_state_matrix=self.raw_state_matrix)
-        return _normalise_dist(dist, self.cfg.prob_floor)
-
-    def fisher_diagonal(self, trajectories: Sequence[Trajectory], weights: Optional[Sequence[float]] = None) -> Optional[np.ndarray]:
-        """Diagonal Fisher information for the linear-reward MaxEnt policy. For a softmax policy parameterised as `pi(a|s) ∝ exp(Q(s,a)/T)` with linear reward `R(s) = theta . phi(s)`, the per-state log-likelihood gradient is dominated by `phi(s)` (the reward gradient term carries through the soft Bellman backup). 
-        The diagonal Fisher under the data distribution is therefore `E_{s~p}[phi_i(s)^2]`, a standard linear softmax approximation that is cheap to compute and meaningful for EWC's elastic anchor.
-        Returns None if the model has not been fit. Per-trajectory weighting respects the same convention as ``fit`` (absolute scale matters: a downweighted trajectory contributes proportionally less to the accumulator).
-        """
-        if self.theta is None or self.feature_matrix is None:
+    def _state_features(self, state: StateVector) -> Optional[np.ndarray]:
+        if self.reward_weights is None:
             return None
-        n_features = int(self.theta.shape[0])
-        fisher = np.zeros(n_features, dtype=np.float32)
-        if weights is None:
-            weights = [1.0] * len(trajectories)
-        total = 0.0
-        for traj, w in zip(trajectories, weights):
-            wf = float(w)
-            if wf <= 0.0: continue
-            for state, _ in traj:
-                s_idx = self.state_to_idx.get(state)
-                if s_idx is None or s_idx >= self.feature_matrix.shape[0]:  continue
-                phi = self.feature_matrix[s_idx]
-                fisher += wf * (phi * phi).astype(np.float32)
-                total += wf
-        if total > 0.0:     fisher /= total
-        clip = float(getattr(self.cfg, "ewc_fisher_clip", 0.0))
-        if clip > 0.0:
-            fisher = np.clip(fisher, 0.0, clip).astype(np.float32)
-        return fisher
+        features, _mean, _scale = build_features(
+            {0: tuple(state)},
+            known_mean=self.feature_mean,
+            known_scale=self.feature_scale,
+            feature_mode=self.settings.irl_features,
+        )
+        return features[0] if features.size else None
 
+    def _semantic_neighbor_value(
+        self, state: StateVector,
+    ) -> Optional[float]:
+        """Return a value only when a semantic neighbour passes the gate."""
+        if (
+            not self.settings.semantic_fallback_enabled
+            or self.values is None
+            or self.semantic_features is None
+            or not len(self.values)
+        ):
+            return None
+        exact = self.state_ids.get(tuple(state))
+        if exact is not None and exact < len(self.values):
+            return float(self.values[exact])
+        query, _, _ = build_features(
+            {0: tuple(state)}, feature_mode="semantic", normalize=False,
+        )
+        if query.size == 0 or self.semantic_features.size == 0:
+            return None
+        distances = np.sqrt(np.mean(
+            (self.semantic_features - query[0][None, :]) ** 2,
+            axis=1,
+        ))
+        threshold = float(self.settings.semantic_fallback_max_rms_distance)
+        eligible = np.flatnonzero(distances <= threshold)
+        if eligible.size == 0:
+            return None
+        count = min(max(1, int(self.settings.semantic_knn)), len(eligible))
+        eligible_distances = distances[eligible]
+        selected = np.argpartition(eligible_distances, count - 1)[:count]
+        neighbors = eligible[selected]
+        neighbor_distances = distances[neighbors]
+        exact_neighbors = neighbors[neighbor_distances <= 1e-12]
+        if exact_neighbors.size:
+            return float(np.mean(self.values[exact_neighbors]))
+        weights = 1.0 / np.maximum(neighbor_distances, 1e-8)
+        return float(np.average(self.values[neighbors], weights=weights))
 
-
-
-class _StateNNMixin:
-    state_to_idx: Dict[State, int]
-    feature_matrix: Optional[np.ndarray]
-    col_min: Optional[np.ndarray]
-    col_max: Optional[np.ndarray]
-    normalizer: Optional[WelfordFeatureNormalizer]
-    idx_to_state: Dict[int, State]
-    raw_state_matrix: Optional[np.ndarray]
-
-    def _nearest_state_idx(self, state: State) -> Optional[int]:
-        if state in self.state_to_idx:                                      return self.state_to_idx[state]
-        return _nearest_hamming_idx(tuple(state), self.idx_to_state, self.raw_state_matrix)
-
-
-class NGramMarkov(_StateNNMixin):
-    """State-aware weighted n-gram predictor with nearest-state fallback."""
-
-    def __init__(self, order = 3, prob_floor = 1e-6, state_log_weight: float = 0.60, prefix_log_weight: float = 0.40):
-        self.order = order
-        self.prob_floor = prob_floor
-        self.state_log_weight = float(state_log_weight)
-        self.prefix_log_weight = float(prefix_log_weight)
-        self.counts_ngram: List[Dict[tuple, Counter]] = [defaultdict(Counter) for _ in range(order + 1)]
-        self.counts_state: Dict[int, Counter] = defaultdict(Counter)
-        self.vocab: set = set()
-        self.state_to_idx: Dict[State, int] = {}
-        self.idx_to_state: Dict[int, State] = {}
-        self.feature_matrix: Optional[np.ndarray] = None
-        self.col_min: Optional[np.ndarray] = None
-        self.col_max: Optional[np.ndarray] = None
-        self.normalizer: Optional[WelfordFeatureNormalizer] = None
-        self.raw_state_matrix: Optional[np.ndarray] = None
-
-    def fit(self,  demonstrations: Sequence[Trajectory], weights: Optional[Sequence[float]] = None, state_to_idx: Optional[Dict[State, int]] = None, idx_to_state: Optional[Dict[int, State]] = None, feature_matrix: Optional[np.ndarray] = None, col_min: Optional[np.ndarray] = None, col_max: Optional[np.ndarray] = None, normalizer: Optional[WelfordFeatureNormalizer] = None) -> None:
-        self.counts_ngram = [defaultdict(Counter) for _ in range(self.order + 1)]
-        self.counts_state = defaultdict(Counter)
-        self.vocab = set()
-        self.state_to_idx = dict(state_to_idx or {})
-        self.idx_to_state = dict(idx_to_state or {})
-        self.feature_matrix = feature_matrix
-        self.col_min = col_min
-        self.col_max = col_max
-        self.normalizer = normalizer
-        self.raw_state_matrix = _raw_state_matrix(self.idx_to_state)
-
-        if weights is None: weights = [1.0] * len(demonstrations)
-        # Relative rehearsal weights are real counts here. Uniform scaling still cancels at prediction, but decayed demos exert proportionally less influence than fresh or pinned demos.
-        for traj, w in zip(demonstrations, weights):
-            wf = float(w)
-            if wf <= 0: continue
-            seq = [a for _, a in traj if a != "stop"]
-            for i, action in enumerate(seq):
-                self.vocab.add(action)
-                state = traj[i][0]
-                s_idx = self.state_to_idx.get(state)
-                if s_idx is not None: self.counts_state[s_idx][action] += wf
-                for k in range(self.order + 1):
-                    ctx = tuple(seq[max(0, i - k):i])
-                    if len(ctx) == k: self.counts_ngram[k][ctx][action] += wf
-
-    def predict(self, state: State, prefix: Sequence[str]) -> Dict[str, float]:
-        if not self.vocab:  return {}
-
-        # State-local distribution.
-        s_idx = self._nearest_state_idx(tuple(state))
-        state_dist: Dict[str, float] = {}
-        if s_idx is not None and self.counts_state.get(s_idx):
-            c = self.counts_state[s_idx]
-            z = float(sum(c.values()))
-            state_dist = {a: c[a] / max(z, 1e-9) for a in c}
-
-        # n-gram backoff distribution.
-        ngram_dist: Dict[str, float] = {}
-        for k in range(min(self.order, len(prefix)), -1, -1):
-            ctx = tuple(prefix[-k:]) if k > 0 else ()
-            c = self.counts_ngram[k].get(ctx)
-            if c:
-                z = float(sum(c.values()))
-                ngram_dist = {a: c[a] / max(z, 1e-9) for a in c}
-                break
-
-        if state_dist and ngram_dist:
-            vocab = set(state_dist) | set(ngram_dist)
-            mix = {
-                a: (
-                    max(state_dist.get(a, self.prob_floor), self.prob_floor) ** self.state_log_weight
-                ) * (
-                    max(ngram_dist.get(a, self.prob_floor), self.prob_floor) ** self.prefix_log_weight
+    def _feasible_distribution(
+        self, state: StateVector, candidates: Sequence[str],
+    ) -> Dict[str, float]:
+        if self.reward_weights is None:
+            return {}
+        state_id = self.state_ids.get(tuple(state))
+        candidate_actions = sorted(set(str(value) for value in candidates))
+        learned = [
+            (action, float(self.q_values[(state_id, action_id)]))
+            for action in candidate_actions
+            for action_id in (self.action_ids.get(action),)
+            if state_id is not None
+            and action_id is not None
+            and (state_id, action_id) in self.q_values
+        ]
+        self._last_exact_learned_action_count = len(learned)
+        if learned:
+            self._fallback_counts = (0, 0, 0)
+            probabilities = _softmax_probs(
+                [value for _action, value in learned],
+                self.settings.irl_temperature,
+            )
+            distribution = {
+                action: probability
+                for (action, _value), probability in zip(
+                    learned, probabilities,
                 )
-                for a in vocab
             }
-            return _normalise_dist(mix, self.prob_floor)
-        if state_dist:  return _normalise_dist(state_dist, self.prob_floor)
-        if ngram_dist:  return _normalise_dist(ngram_dist, self.prob_floor)
-        u = 1.0 / len(self.vocab)
-        return {a: u for a in self.vocab}
+            # Preserve the complete state-valid distribution requested by the
+            # evaluation contract, but do not let unlearned semantic estimates
+            # compete with an exact-state MaxEnt policy.  They remain explicit
+            # floor-probability alternatives for calibration and NLL.
+            for action in candidate_actions:
+                if action not in distribution and _apply_action(
+                    tuple(state), action,
+                ) is not None:
+                    distribution[action] = 0.0
+            return _normalize_probs(
+                distribution, self.settings.min_probability,
+            )
+
+        current_features = self._state_features(tuple(state))
+        if current_features is None:
+            return {}
+        current_reward = float(current_features @ self.reward_weights)
+        actions: List[str] = []
+        q_values: List[float] = []
+        semantic_fallback_enabled = bool(
+            self.settings.semantic_fallback_enabled
+        )
+        fallback_counts = [0, 0, 0]
+        for action in candidate_actions:
+            successor = _apply_action(tuple(state), action)
+            if successor is None:
+                continue
+            actions.append(action)
+            if not semantic_fallback_enabled:
+                # Pure MaxEnt controls retain the common feasible-action
+                # interface without receiving a semantic transfer signal.
+                q_values.append(current_reward)
+                continue
+            fallback_counts[0] += 1
+            neighbor_value = self._semantic_neighbor_value(successor)
+            if neighbor_value is None:
+                # Rejected transfer retains neutral probability support.
+                fallback_counts[2] += 1
+                q_values.append(current_reward)
+                continue
+            fallback_counts[1] += 1
+            q_values.append(
+                current_reward
+                + float(self.settings.irl_discount) * neighbor_value
+            )
+        self._fallback_counts = tuple(fallback_counts)
+        if not actions:
+            return {}
+        probabilities = _softmax_probs(q_values, self.settings.irl_temperature)
+        return _normalize_probs(
+            dict(zip(actions, probabilities)), self.settings.min_probability,
+        )
+
+    def _record_prediction_stats(self, candidate_count: int) -> None:
+        attempted, accepted, rejected = self._fallback_counts
+        self.last_prediction_stats = {
+            "model_structure": (
+                "maxent_irl_with_latent_strategy_residual"
+                if self.settings.latent_strategy_enabled else "single_maxent_irl"
+            ),
+            "candidate_count": int(candidate_count),
+            "exact_state_learned_action_count": int(
+                self._last_exact_learned_action_count
+            ),
+            "semantic_fallback_enabled": bool(
+                self.settings.semantic_fallback_enabled
+            ),
+            "semantic_fallback_attempted": bool(attempted),
+            "semantic_fallback_used": bool(accepted),
+            "semantic_fallback_accepted_actions": int(accepted),
+            "semantic_fallback_rejected_actions": int(rejected),
+        }
+
+    def predict(
+        self,
+        state: StateVector,
+        candidate_actions: Optional[Sequence[str]] = None,
+        prefix: Optional[Sequence[str]] = None,
+        allow_latent_strategy: bool = True,
+    ) -> Dict[str, float]:
+        if self.reward_weights is None or self.features is None:
+            return {}
+        candidates = (
+            tuple(candidate_actions) if candidate_actions is not None
+            else feasible_actions(tuple(state), tuple(self.action_ids))
+        )
+        distribution = self._feasible_distribution(tuple(state), candidates)
+        attempted = bool(self._fallback_counts[0])
+        conflict = self._last_exact_learned_action_count >= 2
+        latent_score = self.latent_strategy.score(tuple(prefix or ()), candidates)
+        alpha = 0.0
+        latent_enabled = bool(self.settings.latent_strategy_enabled)
+        if latent_enabled and allow_latent_strategy and (attempted or conflict):
+            distribution, alpha = fuse_strategy_residual(
+                distribution,
+                latent_score,
+                float(self.settings.latent_strategy_strength),
+            )
+        self._record_prediction_stats(len(distribution))
+        self.last_prediction_stats.update(
+            dict(self.latent_strategy.last_score_stats)
+        )
+        self.last_prediction_stats.update({
+            "latent_strategy_eligible": bool(
+                latent_enabled and allow_latent_strategy
+                and (attempted or conflict)
+            ),
+            "latent_strategy_used": bool(alpha > 0.0),
+            "latent_strategy_alpha": float(alpha),
+        })
+        return distribution
+
+    def latent_supports_correction(
+        self,
+        corrected_prefix: Sequence[str],
+        candidates: Sequence[str],
+        actual: str,
+        predicted: str,
+    ) -> bool:
+        """Test a correction after incorporating it into the latent prefix."""
+        if not self.settings.latent_strategy_enabled:
+            return False
+        score = self.latent_strategy.score(
+            corrected_prefix,
+            candidates,
+            decision_prefix=corrected_prefix[:-1],
+        )
+        return self.latent_strategy.supports_correction(actual, predicted)
+
+    def fisher(
+        self,
+        trajectories: Sequence[Demonstration],
+        demo_weights: Optional[Sequence[float]] = None,
+    ) -> Optional[np.ndarray]:
+        if self.reward_weights is None or self.features is None:
+            return None
+        sample_weights = (
+            [1.0] * len(trajectories)
+            if demo_weights is None else list(demo_weights)
+        )
+        fisher = np.zeros(len(self.reward_weights), dtype=np.float32)
+        total = 0.0
+        for trajectory, weight in zip(trajectories, sample_weights):
+            weight = float(weight)
+            if weight <= 0.0:
+                continue
+            for state, _action in trajectory:
+                state_id = self.state_ids.get(state)
+                if state_id is None or state_id >= len(self.features):
+                    continue
+                feature = self.features[state_id]
+                fisher += weight * feature * feature
+                total += weight
+        if total > 0.0:
+            fisher /= total
+        fisher_cap = float(self.settings.fisher_cap)
+        return np.clip(fisher, 0.0, fisher_cap).astype(np.float32)
 
 
-def ensemble_predict(p_irl: Dict[str, float], p_markov: Dict[str, float], cfg: Config = DEFAULT_CONFIG) -> Dict[str, float]:
-    """Fuse the MaxEnt IRL and state-aware n-gram heads as p ∝ p_irl^a · p_markov^b.
+def top_probability_tie_size(distribution: Mapping[str, float]) -> int:
+    """Return the number of actions sharing the exact maximum probability."""
+    if not distribution:
+        return 0
+    maximum = max(float(probability) for probability in distribution.values())
+    return sum(
+        float(probability) == maximum
+        for probability in distribution.values()
+    )
 
-    ``a = cfg.ensemble_alpha * cfg.irl_weight`` and ``b = cfg.ensemble_beta`` are
-    used **without** normalising to a+b=1.  This preserves the absolute scale of
-    each exponent so that:
-      - higher |a|+|b| sharpens the combined distribution toward argmax;
-      - the ratio a/b sets the relative IRL vs. Markov influence;
-      - ``irl_weight`` is a genuine multiplicative scaling of the IRL contribution,
-        not a no-op masked by subsequent renormalisation.
-    The output distribution is normalised to sum to 1 via the final division by s.
+
+def top_actions(
+    distribution: Mapping[str, float],
+    k: int = 1,
+    *,
+    rng: np.random.Generator,
+) -> List[str]:
+    """Rank actions by probability and i.i.d. Gaussian draws within exact ties.
+
+    The input distribution is never modified.  Gaussian draws are used only to
+    order equal-probability actions, so non-tied probabilities retain their
+    original ranking and every member of a tie is exchangeable.
     """
-    vocab = set(p_irl) | set(p_markov)
-    if not vocab:
-        return {}
-    floor = cfg.prob_floor
-    a = max(0.0, float(cfg.ensemble_alpha) * float(cfg.irl_weight))
-    b = max(0.0, float(cfg.ensemble_beta))
-    if a <= 0.0 and b <= 0.0:
-        a = b = 0.5  # degenerate config — fall back to equal weighting
-    out: Dict[str, float] = {}
-    for act in vocab:
-        pi = max(p_irl.get(act, floor), floor) if p_irl else 1.0
-        pm = max(p_markov.get(act, floor), floor) if p_markov else 1.0
-        out[act] = (pi ** a) * (pm ** b)
-    s = sum(out.values())
-    if s <= 0:
-        u = 1.0 / len(vocab)
-        return {a_: u for a_ in vocab}
-    return {a_: p / s for a_, p in out.items()}
-
-def top_k(distribution: Dict[str, float], k = 1) -> List[str]: return [a for a, _ in sorted(distribution.items(), key=lambda kv: -kv[1])[:k]]
+    limit = max(0, int(k))
+    if not distribution or limit == 0:
+        return []
+    groups: Dict[float, List[str]] = {}
+    for action, probability in distribution.items():
+        groups.setdefault(float(probability), []).append(str(action))
+    ranked: List[str] = []
+    for probability in sorted(groups, reverse=True):
+        actions = groups[probability]
+        if len(actions) > 1:
+            draws = np.asarray(
+                rng.normal(loc=0.0, scale=1.0, size=len(actions)),
+                dtype=np.float64,
+            )
+            order = np.argsort(-draws, kind="stable")
+            ranked.extend(actions[int(index)] for index in order)
+        else:
+            ranked.extend(actions)
+        if len(ranked) >= limit:
+            break
+    return ranked[:limit]
