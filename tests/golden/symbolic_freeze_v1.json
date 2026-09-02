@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source_commit": "eee03781276f4cefd7e419b663f2ba629234c192",
+  "description": "Frozen pre-Burrito symbolic MaxEnt smoke policy",
+  "actions": [
+    "transfer (pot, from=storage, to=cooking_station)",
+    "transfer (tomato, from=storage, to=prep_station)",
+    "cut (tomato, prep_station)",
+    "load (tomato, pot, cooking_station)",
+    "turn_on (stove, cooking_station)"
+  ],
+  "settings": {
+    "seed": 1337,
+    "irl_cold_steps": 3,
+    "irl_warm_steps": 2,
+    "irl_horizon": 8,
+    "latent_strategy_enabled": false
+  },
+  "reward_weights": {
+    "dtype": "float32",
+    "shape": [199],
+    "sha256": "8bb2d0ae3f7f828d2ce4c2f9b6422364cc5d1deba9498e526a584bc08c6b3284"
+  },
+  "predictions": [
+    {
+      "transfer (pot, from=storage, to=cooking_station)": 0.999998000004,
+      "transfer (tomato, from=storage, to=prep_station)": 9.999980000039998e-07,
+      "turn_on (stove, cooking_station)": 9.999980000039998e-07
+    },
+    {
+      "transfer (tomato, from=storage, to=prep_station)": 0.9999990000010001,
+      "turn_on (stove, cooking_station)": 9.99999000001e-07
+    },
+    {
+      "cut (tomato, prep_station)": 0.9999990000010001,
+      "turn_on (stove, cooking_station)": 9.99999000001e-07
+    },
+    {"turn_on (stove, cooking_station)": 1.0},
+    {"turn_on (stove, cooking_station)": 1.0}
+  ]
+}

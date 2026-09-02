@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools==72.1.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-hrc-burrito-wrapper"
+version = "0.1.0"
+description = "Isolated Adaptive-HRC integration boundary for Burrito/Overcooked"
+requires-python = "==3.10.*"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["adaptive_hrc_burrito*"]

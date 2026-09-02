@@ -4,10 +4,7 @@ from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .environment import (
-    ACTION_LABEL_ARGUMENTS, Action, CONTAINERS, INGREDIENTS,
-    parse_action_label, task_goal_signature, validate_ordering,
-)
+from .environment import (ACTION_LABEL_ARGUMENTS, Action, CONTAINERS, INGREDIENTS, parse_action_label, task_goal_signature, validate_ordering)
 
 PREP_VALUES = ("serial", "prep_first")
 EQUIPMENT_VALUES = ("early", "just_in_time")
@@ -17,26 +14,8 @@ SHUTDOWN_VALUES = ("immediate", "delayed")
 LOADING_VALUES = ("incremental", "just_in_time")
 COOK_START_VALUES = ("immediate", "delayed")
 SERVE_ORDER_VALUES = ("serve_first", "cleanup_first")
-PREFERENCE_AXES: Tuple[str, ...] = (
-    "prep",
-    "equipment",
-    "serving",
-    "loading",
-    "shutdown",
-    "cook_start",
-    "cleanup",
-    "serve_order",
-)
-PREFERENCE_VALUES: Dict[str, Tuple[str, ...]] = {
-    "prep": PREP_VALUES,
-    "equipment": EQUIPMENT_VALUES,
-    "serving": SERVING_VALUES,
-    "loading": LOADING_VALUES,
-    "shutdown": SHUTDOWN_VALUES,
-    "cook_start": COOK_START_VALUES,
-    "cleanup": CLEANUP_VALUES,
-    "serve_order": SERVE_ORDER_VALUES,
-}
+PREFERENCE_AXES: Tuple[str, ...] =              ("prep",              "equipment",                   "serving",                 "loading",                 "shutdown",                  "cook_start",                    "cleanup",                 "serve_order")
+PREFERENCE_VALUES: Dict[str, Tuple[str, ...]] = {"prep": PREP_VALUES, "equipment": EQUIPMENT_VALUES, "serving": SERVING_VALUES, "loading": LOADING_VALUES, "shutdown": SHUTDOWN_VALUES, "cook_start": COOK_START_VALUES, "cleanup": CLEANUP_VALUES, "serve_order": SERVE_ORDER_VALUES}
 
 @dataclass(frozen=True)
 class Preference:
@@ -56,9 +35,7 @@ class Preference:
 
     @property
     def label(self) -> str:
-        return "_".join(
-            f"{axis}-{value}" for axis, value in self.as_dict().items()
-        )
+        return "_".join(f"{axis}-{value}" for axis, value in self.as_dict().items())
 
     def as_dict(self) -> Dict[str, str]:
         return asdict(self)
@@ -75,36 +52,21 @@ class PreferenceResult:
 PREFERENCES: Dict[str, Preference] = {
     "default": Preference(),
     # Isolated primary axes in schema order.
-    "prep_first": Preference(prep="prep_first"),
-    "equipment_jit": Preference(equipment="just_in_time"),
-    "serving_early": Preference(serving="early"),
-    "loading_jit": Preference(loading="just_in_time"),
-    "shutdown_late": Preference(shutdown="delayed"),
-    "cook_start_late": Preference(cook_start="delayed"),
-    "cleanup_when_free": Preference(cleanup="when_free"),
-    "cleanup_first": Preference(serve_order="cleanup_first"),
+    "prep_first":                       Preference(prep="prep_first"),
+    "equipment_jit":                    Preference(                                                                                     equipment="just_in_time"),
+    "serving_early":                    Preference(                   serving="early"),
+    "loading_jit":                      Preference(                                     loading="just_in_time"),
+    "shutdown_late":                    Preference(                                                                                                                                 shutdown="delayed"),
+    "cook_start_late":                  Preference(                                                                                                                                             cook_start="delayed"),
+    "cleanup_when_free":                Preference(                                                             cleanup="when_free"),
+    "cleanup_first":                    Preference(                                                                                                                 serve_order="cleanup_first"),
     # Composition probes outside the primary ladder.
-    "equipment_jit_serving_early": Preference(
-        equipment="just_in_time", serving="early",
-    ),
-    "prep_first_cleanup": Preference(
-        prep="prep_first", cleanup="when_free",
-    ),
-    "prep_first_serving_cleanup": Preference(
-        prep="prep_first", serving="early",
-        cleanup="when_free",
-    ),
-    "prep_loading_serving_cleanup": Preference(
-        prep="prep_first", serving="early",
-        loading="just_in_time", cleanup="when_free",
-    ),
-    "equipment_jit_cleanup": Preference(
-        equipment="just_in_time", cleanup="when_free",
-    ),
-    "prep_loading_cleanup": Preference(
-        prep="prep_first", loading="just_in_time",
-        cleanup="when_free",
-    ),
+    "equipment_jit_serving_early":      Preference(                   serving="early",                                                  equipment="just_in_time"),
+    "prep_first_cleanup":               Preference(prep="prep_first",                                           cleanup="when_free"),
+    "prep_first_serving_cleanup":       Preference(prep="prep_first", serving="early",                          cleanup="when_free"),
+    "prep_loading_serving_cleanup":     Preference(prep="prep_first", serving="early",  loading="just_in_time", cleanup="when_free"),
+    "equipment_jit_cleanup":            Preference(                                                             cleanup="when_free",    equipment="just_in_time"),
+    "prep_loading_cleanup":             Preference(prep="prep_first",                   loading="just_in_time", cleanup="when_free"),
 }
 PREFERENCE_IDS: Tuple[str, ...] = tuple(PREFERENCES)
 DEFAULT_PREFERENCE = PREFERENCES["default"].as_dict()
@@ -119,11 +81,7 @@ def _verb(action: str) -> str:
 
 def _args(action: str) -> List[str]:
     parsed = _action(action)
-    return [
-        parsed.args[key]
-        for key in ACTION_LABEL_ARGUMENTS[parsed.verb]
-        if key in parsed.args
-    ]
+    return [parsed.args[key] for key in ACTION_LABEL_ARGUMENTS[parsed.verb] if key in parsed.args]
 
 def _first_argument(action: str) -> str:
     args = _args(action)
@@ -163,12 +121,7 @@ def _move_matching_block(actions: Sequence[str], predicate, *, earliest: bool) -
     return list(actions)
 
 
-def _move_actions(
-    actions: Sequence[str],
-    predicate,
-    *,
-    earliest: bool,
-) -> List[str]:
+def _move_actions(actions: Sequence[str], predicate, *, earliest: bool) -> List[str]:
     """Move each matching occurrence to a valid, goal-equivalent extreme."""
     base = list(actions)
     base_goal = task_goal_signature(base)
@@ -228,35 +181,18 @@ def _cleanup_blocks(actions: Sequence[str]) -> Tuple[List[str], List[List[str]]]
                 transport_index = search_index
                 break
             # A different wash starts another cleanup block.
-            if (
-                _verb(actions[search_index]) == "wash"
-                and _first_argument(actions[search_index]) != item
-            ):
-                break
-        start = (
-            transport_index if transport_index is not None else action_index
-        )
+            if (_verb(actions[search_index]) == "wash" and _first_argument(actions[search_index]) != item): break
+        start = (transport_index if transport_index is not None else action_index)
         block = list(actions[start: action_index + 1])
         consumed.update(range(start, action_index + 1))
         blocks.append(block)
-    rest = [
-        action for index, action in enumerate(actions)
-        if index not in consumed
-    ]
+    rest = [action for index, action in enumerate(actions) if index not in consumed]
     return rest, blocks
 
 
 def _apply_prep(actions: Sequence[str], _value: str) -> List[str]:
     """Apply the non-default mise-en-place policy."""
-    return _move_actions(
-        actions,
-        lambda action: (
-            _is_ingredient_retrieval(action)
-            or _verb(action) in ("cut", "grate")
-            or _is_productive_load(action)
-        ),
-        earliest=True,
-    )
+    return _move_actions(actions, lambda action: (_is_ingredient_retrieval(action) or _verb(action) in ("cut", "grate") or _is_productive_load(action)), earliest=True)
 
 
 def _apply_equipment(actions: Sequence[str], _value: str) -> List[str]:
@@ -326,10 +262,7 @@ PREFERENCE_RULES = {
     "cleanup": _apply_cleanup,
     "serve_order": _apply_serve_order,
 }
-def apply_preference(
-    actions: Sequence[str],
-    preference: Preference,
-) -> PreferenceResult:
+def apply_preference(actions: Sequence[str],    preference: Preference) -> PreferenceResult:
     """Apply one goal-preserving workflow preference."""
     if not _try_validate(actions):
         raise ValueError("input recipe is invalid")
@@ -351,38 +284,18 @@ def apply_preference(
             continue
         modified = list(candidate)
         (applied if tuple(modified) != before else failed).append(axis)
-    if not validate_ordering(modified, expected_goal=goal):
-        raise ValueError("preference changed the recipe goal")
-    return PreferenceResult(
-        actions=modified,
-        applied=applied,
-        failed=failed,
-        unchanged=unchanged,
-        values=dict(values),
-    )
+    if not validate_ordering(modified, expected_goal=goal):     raise ValueError("preference changed the recipe goal")
+    return PreferenceResult(actions=modified,   applied=applied,    failed=failed,      unchanged=unchanged,        values=dict(values))
 
 
 def _get_preference(name: str) -> Preference:
-    try:
-        return PREFERENCES[name]
-    except KeyError as exc:
-        raise KeyError(
-            f"unknown preset {name!r}; known: {sorted(PREFERENCES)}"
-        ) from exc
+    try:                        return PREFERENCES[name]
+    except KeyError as exc:     raise KeyError(f"unknown preset {name!r}; known: {sorted(PREFERENCES)}") from exc
 
 
-def apply_preset(
-    actions: Sequence[str], preference_id: str,
-) -> PreferenceResult:
+def apply_preset(actions: Sequence[str], preference_id: str) -> PreferenceResult:
     preference = _get_preference(preference_id)
-    if preference_id == "default":
-        return PreferenceResult(
-            actions=list(actions),
-            applied=[],
-            failed=[],
-            unchanged=list(PREFERENCE_AXES),
-            values=preference.as_dict(),
-        )
+    if preference_id == "default":      return PreferenceResult(actions=list(actions),      applied=[],     failed=[],   unchanged=list(PREFERENCE_AXES),       values=preference.as_dict())
     return apply_preference(actions, preference)
 
 

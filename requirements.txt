@@ -1,5 +1,11 @@
-# Reproducible Python 3.13 environment for HRC.ipynb, tests, and the
-# standard evaluator. GPU-specific dependencies remain separate.
+# INSTALL WITH: ./hrc setup
+# DESTINATION:  ./venv (Python 3.13)
+# USED BY:      HRC.ipynb, the standard 3-scenario x 5-seed evaluation,
+#               all normal ablations, and the complete test suite.
+#
+# This is the single normal/test environment. Do not create a separate smoke
+# or test environment, and do not install requirements-llm.txt into this venv.
+# GPU/LLM dependencies are intentionally isolated in .venv-llm.
 asttokens==3.0.1
 comm==0.2.3
 contourpy==1.3.3

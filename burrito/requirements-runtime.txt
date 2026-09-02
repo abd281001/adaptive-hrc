@@ -1,0 +1,38 @@
+# Fully pinned, CPU-only runtime validated with Python 3.10.20.
+# TALENTS training dependencies (Ray, Torch, WandB, etc.) are intentionally
+# excluded because Adaptive-HRC supplies the policy and learning components.
+asttokens==3.0.2
+backcall==0.2.0
+cloudpickle==3.1.2
+comm==0.2.3
+decorator==5.3.1
+dill==0.3.9
+executing==2.2.1
+farama-notifications==0.0.6
+gym==0.23.1
+gym-notices==0.1.0
+gymnasium==1.0.0
+ipython==8.12.3
+ipywidgets==8.1.5
+jedi==0.20.0
+jupyterlab-widgets==3.0.17
+matplotlib-inline==0.2.2
+numpy==1.23.0
+opencv-python==4.10.0.84
+parso==0.8.7
+pettingzoo==1.24.3
+pexpect==4.9.0
+pickleshare==0.7.5
+pillow==11.1.0
+prompt-toolkit==3.0.53
+ptyprocess==0.7.0
+pure-eval==0.2.3
+pygame==2.6.1
+pygments==2.21.0
+scipy==1.13.1
+stack-data==0.6.3
+tqdm==4.67.1
+traitlets==5.16.1
+typing-extensions==4.15.0
+wcwidth==0.8.3
+widgetsnbextension==4.0.16

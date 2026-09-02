@@ -9,28 +9,10 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import numpy as np
 
-from .environment import StateTracker
-from .memory import (
-    MatchResult,
-    ReplayMemory,
-    StateTransition,
-    RecipeMatcher,
-    MemoryItem,
-    Variant,
-    VariantKey,
-    VariantLibrary,
-    make_variant_id,
-)
-from .models import (
-    Settings,
-    DEFAULT_SETTINGS,
-    MaxEntIrl,
-    feasible_actions,
-    top_actions,
-)
-from .representations import (
-    Observation,
-)
+from .domain import DomainAdapter, default_domain
+from .memory import (MatchResult, ReplayMemory, StateTransition, RecipeMatcher, MemoryItem, Variant, VariantKey, VariantLibrary, make_variant_id)
+from .models import (Settings, DEFAULT_SETTINGS, MaxEntIrl, top_actions)
+from .representations import (Observation)
 
 MODE_OBSERVE = "observe"
 MODE_ONLINE = "online"
@@ -57,26 +39,18 @@ class TrainPolicy:
     cold_after: int = 3
     warm_on_weight_change: bool = False
 
-    def decide(
-        self, membership_changes: int, weight_changed: bool, since_cold: int,
-    ) -> Tuple[str, str, int]:
+    def decide(self, membership_changes: int, weight_changed: bool, since_cold: int) -> Tuple[str, str, int]:
         projected = int(since_cold) + int(membership_changes)
         if membership_changes > 0:
             if projected >= max(1, int(self.cold_after)):
                 return "cold", "cumulative_membership_threshold_reached", projected
             return "warm", "cumulative_membership_below_threshold", projected
-        if weight_changed:
-            return (
-                ("warm", "weight_only_change", projected)
-                if self.warm_on_weight_change
-                else ("skip", "weight_only_change_skipped", projected)
-            )
+        if weight_changed: return (("warm", "weight_only_change", projected) if self.warm_on_weight_change else ("skip", "weight_only_change_skipped", projected))
         return "skip", "replay_unchanged", projected
 
 
 FULL_TRAIN_POLICY = TrainPolicy()
-# Shared-agent comparisons use the same warm/cold schedule so their memory or
-# predictor policy remains the experimental difference.
+# Shared-agent comparisons use the same warm/cold schedule so their memory or predictor policy remains the experimental difference.
 BASELINE_TRAIN_POLICY = FULL_TRAIN_POLICY
 
 
@@ -85,8 +59,9 @@ class AdaptiveAgent:
 
     RETRAIN_POLICY = FULL_TRAIN_POLICY
 
-    def __init__(self, settings: Settings = DEFAULT_SETTINGS, narrate: Optional[Callable[[str], None]] = None, retrain_policy: Optional[TrainPolicy] = None):
+    def __init__(self, settings: Settings = DEFAULT_SETTINGS, narrate: Optional[Callable[[str], None]] = None, retrain_policy: Optional[TrainPolicy] = None, domain: Optional[DomainAdapter] = None):
         self.settings = settings
+        self.domain = domain or default_domain()
         self.retrain_policy = retrain_policy or self.RETRAIN_POLICY
         self.replay = ReplayMemory(settings)
         self.library = VariantLibrary()
@@ -94,13 +69,9 @@ class AdaptiveAgent:
         self.commit_events: List[Dict[str, Any]] = []
         self.last_commit_stats: Dict[str, Any] = {}
 
-        self.maxent = MaxEntIrl(settings=settings)
-        # Keep action-selection randomness separate from MaxEnt optimization so
-        # a prediction tie cannot alter future model initialization or fitting.
-        tie_seed = np.random.SeedSequence([
-            int(settings.seed) & 0xFFFFFFFF,
-            0x544945,
-        ])
+        self.maxent = MaxEntIrl(settings=settings, domain=self.domain)
+        # Keep action-selection randomness separate from MaxEnt optimization so a prediction tie cannot alter future model initialization or fitting.
+        tie_seed = np.random.SeedSequence([int(settings.seed) & 0xFFFFFFFF, 0x544945])
         self._tie_break_rng = np.random.default_rng(tie_seed)
         self._last_action_mask_stats: Dict[str, Any] = {}
 
@@ -166,10 +137,7 @@ class AdaptiveAgent:
             yield
         finally:
             calls, wall_seconds = self.profile.get(event, (0, 0.0))
-            self.profile[event] = (
-                calls + 1,
-                wall_seconds + (time.perf_counter() - start_time),
-            )
+            self.profile[event] = (calls + 1, wall_seconds + (time.perf_counter() - start_time))
 
     def snapshot(self) -> "AdaptiveAgent":
         """Deep-copy the agent for phase-A sweep reuse. Lossless and pure (no leakage between branches)."""
@@ -186,90 +154,31 @@ class AdaptiveAgent:
     def set_frozen(self, value: bool) -> None:
         """Freeze or restore all mutable state so evaluation cannot leak."""
         if value and not self._frozen:
-            with self._profile("freeze_snapshot_enter"):
-                self._freeze_snapshot = copy.deepcopy({
-                    key: item
-                    for key, item in self.__dict__.items()
-                    if key not in ("_freeze_snapshot", "_frozen")
-                })
+            with self._profile("freeze_snapshot_enter"): self._freeze_snapshot = copy.deepcopy({key: item for key, item in self.__dict__.items() if key not in ("_freeze_snapshot", "_frozen")})
             self._frozen = True
         elif not value and self._frozen:
             frozen_state = self._freeze_snapshot
             if frozen_state is not None:
                 with self._profile("freeze_snapshot_exit"):
-                    for key, item in frozen_state.items():
-                        self.__dict__[key] = item
+                    for key, item in frozen_state.items(): self.__dict__[key] = item
             self._freeze_snapshot = None
             self._frozen = False
 
     def _frozen_structural_digest(self) -> Dict[str, Any]:
         """Small diagnostic digest for state that must not change in frozen eval."""
-        active = tuple(sorted(
-            (
-                recipe_id,
-                variant_id,
-                tuple(entry.ordering),
-                round(float(entry.weight), 12),
-                int(entry.added_step),
-                int(entry.added_cycle),
-                int(entry.last_seen_step),
-                tuple(entry.transitions),
-            )
-            for (recipe_id, variant_id), entry in self.replay.active.items()
-        ))
-        pruned = tuple(sorted(
-            (
-                recipe_id,
-                variant_id,
-                tuple(entry.ordering),
-                int(entry.added_step),
-                int(entry.removed_step),
-                int(entry.added_cycle),
-                int(entry.removed_cycle),
-                int(entry.last_seen_step),
-                tuple(entry.transitions),
-            )
-            for (recipe_id, variant_id), entry in self.replay.pruned.items()
-        ))
+        active = tuple(sorted((recipe_id, variant_id, tuple(entry.ordering), round(float(entry.weight), 12), int(entry.added_step), int(entry.added_cycle), int(entry.last_seen_step), tuple(entry.transitions))
+            for (recipe_id, variant_id), entry in self.replay.active.items()))
+        pruned = tuple(sorted((recipe_id, variant_id, tuple(entry.ordering), int(entry.added_step), int(entry.removed_step), int(entry.added_cycle), int(entry.removed_cycle), int(entry.last_seen_step), tuple(entry.transitions),)
+            for (recipe_id, variant_id), entry in self.replay.pruned.items()))
         variant_keys = tuple(sorted((recipe_id, variant_id) for recipe_id, slot in self.library.variants.items() for variant_id in slot))
-        return {
-            "mode": self.mode,
-            "step_counter": int(self.step_counter),
-            "demo_counter": int(self.demo_counter),
-            "retrain_cycle": int(self.retrain_cycle),
-            "current_prefix": tuple(self.current_prefix),
-            "current_trace": tuple(self.current_trace),
-            "pending_demo": tuple(self.pending_demo),
-            "pending_trace": tuple(self.pending_trace),
-            "demo_traces": tuple(sorted(self.demo_traces.items())),
-            "step_log_len": len(self.step_log),
-            "classification_events_len": len(self.classification_events),
-            "accuracy_events_len": len(self.accuracy_events),
-            "retrain_events_len": len(self.retrain_events),
-            "online_commit_events_len": len(self.commit_events),
-            "prediction_mismatch_count": int(self._prediction_mismatch_count),
-            "latent_strategy_confirmed": bool(self._latent_strategy_confirmed),
-            "active": active,
-            "pruned": pruned,
-            "variant_keys": variant_keys,
-            "memory_latest": tuple(sorted(self.library.latest.items())),
-            "latest_by_recipe": tuple(sorted(self.replay.latest_by_recipe.items())),
-            "latest_keys": tuple(sorted(self.replay.latest_keys)),
-            "pair_gap_windows": tuple(sorted(
-                (key, tuple(gaps))
-                for key, gaps in self.replay._pair_gap_window.items()
-            )),
-            "pair_last_seen_steps": tuple(sorted(
-                self.replay._pair_last_seen_step.items()
-            )),
-            "recipe_gap_events": tuple(sorted(
-                (recipe_id, tuple(events))
-                for recipe_id, events in self.replay._recipe_gap_events.items()
-            )),
-            "global_gap_events": tuple(self.replay._global_gap_events),
-            "last_observed_replay_weights": tuple(sorted(self._last_observed_replay_weights.items())),
-            "membership_changes_since_cold": int(self.cold_change_count),
-        }
+        return {"mode": self.mode, "step_counter": int(self.step_counter), "demo_counter": int(self.demo_counter), "retrain_cycle": int(self.retrain_cycle), "current_prefix": tuple(self.current_prefix),
+            "current_trace": tuple(self.current_trace), "pending_demo": tuple(self.pending_demo), "pending_trace": tuple(self.pending_trace), "demo_traces": tuple(sorted(self.demo_traces.items())),
+            "step_log_len": len(self.step_log), "classification_events_len": len(self.classification_events), "accuracy_events_len": len(self.accuracy_events), "retrain_events_len": len(self.retrain_events),
+            "online_commit_events_len": len(self.commit_events), "prediction_mismatch_count": int(self._prediction_mismatch_count), "latent_strategy_confirmed": bool(self._latent_strategy_confirmed),
+            "active": active, "pruned": pruned, "variant_keys": variant_keys, "memory_latest": tuple(sorted(self.library.latest.items())), "latest_by_recipe": tuple(sorted(self.replay.latest_by_recipe.items())),
+            "latest_keys": tuple(sorted(self.replay.latest_keys)), "pair_gap_windows": tuple(sorted((key, tuple(gaps)) for key, gaps in self.replay._pair_gap_window.items())),
+            "pair_last_seen_steps": tuple(sorted(self.replay._pair_last_seen_step.items())), "recipe_gap_events": tuple(sorted((recipe_id, tuple(events)) for recipe_id, events in self.replay._recipe_gap_events.items())),
+            "global_gap_events": tuple(self.replay._global_gap_events), "last_observed_replay_weights": tuple(sorted(self._last_observed_replay_weights.items())), "membership_changes_since_cold": int(self.cold_change_count)}
 
     @contextlib.contextmanager
     def frozen(self):
@@ -282,11 +191,7 @@ class AdaptiveAgent:
             state_after = self._frozen_structural_digest()
             self.set_frozen(False)
             if state_before != state_after:
-                changed = sorted(
-                    key
-                    for key in state_before
-                    if state_before.get(key) != state_after.get(key)
-                )
+                changed = sorted(key for key in state_before if state_before.get(key) != state_after.get(key))
                 raise RuntimeError(f"frozen() invariant violated: structural state changed ({', '.join(changed)})")
 
     def start_demo(self) -> None:
@@ -311,12 +216,7 @@ class AdaptiveAgent:
 
     def _log_commit(self, **fields: Any) -> None:
         """Persist one auditable decision for the completed assist episode."""
-        event = {
-            "decision_id": f"assist_{self.demo_counter}_{self.step_counter}",
-            "demo_index": int(self.demo_counter),
-            "step": int(self.step_counter),
-            **fields,
-        }
+        event = {"decision_id": f"assist_{self.demo_counter}_{self.step_counter}", "demo_index": int(self.demo_counter), "step": int(self.step_counter), **fields}
         self.last_commit_stats.update(event)
         self.commit_events.append(dict(event))
 
@@ -336,8 +236,7 @@ class AdaptiveAgent:
 
         # Every non-empty demonstration ages memory, regardless of its outcome.
         self.demo_counter += 1
-        if self.mode == MODE_OBSERVE:
-            return self._finish_observation(apply_decay=True)
+        if self.mode == MODE_OBSERVE: return self._finish_observation(apply_decay=True)
 
         self.last_commit_stats = {}
         scored_before = self.matcher.variants_scored
@@ -346,19 +245,9 @@ class AdaptiveAgent:
         classification_wall_s = time.perf_counter() - classification_t0
         active_keys = self._active_variants()
         registry_variants = sum(len(slot) for slot in self.library.variants.values())
-        active_variants = sum(
-            (recipe_id, variant_id) in active_keys
-            for recipe_id, slot in self.library.variants.items() for variant_id in slot
-        )
-        self.last_commit_stats = {
-            "registry_size": registry_variants,
-            "active_variants": active_variants,
-            "archived_variants": registry_variants - active_variants,
-            "registry_recipes": sum(bool(slot) for slot in self.library.variants.values()),
-            "variants_scored": self.matcher.variants_scored - scored_before,
-            "classification_wall_s": float(classification_wall_s),
-            "scoring_wall_s": float(classification_wall_s),
-        }
+        active_variants = sum((recipe_id, variant_id) in active_keys for recipe_id, slot in self.library.variants.items() for variant_id in slot)
+        self.last_commit_stats = {"registry_size": registry_variants, "active_variants": active_variants, "archived_variants": registry_variants - active_variants, "registry_recipes": sum(bool(slot) for slot in self.library.variants.values()),
+            "variants_scored": self.matcher.variants_scored - scored_before, "classification_wall_s": float(classification_wall_s), "scoring_wall_s": float(classification_wall_s)}
         # Assist is closed-set. Registration remains confidence-gated below.
         return self._finish_session(prefix_match, reentry_from_pruned, apply_decay=True)
 
@@ -367,26 +256,11 @@ class AdaptiveAgent:
         next_state = tuple(int(x) for x in observation.next_state)
         return (state, action, next_state)
 
-    def _normalize_trace(
-        self,
-        transitions: Optional[Sequence[StateTransition]],
-    ) -> Tuple[StateTransition, ...]:
-        if not transitions:
-            return ()
-        return tuple(
-            (
-                tuple(int(x) for x in state),
-                str(action),
-                tuple(int(x) for x in next_state),
-            )
-            for state, action, next_state in transitions
-        )
+    def _normalize_trace(self, transitions: Optional[Sequence[StateTransition]]) -> Tuple[StateTransition, ...]:
+        if not transitions: return ()
+        return tuple((tuple(int(x) for x in state), str(action), tuple(int(x) for x in next_state)) for state, action, next_state in transitions)
 
-    def _store_trace(
-        self,
-        ordering: Sequence[str],
-        transitions: Optional[Sequence[StateTransition]],
-    ) -> Tuple[StateTransition, ...]:
+    def _store_trace(self, ordering: Sequence[str], transitions: Optional[Sequence[StateTransition]]) -> Tuple[StateTransition, ...]:
         trace = self._normalize_trace(transitions)
         ordering_tuple = tuple(str(t) for t in ordering)
         if trace and tuple(t[1] for t in trace) == ordering_tuple:
@@ -395,84 +269,36 @@ class AdaptiveAgent:
         return self.demo_traces.get(ordering_tuple, ())
 
     def _get_trace(self, demo: Any, actions: Sequence[str]) -> Tuple[StateTransition, ...]:
-        if isinstance(demo, Mapping):
-            trace = self._normalize_trace(demo.get("transitions", ()))
-        else:
-            trace = self._normalize_trace(
-                getattr(demo, "transitions", ()),
-            )
+        if isinstance(demo, Mapping):   trace = self._normalize_trace(demo.get("transitions", ()))
+        else:                           trace = self._normalize_trace(getattr(demo, "transitions", ()))
         if not trace:
             trace = self.demo_traces.get(tuple(actions), ())
         if trace and tuple(t[1] for t in trace) == tuple(actions):
             return trace
         return ()
 
-    def _register_if_live(
-        self,
-        recipe_id: str,
-        actions: List[str],
-        step: int,
-        transitions: Optional[Sequence[StateTransition]] = None,
-    ) -> Variant:
+    def _register_if_live(self, recipe_id: str, actions: List[str], step: int, transitions: Optional[Sequence[StateTransition]] = None) -> Variant:
         """Register a completed demonstration in variant memory and decay state."""
         variant = self.library.register(recipe_id, actions, step)
         if not self._frozen:
             transition_trace = self._store_trace(actions, transitions)
-            entry = self.replay.register(
-                recipe_id,
-                variant.variant_id,
-                tuple(actions),
-                self.demo_counter,
-                self.retrain_cycle,
-                transitions=transition_trace,
-            )
-            self._record_demo(
-                recipe_id,
-                variant.variant_id,
-                tuple(actions),
-                transitions=transition_trace,
-                demo_step=self.demo_counter,
-                action_step=step,
-                source_mode=self.mode,
-                entry=entry,
-            )
+            entry = self.replay.register(recipe_id, variant.variant_id, tuple(actions), self.demo_counter, self.retrain_cycle, transitions=transition_trace)
+            self._record_demo(recipe_id, variant.variant_id, tuple(actions), transitions=transition_trace, demo_step=self.demo_counter, action_step=step, source_mode=self.mode, entry=entry)
             self._check_latest(recipe_id)
         return variant
 
-    def _record_demo(
-        self,
-        recipe_id: str,
-        variant_id: str,
-        ordering: Tuple[str, ...],
-        *,
-        transitions: Tuple[StateTransition, ...] = (),
-        demo_step: int,
-        action_step: int,
-        source_mode: str,
-        entry: Optional[MemoryItem] = None,
-    ) -> None:
+    def _record_demo(self, recipe_id: str, variant_id: str, ordering: Tuple[str, ...], *, transitions: Tuple[StateTransition, ...] = (), demo_step: int, action_step: int, source_mode: str, entry: Optional[MemoryItem] = None) -> None:
         """Hook for replay baselines; the full agent trains from active memory."""
         return None
 
     def _check_latest(self, recipe_id: Optional[str] = None) -> None:
         if self._frozen or not getattr(self.settings, "pin_latest", True): return
-        recipe_ids = (
-            [recipe_id]
-            if recipe_id is not None
-            else [
-                known_recipe_id
-                for known_recipe_id, variants in self.library.variants.items()
-                if variants
-            ]
-        )
+        recipe_ids = ([recipe_id] if recipe_id is not None else [known_recipe_id for known_recipe_id, variants in self.library.variants.items() if variants])
         for recipe_id in recipe_ids:
             slot = self.library.variants.get(recipe_id, {})
             if not slot: continue
             latest_variant_id = self.library.latest.get(recipe_id)
-            latest_key = (
-                (recipe_id, latest_variant_id)
-                if latest_variant_id is not None else None
-            )
+            latest_key = ((recipe_id, latest_variant_id)if latest_variant_id is not None else None)
             if latest_variant_id is None or latest_variant_id not in slot:
                 raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: memory.latest missing from registry")
             if self.replay.latest_by_recipe.get(recipe_id) != latest_variant_id:
@@ -526,16 +352,10 @@ class AdaptiveAgent:
         active_keys = self._active_variants()
         all_variants = self.library.known_variants()
         prefix_match = self.matcher.match_known(prefix, all_variants)
-        if prefix_match.recipe_id is None:
-            return prefix_match, False
+        if prefix_match.recipe_id is None: return prefix_match, False
         variant_id = make_variant_id(prefix)
-        exact_archived = (
-            variant_id in self.library.variants.get(prefix_match.recipe_id, {})
-            and (prefix_match.recipe_id, variant_id) not in active_keys
-        )
-        recipe_has_active_variant = any(
-            recipe_id == prefix_match.recipe_id for recipe_id, _variant_id in active_keys
-        )
+        exact_archived = (variant_id in self.library.variants.get(prefix_match.recipe_id, {}) and (prefix_match.recipe_id, variant_id) not in active_keys)
+        recipe_has_active_variant = any(recipe_id == prefix_match.recipe_id for recipe_id, _variant_id in active_keys)
         reentry_from_pruned = bool(exact_archived or not recipe_has_active_variant)
         return prefix_match, reentry_from_pruned
 
@@ -550,20 +370,9 @@ class AdaptiveAgent:
         if prefix_match.recipe_id is None:
             match = MatchResult("assist_unavailable", None, None, prefix_match.jaccard, prefix_match.order_distance)
             self.classification_events.append((self.step_counter, match))
-            self._log_commit(
-                event="assist_unavailable",
-                decision="none",
-                commit_applied=False,
-                reason="no_known_recipe_candidates",
-                confidence=None,
-                candidate_recipe_id=None,
-                candidate_variant_id=None,
-                latest_pinned=False,
-                promoted_from_tentative=False,
-            )
+            self._log_commit(event="assist_unavailable", decision="none",   commit_applied=False, reason="no_known_recipe_candidates", confidence=None, candidate_recipe_id=None, candidate_variant_id=None, latest_pinned=False, promoted_from_tentative=False)
             self._clear_online_session(needs_observation=False)
-            if apply_decay:
-                self._update(apply_decay=True)
+            if apply_decay: self._update(apply_decay=True)
             return match
 
         recipe_id = prefix_match.recipe_id
@@ -580,65 +389,31 @@ class AdaptiveAgent:
         if confidence < tentative_threshold:
             match = MatchResult("known_recipe_uncertain", recipe_id, None, prefix_match.jaccard, prefix_match.order_distance)
             self.classification_events.append((self.step_counter, match))
-            self._log_commit(
-                event="commit_abstained",
-                decision="none",
-                commit_applied=False,
-                reason="below_tentative_threshold",
-                confidence=float(confidence),
-                confidence_parts=dict(confidence_parts),
-                candidate_recipe_id=recipe_id,
-                candidate_variant_id=variant_id,
-                latest_pinned=False,
-                promoted_from_tentative=False,
-            )
+            self._log_commit(event="commit_abstained", decision="none", commit_applied=False, reason="below_tentative_threshold", confidence=float(confidence), confidence_parts=dict(confidence_parts), candidate_recipe_id=recipe_id, candidate_variant_id=variant_id, latest_pinned=False, promoted_from_tentative=False)
             self._clear_online_session(needs_observation=False)
-            if apply_decay:
-                self._update(apply_decay=True)
+            if apply_decay: self._update(apply_decay=True)
             return match
 
         known_variant = variant_id in self.library.variants.get(recipe_id, {})
         if confidence < full_threshold and not known_variant:
-            weight = max(
-                self.settings.provisional_weight,
-                min(self.settings.provisional_cap, confidence),
-            )
+            weight = max(self.settings.provisional_weight, min(self.settings.provisional_cap, confidence))
             trace = self._store_trace(prefix, transition_trace)
-            self.replay.register(
-                recipe_id, variant_id, tuple(prefix), self.demo_counter, self.retrain_cycle,
-                weight=weight, pin_latest=False, transitions=trace,
-            )
-            self.provisional[(recipe_id, variant_id)] = {
-                "first_demo": self.demo_counter,
-                "last_demo": self.demo_counter,
-                "weight": weight,
-                "confidence": confidence,
-                "parts": confidence_parts,
-                "promotion_eligible_until_demo": self.demo_counter + int(self.settings.confirm_window),
-            }
+            self.replay.register(recipe_id, variant_id, tuple(prefix), self.demo_counter, self.retrain_cycle, weight=weight, pin_latest=False, transitions=trace)
+            self.provisional[(recipe_id, variant_id)] = {"first_demo": self.demo_counter, "last_demo": self.demo_counter, "weight": weight, "confidence": confidence, "parts": confidence_parts, "promotion_eligible_until_demo": self.demo_counter + int(self.settings.confirm_window)}
             match = MatchResult("tentative_preference_shift", recipe_id, variant_id, prefix_match.jaccard, prefix_match.order_distance)
             decision = "tentative"
             latest_pinned = False
             self.narrate(f"[step {self.step_counter}] tentative online variant for '{recipe_id}' (confidence={confidence:.2f})")
         else:
-            variant = self._register_if_live(
-                recipe_id, prefix, self.step_counter, transitions=transition_trace,
-            )
-            kind = "reentry_from_pruned" if reentry_from_pruned else (
-                "known" if known_variant else "preference_shift"
-            )
+            variant = self._register_if_live(recipe_id, prefix, self.step_counter, transitions=transition_trace)
+            kind = "reentry_from_pruned" if reentry_from_pruned else ("known" if known_variant else "preference_shift")
             match = MatchResult(kind, recipe_id, variant.variant_id, prefix_match.jaccard, prefix_match.order_distance)
             self.provisional.pop((recipe_id, variant.variant_id), None)
-            decision = "promotion" if promotion_reasons else (
-                "known_refresh" if known_variant else "full"
-            )
+            decision = "promotion" if promotion_reasons else ("known_refresh" if known_variant else "full")
             latest_pinned = True
 
         self._update(apply_decay)
-        first_tentative_demo = (
-            int(provisional_before.get("first_demo"))
-            if provisional_before is not None else None
-        )
+        first_tentative_demo = (int(provisional_before.get("first_demo")) if provisional_before is not None else None)
         self._log_commit(
             event=("provisional_commit_promoted" if promotion_reasons else "online_commit"),
             decision=decision,
@@ -653,12 +428,8 @@ class AdaptiveAgent:
             latest_pinned=bool(latest_pinned),
             promoted_from_tentative=bool(promotion_reasons),
             tentative_first_demo=first_tentative_demo,
-            promotion_delay_demos=(
-                int(self.demo_counter - first_tentative_demo)
-                if promotion_reasons and first_tentative_demo is not None else None
-            ),
-            promotion_reasons=tuple(promotion_reasons),
-        )
+            promotion_delay_demos=(int(self.demo_counter - first_tentative_demo) if promotion_reasons and first_tentative_demo is not None else None),
+            promotion_reasons=tuple(promotion_reasons))
         self.classification_events.append((self.step_counter, match))
         self._clear_online_session()
         return match
@@ -668,21 +439,13 @@ class AdaptiveAgent:
         if n <= 0 or not self.step_log: return 0.0
         session_rows = self.step_log[-n:]
         if not session_rows:            return 0.0
-        width = max(1, int(math.ceil(
-            len(session_rows) * self.settings.agreement_window,
-        )))
+        width = max(1, int(math.ceil(len(session_rows) * self.settings.agreement_window)))
         late_rows = session_rows[-width:]
         usable = [row for row in late_rows if row.predicted is not None]
         if not usable:                  return 0.0
         return sum(1 for row in usable if row.predicted == row.actual) / max(1, len(usable))
 
-    def _promotion_reasons(
-        self,
-        recipe_id: str,
-        variant_id: str,
-        confidence: float,
-        confidence_parts: Dict[str, float],
-    ) -> List[str]:
+    def _promotion_reasons(self, recipe_id: str, variant_id: str, confidence: float, confidence_parts: Dict[str, float]) -> List[str]:
         provisional = self.provisional.get((recipe_id, variant_id))
         if provisional is None:
             return []
@@ -693,300 +456,130 @@ class AdaptiveAgent:
         reasons = ["same_variant_recurred"]
         if confidence >= self.settings.commit_threshold:
             reasons.append("commit_confidence_full_threshold")
-        if (
-            float(confidence_parts.get("late_window_prediction_agreement", 0.0))
-            >= self.settings.confirm_accuracy
-            and float(confidence_parts.get("recipe_jaccard", 0.0))
-            >= self.settings.confirm_similarity
-        ):
-            reasons.append("late_window_prediction_alignment")
-        provisional.update(
-            last_demo=self.demo_counter,
-            last_confidence=confidence,
-            last_parts=dict(confidence_parts),
-        )
+        if (float(confidence_parts.get("late_window_prediction_agreement", 0.0)) >= self.settings.confirm_accuracy and float(confidence_parts.get("recipe_jaccard", 0.0)) >= self.settings.confirm_similarity): reasons.append("late_window_prediction_alignment")
+        provisional.update(last_demo=self.demo_counter, last_confidence=confidence, last_parts=dict(confidence_parts))
         return reasons
 
-    def _commit_confidence(
-        self,
-        recipe_id: str,
-        prefix: Sequence[str],
-        prefix_match: MatchResult,
-    ) -> Tuple[float, Dict[str, float]]:
+    def _commit_confidence(self, recipe_id: str, prefix: Sequence[str], prefix_match: MatchResult) -> Tuple[float, Dict[str, float]]:
         """Score a completed online sequence with deployable evidence only."""
         scoring_t0 = time.perf_counter()
         scored_before = self.matcher.variants_scored
         all_variants = self.library.known_variants()
         active_keys = self._active_variants()
-        active_variants = [
-            variant for variant in all_variants
-            if (variant.recipe_id, variant.variant_id) in active_keys
-        ]
+        active_variants = [variant for variant in all_variants if (variant.recipe_id, variant.variant_id) in active_keys]
         scored = self.matcher.score(prefix, all_variants)
-        recipe_score = float(
-            scored.get(recipe_id, (None, float(prefix_match.jaccard or 0.0), 0.0))[1]
-        )
-        second_jaccard = max(
-            (
-                score
-                for other_id, (_variant, score, _distance) in scored.items()
-                if other_id != recipe_id
-            ),
-            default=0.0,
-        )
+        recipe_score = float(scored.get(recipe_id, (None, float(prefix_match.jaccard or 0.0), 0.0))[1])
+        second_jaccard = max((score for other_id, (_variant, score, _distance) in scored.items() if other_id != recipe_id), default=0.0)
         confidence_wall_s = time.perf_counter() - scoring_t0
-        classification_wall_s = float(
-            self.last_commit_stats.get("classification_wall_s", 0.0)
-        )
-        self.last_commit_stats.update({
-            "registry_size": len(all_variants),
-            "active_variants": len(active_variants),
-            "archived_variants": max(0, len(all_variants) - len(active_variants)),
-            "registry_recipes": len(scored),
-            "variants_scored": int(self.last_commit_stats.get("variants_scored", 0))
-            + self.matcher.variants_scored - scored_before,
-            "confidence_scoring_wall_s": float(confidence_wall_s),
-            "scoring_wall_s": classification_wall_s + float(confidence_wall_s),
-        })
+        classification_wall_s = float(self.last_commit_stats.get("classification_wall_s", 0.0))
+        self.last_commit_stats.update({"registry_size": len(all_variants), "active_variants": len(active_variants), "archived_variants": max(0, len(all_variants) - len(active_variants)), "registry_recipes": len(scored),
+            "variants_scored": int(self.last_commit_stats.get("variants_scored", 0)) + self.matcher.variants_scored - scored_before, "confidence_scoring_wall_s": float(confidence_wall_s), "scoring_wall_s": classification_wall_s + float(confidence_wall_s)})
         jaccard_margin = max(0.0, recipe_score - second_jaccard)
         history = list(self._policy_history)
-        policy_confidence = (
-            sum(float(row.get("final_confidence") or row.get("confidence") or 0.0) for row in history)
-            / len(history)
-            if history else 0.0
-        )
+        policy_confidence = (sum(float(row.get("final_confidence") or row.get("confidence") or 0.0) for row in history) / len(history) if history else 0.0)
         late_agreement = self._late_agreement(prefix)
         margin_scale = self.settings.margin_scale
-        score = (
-            self.settings.match_weight * min(1.0, recipe_score)
-            + self.settings.margin_weight
-            * min(1.0, jaccard_margin / margin_scale)
-            + self.settings.policy_weight
-            * policy_confidence
-        )
-        score = min(
-            1.0,
-            score + self.settings.agreement_bonus * late_agreement,
-        )
-        if (
-            prefix_match.kind == "known"
-            and recipe_score >= self.settings.known_similarity
-        ):
-            score = max(score, self.settings.known_score_floor)
+        score = (self.settings.match_weight * min(1.0, recipe_score) + self.settings.margin_weight * min(1.0, jaccard_margin / margin_scale) + self.settings.policy_weight * policy_confidence)
+        score = min(1.0, score + self.settings.agreement_bonus * late_agreement)
+        if (prefix_match.kind == "known" and recipe_score >= self.settings.known_similarity): score = max(score, self.settings.known_score_floor)
         # Archived-only fuzzy matches cannot self-commit on an artificial margin.
-        if (
-            all_variants
-            and not active_variants
-            and not (
-                prefix_match.kind == "known"
-                and recipe_score >= self.settings.known_similarity
-            )
-        ):
-            score = min(score, self.settings.empty_score_cap)
-        parts = {
-            "recipe_jaccard": recipe_score,
-            "recipe_jaccard_margin": jaccard_margin,
-            "recipe_score": recipe_score,
-            "recipe_margin": jaccard_margin,
-            "online_policy_confidence": policy_confidence,
-            "late_window_prediction_agreement": late_agreement,
-        }
+        if (all_variants and not active_variants and not (prefix_match.kind == "known" and recipe_score >= self.settings.known_similarity)): score = min(score, self.settings.empty_score_cap)
+        parts = {"recipe_jaccard": recipe_score, "recipe_jaccard_margin": jaccard_margin, "recipe_score": recipe_score, "recipe_margin": jaccard_margin, "online_policy_confidence": policy_confidence, "late_window_prediction_agreement": late_agreement}
         return max(0.0, min(1.0, float(score))), parts
     def _active_variants(self) -> Set[VariantKey]:
         """Current trainable memory keys. Pruned variants are excluded from online prediction."""
         return {entry.key for entry in self.replay.active_items()}
 
     def policy_stats(self) -> Dict[str, Any]:
-        return {
-            **dict(self._policy_stats),
-            **dict(self._last_action_mask_stats),
-            **dict(getattr(self.maxent, "last_prediction_stats", {}) or {}),
-        }
+        return {**dict(self._policy_stats), **dict(self._last_action_mask_stats), **dict(getattr(self.maxent, "last_prediction_stats", {}) or {})}
 
-    def _set_policy_stats(
-        self,
-        confidence: Optional[float],
-        entropy: Optional[float],
-        reason: str,
-        *,
-        margin: Optional[float] = None,
-        source: Optional[str] = None,
-    ) -> None:
-        if self._frozen:
-            return
-        self._policy_stats = {
-            "action_required": True,
-            "confidence": confidence,
-            "raw_confidence": confidence,
-            "margin": margin,
-            "entropy": entropy,
-            "entropy_basis": "prediction_support",
-            "predictor": source or "configured_policy",
-            "final_confidence": confidence,
-            "final_margin": margin,
-            "final_entropy": entropy,
-            "reason": reason,
-        }
+    def _set_policy_stats(self, confidence: Optional[float], entropy: Optional[float], reason: str, *, margin: Optional[float] = None, source: Optional[str] = None) -> None:
+        if self._frozen: return
+        self._policy_stats = {"action_required": True, "confidence": confidence, "raw_confidence": confidence, "margin": margin, "entropy": entropy, "entropy_basis": "prediction_support", "predictor": source or "configured_policy", "final_confidence": confidence, "final_margin": margin, "final_entropy": entropy, "reason": reason}
 
     def _prediction_stats(self, distribution: Dict[str, float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         if not distribution: return None, None, None
-        probabilities = sorted(
-            (float(value) for value in distribution.values()), reverse=True,
-        )
+        probabilities = sorted((float(value) for value in distribution.values()), reverse=True)
         confidence = probabilities[0] if probabilities else None
         margin = probabilities[0] - probabilities[1] if len(probabilities) >= 2 else (probabilities[0] if probabilities else None)
         entropy = 0.0
         for probability in probabilities:
-            if probability > 0:
-                entropy -= probability * math.log(probability)
-        if len(probabilities) > 1:
-            entropy = entropy / math.log(len(probabilities))
+            if probability > 0: entropy -= probability * math.log(probability)
+        if len(probabilities) > 1: entropy = entropy / math.log(len(probabilities))
         return confidence, entropy, margin
 
     def _replay_prefix(self, prefix: Sequence[str]) -> Tuple[int, ...]:
         with self._profile("state_from_prefix"):
-            tracker = StateTracker()
-            for action in prefix:
-                tracker.apply_action(str(action))
-            return tuple(tracker.get_state_vector().astype(int).tolist())
+            return self.domain.state_from_actions(prefix)
 
     def _known_action_universe(self) -> Tuple[str, ...]:
         """Union of grounded actions in active replay, without task routing."""
-        actions = {
-            action
-            for entry in self.replay.active_items()
-            for action in entry.ordering
-            if action != "stop"
-        }
+        actions = {self.domain.canonical_action(action) for entry in self.replay.active_items() for action in entry.ordering if action != "stop"}
         return tuple(sorted(actions))
 
-    def _conditioned_actions(
-        self,
-        state: Tuple[int, ...],
-        action_universe: Optional[Sequence[str]] = None,
-    ) -> Tuple[str, ...]:
+    def _conditioned_actions(self, state: Tuple[int, ...], action_universe: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
         """Apply the shared mask using current-state preconditions only."""
         known_actions = self._known_action_universe()
-        if action_universe is None:
-            candidates = known_actions
+        if action_universe is None: candidates = known_actions
         else:
             universe = {str(action) for action in action_universe}
-            candidates = tuple(
-                action for action in known_actions if action in universe
-            )
-        conditioned = feasible_actions(tuple(state), candidates)
+            candidates = tuple(action for action in known_actions if action in universe)
+        conditioned = self.domain.legal_actions(tuple(state), candidates)
         self._last_action_mask_stats = {
             "action_mask": "shared_state_preconditions_only",
             "action_mask_shared_across_predictors": True,
             "action_mask_preference_neutral": True,
             "action_mask_uses_recipe_hypothesis": False,
             "action_universe_count": len(candidates),
-            "feasible_action_count": len(conditioned),
-        }
+            "feasible_action_count": len(conditioned)}
         return conditioned
 
-    def _apply_shared_action_mask(
-        self,
-        state: Tuple[int, ...],
-        distribution: Mapping[str, float],
-    ) -> Dict[str, float]:
+    def _apply_shared_action_mask(self, state: Tuple[int, ...], distribution: Mapping[str, float]) -> Dict[str, float]:
         """Apply and renormalize the common state-only legality interface."""
         legal = set(self._conditioned_actions(state, tuple(distribution)))
-        masked = {
-            str(action): max(0.0, float(probability))
-            for action, probability in distribution.items()
-            if str(action) in legal and math.isfinite(float(probability))
-        }
-        if not masked:
-            return {}
+        masked = {str(action): max(0.0, float(probability)) for action, probability in distribution.items() if str(action) in legal and math.isfinite(float(probability))}
+        if not masked: return {}
         total = sum(masked.values())
         if total <= 0.0:
             probability = 1.0 / len(masked)
             return {action: probability for action in masked}
-        return {
-            action: probability / total
-            for action, probability in masked.items()
-        }
+        return {action: probability / total for action, probability in masked.items()}
 
-    def predict_actions(self, prefix: Optional[Sequence[str]] = None) -> Dict[str, float]:
+    def predict_actions(self, prefix: Optional[Sequence[str]] = None, *, state: Optional[Any] = None, actor_id: int = 0, action_universe: Optional[Sequence[str]] = None) -> Dict[str, float]:
         """Return the MaxEnt IRL policy over feasible task actions."""
         with self._profile("predict_actions"):
             prefix_actions = list(prefix) if prefix is not None else list(self.current_prefix)
-            state = self._replay_prefix(prefix_actions)
-            candidates = self._conditioned_actions(state)
-            distribution = self.maxent.predict(
-                state, candidates, prefix=prefix_actions,
-                allow_latent_strategy=self._latent_strategy_confirmed,
-            )
+            encoded_state = (self._replay_prefix(prefix_actions) if state is None else self.domain.state_key(state, actor_id=actor_id))
+            candidates = self._conditioned_actions(encoded_state, action_universe)
+            distribution = self.maxent.predict(encoded_state, candidates, prefix=prefix_actions, allow_latent_strategy=self._latent_strategy_confirmed)
             confidence, entropy, margin = self._prediction_stats(distribution)
             semantic_enabled = bool(self.settings.semantic_fallback_enabled)
             latent_enabled = bool(self.settings.latent_strategy_enabled)
-            if semantic_enabled and latent_enabled:
-                source = "maxent_with_semantic_fallback_and_latent_strategy"
-            elif semantic_enabled:
-                source = "maxent_with_semantic_fallback"
-            elif latent_enabled:
-                source = "maxent_with_latent_strategy"
-            else:
-                source = "maxent_irl_only"
-            self._set_policy_stats(
-                confidence,
-                entropy,
-                source,
-                margin=margin,
-                source=source,
-            )
+            if semantic_enabled and latent_enabled: source = "maxent_with_semantic_fallback_and_latent_strategy"
+            elif semantic_enabled:                  source = "maxent_with_semantic_fallback"
+            elif latent_enabled:                    source = "maxent_with_latent_strategy"
+            else:                                   source = "maxent_irl_only"
+            self._set_policy_stats(confidence, entropy, source, margin=margin, source=source)
             return distribution
 
-    def rank_actions(
-        self, distribution: Mapping[str, float], k: int = 1,
-    ) -> List[str]:
+    def rank_actions(self, distribution: Mapping[str, float], k: int = 1) -> List[str]:
         """Apply seeded Gaussian tie-breaking without changing probabilities."""
         return top_actions(distribution, k=k, rng=self._tie_break_rng)
 
-    def observe(
-        self,
-        observation: Observation,
-        ground_truth_recipe: Optional[str] = None,
-        *,
-        precomputed_distribution: Optional[Mapping[str, float]] = None,
-        precomputed_prediction: Optional[str] = None,
-    ) -> StepResult:
+    def observe(self, observation: Observation, ground_truth_recipe: Optional[str] = None, *, precomputed_distribution: Optional[Mapping[str, float]] = None, precomputed_prediction: Optional[str] = None) -> StepResult:
         """Consume one observed semantic action and its state transition."""
         if self._frozen:
             action = observation.action
-            distribution = (
-                dict(precomputed_distribution)
-                if precomputed_distribution is not None
-                else self.predict_actions(self.current_prefix)
-            )
-            predicted = (
-                precomputed_prediction
-                if precomputed_distribution is not None else
-                (self.rank_actions(distribution, k=1)[0] if distribution else None)
-            )
-            return StepResult(
-                step=self.step_counter,
-                predicted=predicted,
-                actual=action,
-                correct=predicted == action,
-                mode=self.mode,
-                event="frozen_prediction",
-            )
+            distribution = (dict(precomputed_distribution) if precomputed_distribution is not None else self.predict_actions(self.current_prefix))
+            predicted = (precomputed_prediction if precomputed_distribution is not None else (self.rank_actions(distribution, k=1)[0] if distribution else None))
+            return StepResult(step=self.step_counter, predicted=predicted, actual=action, correct=predicted == action, mode=self.mode, event="frozen_prediction")
 
         self.step_counter += 1
         if self.mode == MODE_OBSERVE:
             action = observation.action
             self.pending_demo.append(action)
             self.pending_trace.append(self._transition(action, observation))
-            result = StepResult(
-                step=self.step_counter,
-                predicted=None,
-                actual=action,
-                correct=False,
-                mode=self.mode,
-                event="observing",
-            )
+            result = StepResult(step=self.step_counter, predicted=None, actual=action, correct=False, mode=self.mode, event="observing")
             self.step_log.append(result)
             return result
 
@@ -994,63 +587,29 @@ class AdaptiveAgent:
         if first_online_action:
             distribution: Dict[str, float] = {}
         else:
-            distribution = (
-                dict(precomputed_distribution)
-                if precomputed_distribution is not None
-                else self.predict_actions(self.current_prefix)
-            )
+            distribution = (dict(precomputed_distribution) if precomputed_distribution is not None else self.predict_actions(self.current_prefix))
             self._policy_history.append(dict(self._policy_stats))
-        predicted = (
-            None if first_online_action else
-            (
-                precomputed_prediction
-                if precomputed_distribution is not None else
-                (self.rank_actions(distribution, k=1)[0] if distribution else None)
-            )
-        )
+        predicted = (None if first_online_action else (precomputed_prediction if precomputed_distribution is not None else (self.rank_actions(distribution, k=1)[0] if distribution else None)))
         action = observation.action
         correct = predicted == action
         if predicted is not None and not correct:
             self._prediction_mismatch_count += 1
-            if self.maxent.latent_supports_correction(
-                (*self.current_prefix, action),
-                tuple(distribution),
-                action,
-                predicted,
-            ):
-                self._latent_strategy_confirmed = True
+            if self.maxent.latent_supports_correction((*self.current_prefix, action), tuple(distribution), action, predicted): self._latent_strategy_confirmed = True
         self.current_prefix.append(action)
         self.current_trace.append(self._transition(action, observation))
-        result = StepResult(
-            step=self.step_counter,
-            predicted=predicted,
-            actual=action,
-            correct=correct,
-            mode=self.mode,
-        )
+        result = StepResult(step=self.step_counter, predicted=predicted, actual=action, correct=correct, mode=self.mode)
         self.step_log.append(result)
         self.accuracy_events.append((self.step_counter, ground_truth_recipe or "?", correct))
         return result
 
-    def evaluate_actions(
-        self,
-        ordering: Sequence[str],
-        top_k: int = 3,
-    ) -> Dict[str, float]:
+    def evaluate_actions(self, ordering: Sequence[str], top_k: int = 3) -> Dict[str, float]:
         if not self._frozen:
-            with self.frozen():
-                return self.evaluate_actions(ordering, top_k=top_k)
+            with self.frozen(): return self.evaluate_actions(ordering, top_k=top_k)
         actions = list(ordering)
         total = len(actions)
         rank_count = max(1, int(top_k))
         if total == 0:
-            result = {
-                "top_1": 0.0,
-                "top_k": 0.0,
-                "prediction_available_rate": 0.0,
-                "empty_prediction_rate": 0.0,
-                "cross_entropy": 0.0,
-            }
+            result = {"top_1": 0.0, "top_k": 0.0, "prediction_available_rate": 0.0, "empty_prediction_rate": 0.0, "cross_entropy": 0.0}
             result[f"top{rank_count}"] = 0.0
             return result
 
@@ -1060,10 +619,7 @@ class AdaptiveAgent:
         floor = max(float(self.settings.min_probability), 1e-12)
         for actual in actions:
             distribution = self.predict_actions(prefix)
-            ranked = (
-                self.rank_actions(distribution, k=rank_count)
-                if distribution else []
-            )
+            ranked = (self.rank_actions(distribution, k=rank_count) if distribution else [])
             if distribution:
                 available += 1
                 top_1_hits += int(ranked[0] == actual)
@@ -1074,13 +630,7 @@ class AdaptiveAgent:
                 log_loss -= math.log(floor)
             prefix.append(actual)
 
-        result = {
-            "top_1": top_1_hits / total,
-            "top_k": top_k_hits / total,
-            "prediction_available_rate": available / total,
-            "empty_prediction_rate": empty_predictions / total,
-            "cross_entropy": log_loss / total,
-        }
+        result = {"top_1": top_1_hits / total, "top_k": top_k_hits / total, "prediction_available_rate": available / total, "empty_prediction_rate": empty_predictions / total, "cross_entropy": log_loss / total}
         result[f"top{rank_count}"] = top_k_hits / total
         return result
 
@@ -1089,10 +639,8 @@ class AdaptiveAgent:
         trajectories = []
         dropped_total = 0
         for record in records:
-            if isinstance(record, Mapping):
-                actions = list(record.get("ordering", ()))
-            else:
-                actions = list(getattr(record, "ordering", record))
+            if isinstance(record, Mapping): actions = list(record.get("ordering", ()))
+            else:                           actions = list(getattr(record, "ordering", record))
             trajectory = []
             trace = self._get_trace(record, actions)
             if trace:
@@ -1106,13 +654,9 @@ class AdaptiveAgent:
                     state = after
             else:
                 # Semantic replay reconstructs exact states and drops self-loops.
-                tracker = StateTracker()
-                state = tuple(tracker.get_state_vector().astype(int).tolist())
+                state = self.domain.initial_state()
                 for action in actions:
-                    tracker.apply_action(action)
-                    new_state = tuple(
-                        tracker.get_state_vector().astype(int).tolist()
-                    )
+                    new_state = self.domain.replay_transition(state, action)
                     if new_state == state:
                         dropped_total += 1
                         state = new_state
@@ -1129,8 +673,7 @@ class AdaptiveAgent:
         recorded_flops = float(flop_estimate)
         if not skipped and float(flop_estimate) <= 0.0:
             estimate = fit_stats.get("estimated_flops") if isinstance(fit_stats, dict) else None
-            if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)):
-                recorded_flops = float(estimate)
+            if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)): recorded_flops = float(estimate)
         event = {"step": self.step_counter, "cycle": int(self.retrain_cycle), "dropped_actions": int(dropped_actions), "active_demos": int(active_demos), "total_wall_s": float(total_wall_s), "build_wall_s": float(build_wall_s),
             "fit_wall_s": float(fit_wall_s), "flop_estimate": recorded_flops, "skipped": bool(skipped)}
         if fit_stats: event["fit_stats"] = fit_stats
@@ -1145,14 +688,8 @@ class AdaptiveAgent:
         """Return structured accounting from the model fit that just ran."""
         stats: Dict[str, Any] = {}
         maxent_stats = getattr(getattr(self, "maxent", None), "last_fit_stats", None)
-        if (
-            self.settings.predictor == "maxent"
-            and isinstance(maxent_stats, dict) and maxent_stats
-        ):
-            stats.update(maxent_stats)
-        cloning_stats = getattr(
-            getattr(self, "cloner", None), "last_fit_stats", None,
-        )
+        if (self.settings.predictor == "maxent" and isinstance(maxent_stats, dict) and maxent_stats): stats.update(maxent_stats)
+        cloning_stats = getattr(getattr(self, "cloner", None), "last_fit_stats", None)
         if isinstance(cloning_stats, dict) and cloning_stats:         stats.update(cloning_stats)
         custom_stats = getattr(self, "_custom_fit_stats", None)
         if isinstance(custom_stats, dict) and custom_stats: stats.update(custom_stats)
@@ -1169,11 +706,7 @@ class AdaptiveAgent:
         return str(self.settings.predictor)
 
     def irl_feature_name(self) -> str:
-        return (
-            str(self.settings.irl_features)
-            if self.settings.predictor == "maxent"
-            else "not_applicable"
-        )
+        return (str(self.settings.irl_features) if self.settings.predictor == "maxent" else "not_applicable")
 
     def baseline_stats(self) -> Dict[str, Any]:
         return {}
@@ -1183,20 +716,14 @@ class AdaptiveAgent:
 
     def diagnostics(self) -> Dict[str, Any]:
         """Return the model-specific sections required by evaluation."""
-        sections = {
-            "fit_stats": self._fit_stats(),
-            "replay_buffer": self.replay_stats(),
-            "baseline_model_memory": self.baseline_stats(),
-            "offline_pretraining": self.training_stats(),
-        }
+        sections = {"fit_stats": self._fit_stats(), "replay_buffer": self.replay_stats(), "baseline_model_memory": self.baseline_stats(), "offline_pretraining": self.training_stats()}
         return {name: value for name, value in sections.items() if value}
 
     def _estimate_flops(self, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]]) -> float:
         """Estimate fit FLOPs from the fitted model's actual accounting."""
         stats = self._fit_stats()
         estimate = stats.get("estimated_flops") if isinstance(stats, dict) else None
-        if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)):
-            return float(estimate)
+        if isinstance(estimate, (int, float)) and math.isfinite(float(estimate)): return float(estimate)
         # Fallback for external predictors without fit statistics.
         n_transitions = sum(max(0, len(demo) - 1) for demo in trajectories)
         n_actions = max(1, len({action for demo in trajectories for _state, action in demo}))
@@ -1204,115 +731,70 @@ class AdaptiveAgent:
         iters = int(getattr(self.settings, "irl_warm_steps", 1) if self.retrain_cycle > 1 else getattr(self.settings, "irl_cold_steps", 1))
         return float(n_transitions * n_actions * feature_dim * max(1, iters))
 
-    def _fit_models(
-        self,
-        maxent: MaxEntIrl,
-        trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]],
-        weights: Sequence[float],
-        *,
-        warm_start: bool,
-        records: Optional[Sequence[Any]] = None,
-    ) -> None:
+    def _fit_models(self, maxent: MaxEntIrl, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]], weights: Sequence[float], *, warm_start: bool, records: Optional[Sequence[Any]] = None) -> None:
         maxent.fit(trajectories, weights)
 
     def _fit_predictors(self, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]], weights: Sequence[float], *, warm_start: bool, records: Optional[Sequence[Any]] = None) -> None:
-        self._fit_models(
-            self.maxent, trajectories, weights,
-            warm_start=warm_start, records=records,
-        )
+        self._fit_models(self.maxent, trajectories, weights, warm_start=warm_start, records=records)
 
     def _predictors_ready(self) -> bool:
         return self.maxent.reward_weights is not None
 
     def _reset_predictors(self) -> None:
-        self.maxent = MaxEntIrl(settings=self.settings)
+        self.maxent = MaxEntIrl(settings=self.settings, domain=self.domain)
 
     def _demo_length(self, demo: Any) -> int:
         if isinstance(demo, Mapping):
             ordering = demo.get("ordering", ())
             return max(1, len(ordering))
         ordering = getattr(demo, "ordering", None)
-        if ordering is not None:
-            return max(1, len(ordering))
-        if isinstance(demo, (list, tuple)):
-            return max(1, len(demo))
+        if ordering is not None:            return max(1, len(ordering))
+        if isinstance(demo, (list, tuple)): return max(1, len(demo))
         return 1
 
     def _demo_weights(self, demos: Sequence[Any], base_weights: Sequence[float]) -> List[float]:
         """Equalize episode mass by length while preserving mean replay weight."""
         replay_weights = [float(weight) for weight in base_weights]
-        if not demos or not replay_weights:
-            return replay_weights
+        if not demos or not replay_weights: return replay_weights
         count = min(len(demos), len(replay_weights))
-        selected_demos = demos[:count]
-        replay_weights = replay_weights[:count]
-        normalized_weights = [
-            float(weight) / float(self._demo_length(demo))
-            for demo, weight in zip(selected_demos, replay_weights)
-        ]
-        normalized_mean = sum(normalized_weights) / max(
-            1, len(normalized_weights),
-        )
-        replay_mean = sum(replay_weights) / max(1, len(replay_weights))
-        if normalized_mean <= 0.0 or not math.isfinite(normalized_mean):
-            return normalized_weights
+        selected_demos      = demos[:count]
+        replay_weights      = replay_weights[:count]
+        normalized_weights  = [float(weight) / float(self._demo_length(demo)) for demo, weight in zip(selected_demos, replay_weights)]
+        normalized_mean     = sum(normalized_weights) / max(1, len(normalized_weights))
+        replay_mean         = sum(replay_weights) / max(1, len(replay_weights))
+        if normalized_mean <= 0.0 or not math.isfinite(normalized_mean): return normalized_weights
         scale = replay_mean / normalized_mean
         return [float(weight * scale) for weight in normalized_weights]
 
     def _update(self, apply_decay: bool) -> None:
-        if apply_decay:
-            self.replay.step(self.demo_counter, self.retrain_cycle)
+        if apply_decay: self.replay.step(self.demo_counter, self.retrain_cycle)
         self._retrain()
 
     def _retrain(self) -> None:
-        if self._frozen:
-            return
+        if self._frozen: return
 
-        retrain_t0 = time.perf_counter()
-        current = {
-            key: float(entry.weight)
-            for key, entry in self.replay.active.items()
-        }
-        previous = self._last_observed_replay_weights
-        added = set(current) - set(previous)
+        retrain_t0  = time.perf_counter()
+        current     = {key: float(entry.weight) for key, entry in self.replay.active.items()}
+        previous    = self._last_observed_replay_weights
+        added   = set(current) - set(previous)
         removed = set(previous) - set(current)
-        weight_changed = {
-            key
-            for key in set(current) & set(previous)
-            if not math.isclose(
-                current[key], previous[key], rel_tol=0.0, abs_tol=1e-12,
-            )
-        }
+        weight_changed = {key for key in set(current) & set(previous) if not math.isclose(current[key], previous[key], rel_tol=0.0, abs_tol=1e-12)}
         self._last_observed_replay_weights = dict(current)
 
         alterations = len(added) + len(removed)
         counter_before = self.cold_change_count
-        requested_start, trigger, projected = self.retrain_policy.decide(
-            alterations, bool(weight_changed), counter_before,
-        )
+        requested_start, trigger, projected = self.retrain_policy.decide(alterations, bool(weight_changed), counter_before)
 
         def audit(effective_start: str, counter_after: int) -> None:
             self.retrain_events[-1].update({
-                "retrain_requested_start": requested_start,
-                "retrain_effective_start": effective_start,
-                "retrain_trigger": trigger,
-                "active_added_count": len(added),
-                "active_removed_count": len(removed),
-                "active_weight_changed_count": len(weight_changed),
-                "membership_changes_since_cold_before": counter_before,
-                "membership_changes_since_cold_projected": projected,
-                "membership_changes_since_cold_after": counter_after,
-            })
+                "retrain_requested_start": requested_start,             "retrain_effective_start": effective_start,             "retrain_trigger": trigger,
+                "active_added_count": len(added),                       "active_removed_count": len(removed),                   "active_weight_changed_count": len(weight_changed),
+                "membership_changes_since_cold_before": counter_before, "membership_changes_since_cold_projected": projected,   "membership_changes_since_cold_after": counter_after,})
 
         self.retrain_cycle += 1
         if requested_start == "skip":
             self.skipped_trains += 1
-            self._log_training(
-                dropped_actions=0,
-                active_demos=len(self.replay.active),
-                total_wall_s=time.perf_counter() - retrain_t0,
-                skipped=True,
-            )
+            self._log_training(dropped_actions=0, active_demos=len(self.replay.active), total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
             audit("skipped", counter_before)
             return
 
@@ -1321,12 +803,7 @@ class AdaptiveAgent:
             self._reset_predictors()
             self.cold_change_count = 0
             self.skipped_trains += 1
-            self._log_training(
-                dropped_actions=0,
-                active_demos=0,
-                total_wall_s=time.perf_counter() - retrain_t0,
-                skipped=True,
-            )
+            self._log_training(dropped_actions=0, active_demos=0, total_wall_s=time.perf_counter() - retrain_t0, skipped=True)
             audit("clear_empty", 0)
             return
 
@@ -1338,37 +815,16 @@ class AdaptiveAgent:
             effective_start = "cold_fallback_no_model"
 
         build_t0 = time.perf_counter()
-        with self._profile("retrain_build_trajectories"):
-            trajectories, dropped_total = self._build_demos(entries)
+        with self._profile("retrain_build_trajectories"): trajectories, dropped_total = self._build_demos(entries)
         build_wall_s = time.perf_counter() - build_t0
-        weights = self._demo_weights(
-            entries, [entry.weight for entry in entries],
-        )
+        weights = self._demo_weights(entries, [entry.weight for entry in entries])
         fit_t0 = time.perf_counter()
-        with self._profile("retrain_fit_predictors"):
-            self._fit_predictors(
-                trajectories,
-                weights,
-                warm_start=(effective_start == "warm"),
-                records=entries,
-            )
+        with self._profile("retrain_fit_predictors"): self._fit_predictors(trajectories, weights, warm_start=(effective_start == "warm"), records=entries)
         fit_wall_s = time.perf_counter() - fit_t0
-        self._log_training(
-            dropped_actions=dropped_total,
-            active_demos=len(entries),
-            total_wall_s=time.perf_counter() - retrain_t0,
-            build_wall_s=build_wall_s,
-            fit_wall_s=fit_wall_s,
-            flop_estimate=self._estimate_flops(trajectories),
-        )
-        if effective_start == "warm":
-            self.cold_change_count = projected
-        else:
-            self.cold_change_count = 0
-        audit(
-            effective_start,
-            self.cold_change_count,
-        )
+        self._log_training(dropped_actions=dropped_total, active_demos=len(entries), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_flops(trajectories))
+        if effective_start == "warm": self.cold_change_count = projected
+        else: self.cold_change_count = 0
+        audit(effective_start, self.cold_change_count)
         if self.settings.verbose:
             self.narrate(
                 f"[step {self.step_counter}] {effective_start} retrained on "
@@ -1384,25 +840,14 @@ class AdaptiveAgent:
     def discard(self, keys: Sequence[VariantKey]) -> None:
         """Remove replay variants and repair both latest-variant indexes."""
         recipe_ids = {recipe_id for recipe_id, _variant_id in keys}
-        for recipe_id, variant_id in keys:
-            self.replay.discard(recipe_id, variant_id, allow_latest=True)
+        for recipe_id, variant_id in keys: self.replay.discard(recipe_id, variant_id, allow_latest=True)
         for recipe_id in recipe_ids:
             latest = self.replay.latest_by_recipe.get(recipe_id)
-            if latest is None:
-                self.library.latest.pop(recipe_id, None)
-            else:
-                self.library.latest[recipe_id] = latest
+            if latest is None:  self.library.latest.pop(recipe_id, None)
+            else:               self.library.latest[recipe_id] = latest
 
-    def _compare_policies(
-        self,
-        entries: Sequence[MemoryItem],
-        current: Callable[[Tuple[int, ...], Tuple[str, ...]], Mapping[str, float]],
-        reference: Callable[[Tuple[int, ...], Tuple[str, ...]], Mapping[str, float]],
-        *,
-        max_prefixes: int,
-        tolerance: float,
-        **metadata: Any,
-    ) -> Dict[str, Any]:
+    def _compare_policies(self, entries: Sequence[MemoryItem],  current: Callable[[Tuple[int, ...], Tuple[str, ...]], Mapping[str, float]], reference: Callable[[Tuple[int, ...], Tuple[str, ...]], Mapping[str, float]],
+                        *, max_prefixes: int,                   tolerance: float,                                                           **metadata: Any) -> Dict[str, Any]:
         prefixes: List[Tuple[str, ...]] = []
         seen: Set[Tuple[str, ...]] = set()
         for entry in entries:
@@ -1412,78 +857,37 @@ class AdaptiveAgent:
                 if prefix not in seen:
                     prefixes.append(prefix)
                     seen.add(prefix)
-                if len(prefixes) >= max(1, int(max_prefixes)):
-                    break
-            if len(prefixes) >= max(1, int(max_prefixes)):
-                break
+                if len(prefixes) >= max(1, int(max_prefixes)): break
+            if len(prefixes) >= max(1, int(max_prefixes)): break
         differences = []
         for prefix in prefixes:
             state = self._replay_prefix(prefix)
             deployed = current(state, prefix)
             refit = reference(state, prefix)
             tokens = sorted(set(deployed) | set(refit))
-            differences.append(sum(
-                abs(float(deployed.get(token, 0.0)) - float(refit.get(token, 0.0)))
-                for token in tokens
-            ))
+            differences.append(sum(abs(float(deployed.get(token, 0.0)) - float(refit.get(token, 0.0))) for token in tokens))
         maximum = max(differences, default=0.0)
-        return {
-            "max_l1": float(maximum),
-            "mean_l1": float(sum(differences) / max(1, len(differences))),
-            "n_prefixes": len(prefixes),
-            "passed": bool(maximum <= tolerance),
-            "tolerance": float(tolerance),
-            **metadata,
-        }
+        return {"max_l1": float(maximum), "mean_l1": float(sum(differences) / max(1, len(differences))), "n_prefixes": len(prefixes), "passed": bool(maximum <= tolerance), "tolerance": float(tolerance), **metadata}
 
     def audit_pruning(self, max_prefixes: int = 24, tolerance: float = 5e-2) -> Dict[str, Any]:
         """Verify that the fitted deployable predictors use active replay only."""
         entries = self.replay.active_items()
-        if not entries:
-            return {
-                "max_l1": 0.0,
-                "mean_l1": 0.0,
-                "n_prefixes": 0,
-                "passed": True,
-                "tolerance": float(tolerance),
-                "audit_reference_seed": int(self.settings.seed),
-            }
+        if not entries: return {"max_l1": 0.0, "mean_l1": 0.0, "n_prefixes": 0, "passed": True, "tolerance": float(tolerance), "audit_reference_seed": int(self.settings.seed)}
 
         trajectories, _ = self._build_demos(entries)
         weights = self._demo_weights(entries, [float(entry.weight) for entry in entries])
-        # Hold optimization randomness fixed so this audit isolates replay
-        # membership rather than conflating it with a different initialization.
+        # Hold optimization randomness fixed so this audit isolates replay membership rather than conflating it with a different initialization.
         audit_seed = int(self.settings.seed)
         audit_settings = replace(self.settings, seed=audit_seed)
-        fresh_maxent = MaxEntIrl(settings=audit_settings)
-        self._fit_models(
-            fresh_maxent,
-            trajectories,
-            weights,
-            warm_start=False,
-            records=entries,
-        )
+        fresh_maxent = MaxEntIrl(settings=audit_settings, domain=self.domain)
+        self._fit_models(fresh_maxent, trajectories, weights, warm_start=False, records=entries)
 
-        def predict_with(
-            model: MaxEntIrl,
-            state: Tuple[int, ...],
-            prefix: Tuple[str, ...],
-        ) -> Mapping[str, float]:
+        def predict_with(model: MaxEntIrl, state: Tuple[int, ...], prefix: Tuple[str, ...]) -> Mapping[str, float]:
             candidates = self._conditioned_actions(state)
-            return model.predict(
-                state,
-                candidates,
-                prefix=prefix,
-            )
+            return model.predict(state, candidates, prefix=prefix)
 
-        return self._compare_policies(
-            entries,
-            lambda state, prefix: predict_with(self.maxent, state, prefix),
-            lambda state, prefix: predict_with(fresh_maxent, state, prefix),
-            max_prefixes=max_prefixes,
-            tolerance=tolerance,
-            audit_reference_seed=audit_seed,
-        )
+        return self._compare_policies(entries, lambda state, prefix: predict_with(self.maxent, state, prefix), lambda state, prefix: predict_with(fresh_maxent, state, prefix),
+            max_prefixes=max_prefixes, tolerance=tolerance, audit_reference_seed=audit_seed)
     def evaluate(self, ordering: Sequence[str]) -> float:
         """Prefix-conditioned accuracy of the configured predictor on one ordering."""
         if not ordering: return 0.0

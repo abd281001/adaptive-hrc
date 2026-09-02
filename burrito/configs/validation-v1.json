@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "experiment": "burrito_progressive_validation_v1",
+  "require_clean_git": false,
+  "output": "burrito/results",
+  "seeds": [1337, 2024],
+  "planner_seed": 11,
+  "layouts": ["burrito_1-2_2p", "burrito"],
+  "horizon": 2400,
+  "arms": [
+    "maxent_only",
+    "latent_timing_lightweight",
+    "latent_timing_capacity_matched",
+    "latent_timing_trajectory_hybrid"
+  ],
+  "settings": {
+    "irl_cold_steps": 8,
+    "irl_warm_steps": 4,
+    "irl_horizon": 12,
+    "initial_grace": 6,
+    "min_grace": 3,
+    "semantic_fallback_max_rms_distance": 0.1
+  },
+  "conditions": [
+    {
+      "name": "observation_to_assist",
+      "tasks": [
+        {"protein": "steak", "preference": "plate_early"},
+        {"protein": "steak", "preference": "protein_first"}
+      ]
+    },
+    {
+      "name": "cross_recipe_semantic_transfer",
+      "tasks": [
+        {"protein": "steak", "preference": "protein_first"},
+        {"protein": "mushroom", "preference": "rice_first"},
+        {"protein": "steak", "preference": "rice_first"}
+      ]
+    },
+    {
+      "name": "preference_switch",
+      "tasks": [
+        {"protein": "steak", "preference": "plate_early"},
+        {"protein": "steak", "preference": "protein_first"},
+        {"protein": "steak", "preference": "rice_first"},
+        {"protein": "steak", "preference": "plate_jit"}
+      ]
+    },
+    {
+      "name": "long_gap_recurrence",
+      "tasks": [
+        {"protein": "steak", "preference": "protein_first"},
+        {"protein": "steak", "preference": "rice_first"},
+        {"protein": "mushroom", "preference": "plate_early"},
+        {"protein": "mushroom", "preference": "rice_first", "repeat": 12},
+        {"protein": "steak", "preference": "protein_first"}
+      ]
+    }
+  ],
+  "validation_requirements": [
+    "cross_recipe_transfer",
+    "preference_switch",
+    "long_gap_recurrence",
+    "memory_decay_adaptation",
+    "multiple_layouts",
+    "multiple_seeds",
+    "registered_ablations"
+  ]
+}

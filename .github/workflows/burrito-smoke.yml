@@ -1,0 +1,33 @@
+name: Burrito deterministic smoke
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  burrito-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYGAME_HIDE_SUPPORT_PROMPT: "1"
+      SDL_VIDEODRIVER: dummy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Build pinned Burrito environment
+        env:
+          BURRITO_PYTHON: python
+        run: ./burrito/bootstrap.sh
+      - name: Verify upstream revisions
+        run: ./burrito/.venv/bin/python -m adaptive_hrc_burrito verify
+      - name: Run authoritative observation-to-assist smoke
+        run: >-
+          ./burrito/.venv/bin/python -m adaptive_hrc_burrito validate
+          --config burrito/configs/ci-v1.json
+          --output /tmp/adaptive-hrc-burrito-ci
+      - name: Run Burrito integration tests
+        run: ./burrito/.venv/bin/python -m unittest discover -s burrito/tests -v

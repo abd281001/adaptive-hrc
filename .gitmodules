@@ -1,0 +1,3 @@
+[submodule "talents-zsc"]
+	path = burrito/third_party/talents-zsc
+	url = https://github.com/benji-li/talents-zsc.git

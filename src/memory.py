@@ -29,11 +29,7 @@ def jaccard(first: Sequence[str], second: Sequence[str]) -> float:
     """Multiset overlap over complete semantic actions."""
     return _jaccard_counters(Counter(first), Counter(second))
 
-def kendall_tau_distance(
-    first: Sequence[str],
-    second: Sequence[str],
-    unmatched_penalty: float = 0.5,
-) -> float:
+def kendall_tau_distance(first: Sequence[str], second: Sequence[str], unmatched_penalty: float = 0.5) -> float:
     """Return normalized Kendall tau with a bounded unmatched-action penalty."""
     def indexed_tokens(sequence: Sequence[str]) -> List[Tuple[str, int]]:
         counts: Counter = Counter()
@@ -47,54 +43,31 @@ def kendall_tau_distance(
     second_tokens = indexed_tokens(second)
     second_set = set(second_tokens)
     common_tokens = [token for token in first_tokens if token in second_set]
-    second_positions = {
-        token: index for index, token in enumerate(second_tokens)
-    }
+    second_positions = {token: index for index, token in enumerate(second_tokens)}
     first_counts = Counter(first)
     second_counts = Counter(second)
-    unmatched = sum((first_counts - second_counts).values()) + sum(
-        (second_counts - first_counts).values()
-    )
+    unmatched = sum((first_counts - second_counts).values()) + sum((second_counts - first_counts).values())
     denominator = max(len(first), len(second), 1)
     penalty = max(0.0, float(unmatched_penalty)) * unmatched / denominator
-    if len(common_tokens) < 2:
-        return min(1.0, penalty)
+    if len(common_tokens) < 2: return min(1.0, penalty)
     count = len(common_tokens)
     inversions = 0
     for first_index in range(count):
         for second_index in range(first_index + 1, count):
-            if (
-                second_positions[common_tokens[first_index]]
-                > second_positions[common_tokens[second_index]]
-            ):
-                inversions += 1
-    tau = (
-        inversions / (count * (count - 1) / 2)
-        if count > 1 else 0.0
-    )
+            if (second_positions[common_tokens[first_index]] > second_positions[common_tokens[second_index]]): inversions += 1
+    tau = (inversions / (count * (count - 1) / 2) if count > 1 else 0.0)
     return min(1.0, tau + penalty)
 
 @lru_cache(maxsize=65536)
 def _lcs_aligned_subsequence_cached(prefix: Tuple[str, ...], ordering: Tuple[str, ...]) -> Tuple[str, ...]:
     prefix_length = len(prefix)
     ordering_length = len(ordering)
-    if prefix_length <= 0 or ordering_length <= 0:
-        return ()
-    lengths = [
-        [0] * (ordering_length + 1)
-        for _ in range(prefix_length + 1)
-    ]
+    if prefix_length <= 0 or ordering_length <= 0: return ()
+    lengths = [[0] * (ordering_length + 1) for _ in range(prefix_length + 1)]
     for prefix_index in range(1, prefix_length + 1):
         for ordering_index in range(1, ordering_length + 1):
-            if prefix[prefix_index - 1] == ordering[ordering_index - 1]:
-                lengths[prefix_index][ordering_index] = (
-                    lengths[prefix_index - 1][ordering_index - 1] + 1
-                )
-            else:
-                lengths[prefix_index][ordering_index] = max(
-                    lengths[prefix_index - 1][ordering_index],
-                    lengths[prefix_index][ordering_index - 1],
-                )
+            if prefix[prefix_index - 1] == ordering[ordering_index - 1]: lengths[prefix_index][ordering_index] = (lengths[prefix_index - 1][ordering_index - 1] + 1)
+            else:                                                        lengths[prefix_index][ordering_index] = max(lengths[prefix_index - 1][ordering_index], lengths[prefix_index][ordering_index - 1])
     aligned: List[str] = []
     prefix_index = prefix_length
     ordering_index = ordering_length
@@ -103,13 +76,8 @@ def _lcs_aligned_subsequence_cached(prefix: Tuple[str, ...], ordering: Tuple[str
             aligned.append(ordering[ordering_index - 1])
             prefix_index -= 1
             ordering_index -= 1
-        elif (
-            lengths[prefix_index - 1][ordering_index]
-            >= lengths[prefix_index][ordering_index - 1]
-        ):
-            prefix_index -= 1
-        else:
-            ordering_index -= 1
+        elif (lengths[prefix_index - 1][ordering_index] >= lengths[prefix_index][ordering_index - 1]):  prefix_index -= 1
+        else:                                                                                           ordering_index -= 1
     aligned.reverse()
     return tuple(aligned)
 
@@ -150,109 +118,41 @@ class RecipeMatcher:
             yield
             return
         start_time = time.perf_counter()
-        try:
-            yield
+        try: yield
         finally:
             calls, wall_seconds = self.profile.get(event, (0, 0.0))
-            self.profile[event] = (
-                calls + 1,
-                wall_seconds + (time.perf_counter() - start_time),
-            )
+            self.profile[event] = (calls + 1, wall_seconds + (time.perf_counter() - start_time))
 
-    def classify(
-        self,
-        sequence: Sequence[str],
-        library: List[KnownVariant],
-        threshold: Optional[float] = None,
-    ) -> MatchResult:
+    def classify(self, sequence: Sequence[str], library: List[KnownVariant], threshold: Optional[float] = None) -> MatchResult:
         """Classify a sequence of canonical semantic actions."""
-        match_threshold = float(
-            self.settings.match_threshold if threshold is None else threshold
-        )
+        match_threshold = float(self.settings.match_threshold if threshold is None else threshold)
         with self._profile("classify"):
             if not library: return MatchResult("new_recipe", None, None, 0.0, 0.0)
             actions = tuple(sequence)
             variant_id = make_variant_id(actions)
             for variant in library:
-                if (
-                    variant.variant_id == variant_id
-                    and variant.ordering == actions
-                ):
-                    return MatchResult(
-                        "known", variant.recipe_id, variant.variant_id,
-                        1.0, 0.0,
-                    )
+                if (variant.variant_id == variant_id and variant.ordering == actions):
+                    return MatchResult("known", variant.recipe_id, variant.variant_id, 1.0, 0.0)
             best_per_recipe = self.score(actions, library)
-            best_recipe_id, (
-                _best_variant,
-                best_score,
-                best_distance,
-            ) = max(
-                best_per_recipe.items(),
-                key=lambda item: (item[1][1], -item[1][2]),
-            )
-            runner_up = max(
-                (
-                    score
-                    for recipe_id, (_variant, score, _distance)
-                    in best_per_recipe.items()
-                    if recipe_id != best_recipe_id
-                ),
-                default=None,
-            )
-            margin = (
-                float("inf")
-                if runner_up is None else best_score - runner_up
-            )
-            if best_score < match_threshold or (
-                runner_up is not None and margin < self.settings.match_margin
-            ):
-                return MatchResult(
-                    "new_recipe", None, None, best_score, best_distance,
-                )
-            return MatchResult(
-                "preference_shift", best_recipe_id, None,
-                best_score, best_distance,
-            )
+            best_recipe_id, (_best_variant, best_score, best_distance) = max(best_per_recipe.items(), key=lambda item: (item[1][1], -item[1][2]))
+            runner_up = max((score for recipe_id, (_variant, score, _distance) in best_per_recipe.items() if recipe_id != best_recipe_id), default=None)
+            margin = (float("inf") if runner_up is None else best_score - runner_up)
+            if best_score < match_threshold or (runner_up is not None and margin < self.settings.match_margin): return MatchResult("new_recipe", None, None, best_score, best_distance)
+            return MatchResult("preference_shift", best_recipe_id, None, best_score, best_distance)
 
-    def match_known(
-        self,
-        sequence: Sequence[str],
-        library: Sequence[KnownVariant],
-    ) -> MatchResult:
-        """Return the best known recipe without applying open-set rejection.
-
-        Assist mode is an externally declared known-task protocol. Low evidence is
-        handled by the commit gate, not by allocating or requesting a new recipe.
+    def match_known(self, sequence: Sequence[str], library: Sequence[KnownVariant]) -> MatchResult:
+        """Return the best known recipe without applying open-set rejection. Assist mode is an externally declared known-task protocol. Low evidence is handled by the commit gate, not by allocating or requesting a new recipe.
         """
-        if not library:
-            return MatchResult("assist_unavailable", None, None, 0.0, 0.0)
+        if not library: return MatchResult("assist_unavailable", None, None, 0.0, 0.0)
         actions = tuple(sequence)
         variant_id = make_variant_id(actions)
         for candidate in library:
-            if (
-                candidate.variant_id == variant_id
-                and candidate.ordering == actions
-            ):
-                return MatchResult("known", candidate.recipe_id, candidate.variant_id, 1.0, 0.0)
+            if (candidate.variant_id == variant_id and candidate.ordering == actions): return MatchResult("known", candidate.recipe_id, candidate.variant_id, 1.0, 0.0)
         best_per_recipe = self.score(actions, library)
-        best_recipe_id, (best_variant, best_score, best_distance) = max(
-            best_per_recipe.items(),
-            key=lambda item: (item[1][1], -item[1][2]),
-        )
-        return MatchResult(
-            "preference_shift",
-            best_recipe_id,
-            best_variant.variant_id,
-            best_score,
-            best_distance,
-        )
+        best_recipe_id, (best_variant, best_score, best_distance) = max(best_per_recipe.items(), key=lambda item: (item[1][1], -item[1][2]))
+        return MatchResult("preference_shift", best_recipe_id, best_variant.variant_id, best_score, best_distance)
 
-    def score(
-        self,
-        sequence: Sequence[str],
-        library: Sequence[KnownVariant],
-    ) -> Dict[str, Tuple[KnownVariant, float, float]]:
+    def score(self, sequence: Sequence[str], library: Sequence[KnownVariant]) -> Dict[str, Tuple[KnownVariant, float, float]]:
         """Score a library in one pass and retain its best variant per recipe."""
         with self._profile("score"):
             self.variants_scored += len(library)
@@ -261,22 +161,12 @@ class RecipeMatcher:
             action_counts = Counter(actions)
             best: Dict[str, Tuple[KnownVariant, float, float]] = {}
             for variant in library:
-                if (
-                    variant.variant_id == variant_id
-                    and variant.ordering == actions
-                ):
-                    score, distance = 1.0, 0.0
+                if (variant.variant_id == variant_id and variant.ordering == actions): score, distance = 1.0, 0.0
                 else:
-                    score = _jaccard_counters(
-                        action_counts, variant.counts(),
-                    )
-                    distance = kendall_tau_distance(
-                        actions, variant.ordering,
-                        unmatched_penalty=self.settings.unmatched_penalty,
-                    )
+                    score = _jaccard_counters(action_counts, variant.counts())
+                    distance = kendall_tau_distance(actions, variant.ordering, unmatched_penalty=self.settings.unmatched_penalty)
                 previous = best.get(variant.recipe_id)
-                if previous is None or score > previous[1]:
-                    best[variant.recipe_id] = (variant, float(score), float(distance))
+                if previous is None or score > previous[1]: best[variant.recipe_id] = (variant, float(score), float(distance))
             return best
 
     def score_prefix(self, prefix: Sequence[str], variants: List[KnownVariant]) -> List[Tuple[KnownVariant, float]]:
@@ -298,11 +188,7 @@ class RecipeMatcher:
             union = sum((prefix_counter | variant_counter).values())
             set_overlap = intersection / max(union, 1)
             tau = 1.0 - kendall_tau_distance(prefix, aligned, unmatched_penalty=unmatched_penalty)
-            ranked.append((
-                variant,
-                self.settings.overlap_weight * set_overlap
-                + self.settings.order_weight * tau,
-            ))
+            ranked.append((variant, self.settings.overlap_weight * set_overlap + self.settings.order_weight * tau))
         ranked.sort(key=lambda item: -item[1])
         return ranked
 
@@ -322,12 +208,7 @@ class VariantLibrary:
         self.variants: Dict[str, Dict[str, Variant]] = defaultdict(dict)    # recipe_id -> insertion-ordered dict of variant_id -> Variant
         self.latest: Dict[str, str] = {}                                    # recipe_id -> variant_id of most-recently-observed variant.
 
-    def register(
-        self,
-        recipe_id: str,
-        ordering: Sequence[str],
-        step: int,
-    ) -> Variant:
+    def register(self, recipe_id: str, ordering: Sequence[str], step: int) -> Variant:
         variant_id = make_variant_id(ordering)
         slot = self.variants[recipe_id]
         if variant_id in slot:
@@ -346,26 +227,15 @@ class VariantLibrary:
             self.variants[recipe_id][variant_id].last_seen_step = step
 
     def known_variants(self, allowed_keys: Optional[Set[VariantKey]] = None) -> List[KnownVariant]:
-        return [
-            KnownVariant(recipe_id, variant_id, variant.ordering)
-            for recipe_id, slot in self.variants.items()
-            for variant_id, variant in slot.items()
-            if allowed_keys is None or (recipe_id, variant_id) in allowed_keys
-        ]
+        return [KnownVariant(recipe_id, variant_id, variant.ordering) for recipe_id, slot in self.variants.items() for variant_id, variant in slot.items() if allowed_keys is None or (recipe_id, variant_id) in allowed_keys]
 
     def latest_variant(self, recipe_id: str, allowed_keys: Optional[Set[VariantKey]] = None) -> Optional[Variant]:
         variant_id = self.latest.get(recipe_id)
         slot = self.variants.get(recipe_id, {})
         if variant_id and variant_id in slot and (allowed_keys is None or (recipe_id, variant_id) in allowed_keys): return slot[variant_id]
         if allowed_keys is None: return None
-        candidates = [
-            variant for variant in slot.values()
-            if (variant.recipe_id, variant.variant_id) in allowed_keys
-        ]
-        return (
-            max(candidates, key=lambda variant: variant.last_seen_step)
-            if candidates else None
-        )
+        candidates = [variant for variant in slot.values() if (variant.recipe_id, variant.variant_id) in allowed_keys]
+        return (max(candidates, key=lambda variant: variant.last_seen_step) if candidates else None)
 
 def clear_caches() -> None:
     """Clear module-level caches that can otherwise bleed across seed jobs."""
@@ -414,34 +284,14 @@ class ReplayMemory:
         self.min_grace: int = max(0, int(getattr(settings, "min_grace", 6)))
         self.prune_delay: int = max(1, int(getattr(settings, "prune_delay", 3)))
         self.reuse_window: int = max(1, int(getattr(settings, "pair_gap_window", 12)))
-        self.reuse_min_samples: int = min(
-            self.reuse_window,
-            max(1, int(getattr(settings, "parent_weight_samples", 5))),
-        )
-        self.pair_downward_half_life: float = float(
-            getattr(settings, "pair_prior_half_life", 3.0),
-        )
-        if not math.isfinite(self.pair_downward_half_life) or self.pair_downward_half_life <= 0.0:
-            raise ValueError("pair_prior_half_life must be finite and positive")
-        self.reuse_quantile: float = min(
-            1.0, max(0.0, float(getattr(settings, "gap_quantile", 0.90))),
-        )
-        self.reuse_iqr_multiplier: float = max(
-            0.0, float(getattr(settings, "gap_iqr_scale", 1.50)),
-        )
-        self.recipe_reuse_window: int = max(
-            self.reuse_window,
-            int(getattr(settings, "recipe_gap_window", 24)),
-        )
-        self.global_reuse_window: int = max(
-            self.recipe_reuse_window,
-            int(getattr(settings, "global_gap_window", 60)),
-        )
-        self.post_grace_decay_rate = (
-            0.0 if policy == "none"
-            else float(settings.fixed_decay) if policy == "fixed"
-            else 1.0 / float(self.prune_delay)
-        )
+        self.reuse_min_samples: int = min(self.reuse_window, max(1, int(getattr(settings, "parent_weight_samples", 5))))
+        self.pair_downward_half_life: float = float(getattr(settings, "pair_prior_half_life", 3.0))
+        if not math.isfinite(self.pair_downward_half_life) or self.pair_downward_half_life <= 0.0: raise ValueError("pair_prior_half_life must be finite and positive")
+        self.reuse_quantile: float = min(1.0, max(0.0, float(getattr(settings, "gap_quantile", 0.90))))
+        self.reuse_iqr_multiplier: float = max(0.0, float(getattr(settings, "gap_iqr_scale", 1.50)))
+        self.recipe_reuse_window: int = max(self.reuse_window, int(getattr(settings, "recipe_gap_window", 24)))
+        self.global_reuse_window: int = max(self.recipe_reuse_window, int(getattr(settings, "global_gap_window", 60)))
+        self.post_grace_decay_rate = (0.0 if policy == "none" else float(settings.fixed_decay) if policy == "fixed"else 1.0 / float(self.prune_delay))
         self.active: Dict[VariantKey, MemoryItem] = {}
         self.pruned: Dict[VariantKey, RemovedItem] = {}
         self.latest_by_recipe: Dict[str, str] = {}
@@ -452,24 +302,11 @@ class ReplayMemory:
         self._pair_last_seen_step: Dict[VariantKey, int] = {}
         # Bounded disjoint events supply recipe and global priors.
         self._recipe_gap_events: Dict[str, Deque[Tuple[VariantKey, int]]] = {}
-        self._global_gap_events: Deque[Tuple[VariantKey, int]] = deque(
-            maxlen=self.global_reuse_window,
-        )
+        self._global_gap_events: Deque[Tuple[VariantKey, int]] = deque(maxlen=self.global_reuse_window)
         self.reuse_gap_events: List[Tuple[int, VariantKey, int]] = []  # positive reuse gaps
         self.reentry_events: List[Tuple[int, VariantKey, int]] = []
 
-    def register(
-        self,
-        recipe_id: str,
-        variant_id: str,
-        ordering: Tuple[str, ...],
-        now: int,
-        cycle: int,
-        *,
-        weight: float = 1.0,
-        pin_latest: Optional[bool] = None,
-        transitions: Optional[Sequence[StateTransition]] = None,
-    ) -> MemoryItem:
+    def register(self, recipe_id: str, variant_id: str, ordering: Tuple[str, ...], now: int, cycle: int, *, weight: float = 1.0, pin_latest: Optional[bool] = None, transitions: Optional[Sequence[StateTransition]] = None) -> MemoryItem:
         """Insert, reset an active variant, or restore a pruned variant."""
         key = (recipe_id, variant_id)
         should_pin_latest = self.settings.pin_latest if pin_latest is None else bool(pin_latest)
@@ -478,26 +315,21 @@ class ReplayMemory:
         reuse_gap = self._record_pair_reuse(key, now, step=now)
         if key in self.active:
             entry = self.active[key]
-            entry.weight = (
-                1.0 if key in self.latest_keys else initial_weight
-            )
+            entry.weight = (1.0 if key in self.latest_keys else initial_weight)
             entry.last_seen_step = now
             entry.ordering = ordering
-            if transitions is not None:
-                entry.transitions = transition_trace
+            if transitions is not None: entry.transitions = transition_trace
             if should_pin_latest: self.mark_latest(recipe_id, variant_id)
             return entry
 
         reentering = key in self.pruned
         if reentering:
             removed_item = self.pruned.pop(key)
-            if transitions is None:
-                transition_trace = tuple(removed_item.transitions)
+            if transitions is None: transition_trace = tuple(removed_item.transitions)
 
         entry = MemoryItem(recipe_id=recipe_id, variant_id=variant_id, ordering=ordering, weight=initial_weight, added_step=now, added_cycle=cycle, last_seen_step=now, transitions=transition_trace)
         self.active[key] = entry
-        if reentering:
-            self.reentry_events.append((int(now), key, int(reuse_gap or 0)))
+        if reentering: self.reentry_events.append((int(now), key, int(reuse_gap or 0)))
         if should_pin_latest: self.mark_latest(recipe_id, variant_id)
         return entry
 
@@ -528,126 +360,65 @@ class ReplayMemory:
         return list(self.active.values())
 
     def recipe_items(self, recipe_id: str) -> List[MemoryItem]:
-        return [
-            entry for entry in self.active.values()
-            if entry.recipe_id == recipe_id
-        ]
+        return [entry for entry in self.active.values() if entry.recipe_id == recipe_id]
     def _robust_upper_gap(self, gaps: Sequence[int]) -> float:
         ordered = sorted(float(gap) for gap in gaps)
-        if not ordered:
-            return float(self.default_grace_horizon)
+        if not ordered: return float(self.default_grace_horizon)
         lower_quartile = self._linear_quantile(ordered, 0.25)
         upper_quartile = self._linear_quantile(ordered, 0.75)
         upper_quantile = self._linear_quantile(ordered, self.reuse_quantile)
-        tukey_upper_fence = upper_quartile + self.reuse_iqr_multiplier * (
-            upper_quartile - lower_quartile
-        )
+        tukey_upper_fence = upper_quartile + self.reuse_iqr_multiplier * (upper_quartile - lower_quartile)
         return min(upper_quantile, tukey_upper_fence)
 
     def _linear_evidence_weight(self, sample_count: int) -> float:
         return min(1.0, int(sample_count) / float(self.reuse_min_samples))
 
-    def _pool_parent_prior(
-        self,
-        prior: float,
-        gaps: Sequence[int],
-    ) -> Tuple[float, float]:
+    def _pool_parent_prior(self, prior: float, gaps: Sequence[int]) -> Tuple[float, float]:
         """Let recipe/global evidence raise, but never shorten, its parent prior."""
-        if not gaps:
-            return float(prior), 0.0
+        if not gaps: return float(prior), 0.0
         evidence_weight = self._linear_evidence_weight(len(gaps))
         estimate = self._robust_upper_gap(gaps)
-        pooled = (
-            (1.0 - evidence_weight) * float(prior)
-            + evidence_weight * estimate
-        )
+        pooled = ((1.0 - evidence_weight) * float(prior) + evidence_weight * estimate)
         return max(float(prior), pooled), evidence_weight
 
-    def _pool_exact_pair(
-        self,
-        prior: float,
-        gaps: Sequence[int],
-    ) -> Tuple[float, float, str]:
+    def _pool_exact_pair(self, prior: float, gaps: Sequence[int]) -> Tuple[float, float, str]:
         """Adapt down asymptotically and preserve the fast linear upward response."""
-        if not gaps:
-            return float(prior), 0.0, "prior_only"
+        if not gaps: return float(prior), 0.0, "prior_only"
         estimate = self._robust_upper_gap(gaps)
         if estimate < float(prior):
-            evidence_weight = 1.0 - math.pow(
-                2.0,
-                -len(gaps) / self.pair_downward_half_life,
-            )
+            evidence_weight = 1.0 - math.pow(2.0, -len(gaps) / self.pair_downward_half_life)
             pooling_mode = "exponential_downward"
         else:
             evidence_weight = self._linear_evidence_weight(len(gaps))
             pooling_mode = "linear_upward"
-        pooled = (
-            (1.0 - evidence_weight) * float(prior)
-            + evidence_weight * estimate
-        )
+        pooled = ((1.0 - evidence_weight) * float(prior) + evidence_weight * estimate)
         return pooled, evidence_weight, pooling_mode
 
     def horizon_stats(self, key: VariantKey) -> Dict[str, Any]:
         """Return the pair horizon and its disjoint hierarchical evidence."""
         recipe_id = key[0]
-        global_gaps = [
-            gap for event_key, gap in self._global_gap_events
-            if event_key[0] != recipe_id
-        ]
-        recipe_gaps = [
-            gap for event_key, gap in self._recipe_gap_events.get(recipe_id, ())
-            if event_key != key
-        ]
+        global_gaps = [gap for event_key, gap in self._global_gap_events if event_key[0] != recipe_id]
+        recipe_gaps = [gap for event_key, gap in self._recipe_gap_events.get(recipe_id, ()) if event_key != key]
         pair_gaps = list(self._pair_gap_window.get(key, ()))
 
-        global_estimate, global_weight = self._pool_parent_prior(
-            float(self.default_grace_horizon), global_gaps,
-        )
-        recipe_estimate, recipe_weight = self._pool_parent_prior(
-            global_estimate, recipe_gaps,
-        )
-        pair_estimate, pair_weight, pair_pooling_mode = self._pool_exact_pair(
-            recipe_estimate, pair_gaps,
-        )
-        horizon = max(
-            float(math.ceil(pair_estimate)),
-            float(self.min_grace),
-        )
-        return {
-            "horizon_demos": horizon,
-            "pair_gap_samples": int(len(pair_gaps)),
-            "recipe_prior_gap_samples": int(len(recipe_gaps)),
-            "global_prior_gap_samples": int(len(global_gaps)),
-            "pair_evidence_weight": float(pair_weight),
-            "pair_pooling_mode": pair_pooling_mode,
-            "pair_downward_half_life_samples": float(self.pair_downward_half_life),
-            "recipe_evidence_weight": float(recipe_weight),
-            "global_evidence_weight": float(global_weight),
-            "pair_robust_upper_demos": (
-                float(self._robust_upper_gap(pair_gaps)) if pair_gaps else 0.0
-            ),
-            "recipe_prior_horizon_demos": float(recipe_estimate),
-            "global_prior_horizon_demos": float(global_estimate),
-        }
+        global_estimate, global_weight = self._pool_parent_prior(float(self.default_grace_horizon), global_gaps)
+        recipe_estimate, recipe_weight = self._pool_parent_prior(global_estimate, recipe_gaps)
+        pair_estimate, pair_weight, pair_pooling_mode = self._pool_exact_pair(recipe_estimate, pair_gaps)
+        horizon = max(float(math.ceil(pair_estimate)), float(self.min_grace))
+        return { "horizon_demos": horizon, "pair_gap_samples": int(len(pair_gaps)), "recipe_prior_gap_samples": int(len(recipe_gaps)), "global_prior_gap_samples": int(len(global_gaps)), "pair_evidence_weight": float(pair_weight),
+                "pair_pooling_mode": pair_pooling_mode, "pair_downward_half_life_samples": float(self.pair_downward_half_life), "recipe_evidence_weight": float(recipe_weight), "global_evidence_weight": float(global_weight),
+                "pair_robust_upper_demos": (float(self._robust_upper_gap(pair_gaps)) if pair_gaps else 0.0), "recipe_prior_horizon_demos": float(recipe_estimate), "global_prior_horizon_demos": float(global_estimate)}
 
     def horizon(self, key: VariantKey) -> float:
         return self.horizon_stats(key)["horizon_demos"]
 
     def horizons(self) -> Dict[str, float]:
         keys = set(self.active) | set(self.pruned) | set(self._pair_gap_window)
-        return {
-            f"{recipe_id}/{variant_id}": self.horizon((recipe_id, variant_id))
-            for recipe_id, variant_id in sorted(keys)
-        }
+        return {f"{recipe_id}/{variant_id}": self.horizon((recipe_id, variant_id)) for recipe_id, variant_id in sorted(keys)}
 
     def horizon_evidence(self) -> Dict[str, Dict[str, Any]]:
         keys = set(self.active) | set(self.pruned) | set(self._pair_gap_window)
-        return {
-            f"{recipe_id}/{variant_id}": self.horizon_stats(
-                (recipe_id, variant_id)
-            )
-            for recipe_id, variant_id in sorted(keys)
-        }
+        return {f"{recipe_id}/{variant_id}": self.horizon_stats((recipe_id, variant_id)) for recipe_id, variant_id in sorted(keys)}
 
     def mark_latest(self, recipe_id: str, variant_id: str) -> None:
         """Pin the latest variant and release the recipe's previous pin."""
@@ -677,13 +448,8 @@ class ReplayMemory:
         self.latest_keys.discard(key)
         if was_latest:
             self.latest_by_recipe.pop(recipe_id, None)
-            replacement = max(
-                self.recipe_items(recipe_id),
-                key=lambda entry: (entry.last_seen_step, entry.variant_id),
-                default=None,
-            )
-            if replacement is not None:
-                self.mark_latest(recipe_id, replacement.variant_id)
+            replacement = max(self.recipe_items(recipe_id), key=lambda entry: (entry.last_seen_step, entry.variant_id), default=None)
+            if replacement is not None: self.mark_latest(recipe_id, replacement.variant_id)
 
     def gap_history(self) -> List[int]:
         """Return the bounded diagnostic trace of exact-pair reuse gaps."""
@@ -706,14 +472,11 @@ class ReplayMemory:
         """Record a positive exact-pair gap in that variant's rolling window."""
         if gap <= 0: return
         gap_i = int(gap)
-        if key not in self._pair_gap_window:
-            self._pair_gap_window[key] = deque(maxlen=self.reuse_window)
+        if key not in self._pair_gap_window: self._pair_gap_window[key] = deque(maxlen=self.reuse_window)
         self._pair_gap_window[key].append(gap_i)
         recipe_id = key[0]
         if recipe_id not in self._recipe_gap_events:
-            self._recipe_gap_events[recipe_id] = deque(
-                maxlen=self.recipe_reuse_window,
-            )
+            self._recipe_gap_events[recipe_id] = deque(maxlen=self.recipe_reuse_window)
         event = (key, gap_i)
         self._recipe_gap_events[recipe_id].append(event)
         self._global_gap_events.append(event)
@@ -723,15 +486,12 @@ class ReplayMemory:
     @staticmethod
     def _linear_quantile(ordered: Sequence[float], quantile: float) -> float:
         """Linearly interpolated quantile for an already-sorted sample."""
-        if not ordered:
-            raise ValueError("cannot estimate a quantile from an empty sample")
-        if len(ordered) == 1:
-            return float(ordered[0])
+        if not ordered: raise ValueError("cannot estimate a quantile from an empty sample")
+        if len(ordered) == 1: return float(ordered[0])
         position = min(1.0, max(0.0, float(quantile))) * (len(ordered) - 1)
         lower = int(math.floor(position))
         upper = int(math.ceil(position))
-        if lower == upper:
-            return float(ordered[lower])
+        if lower == upper: return float(ordered[lower])
         fraction = position - lower
         return float(ordered[lower] + fraction * (ordered[upper] - ordered[lower]))
 

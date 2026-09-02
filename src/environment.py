@@ -1,36 +1,21 @@
 """Symbolic kitchen state, action grammar, semantics, and reference recipes."""
 from __future__ import annotations
-
 from dataclasses import dataclass
 import re
 from typing import Mapping
-
 import numpy as np
 
 
 CONTAINERS = ("pot", "pan", "plate", "bowl", "glass", "measuring_cup")
 LIQUID_INGREDIENTS = ("milk", "oil")
-SOLID_INGREDIENTS = (
-    "tomato", "garlic", "onion", "mushroom", "lettuce", "cheese", "rice",
-    "yoghurt", "strawberries", "banana", "egg", "fish", "chicken", "meat",
-    "salt", "spice1", "spice2", "mixture",
-)
+SOLID_INGREDIENTS = ("tomato", "garlic", "onion", "mushroom", "lettuce", "cheese", "rice", "yoghurt", "strawberries", "banana", "egg", "fish", "chicken", "meat", "salt", "spice1", "spice2", "mixture")
 INGREDIENTS = LIQUID_INGREDIENTS + SOLID_INGREDIENTS
 ITEMS = CONTAINERS + INGREDIENTS
-CUTTABLES = (
-    "tomato", "onion", "mushroom", "lettuce", "banana", "strawberries",
-    "chicken", "fish", "cheese",
-)
+CUTTABLES = ("tomato", "onion", "mushroom", "lettuce", "banana", "strawberries", "chicken", "fish", "cheese")
 GRATABLE = ("cheese",)
-COOKABLES = (
-    "meat", "egg", "rice", "tomato", "onion", "mushroom", "chicken", "fish",
-    "mixture",
-)
+COOKABLES = ("meat", "egg", "rice", "tomato", "onion", "mushroom", "chicken", "fish", "mixture")
 SEASONINGS = ("salt", "spice1", "spice2", "garlic")
-LOCATIONS = (
-    "storage", "prep_station", "cooking_station", "plating_station",
-    "serving_station", "washing_station", "blending_station",
-)
+LOCATIONS = ("storage", "prep_station", "cooking_station", "plating_station", "serving_station", "washing_station", "blending_station")
 TOOLS = ("stove", "sink", "blender")
 
 ACTION_ARGUMENTS: Mapping[str, tuple[str, ...]] = {
@@ -53,13 +38,8 @@ ACTION_ARGUMENTS: Mapping[str, tuple[str, ...]] = {
     "wash": ("item", "location"),
 }
 
-# Reference trajectories ground appliance actions at a location, whereas the
-# structured LLM interface needs only the tool name. The simulator accepts both.
-ACTION_LABEL_ARGUMENTS: Mapping[str, tuple[str, ...]] = {
-    **ACTION_ARGUMENTS,
-    "turn_on": ("tool", "location"),
-    "turn_off": ("tool", "location"),
-}
+# Reference trajectories ground appliance actions at a location, whereas the structured LLM interface needs only the tool name. The simulator accepts both.
+ACTION_LABEL_ARGUMENTS: Mapping[str, tuple[str, ...]] = {**ACTION_ARGUMENTS, "turn_on": ("tool", "location"), "turn_off": ("tool", "location")}
 _ACTION_PATTERN = re.compile(r"^\s*([a-z_]+)\s*\((.*)\)\s*$")
 
 
@@ -71,59 +51,40 @@ class ActionSyntaxError(ValueError):
 class Action:
     verb: str
     args: Mapping[str, str]
-
-    def get(self, key: str, default: str | None = None) -> str | None:
-        return self.args.get(key, default)
+    def get(self, key: str, default: str | None = None) -> str | None: return self.args.get(key, default)
 
 
 def parse_action_label(label: str) -> Action:
     match = _ACTION_PATTERN.fullmatch(label)
-    if match is None:
-        raise ActionSyntaxError(f"invalid action syntax: {label!r}")
+    if match is None:               raise ActionSyntaxError(f"invalid action syntax: {label!r}")
     verb, body = match.groups()
     names = ACTION_LABEL_ARGUMENTS.get(verb)
-    if names is None:
-        raise ActionSyntaxError(f"unknown action: {verb}")
+    if names is None:               raise ActionSyntaxError(f"unknown action: {verb}")
     tokens = [part.strip() for part in body.split(",") if part.strip()]
-    if len(tokens) > len(names):
-        raise ActionSyntaxError(f"too many arguments for {verb}")
+    if len(tokens) > len(names):    raise ActionSyntaxError(f"too many arguments for {verb}")
     values: dict[str, str] = {}
     for index, token in enumerate(tokens):
         if "=" in token:
             key, value = (part.strip() for part in token.split("=", 1))
-            if key not in names:
-                raise ActionSyntaxError(f"unknown {verb} argument: {key}")
-        else:
-            key, value = names[index], token
-        if key in values:
-            raise ActionSyntaxError(f"duplicate {verb} argument: {key}")
+            if key not in names:    raise ActionSyntaxError(f"unknown {verb} argument: {key}")
+        else: key, value = names[index], token
+        if key in values:           raise ActionSyntaxError(f"duplicate {verb} argument: {key}")
         values[key] = value
     return Action(verb, values)
 
 
 def _validate_argument(action: str, key: str, value: object) -> str:
-    if not isinstance(value, str):
-        raise ActionSyntaxError(f"argument_{key}_must_be_string")
-    domains = {
-        "from": LOCATIONS, "to": LOCATIONS, "location": LOCATIONS,
-        "container": CONTAINERS, "from_container": CONTAINERS,
-        "to_container": CONTAINERS, "tool": TOOLS, "seasoning": SEASONINGS,
-        "liquid": LIQUID_INGREDIENTS, "vessel": ("plate", "glass"),
-        "item": ITEMS,
-    }
-    if key in domains and value not in domains[key]:
-        raise ActionSyntaxError(f"invalid_{key}:{value}")
-    if action in {"load", "unload", "season"} and key == "item" and value not in INGREDIENTS:
-        raise ActionSyntaxError(f"{action}_requires_ingredient:{value}")
+    if not isinstance(value, str): raise ActionSyntaxError(f"argument_{key}_must_be_string")
+    domains = {"from": LOCATIONS, "to": LOCATIONS, "location": LOCATIONS,"container": CONTAINERS, "from_container": CONTAINERS, "to_container": CONTAINERS, "tool": TOOLS, "seasoning": SEASONINGS, "liquid": LIQUID_INGREDIENTS, "vessel": ("plate", "glass"), "item": ITEMS}
+    if key in domains and value not in domains[key]: raise ActionSyntaxError(f"invalid_{key}:{value}")
+    if action in {"load", "unload", "season"} and key == "item" and value not in INGREDIENTS: raise ActionSyntaxError(f"{action}_requires_ingredient:{value}")
     return value
 
 
 def canonical_action(action: str, args: Mapping[str, object]) -> str:
     names = ACTION_ARGUMENTS.get(action)
-    if names is None:
-        raise ActionSyntaxError(f"unknown_action:{action}")
-    if set(args) != set(names):
-        raise ActionSyntaxError(f"wrong_argument_keys_for:{action}")
+    if names is None:           raise ActionSyntaxError(f"unknown_action:{action}")
+    if set(args) != set(names): raise ActionSyntaxError(f"wrong_argument_keys_for:{action}")
     values = {key: _validate_argument(action, key, args[key]) for key in names}
     if action in {"transfer", "move_container"}:
         first = "item" if action == "transfer" else "container"
@@ -192,8 +153,8 @@ class StateTracker:
         """Initial state: every real item lives in storage; no tool is on."""
         self.current_state = np.zeros(self.n_features, dtype=int)
         for item in ITEMS:
-            if item != "mixture":   # "mixture" only exists once ingredients are combined
-                self.set_feature(f"{item}_at_storage", 1)
+            if item != "mixture": self.set_feature(f"{item}_at_storage", 1)  # "mixture" only exists once ingredients are combined
+
 
     def set_feature(self, key, value):
         if key in self.feature_map:
@@ -208,15 +169,13 @@ class StateTracker:
     def get_item_location(self, item):
         """Return the location an item is at, or None if none/contained."""
         for loc in LOCATIONS:
-            if self.get_feature(f"{item}_at_{loc}") == 1:
-                return loc
+            if self.get_feature(f"{item}_at_{loc}") == 1: return loc
         return None
 
     def is_contained(self, item):
         """Return the container holding `item`, or None if it is free."""
         for container in CONTAINERS:
-            if self.get_feature(f"{container}_contains_{item}") == 1:
-                return container
+            if self.get_feature(f"{container}_contains_{item}") == 1: return container
         return None
 
     def apply_action(self, action_str, *, enforce_preconditions: bool = False):
@@ -225,8 +184,7 @@ class StateTracker:
         verb, args = action.verb, action.args
 
         def _require(condition, msg):
-            if enforce_preconditions and not condition:
-                raise ValueError(msg)
+            if enforce_preconditions and not condition: raise ValueError(msg)
 
         if verb == "transfer":
             item, from_loc, to_loc = args["item"], args["from"], args["to"]
@@ -285,14 +243,7 @@ class StateTracker:
             _require(container in {"pot", "pan"}, f"Precondition failed: {container} is not cook-safe")
             _require(self.get_feature(f"{container}_at_{location}") == 1, f"Precondition failed: {container} not at {location}")
             _require(location != "cooking_station" or self.get_feature("stove_on") == 1, "Precondition failed: stove not on")
-            _require(
-                any(
-                    self.get_feature(f"{container}_contains_{ingredient}") == 1
-                    and ingredient in COOKABLES
-                    for ingredient in INGREDIENTS
-                ),
-                f"Precondition failed: {container} contains no cookable ingredients",
-            )
+            _require(any(self.get_feature(f"{container}_contains_{ingredient}") == 1 and ingredient in COOKABLES for ingredient in INGREDIENTS), f"Precondition failed: {container} contains no cookable ingredients")
             for ingredient in INGREDIENTS:
                 if (self.get_feature(f"{container}_contains_{ingredient}") == 1 and ingredient in COOKABLES): self.set_feature(f"{ingredient}_cooked", 1)
 
@@ -312,10 +263,7 @@ class StateTracker:
             _require(seasoning in SEASONINGS, f"{seasoning} is not a seasoning")
             _require(location is not None, "season_container requires an explicit location")
             _require(self.get_feature(f"{container}_at_{location}") == 1, f"{container} not at {location}")
-            _require(
-                any(self.get_feature(f"{container}_contains_{ingredient}") == 1 for ingredient in INGREDIENTS),
-                f"Precondition failed: {container} contains no ingredients",
-            )
+            _require(any(self.get_feature(f"{container}_contains_{ingredient}") == 1 for ingredient in INGREDIENTS), f"Precondition failed: {container} contains no ingredients")
             for ing in INGREDIENTS:
                 if self.get_feature(f"{container}_contains_{ing}") == 1:
                     self.set_feature(f"{ing}_seasoned", 1)
@@ -367,10 +315,7 @@ class StateTracker:
             _require(vessel in {"plate", "glass"}, f"Precondition failed: {vessel} is not a serving vessel")
             _require(location == "serving_station", "serve requires serving_station")
             _require(self.get_feature(f"{vessel}_at_{location}") == 1, f"{vessel} not at {location}")
-            _require(
-                any(self.get_feature(f"{vessel}_contains_{ingredient}") == 1 for ingredient in INGREDIENTS),
-                f"{vessel} contains no dish",
-            )
+            _require(any(self.get_feature(f"{vessel}_contains_{ingredient}") == 1 for ingredient in INGREDIENTS), f"{vessel} contains no dish")
             self.set_feature("dish_served", 1)
 
         elif verb == "wash":
@@ -384,13 +329,7 @@ class StateTracker:
 _FEAT = StateTracker._build_feature_map()
 
 
-_GOAL_FEATURE_INDICES = tuple(
-    index
-    for name, index in _FEAT.items()
-    if "_at_" not in name
-    and not name.endswith("_washed")
-    and name not in {"stove_on", "sink_on", "blender_on"}
-)
+_GOAL_FEATURE_INDICES = tuple(index for name, index in _FEAT.items() if "_at_" not in name and not name.endswith("_washed") and name not in {"stove_on", "sink_on", "blender_on"})
 
 
 def replay_validated_actions(actions):
@@ -400,8 +339,7 @@ def replay_validated_actions(actions):
         before = tuple(tracker.get_state_vector().astype(int).tolist())
         tracker.apply_action(action, enforce_preconditions=True)
         after = tuple(tracker.get_state_vector().astype(int).tolist())
-        if after == before:
-            raise ValueError(f"No-effect action in validated ordering: {action}")
+        if after == before: raise ValueError(f"No-effect action in validated ordering: {action}")
     return tuple(tracker.get_state_vector().astype(int).tolist())
 
 
@@ -413,10 +351,8 @@ def task_goal_signature(actions):
 
 def validate_ordering(actions, *, expected_goal=None):
     """Return whether an ordering is executable, effectful, and goal-preserving."""
-    try:
-        goal = task_goal_signature(actions)
-    except (ValueError, IndexError, KeyError):
-        return False
+    try: goal = task_goal_signature(actions)
+    except (ValueError, IndexError, KeyError): return False
     return expected_goal is None or tuple(goal) == tuple(expected_goal)
 
 RECIPES = {'tomato_onion_soup': ('transfer (pot, from=storage, to=cooking_station)',
@@ -1132,7 +1068,4 @@ RECIPES = {'tomato_onion_soup': ('transfer (pot, from=storage, to=cooking_statio
 
 def recipe_builders():
     """Return ordered builders that create fresh action lists."""
-    return {
-        name: (lambda actions=actions: list(actions))
-        for name, actions in RECIPES.items()
-    }
+    return {name: (lambda actions=actions: list(actions)) for name, actions in RECIPES.items()}

@@ -1,7 +1,15 @@
-# Qualified RTX 50-series inference stack for the frozen Qwen baseline.
-# PyTorch 2.13 ships the stable CUDA 13 wheel on PyPI. bitsandbytes 0.50.x's
-# fused nested-NF4 path is intentionally excluded: it is not viable for this
-# Qwen checkpoint on the RTX 5070. Runtime preflight enforces these exact pins.
+# INSTALL WITH: ./hrc setup-llm
+# DESTINATION:  ./.venv-llm (Python 3.12)
+# USED BY:      only the optional frozen Qwen LLM baseline.
+#
+# Do not install requirements.txt here. HRC.ipynb, normal experiments,
+# ablations, and tests all use ./venv instead. There is no LLM smoke venv.
+#
+# This is the qualified RTX 5070/SM120 inference stack. bitsandbytes 0.50.x is
+# intentionally excluded because its fused nested-NF4 path is not viable for
+# this checkpoint on this GPU. Runtime preflight enforces the four core package
+# versions below; inference then uses the stable PyTorch NF4 decoder described
+# in README.md.
 torch==2.13.0
 transformers==5.16.1
 accelerate==1.14.0

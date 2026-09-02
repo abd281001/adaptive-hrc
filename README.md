@@ -12,21 +12,41 @@ implementation and is committed without execution outputs.
 
 ## Setup
 
-The normal workflow uses one Python 3.13 environment, `venv`, for
-`HRC.ipynb`, the standard experiments, ablations, and tests. From a fresh
-clone:
+The core project has exactly two environments. There is no separate smoke or
+test environment.
+
+| Workflow | Environment | Python | Dependency file |
+| --- | --- | --- | --- |
+| `HRC.ipynb`, normal evaluation, ablations, and tests | `venv` | 3.13 | `requirements.txt` |
+| Optional frozen Qwen LLM baseline only | `.venv-llm` | 3.12 | `requirements-llm.txt` |
+
+The `./hrc` launcher always selects the correct interpreter, so activation is
+not required. Do not install both requirement files into one environment.
+
+### Normal notebook, evaluation, ablations, and tests
+
+From a fresh clone:
 
 ```bash
 git clone https://github.com/abd281001/adaptive-hrc.git
 cd adaptive-hrc
 ./hrc setup
 ./hrc kernel
+./hrc test
 ```
 
 Open `HRC.ipynb` in a Jupyter-compatible frontend, select the
 `Python (adaptive-hrc)` kernel, and run the cells from the repository root.
-Running all cells launches the normal evaluation and the notebook ablations;
-no separate command or environment is involved.
+Running all cells performs these two stages in order, both through `venv`:
+
+1. the standard evaluation: three scenarios times five paired seeds, written
+   as one new directory under `eval_results/runs/`; and
+2. the matcher, routing, and latent-strategy ablations, written as one new
+   directory under `eval_results/ablation_runs/`.
+
+The three scenarios are stored inside one standard run directory; they are not
+three separate top-level runs. Every notebook execution creates new immutable
+run directories rather than overwriting an earlier execution.
 
 Generated artifacts are written beneath `eval_results/`. Full evaluation is
 computationally expensive. The notebook defaults to one seed worker for
@@ -34,7 +54,7 @@ portability. Set `HRC_WORKERS` to at most 5 and `HRC_ABLATION_WORKERS` to at
 most 3 before starting Jupyter only when sufficient CPU and memory are
 available.
 
-The same `venv` is used for the command-line normal workflows:
+The same `venv` is used for every command-line normal workflow:
 
 ```bash
 ./hrc test
@@ -42,7 +62,20 @@ The same `venv` is used for the command-line normal workflows:
 ./hrc ablation --suite matcher
 ```
 
-Additional evaluator arguments can be appended to any command.
+`./hrc run` runs only the standard three-scenario, five-seed evaluation.
+Running all notebook cells additionally launches all three ablation suites.
+`./hrc ablation` runs only the explicitly selected suite. Additional evaluator
+arguments can be appended to the command-line runners.
+
+The optional Overcooked/Burrito replication uses a separate pinned Python 3.10
+environment under `burrito/.venv` because it is an external replication with
+incompatible dependencies. It is not created or used by any core `./hrc`
+command and cannot perturb either core environment. See
+[`burrito/README.md`](burrito/README.md) for its isolated setup. It includes a
+physical task-option adapter and the same one-observation-then-assist correction
+protocol used by the symbolic evaluation. Its authoritative experiments are
+versioned CLI configs; `HRC.ipynb` remains a thin symbolic launcher/analysis
+notebook and contains no Burrito integration logic.
 
 ## Experiment design
 
@@ -92,13 +125,24 @@ intentionally excluded from `HRC.ipynb`. It uses one separate GPU environment,
 
 ```bash
 ./hrc setup-llm
-./hrc llm
+./hrc doctor
 ```
 
-The launcher configures the GPU and thread defaults and automatically resolves
-the cached Qwen snapshot. The baseline remains separate from the normal
-notebook experiment and uses the same deterministic evaluator protocol. The
-default command runs Full and the LLM together on the shared realized schedule.
+Run `./hrc doctor` after both core environments have been installed. It checks
+the normal environment and the pinned LLM runtime without starting an
+experiment. The launcher configures the GPU and thread defaults and
+automatically resolves the cached Qwen snapshot. The baseline remains separate
+from the normal notebook experiment and uses the same deterministic evaluator
+protocol. The default LLM runner pairs Full and the LLM on the shared realized
+schedule.
+
+On the RTX 5070/SM120 host, the checkpoint's original NF4 codes and scales are
+decoded with PyTorch tensor operations. The unstable bitsandbytes native 4-bit
+inference entrypoints are disabled after model loading and fail closed if they
+are reached. This changes the inference implementation, not the checkpoint,
+prompts, candidate scores, plans, seeds, routing, or information available to
+the baseline.
+
 Each scenario can also be run independently without changing its plan, seeds,
 metrics, or paired schedule:
 
@@ -109,11 +153,14 @@ metrics, or paired schedule:
 ```
 
 Aliases `homo`, `hetero`, and `axis` are accepted. Add `--seeds 1337` (or any
-comma-separated subset of the paper seeds) to make each invocation shorter.
+comma-separated subset) for a shorter diagnostic invocation; retain all five
+default seeds for reported paper results. LLM artifacts are written separately
+under `eval_results/llm_runs/`.
 
 ## Code map
 
 - `src/environment.py`: symbolic states, actions, and reference recipes.
+- `src/domain.py`: injectable state, feature, legality, and workflow-role boundary.
 - `src/preferences.py`: goal-preserving workflow transformations.
 - `src/memory.py`: replay variants, recurrence horizons, decay, and pruning.
 - `src/models.py`: MaxEnt inverse reinforcement learning and semantic fallback.
@@ -125,6 +172,8 @@ comma-separated subset of the paper seeds) to make each invocation shorter.
 - `src/plotting.py`: figures and paired holdout inference.
 - `src/hrc_simulation.py`: alternating human–robot interaction simulator.
 - `src/llm_baseline.py`: optional frozen in-context action predictor.
+- `burrito/wrapper/adaptive_hrc_burrito/`: physical-domain adapter,
+  completion-checked task options, and the two-player HRC protocol.
 
 ## Result artifacts
 

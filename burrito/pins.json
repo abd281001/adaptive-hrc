@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "talents_zsc": {
+    "path": "third_party/talents-zsc",
+    "url": "https://github.com/benji-li/talents-zsc.git",
+    "commit": "b8317bbd8e3207d4b8808ee9bbf7d8419cc64f06"
+  },
+  "overcooked_ai": {
+    "path": "third_party/talents-zsc/overcooked/overcooked_ai",
+    "url": "https://github.com/HumanCompatibleAI/overcooked_ai.git",
+    "commit": "cff884ccf5709658ee4cd489e63367200b4c86d6"
+  }
+}

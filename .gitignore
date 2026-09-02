@@ -1,16 +1,19 @@
 # Local tools and data
 .codex/
 prompts/
-talents-zsc/
+/talents-zsc/
 eval_results/
 
 # Python environments and caches
 .venv-llm/
 .venv-*/
+/burrito/.venv/
+/burrito/results/
 .llm-*/
 venv/
 env/
 __pycache__/
+*.egg-info/
 *.py[cod]
 *$py.class
 
