@@ -52,6 +52,7 @@ GENERIC_INDEX = {name: index for index, name in enumerate(GENERIC_ITEM_GROUPS)}
 
 REWARD_FEATURE_VERSION = "burrito_relational_reward_v1"
 SEMANTIC_FEATURE_VERSION = "burrito_functional_semantic_v1"
+STRATEGY_ROLE_VERSION = "burrito_workflow_roles_v2"
 # Frozen from identity-matched steak/mushroom workflow states. Equivalent
 # pairs have RMS 0.0; the closest distinct workflow states have RMS 0.1961.
 SEMANTIC_FALLBACK_MAX_RMS_DISTANCE = 0.10
@@ -153,7 +154,7 @@ class BurritoDomainAdapter:
     semantic_feature_version = SEMANTIC_FEATURE_VERSION
     strategy_roles = (
         "retrieve", "prepare", "start_cook", "stage", "collect",
-        "assemble", "serve", "clean",
+        "assemble", "serve",
     )
 
     def __init__(
@@ -800,4 +801,5 @@ __all__ = [
     "SCHEMA",
     "SEMANTIC_FALLBACK_MAX_RMS_DISTANCE",
     "SEMANTIC_FEATURE_VERSION",
+    "STRATEGY_ROLE_VERSION",
 ]

@@ -22,6 +22,7 @@ from .domain import (
     REWARD_FEATURE_VERSION,
     SEMANTIC_FALLBACK_MAX_RMS_DISTANCE,
     SEMANTIC_FEATURE_VERSION,
+    STRATEGY_ROLE_VERSION,
 )
 from .macros import macro_actions
 from .options import (
@@ -34,8 +35,9 @@ from .runtime import BurritoRuntime, UpstreamPaths, verify_pins
 
 
 CONFIG_SCHEMA_VERSION = 1
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 FULL_ARM = "latent_timing_lightweight"
+STORAGE_METRIC_VERSION = "adaptive_hrc_retained_payload_v1"
 
 
 def _utc_now() -> str:
@@ -117,28 +119,138 @@ def _expanded_tasks(condition: Mapping[str, Any]) -> Tuple[BurritoTask, ...]:
     return tuple(tasks)
 
 
-def _model_storage_values(agent: Any) -> int:
+def _model_storage_metrics(agent: Any) -> Dict[str, int]:
+    """Return a deterministic lower bound on retained learner-state bytes.
+
+    This is an absolute post-episode footprint, not a recipe-length-normalized
+    proxy and not process RSS. It counts dense NumPy payloads exactly, then a
+    canonical int64/float64 representation of indexed states, actions, Q
+    entries, latent role sequences, and active/pruned replay records. Python
+    container overhead and simulator state are deliberately excluded.
+    """
     model = agent.maxent
+    latent = model.latent_strategy
     arrays = (
         model.reward_weights,
         model.features,
+        model.feature_mean,
+        model.feature_scale,
         model.semantic_features,
         model.values,
-        model.latent_strategy.components,
-        model.latent_strategy.codes,
-        model.latent_strategy.fingerprints,
-        model.latent_strategy.role_counts,
-        model.latent_strategy.weights,
+        latent.mean,
+        latent.scale,
+        latent.components,
+        latent.codes,
+        latent.code_scale,
+        latent.fingerprints,
+        latent.role_counts,
+        latent.weights,
     )
-    dense = sum(
+    dense_values = sum(
         int(value.size) for value in arrays
         if isinstance(value, np.ndarray)
     )
-    replay = sum(
-        len(item.ordering) + 2 * len(item.transitions)
-        for item in agent.replay.active.values()
+    dense_bytes = sum(
+        int(value.nbytes) for value in arrays
+        if isinstance(value, np.ndarray)
     )
-    return dense + len(model.q_values) + replay
+    replay_items = (
+        tuple(agent.replay.active.values())
+        + tuple(agent.replay.pruned.values())
+    )
+    states = {
+        tuple(state) for state in model.state_vectors.values()
+    }
+    actions = {str(action) for action in model.action_ids}
+    for item in replay_items:
+        actions.update(map(str, item.ordering))
+        for state, action, next_state in item.transitions:
+            states.add(tuple(state))
+            states.add(tuple(next_state))
+            actions.add(str(action))
+
+    index_bytes = np.dtype(np.int64).itemsize
+    value_bytes = np.dtype(np.float64).itemsize
+    state_coordinate_count = sum(len(state) for state in states)
+    state_table_bytes = state_coordinate_count * index_bytes
+    action_label_bytes = sum(len(action.encode("utf-8")) for action in actions)
+    q_value_count = len(model.q_values)
+    q_table_bytes = q_value_count * (2 * index_bytes + value_bytes)
+    latent_sequence_index_count = sum(
+        len(sequence) for sequence in latent.role_sequences
+    )
+    latent_sequence_bytes = latent_sequence_index_count * index_bytes
+
+    replay_ordering_index_count = sum(
+        len(item.ordering) for item in replay_items
+    )
+    replay_transition_count = sum(
+        len(item.transitions) for item in replay_items
+    )
+    replay_index_bytes = (
+        replay_ordering_index_count * index_bytes
+        + replay_transition_count * 3 * index_bytes
+    )
+    replay_identifier_bytes = sum(
+        len(item.recipe_id.encode("utf-8"))
+        + len(item.variant_id.encode("utf-8"))
+        + len(str(getattr(item, "source_mode", "")).encode("utf-8"))
+        for item in replay_items
+    )
+    # Active records retain one float and three integer fields; pruned records
+    # retain five integer fields. Keys and variable-length data are counted
+    # separately above.
+    replay_metadata_bytes = (
+        len(agent.replay.active) * (value_bytes + 3 * index_bytes)
+        + len(agent.replay.pruned) * (5 * index_bytes)
+    )
+    replay = agent.replay
+    adaptive_history_index_count = (
+        len(replay._reuse_gap_window)
+        + sum(
+            2 + len(gaps) for gaps in replay._pair_gap_window.values()
+        )
+        + 3 * len(replay._pair_last_seen_step)
+        + sum(
+            1 + 3 * len(events)
+            for events in replay._recipe_gap_events.values()
+        )
+        + 3 * len(replay._global_gap_events)
+        + 4 * len(replay.reuse_gap_events)
+        + 4 * len(replay.reentry_events)
+        + 2 * len(replay.latest_by_recipe)
+        + 2 * len(replay.latest_keys)
+    )
+    adaptive_history_bytes = adaptive_history_index_count * index_bytes
+    retained_payload_bytes = (
+        dense_bytes
+        + state_table_bytes
+        + action_label_bytes
+        + q_table_bytes
+        + latent_sequence_bytes
+        + replay_index_bytes
+        + replay_identifier_bytes
+        + replay_metadata_bytes
+        + adaptive_history_bytes
+    )
+    return {
+        "learner_retained_payload_bytes": int(retained_payload_bytes),
+        "learner_dense_array_bytes": int(dense_bytes),
+        "learner_dense_value_count": int(dense_values),
+        "learner_unique_state_count": int(len(states)),
+        "learner_state_coordinate_count": int(state_coordinate_count),
+        "learner_action_label_count": int(len(actions)),
+        "learner_action_label_bytes": int(action_label_bytes),
+        "learner_q_value_count": int(q_value_count),
+        "learner_replay_variant_count": int(len(replay_items)),
+        "learner_replay_transition_count": int(replay_transition_count),
+        "learner_adaptive_history_index_count": int(
+            adaptive_history_index_count
+        ),
+        "learner_latent_sequence_index_count": int(
+            latent_sequence_index_count
+        ),
+    }
 
 
 def _memory_metrics(agent: Any) -> Dict[str, Any]:
@@ -228,7 +340,7 @@ def _episode_record(
     metadata: Mapping[str, Any],
     wall_s: float,
     train_events: Sequence[Mapping[str, Any]],
-    storage_values: int,
+    storage_metrics: Mapping[str, int],
     memory_metrics: Mapping[str, Any],
 ) -> Dict[str, Any]:
     decisions = [
@@ -280,8 +392,7 @@ def _episode_record(
             if recipe_steps else None
         ),
         "train_flops_per_macro": train_flops / max(1, recipe_steps),
-        "model_storage_values": storage_values,
-        "model_storage_values_per_macro": storage_values / max(1, recipe_steps),
+        **dict(storage_metrics),
         **dict(memory_metrics),
         "semantic_fallback_decisions": sum(
             bool(row.prediction_stats.get("semantic_fallback_used", False))
@@ -388,7 +499,7 @@ def _condition_run(
             metadata=event_metadata,
             wall_s=time.perf_counter() - event_start,
             train_events=agent.retrain_events[train_before:],
-            storage_values=_model_storage_values(agent),
+            storage_metrics=_model_storage_metrics(agent),
             memory_metrics=_memory_metrics(agent),
         ))
         observed_preferences.setdefault(task.recipe_id, set()).add(task.preference)
@@ -405,7 +516,10 @@ def _aggregate(episodes: Sequence[Mapping[str, Any]], failures: Sequence[Mapping
         "human_interventions", "task_wall_s", "task_low_level_ticks",
         "invalid_predictions", "adaptation_latency_robot_turns",
         "recovery_auc", "compute_wall_s_per_macro", "train_flops_per_macro",
-        "model_storage_values_per_macro", "memory_active_variants",
+        "learner_retained_payload_bytes", "learner_dense_array_bytes",
+        "learner_dense_value_count", "learner_unique_state_count",
+        "learner_q_value_count", "learner_replay_variant_count",
+        "learner_replay_transition_count", "memory_active_variants",
         "memory_pruned_variants", "memory_nonunit_weights",
         "memory_pair_gap_sample_count", "memory_horizon_min_demos",
         "memory_horizon_max_demos",
@@ -504,6 +618,26 @@ def _manifest(config: Mapping[str, Any], run_dir: Path) -> Dict[str, Any]:
             "semantic_fallback_max_rms_distance": (
                 SEMANTIC_FALLBACK_MAX_RMS_DISTANCE
             ),
+        },
+        "strategy_roles": {
+            "version": STRATEGY_ROLE_VERSION,
+            "names": list(BurritoDomainAdapter.strategy_roles),
+        },
+        "metric_definitions": {
+            "learner_retained_payload_bytes": {
+                "version": STORAGE_METRIC_VERSION,
+                "unit": "bytes",
+                "normalization": "none",
+                "scope": (
+                    "dense learner arrays plus canonical indexed state, "
+                    "action, Q-value, latent-sequence, active/pruned replay, "
+                    "and adaptive-history payload"
+                ),
+                "excludes": (
+                    "Python container overhead, interpreter/runtime memory, "
+                    "and simulator state"
+                ),
+            },
         },
         "macros": {
             protein: list(macro_actions(protein))

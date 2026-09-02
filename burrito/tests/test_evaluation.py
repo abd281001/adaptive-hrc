@@ -47,6 +47,9 @@ class BurritoEvaluationTests(unittest.TestCase):
             summary = json.loads(
                 (run_dir / "summary.json").read_text(encoding="utf-8")
             )
+            episodes = json.loads(
+                (run_dir / "episodes.json").read_text(encoding="utf-8")
+            )
             self.assertEqual(validation["status"], "passed")
             self.assertEqual(manifest["status"], "completed")
             self.assertEqual(manifest["episode_count"], 2)
@@ -54,10 +57,35 @@ class BurritoEvaluationTests(unittest.TestCase):
             self.assertIn("talents_zsc", manifest["repositories"])
             self.assertIn("overcooked_ai", manifest["repositories"])
             self.assertIn("reward", manifest["features"])
+            self.assertEqual(
+                manifest["strategy_roles"]["names"],
+                [
+                    "retrieve", "prepare", "start_cook", "stage",
+                    "collect", "assemble", "serve",
+                ],
+            )
+            self.assertIn(
+                "learner_retained_payload_bytes",
+                manifest["metric_definitions"],
+            )
             self.assertIn("steak", manifest["macros"])
             self.assertIn("burrito_1-2_2p", manifest["parking_positions"])
             self.assertEqual(summary["delivery_rate"], 1.0)
             self.assertEqual(summary["failure_count"], 0)
+            self.assertTrue(episodes)
+            for episode in episodes:
+                self.assertGreater(
+                    episode["learner_retained_payload_bytes"], 0,
+                )
+                self.assertGreaterEqual(
+                    episode["learner_retained_payload_bytes"],
+                    episode["learner_dense_array_bytes"],
+                )
+                self.assertNotIn("model_storage_values", episode)
+                self.assertNotIn("model_storage_values_per_macro", episode)
+            self.assertIn(
+                "learner_retained_payload_bytes", summary["groups"][0],
+            )
 
 
 if __name__ == "__main__":

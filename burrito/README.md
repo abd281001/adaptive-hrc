@@ -56,6 +56,10 @@ semantic view for steak/mushroom transfer. Unobserved legal options receive a
 deterministic task-progress projection; observed simulator transitions replace
 that projection as soon as evidence exists.
 
+The latent strategy schema declares exactly the seven roles emitted by the
+eight macros: retrieve, prepare, start-cook, stage, collect, assemble, and
+serve. No unreachable all-zero role is included in the latent fingerprint.
+
 ## HRC protocol
 
 `BurritoHrcRunner` enforces the normal evaluation contract:
@@ -132,8 +136,11 @@ Reported measures include reference and acceptable-set top-1/NLL, robot and
 human-shadow accuracy, interventions, human action load, adaptation latency,
 recovery AUC, recurrence retention, delivery/time, invalid predictions,
 planner failures, estimated training FLOPs, compute time, model storage, and
-adaptive-memory evidence per macro decision. Per-decision logs deliberately
-omit full probability vectors to keep artifacts compact.
+adaptive-memory evidence. Model storage is the absolute, versioned retained
+learner payload in bytes; it is not divided by the fixed recipe length and is
+not presented as process RSS. Its component counts and exclusions are recorded
+in the manifest. Per-decision logs deliberately omit full probability vectors
+to keep artifacts compact.
 
 ## Current controlled scope
 

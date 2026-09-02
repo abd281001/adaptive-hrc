@@ -22,6 +22,7 @@ from adaptive_hrc_burrito import (
     START_BOILING_RICE,
     assemble_action,
     fetch_and_stage_action,
+    macro_actions,
     prepare_and_stage_action,
     serve_action,
     start_cooking_action,
@@ -80,9 +81,23 @@ class BurritoDomainTests(unittest.TestCase):
             tuple(domain.strategy_roles),
             (
                 "retrieve", "prepare", "start_cook", "stage",
-                "collect", "assemble", "serve", "clean",
+                "collect", "assemble", "serve",
             ),
         )
+
+    def test_declared_strategy_roles_exactly_cover_recipe_actions(self):
+        executor = BurritoOptionExecutor(self.runtime, seed=2)
+        domain = BurritoDomainAdapter(
+            executor.state,
+            terrain_positions=executor.env.mdp.terrain_pos_dict,
+        )
+        emitted_roles = {
+            domain.action_role(action)
+            for protein in ("steak", "mushroom")
+            for action in macro_actions(protein)
+        }
+        self.assertNotIn("other", emitted_roles)
+        self.assertEqual(emitted_roles, set(domain.strategy_roles))
 
     def test_all_four_policies_are_state_conditioned_partial_orders(self):
         executor = BurritoOptionExecutor(self.runtime, seed=3)

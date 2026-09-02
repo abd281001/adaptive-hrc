@@ -12,6 +12,7 @@ from .domain import (
     REWARD_FEATURE_VERSION,
     SEMANTIC_FALLBACK_MAX_RMS_DISTANCE,
     SEMANTIC_FEATURE_VERSION,
+    STRATEGY_ROLE_VERSION,
 )
 from .macros import (
     COLLECT_AND_STAGE_COOKED_RICE,
@@ -73,6 +74,7 @@ __all__ = [
     "START_BOILING_RICE",
     "SEMANTIC_FALLBACK_MAX_RMS_DISTANCE",
     "SEMANTIC_FEATURE_VERSION",
+    "STRATEGY_ROLE_VERSION",
     "assemble_action",
     "choose_acceptable_action",
     "fetch_and_stage_action",
