@@ -17,14 +17,19 @@ Standalone runners construct isolated agents and never mutate a caller's agent.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import itertools
 import json
 import math
 import multiprocessing as mp
+import os
 import random
+import subprocess
+import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
@@ -78,6 +83,7 @@ ROUTING_BASELINES: Tuple[str, ...] = (
     "ewc",
     "replay_bc",
 )
+DEFAULT_ABLATION_RESULTS_ROOT = "eval_results/ablation_runs"
 
 
 @dataclass(frozen=True)
@@ -3074,8 +3080,8 @@ def run_routing_ablation(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--suite", choices=("matcher", "routing", "latent"),
-        default="matcher",
+        "--suite", choices=("all", "matcher", "routing", "latent"),
+        default="all",
     )
     parser.add_argument("--seed", type=int, default=MatcherSettings.seed)
     parser.add_argument("--recipe-count", type=int, default=MatcherSettings.recipe_count)
@@ -3098,7 +3104,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--latent-recipes", type=int, default=20)
     parser.add_argument("--workers", type=int, default=3)
-    parser.add_argument("--output")
+    parser.add_argument(
+        "--output",
+        help=(
+            "JSON file for one suite, or the immutable run-directory root "
+            "for --suite all"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--indent", type=int, default=2)
     return parser.parse_args()
@@ -3114,8 +3126,230 @@ def _emit(result: Mapping[str, Any], args: argparse.Namespace) -> None:
         print(encoded, end="")
 
 
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _run_ablation_process(
+    name: str,
+    command: Sequence[str],
+    run_dir: Path,
+    environment: Mapping[str, str],
+) -> Dict[str, Any]:
+    started_at = datetime.now(timezone.utc)
+    started = time.perf_counter()
+    stdout_path = run_dir / f"{name}.stdout.log"
+    stderr_path = run_dir / f"{name}.stderr.log"
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout_stream,
+        stderr_path.open("w", encoding="utf-8") as stderr_stream,
+    ):
+        process = subprocess.run(
+            command,
+            cwd=Path(__file__).resolve().parents[1],
+            env=dict(environment),
+            stdout=stdout_stream,
+            stderr=stderr_stream,
+            check=False,
+            text=True,
+        )
+    return {
+        "name": name,
+        "command": list(command),
+        "started_at_utc": started_at.isoformat().replace("+00:00", "Z"),
+        "completed_at_utc": datetime.now(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "return_code": int(process.returncode),
+        "wall_s": float(time.perf_counter() - started),
+        "output": str(run_dir / f"{name}.json"),
+        "stdout": str(stdout_path),
+        "stderr": str(stderr_path),
+    }
+
+
+def _validate_all_ablation_results(
+    results: Mapping[str, Mapping[str, Any]],
+    *,
+    seed: int,
+    scenarios: Sequence[str],
+) -> None:
+    matcher = results.get("matcher", {})
+    if not isinstance(matcher.get("summary_by_matcher"), dict):
+        raise RuntimeError("matcher ablation output is incomplete")
+
+    routing_rows = results.get("routing", {}).get("rows")
+    if not isinstance(routing_rows, list) or not routing_rows:
+        raise RuntimeError("routing ablation has no result rows")
+    if {
+        row.get("scenario") for row in routing_rows
+    } != set(scenarios) or {row.get("seed") for row in routing_rows} != {seed}:
+        raise RuntimeError("routing ablation did not cover its scenario-seed grid")
+    if any(
+        not isinstance(row.get("trend"), list) or not row["trend"]
+        for row in routing_rows
+    ):
+        raise RuntimeError("routing ablation contains a row without phase trends")
+
+    latent_rows = results.get("latent", {}).get("rows")
+    if not isinstance(latent_rows, list) or not latent_rows:
+        raise RuntimeError("latent-strategy ablation has no result rows")
+    expected_arms = {arm.name for arm in LATENT_STRATEGY_ABLATION_ARMS}
+    if {row.get("arm") for row in latent_rows} != expected_arms:
+        raise RuntimeError("latent-strategy ablation did not execute all arms")
+    if {
+        row.get("scenario") for row in latent_rows
+    } != set(scenarios) or {row.get("seed") for row in latent_rows} != {seed}:
+        raise RuntimeError(
+            "latent-strategy ablation did not cover its scenario-seed grid"
+        )
+
+
+def run_all_ablations(
+    output_root: str | Path = DEFAULT_ABLATION_RESULTS_ROOT,
+    *,
+    workers: int = 1,
+) -> Dict[str, Any]:
+    """Run and validate the fixed reviewer-facing ablation collection."""
+    from .evaluation import NATIVE_THREAD_ENV_VARS, SCENARIOS
+
+    longitudinal_workers = int(workers)
+    if not 1 <= longitudinal_workers <= len(SCENARIOS):
+        raise ValueError(
+            f"workers must be between 1 and {len(SCENARIOS)}"
+        )
+    seed = int(MatcherSettings.seed)
+    scenario_csv = ",".join(SCENARIOS)
+    root = Path(output_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    run_name = datetime.now(timezone.utc).strftime(
+        "ablations__%Y%m%dT%H%M%S%fZ"
+    )
+    run_dir = root / run_name
+    run_dir.mkdir(parents=False, exist_ok=False)
+
+    commands = {
+        "matcher": [
+            sys.executable, "-X", "faulthandler", "-m", "src.ablations",
+            "--suite", "matcher", "--seed", str(seed),
+            "--output", str(run_dir / "matcher.json"), "--quiet",
+        ],
+        "routing": [
+            sys.executable, "-X", "faulthandler", "-m", "src.ablations",
+            "--suite", "routing", "--routing-seeds", str(seed),
+            "--routing-scenarios", scenario_csv,
+            "--workers", str(longitudinal_workers),
+            "--output", str(run_dir / "routing.json"), "--quiet",
+        ],
+        "latent": [
+            sys.executable, "-X", "faulthandler", "-m", "src.ablations",
+            "--suite", "latent", "--latent-seeds", str(seed),
+            "--latent-scenarios", scenario_csv,
+            "--workers", str(longitudinal_workers),
+            "--output", str(run_dir / "latent.json"), "--quiet",
+        ],
+    }
+    environment = os.environ.copy()
+    environment.update({name: "1" for name in NATIVE_THREAD_ENV_VARS})
+    environment["PYTHONFAULTHANDLER"] = "1"
+    environment["PYTHONUNBUFFERED"] = "1"
+    manifest_path = run_dir / "manifest.json"
+    manifest: Dict[str, Any] = {
+        "run": run_name,
+        "state": "running",
+        "started_at_utc": datetime.now(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "seed": seed,
+        "longitudinal_scenarios": list(SCENARIOS),
+        "suite_parallelism": len(commands),
+        "longitudinal_workers_per_suite": longitudinal_workers,
+        "commands": commands,
+        "jobs": {},
+    }
+    _atomic_json(manifest_path, manifest)
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+            futures = {
+                executor.submit(
+                    _run_ablation_process,
+                    name,
+                    command,
+                    run_dir,
+                    environment,
+                ): name
+                for name, command in commands.items()
+            }
+            for future in as_completed(futures):
+                record = future.result()
+                manifest["jobs"][record["name"]] = record
+                _atomic_json(manifest_path, manifest)
+                print(
+                    f"[ablation] {record['name']} "
+                    f"return_code={record['return_code']} "
+                    f"wall_s={record['wall_s']:.1f}",
+                    flush=True,
+                )
+
+        failed = sorted(
+            name for name, record in manifest["jobs"].items()
+            if record["return_code"] != 0
+        )
+        if failed:
+            raise RuntimeError(
+                "ablation suites failed; inspect stderr logs for "
+                + ", ".join(failed)
+            )
+        results = {
+            name: json.loads(Path(record["output"]).read_text(encoding="utf-8"))
+            for name, record in manifest["jobs"].items()
+        }
+        _validate_all_ablation_results(
+            results, seed=seed, scenarios=SCENARIOS,
+        )
+    except BaseException as error:
+        manifest["state"] = "failed"
+        manifest["error"] = f"{type(error).__name__}: {error}"
+        manifest["completed_at_utc"] = datetime.now(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+        _atomic_json(manifest_path, manifest)
+        raise
+
+    manifest["state"] = "complete"
+    manifest["completed_at_utc"] = datetime.now(timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+    manifest["jobs"] = {
+        name: manifest["jobs"][name] for name in sorted(manifest["jobs"])
+    }
+    _atomic_json(manifest_path, manifest)
+    return {
+        "run_dir": str(run_dir),
+        "manifest": str(manifest_path),
+        "state": manifest["state"],
+        "outputs": {
+            name: record["output"] for name, record in manifest["jobs"].items()
+        },
+    }
+
+
 def main() -> None:
     args = _parse_args()
+    if args.suite == "all":
+        result = run_all_ablations(
+            args.output or DEFAULT_ABLATION_RESULTS_ROOT,
+            workers=int(args.workers),
+        )
+        if not args.quiet:
+            print(json.dumps(result, indent=args.indent, sort_keys=True))
+        return
     if args.suite == "latent":
         from .evaluation import EvalSettings, ScheduleSettings
 

@@ -144,7 +144,22 @@ class AdaptiveInvariantTests(unittest.TestCase):
         # Membership removal rebuilds predictors; the registry only supports reentry.
         agent.refresh()
         audit = agent.audit_pruning(max_prefixes=8)
+        # The deployed model must reflect active memory only, which is the
+        # path-dependence term: after a refresh it has no history to carry.
+        self.assertLessEqual(
+            audit["deployed_path_dependence_max_l1"], audit["tolerance"],
+        )
+        # The pruned variant is visible to the audit as a counterfactual.
+        self.assertTrue(audit["pruned_available"])
+        self.assertGreaterEqual(audit["n_pruned_variants"], 1)
+        # The membership contract is the only pass/fail term, and it holds:
+        # the fit received no pruned record.
         self.assertTrue(audit["passed"])
+        self.assertTrue(audit["active_only_training_inputs_verified"])
+        # Redundancy is reported as a magnitude, not a verdict. These two
+        # variants are deliberately materially different, so restoring the
+        # pruned one moves the policy: the retention decision was not free.
+        self.assertGreater(audit["redundancy_max_l1"], audit["tolerance"])
 
         cls = run_online_episode(agent, first_actions, BASE_RECIPE_NAME)
         self.assertEqual(cls.kind, "reentry_from_pruned")

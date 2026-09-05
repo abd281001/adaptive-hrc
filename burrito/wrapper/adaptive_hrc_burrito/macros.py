@@ -6,7 +6,13 @@ from typing import Tuple
 
 START_BOILING_RICE = "START_BOILING_RICE"
 STAGE_CLEAN_PLATE = "STAGE_CLEAN_PLATE"
-COLLECT_AND_STAGE_COOKED_RICE = "COLLECT_AND_STAGE_COOKED_RICE"
+PLATE_RICE = "PLATE_RICE"
+PLATE_TORTILLA = "PLATE_TORTILLA"
+
+# Every component a burrito plate can carry, and the option that adds it.  The
+# pinned environment accepts these in any order, so they are separate options
+# rather than one bundled assembly macro.
+PLATE_COMPONENTS: Tuple[str, ...] = ("rice", "tortilla", "protein")
 
 
 def protein_name(value: str) -> str:
@@ -28,8 +34,8 @@ def start_cooking_action(protein: str) -> str:
     return f"START_COOKING_{protein_name(protein).upper()}"
 
 
-def assemble_action(protein: str) -> str:
-    return f"ASSEMBLE_{protein_name(protein).upper()}_BURRITO"
+def plate_protein_action(protein: str) -> str:
+    return f"PLATE_{protein_name(protein).upper()}"
 
 
 def serve_action(protein: str) -> str:
@@ -54,20 +60,23 @@ def macro_actions(protein: str) -> Tuple[str, ...]:
         start_cooking_action(normalized),
         START_BOILING_RICE,
         STAGE_CLEAN_PLATE,
-        COLLECT_AND_STAGE_COOKED_RICE,
-        assemble_action(normalized),
+        PLATE_RICE,
+        PLATE_TORTILLA,
+        plate_protein_action(normalized),
         serve_action(normalized),
     )
 
 
 __all__ = [
-    "COLLECT_AND_STAGE_COOKED_RICE",
+    "PLATE_COMPONENTS",
+    "PLATE_RICE",
+    "PLATE_TORTILLA",
     "STAGE_CLEAN_PLATE",
     "START_BOILING_RICE",
     "action_protein",
-    "assemble_action",
     "fetch_and_stage_action",
     "macro_actions",
+    "plate_protein_action",
     "prepare_and_stage_action",
     "protein_name",
     "serve_action",

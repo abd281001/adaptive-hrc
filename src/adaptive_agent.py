@@ -5,7 +5,7 @@ import contextlib
 import copy
 import math
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import numpy as np
 
@@ -13,6 +13,17 @@ from .domain import DomainAdapter, default_domain
 from .memory import (MatchResult, ReplayMemory, StateTransition, RecipeMatcher, MemoryItem, Variant, VariantKey, VariantLibrary, make_variant_id)
 from .models import (Settings, DEFAULT_SETTINGS, MaxEntIrl, top_actions)
 from .representations import (Observation)
+
+# Design invariants of the shared action mask. These are properties of the
+# implementation, not per-decision observations, so they are asserted in the
+# test suite and recorded once in a run manifest rather than written onto every
+# turn row -- a value that cannot come out False is not evidence for itself.
+ACTION_MASK_CONTRACT: Dict[str, Any] = {
+    "action_mask": "shared_state_preconditions_only",
+    "action_mask_shared_across_predictors": True,
+    "action_mask_preference_neutral": True,
+    "action_mask_uses_recipe_hypothesis": False,
+}
 
 MODE_OBSERVE = "observe"
 MODE_ONLINE = "online"
@@ -35,16 +46,29 @@ class StepResult:
 
 @dataclass(frozen=True)
 class TrainPolicy:
-    """Select cold starts from cumulative replay-membership alterations."""
+    """Select cold starts from cumulative replay *additions*.
+
+    Only an addition introduces demonstrations the current reward weights have
+    never been fit against, so only an addition can justify paying for a fresh
+    optimum.  A removal strictly shrinks the training set: the incumbent
+    weights remain a valid starting point for the surviving subset, and forcing
+    a cold restart there is what made decay-driven churn cost more compute than
+    retaining everything.  Removals therefore warm-start and do not advance the
+    cold-start counter.
+    """
     cold_after: int = 3
     warm_on_weight_change: bool = False
+    cold_threshold_basis: str = "additions_only"
 
-    def decide(self, membership_changes: int, weight_changed: bool, since_cold: int) -> Tuple[str, str, int]:
-        projected = int(since_cold) + int(membership_changes)
-        if membership_changes > 0:
+    def decide(self, additions: int, removals: int, weight_changed: bool, since_cold: int) -> Tuple[str, str, int]:
+        additions = int(additions)
+        removals = int(removals)
+        projected = int(since_cold) + additions
+        if additions > 0:
             if projected >= max(1, int(self.cold_after)):
-                return "cold", "cumulative_membership_threshold_reached", projected
-            return "warm", "cumulative_membership_below_threshold", projected
+                return "cold", "cumulative_addition_threshold_reached", projected
+            return "warm", "cumulative_additions_below_threshold", projected
+        if removals > 0: return "warm", "removal_only_membership_change", projected
         if weight_changed: return (("warm", "weight_only_change", projected) if self.warm_on_weight_change else ("skip", "weight_only_change_skipped", projected))
         return "skip", "replay_unchanged", projected
 
@@ -69,7 +93,11 @@ class AdaptiveAgent:
         self.commit_events: List[Dict[str, Any]] = []
         self.last_commit_stats: Dict[str, Any] = {}
 
-        self.maxent = MaxEntIrl(settings=settings, domain=self.domain)
+        # This agent owns its cold-start initialization stream. Two agents built
+        # from the same Settings instance therefore stay independent, so one arm
+        # can never perturb another's model initialization.
+        self._init_rng = np.random.default_rng(int(settings.seed))
+        self.maxent = MaxEntIrl(settings=settings, domain=self.domain, rng=self._init_rng)
         # Keep action-selection randomness separate from MaxEnt optimization so a prediction tie cannot alter future model initialization or fitting.
         tie_seed = np.random.SeedSequence([int(settings.seed) & 0xFFFFFFFF, 0x544945])
         self._tie_break_rng = np.random.default_rng(tie_seed)
@@ -98,8 +126,6 @@ class AdaptiveAgent:
             "final_entropy": None,
             "reason": "cold_start",
         }
-        # Semantic action sequence -> exact observed state-transition trace.
-        self.demo_traces: Dict[Tuple[str, ...], Tuple[StateTransition, ...]] = {}
         self._next_recipe_index = 1
         self.step_counter = 0       # actions observed
         self.demo_counter = 0       # completed non-empty demonstrations
@@ -121,6 +147,9 @@ class AdaptiveAgent:
         # Optional event -> (calls, wall seconds) profile.
         self.profile: Dict[str, Tuple[int, float]] = {}
 
+        # Encoded state -> distinct actions demonstrated there in active replay.
+        # Rebuilt whenever replay is refitted; the basis of the decision-regime split.
+        self._observed_actions: Dict[Tuple[int, ...], Set[str]] = {}
         self._last_observed_replay_weights: Dict[Tuple[str, str], float] = {}
         self.cold_change_count = 0
         # Public so reports distinguish retrain requests from executed fits.
@@ -139,6 +168,42 @@ class AdaptiveAgent:
             calls, wall_seconds = self.profile.get(event, (0, 0.0))
             self.profile[event] = (calls + 1, wall_seconds + (time.perf_counter() - start_time))
 
+    # Fields that carry the freeze bookkeeping itself and must never be part of
+    # a captured state.
+    _CAPTURE_EXCLUDED = ("_freeze_snapshot", "_frozen")
+
+    def _capture_state(self) -> Dict[str, Any]:
+        """Capture everything a probe could mutate, as one independent copy.
+
+        This is the single definition of "restorable agent state", used by both
+        the freeze context and snapshot/restore.  It deliberately captures the
+        whole instance dictionary rather than an enumerated subset: the field
+        that is easiest to forget is `_tie_break_rng`, whose stream position
+        decides every prediction tie, and a probe that leaves it advanced
+        silently changes later predictions without failing anything.
+        """
+        captured = copy.deepcopy({key: item for key, item in self.__dict__.items() if key not in self._CAPTURE_EXCLUDED})
+        # Capture must be independent, not aliased: a captured generator that is
+        # the live object would make the restore check below vacuously pass.
+        for key, item in captured.items():
+            if isinstance(item, np.random.Generator) and item is self.__dict__.get(key): raise RuntimeError(f"captured state aliases the live generator {key!r}; a restore from it could not undo a probe")
+        return captured
+
+    def _apply_state(self, state: Mapping[str, Any]) -> None:
+        """Restore a captured state in place, then verify the RNG came back."""
+        expected = self._rng_positions(state)
+        for key, item in state.items(): self.__dict__[key] = item
+        restored = self._rng_positions(self.__dict__)
+        if restored != expected: raise RuntimeError(f"state restore left a random stream advanced: {sorted(set(expected) ^ set(restored)) or 'position mismatch'}; predictions after a probe would diverge")
+
+    @staticmethod
+    def _rng_positions(state: Mapping[str, Any]) -> Dict[str, Any]:
+        """Bit-generator positions of every Generator in a captured state."""
+        positions: Dict[str, Any] = {}
+        for key, item in state.items():
+            if isinstance(item, np.random.Generator): positions[key] = repr(item.bit_generator.state)
+        return positions
+
     def snapshot(self) -> "AdaptiveAgent":
         """Deep-copy the agent for phase-A sweep reuse. Lossless and pure (no leakage between branches)."""
         if self._frozen: raise RuntimeError("snapshot called while frozen; release frozen first")
@@ -147,20 +212,21 @@ class AdaptiveAgent:
     def restore_from(self, snapshot: "AdaptiveAgent") -> None:
         """Overwrite this agent's state from a previously-taken snapshot, in place."""
         if type(self) is not type(snapshot): raise TypeError(f"restore_from type mismatch: {type(self).__name__} vs {type(snapshot).__name__}")
-        fresh = copy.deepcopy(snapshot)
+        state = copy.deepcopy({key: item for key, item in snapshot.__dict__.items() if key not in self._CAPTURE_EXCLUDED})
+        frozen_bookkeeping = {key: snapshot.__dict__[key] for key in self._CAPTURE_EXCLUDED if key in snapshot.__dict__}
         self.__dict__.clear()
-        self.__dict__.update(fresh.__dict__)
+        self.__dict__.update(frozen_bookkeeping)
+        self._apply_state(state)
 
     def set_frozen(self, value: bool) -> None:
         """Freeze or restore all mutable state so evaluation cannot leak."""
         if value and not self._frozen:
-            with self._profile("freeze_snapshot_enter"): self._freeze_snapshot = copy.deepcopy({key: item for key, item in self.__dict__.items() if key not in ("_freeze_snapshot", "_frozen")})
+            with self._profile("freeze_snapshot_enter"): self._freeze_snapshot = self._capture_state()
             self._frozen = True
         elif not value and self._frozen:
             frozen_state = self._freeze_snapshot
             if frozen_state is not None:
-                with self._profile("freeze_snapshot_exit"):
-                    for key, item in frozen_state.items(): self.__dict__[key] = item
+                with self._profile("freeze_snapshot_exit"): self._apply_state(frozen_state)
             self._freeze_snapshot = None
             self._frozen = False
 
@@ -172,13 +238,13 @@ class AdaptiveAgent:
             for (recipe_id, variant_id), entry in self.replay.pruned.items()))
         variant_keys = tuple(sorted((recipe_id, variant_id) for recipe_id, slot in self.library.variants.items() for variant_id in slot))
         return {"mode": self.mode, "step_counter": int(self.step_counter), "demo_counter": int(self.demo_counter), "retrain_cycle": int(self.retrain_cycle), "current_prefix": tuple(self.current_prefix),
-            "current_trace": tuple(self.current_trace), "pending_demo": tuple(self.pending_demo), "pending_trace": tuple(self.pending_trace), "demo_traces": tuple(sorted(self.demo_traces.items())),
+            "current_trace": tuple(self.current_trace), "pending_demo": tuple(self.pending_demo), "pending_trace": tuple(self.pending_trace),
             "step_log_len": len(self.step_log), "classification_events_len": len(self.classification_events), "accuracy_events_len": len(self.accuracy_events), "retrain_events_len": len(self.retrain_events),
             "online_commit_events_len": len(self.commit_events), "prediction_mismatch_count": int(self._prediction_mismatch_count), "latent_strategy_confirmed": bool(self._latent_strategy_confirmed),
             "active": active, "pruned": pruned, "variant_keys": variant_keys, "memory_latest": tuple(sorted(self.library.latest.items())), "latest_by_recipe": tuple(sorted(self.replay.latest_by_recipe.items())),
             "latest_keys": tuple(sorted(self.replay.latest_keys)), "pair_gap_windows": tuple(sorted((key, tuple(gaps)) for key, gaps in self.replay._pair_gap_window.items())),
             "pair_last_seen_steps": tuple(sorted(self.replay._pair_last_seen_step.items())), "recipe_gap_events": tuple(sorted((recipe_id, tuple(events)) for recipe_id, events in self.replay._recipe_gap_events.items())),
-            "global_gap_events": tuple(self.replay._global_gap_events), "last_observed_replay_weights": tuple(sorted(self._last_observed_replay_weights.items())), "membership_changes_since_cold": int(self.cold_change_count)}
+            "global_gap_events": tuple(self.replay._global_gap_events), "last_observed_replay_weights": tuple(sorted(self._last_observed_replay_weights.items())), "additions_since_cold": int(self.cold_change_count)}
 
     @contextlib.contextmanager
     def frozen(self):
@@ -261,18 +327,22 @@ class AdaptiveAgent:
         return tuple((tuple(int(x) for x in state), str(action), tuple(int(x) for x in next_state)) for state, action, next_state in transitions)
 
     def _store_trace(self, ordering: Sequence[str], transitions: Optional[Sequence[StateTransition]]) -> Tuple[StateTransition, ...]:
+        """Validate an observed trace against its ordering.
+        The replay item is the single owner of a demonstration's transitions. A
+        trace whose actions disagree with the ordering it was recorded against
+        is a defect, not a condition to recover from: silently substituting a
+        different trace would train the model on something the human never did.
+        """
         trace = self._normalize_trace(transitions)
+        if not trace: return ()
         ordering_tuple = tuple(str(t) for t in ordering)
-        if trace and tuple(t[1] for t in trace) == ordering_tuple:
-            self.demo_traces[ordering_tuple] = trace
-            return trace
-        return self.demo_traces.get(ordering_tuple, ())
+        if tuple(t[1] for t in trace) != ordering_tuple:
+            raise ValueError(f"observed trace does not match its ordering: {len(trace)} transitions vs {len(ordering_tuple)} actions")
+        return trace
 
     def _get_trace(self, demo: Any, actions: Sequence[str]) -> Tuple[StateTransition, ...]:
         if isinstance(demo, Mapping):   trace = self._normalize_trace(demo.get("transitions", ()))
         else:                           trace = self._normalize_trace(getattr(demo, "transitions", ()))
-        if not trace:
-            trace = self.demo_traces.get(tuple(actions), ())
         if trace and tuple(t[1] for t in trace) == tuple(actions):
             return trace
         return ()
@@ -292,7 +362,7 @@ class AdaptiveAgent:
         return None
 
     def _check_latest(self, recipe_id: Optional[str] = None) -> None:
-        if self._frozen or not getattr(self.settings, "pin_latest", True): return
+        if self._frozen or not self.settings.pin_latest: return
         recipe_ids = ([recipe_id] if recipe_id is not None else [known_recipe_id for known_recipe_id, variants in self.library.variants.items() if variants])
         for recipe_id in recipe_ids:
             slot = self.library.variants.get(recipe_id, {})
@@ -484,14 +554,24 @@ class AdaptiveAgent:
         if (prefix_match.kind == "known" and recipe_score >= self.settings.known_similarity): score = max(score, self.settings.known_score_floor)
         # Archived-only fuzzy matches cannot self-commit on an artificial margin.
         if (all_variants and not active_variants and not (prefix_match.kind == "known" and recipe_score >= self.settings.known_similarity)): score = min(score, self.settings.empty_score_cap)
-        parts = {"recipe_jaccard": recipe_score, "recipe_jaccard_margin": jaccard_margin, "recipe_score": recipe_score, "recipe_margin": jaccard_margin, "online_policy_confidence": policy_confidence, "late_window_prediction_agreement": late_agreement}
+        # One key per distinct piece of evidence. Aliased duplicates were removed
+        # so a reader cannot mistake the same quantity for independent support.
+        parts = {"recipe_jaccard": recipe_score, "recipe_jaccard_margin": jaccard_margin, "online_policy_confidence": policy_confidence, "late_window_prediction_agreement": late_agreement}
         return max(0.0, min(1.0, float(score))), parts
     def _active_variants(self) -> Set[VariantKey]:
         """Current trainable memory keys. Pruned variants are excluded from online prediction."""
         return {entry.key for entry in self.replay.active_items()}
 
     def policy_stats(self) -> Dict[str, Any]:
-        return {**dict(self._policy_stats), **dict(self._last_action_mask_stats), **dict(getattr(self.maxent, "last_prediction_stats", {}) or {})}
+        """Live policy telemetry, including the mask contract for assertions.
+        Callers that persist per-turn rows should drop ACTION_MASK_CONTRACT keys
+        via `varying_policy_stats`; they belong in the run manifest.
+        """
+        return {**ACTION_MASK_CONTRACT, **dict(self._policy_stats), **dict(self._last_action_mask_stats), **dict(getattr(self.maxent, "last_prediction_stats", {}) or {})}
+
+    def varying_policy_stats(self) -> Dict[str, Any]:
+        """`policy_stats` without the invariant keys, for per-turn persistence."""
+        return {key: value for key, value in self.policy_stats().items() if key not in ACTION_MASK_CONTRACT}
 
     def _set_policy_stats(self, confidence: Optional[float], entropy: Optional[float], reason: str, *, margin: Optional[float] = None, source: Optional[str] = None) -> None:
         if self._frozen: return
@@ -525,13 +605,16 @@ class AdaptiveAgent:
             universe = {str(action) for action in action_universe}
             candidates = tuple(action for action in known_actions if action in universe)
         conditioned = self.domain.legal_actions(tuple(state), candidates)
+        # Only the measured counts vary per decision. The mask's design
+        # invariants live in ACTION_MASK_CONTRACT and are recorded once per run,
+        # not restamped on every turn where they could not come out otherwise.
         self._last_action_mask_stats = {
-            "action_mask": "shared_state_preconditions_only",
-            "action_mask_shared_across_predictors": True,
-            "action_mask_preference_neutral": True,
-            "action_mask_uses_recipe_hypothesis": False,
             "action_universe_count": len(candidates),
-            "feasible_action_count": len(conditioned)}
+            "feasible_action_count": len(conditioned),
+            # How much choice this decision actually offered, defined on the
+            # demonstrations rather than on any predictor's internals so every
+            # arm is measured the same way.
+            "observed_actions_at_state": len(self._observed_actions.get(tuple(state), ()))}
         return conditioned
 
     def _apply_shared_action_mask(self, state: Tuple[int, ...], distribution: Mapping[str, float]) -> Dict[str, float]:
@@ -635,37 +718,48 @@ class AdaptiveAgent:
         return result
 
     def _build_demos(self, records):
-        """Build O(L) trajectories from traces or semantic-action replay."""
+        """Build O(L) trajectories from the observed transition traces.
+        Training states come only from what was actually observed during the
+        demonstration. A record without its trace is a defect rather than a
+        case to approximate: reconstructing states from the action labels alone
+        would fit the reward on a trajectory the human never performed, and the
+        substitution would be invisible in the results.
+        """
         trajectories = []
         dropped_total = 0
         for record in records:
             if isinstance(record, Mapping): actions = list(record.get("ordering", ()))
             else:                           actions = list(getattr(record, "ordering", record))
-            trajectory = []
             trace = self._get_trace(record, actions)
-            if trace:
-                state = trace[0][0]
-                for before, token, after in trace:
-                    if after == before:
-                        dropped_total += 1
-                        state = after
-                        continue
-                    trajectory.append((before, token))
+            if not trace:
+                raise ValueError(f"replay record for {len(actions)} actions carries no observed transition trace; refusing to train on reconstructed states")
+            trajectory = []
+            state = trace[0][0]
+            for before, token, after in trace:
+                if after == before:
+                    dropped_total += 1
                     state = after
-            else:
-                # Semantic replay reconstructs exact states and drops self-loops.
-                state = self.domain.initial_state()
-                for action in actions:
-                    new_state = self.domain.replay_transition(state, action)
-                    if new_state == state:
-                        dropped_total += 1
-                        state = new_state
-                        continue
-                    trajectory.append((state, action))
-                    state = new_state
+                    continue
+                trajectory.append((before, token))
+                state = after
             trajectory.append((state, "stop"))
             trajectories.append(trajectory)
         return trajectories, dropped_total
+
+    def _index_observed_actions(self, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]]) -> None:
+        """Record which actions were demonstrated at each encoded state.
+
+        This is a property of the replayed demonstrations, not of a fitted
+        model, so it classifies a decision identically for every predictor:
+        one action means memorisation suffices, two or more is a real ranking
+        problem, and an absent state means the answer must be generalised.
+        """
+        observed: Dict[Tuple[int, ...], Set[str]] = {}
+        for trajectory in trajectories:
+            for state, action in trajectory:
+                if action == "stop": continue
+                observed.setdefault(tuple(state), set()).add(str(action))
+        self._observed_actions = observed
 
     def _log_training(self, dropped_actions: int, active_demos: int, *, total_wall_s: float = 0.0, build_wall_s: float = 0.0, fit_wall_s: float = 0.0, flop_estimate: float = 0.0, skipped: bool = False) -> None:
         """Append a structured retrain event. All agent variants funnel through this."""
@@ -728,7 +822,7 @@ class AdaptiveAgent:
         n_transitions = sum(max(0, len(demo) - 1) for demo in trajectories)
         n_actions = max(1, len({action for demo in trajectories for _state, action in demo}))
         feature_dim = len(trajectories[0][0][0]) if trajectories and trajectories[0] else 1
-        iters = int(getattr(self.settings, "irl_warm_steps", 1) if self.retrain_cycle > 1 else getattr(self.settings, "irl_cold_steps", 1))
+        iters = int(self.settings.irl_warm_steps if self.retrain_cycle > 1 else self.settings.irl_cold_steps)
         return float(n_transitions * n_actions * feature_dim * max(1, iters))
 
     def _fit_models(self, maxent: MaxEntIrl, trajectories: Sequence[List[Tuple[Tuple[int, ...], str]]], weights: Sequence[float], *, warm_start: bool, records: Optional[Sequence[Any]] = None) -> None:
@@ -741,7 +835,9 @@ class AdaptiveAgent:
         return self.maxent.reward_weights is not None
 
     def _reset_predictors(self) -> None:
-        self.maxent = MaxEntIrl(settings=self.settings, domain=self.domain)
+        # Reuse the agent's stream so a cold restart continues one reproducible
+        # sequence of initializations rather than restarting it.
+        self.maxent = MaxEntIrl(settings=self.settings, domain=self.domain, rng=self._init_rng)
 
     def _demo_length(self, demo: Any) -> int:
         if isinstance(demo, Mapping):
@@ -781,15 +877,15 @@ class AdaptiveAgent:
         weight_changed = {key for key in set(current) & set(previous) if not math.isclose(current[key], previous[key], rel_tol=0.0, abs_tol=1e-12)}
         self._last_observed_replay_weights = dict(current)
 
-        alterations = len(added) + len(removed)
         counter_before = self.cold_change_count
-        requested_start, trigger, projected = self.retrain_policy.decide(alterations, bool(weight_changed), counter_before)
+        requested_start, trigger, projected = self.retrain_policy.decide(len(added), len(removed), bool(weight_changed), counter_before)
 
         def audit(effective_start: str, counter_after: int) -> None:
             self.retrain_events[-1].update({
                 "retrain_requested_start": requested_start,             "retrain_effective_start": effective_start,             "retrain_trigger": trigger,
                 "active_added_count": len(added),                       "active_removed_count": len(removed),                   "active_weight_changed_count": len(weight_changed),
-                "membership_changes_since_cold_before": counter_before, "membership_changes_since_cold_projected": projected,   "membership_changes_since_cold_after": counter_after,})
+                "additions_since_cold_before": counter_before,          "additions_since_cold_projected": projected,            "additions_since_cold_after": counter_after,
+                "cold_threshold_basis": self.retrain_policy.cold_threshold_basis,})
 
         self.retrain_cycle += 1
         if requested_start == "skip":
@@ -800,6 +896,7 @@ class AdaptiveAgent:
 
         entries = self.replay.active_items()
         if not entries:
+            self._observed_actions = {}
             self._reset_predictors()
             self.cold_change_count = 0
             self.skipped_trains += 1
@@ -816,6 +913,7 @@ class AdaptiveAgent:
 
         build_t0 = time.perf_counter()
         with self._profile("retrain_build_trajectories"): trajectories, dropped_total = self._build_demos(entries)
+        self._index_observed_actions(trajectories)
         build_wall_s = time.perf_counter() - build_t0
         weights = self._demo_weights(entries, [entry.weight for entry in entries])
         fit_t0 = time.perf_counter()
@@ -848,6 +946,12 @@ class AdaptiveAgent:
 
     def _compare_policies(self, entries: Sequence[MemoryItem],  current: Callable[[Tuple[int, ...], Tuple[str, ...]], Mapping[str, float]], reference: Callable[[Tuple[int, ...], Tuple[str, ...]], Mapping[str, float]],
                         *, max_prefixes: int,                   tolerance: float,                                                           **metadata: Any) -> Dict[str, Any]:
+        """Return the L1 policy gap between two predictors on shared prefixes.
+
+        Magnitude only: which gaps constitute a contract violation is the
+        caller's decision, because a warm-start gap and a pruned-data gap mean
+        opposite things.
+        """
         prefixes: List[Tuple[str, ...]] = []
         seen: Set[Tuple[str, ...]] = set()
         for entry in entries:
@@ -867,27 +971,82 @@ class AdaptiveAgent:
             tokens = sorted(set(deployed) | set(refit))
             differences.append(sum(abs(float(deployed.get(token, 0.0)) - float(refit.get(token, 0.0))) for token in tokens))
         maximum = max(differences, default=0.0)
-        return {"max_l1": float(maximum), "mean_l1": float(sum(differences) / max(1, len(differences))), "n_prefixes": len(prefixes), "passed": bool(maximum <= tolerance), "tolerance": float(tolerance), **metadata}
+        return {"max_l1": float(maximum), "mean_l1": float(sum(differences) / max(1, len(differences))), "n_prefixes": len(prefixes), "tolerance": float(tolerance), **metadata}
 
     def audit_pruning(self, max_prefixes: int = 24, tolerance: float = 5e-2) -> Dict[str, Any]:
-        """Verify that the fitted deployable predictors use active replay only."""
-        entries = self.replay.active_items()
-        if not entries: return {"max_l1": 0.0, "mean_l1": 0.0, "n_prefixes": 0, "passed": True, "tolerance": float(tolerance), "audit_reference_seed": int(self.settings.seed)}
+        """Audit what pruned replay does, and does not, do to the fitted policy.
 
-        trajectories, _ = self._build_demos(entries)
-        weights = self._demo_weights(entries, [float(entry.weight) for entry in entries])
-        # Hold optimization randomness fixed so this audit isolates replay membership rather than conflating it with a different initialization.
+        Three separate quantities, because the earlier single pass/fail
+        conflated them and could never hold:
+
+        ``active_only_training_inputs_verified``
+            The contract. Exact set check that the records handed to the fit
+            contain no pruned variant. This is what "trains on active memory
+            only" asserts, and it is the only term that can fail.
+        ``redundancy_*``
+            Cold fit on active memory versus a cold fit on active plus pruned
+            memory, same initialization stream. A large gap means the decayed
+            variants carried information the survivors do not; a small one
+            means the retention decision cost nothing.
+        ``deployed_path_dependence_*``
+            The deployed model versus a fresh cold fit on the same active set.
+            Non-zero whenever the deployed weights were warm-started, which is
+            ordinary optimizer path dependence and not a leak: a warm start
+            carries weights, never demonstrations. Comparing the deployed model
+            against a cold refit was the previous test, which is why it
+            reported a violation at every checkpoint on every agent, including
+            agents that prune nothing at all.
+        """
+        entries = self.replay.active_items()
+        pruned_records = list(self.replay.pruned.values())
+        active_keys = {entry.key for entry in entries}
+        pruned_keys = {record.key for record in pruned_records}
+        inputs_verified = not (active_keys & pruned_keys)
+        base = {"passed": bool(inputs_verified), "active_only_training_inputs_verified": bool(inputs_verified),
+                "comparison": "cold_active_vs_cold_active_plus_pruned", "model_family": "maxent_irl",
+                "n_active_variants": len(entries), "n_pruned_variants": len(pruned_records),
+                "tolerance": float(tolerance), "audit_reference_seed": int(self.settings.seed)}
+        if not entries:
+            return {**base, "max_l1": 0.0, "mean_l1": 0.0, "n_prefixes": 0, "pruned_available": False,
+                    "redundancy_max_l1": 0.0, "redundancy_mean_l1": 0.0,
+                    "deployed_path_dependence_max_l1": 0.0, "deployed_path_dependence_mean_l1": 0.0}
+
+        # Every reference fit draws from its own fresh stream seeded identically,
+        # so the two sides differ only in replay membership.
         audit_seed = int(self.settings.seed)
-        audit_settings = replace(self.settings, seed=audit_seed)
-        fresh_maxent = MaxEntIrl(settings=audit_settings, domain=self.domain)
-        self._fit_models(fresh_maxent, trajectories, weights, warm_start=False, records=entries)
+
+        def cold_fit(records: Sequence[Any], record_weights: Sequence[float]) -> MaxEntIrl:
+            trajectories, _dropped = self._build_demos(records)
+            model = MaxEntIrl(settings=self.settings, domain=self.domain, rng=np.random.default_rng(audit_seed))
+            self._fit_models(model, trajectories, self._demo_weights(records, record_weights), warm_start=False, records=records)
+            return model
 
         def predict_with(model: MaxEntIrl, state: Tuple[int, ...], prefix: Tuple[str, ...]) -> Mapping[str, float]:
-            candidates = self._conditioned_actions(state)
-            return model.predict(state, candidates, prefix=prefix)
+            return model.predict(state, self._conditioned_actions(state), prefix=prefix)
 
-        return self._compare_policies(entries, lambda state, prefix: predict_with(self.maxent, state, prefix), lambda state, prefix: predict_with(fresh_maxent, state, prefix),
-            max_prefixes=max_prefixes, tolerance=tolerance, audit_reference_seed=audit_seed)
+        active_reference = cold_fit(entries, [float(entry.weight) for entry in entries])
+        path_dependence = self._compare_policies(
+            entries,
+            lambda state, prefix: predict_with(self.maxent, state, prefix),
+            lambda state, prefix: predict_with(active_reference, state, prefix),
+            max_prefixes=max_prefixes, tolerance=tolerance)
+        deployed = {"deployed_path_dependence_max_l1": float(path_dependence["max_l1"]),
+                    "deployed_path_dependence_mean_l1": float(path_dependence["mean_l1"])}
+
+        if not pruned_records:
+            return {**base, **deployed, "max_l1": 0.0, "mean_l1": 0.0, "n_prefixes": int(path_dependence["n_prefixes"]),
+                    "pruned_available": False, "redundancy_max_l1": 0.0, "redundancy_mean_l1": 0.0}
+
+        combined = list(entries) + pruned_records
+        restored_reference = cold_fit(combined, [float(entry.weight) for entry in entries] + [1.0] * len(pruned_records))
+        redundancy = self._compare_policies(
+            entries,
+            lambda state, prefix: predict_with(active_reference, state, prefix),
+            lambda state, prefix: predict_with(restored_reference, state, prefix),
+            max_prefixes=max_prefixes, tolerance=tolerance)
+        return {**base, **deployed, **redundancy, "pruned_available": True,
+                "redundancy_max_l1": float(redundancy["max_l1"]), "redundancy_mean_l1": float(redundancy["mean_l1"])}
+
     def evaluate(self, ordering: Sequence[str]) -> float:
         """Prefix-conditioned accuracy of the configured predictor on one ordering."""
         if not ordering: return 0.0

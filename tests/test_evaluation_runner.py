@@ -22,7 +22,9 @@ from src.evaluation import (
     HOMOGENEOUS,
     SCENARIOS,
     _apply_oracle_pruning,
-    _oracle_candidate_noninferior,
+    _select_oracle_probe_rows,
+    _phase_retrain_latency,
+    _recipe_has_active_variant,
     _pair_key,
     _periodic_probe_due,
     _pre_event_probe_due,
@@ -97,6 +99,52 @@ class EvaluationRunnerContractTests(unittest.TestCase):
         )
         for redundant in ("assist_only", "all_episode_workload", "memory", "compute", "paper_hypothesis_views"):
             self.assertNotIn(redundant, summary)
+
+    def test_completed_event_is_checkpointed_before_later_failure(self):
+        recipe_name, pair, _agent = self._pair_and_agent()
+        plan = Plan(
+            scenario="unit_partial_checkpoint",
+            seed=23,
+            events=(
+                Event(
+                    "observe",
+                    pair,
+                    {
+                        "event_type": "unit",
+                        "phase_id": "phase_00",
+                        "stage": 0,
+                    },
+                ),
+            ),
+            eval_pairs=(pair,),
+            selected_recipes=(recipe_name,),
+            selected_preferences=("default",),
+            description="completed events must survive an interrupted seed",
+        )
+
+        def interrupt_after_checkpoint(_progress):
+            raise RuntimeError("planned interruption")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(RuntimeError, "planned interruption"):
+                run_plan(
+                    plan,
+                    _fast_eval_config(),
+                    root,
+                    progress_callback=interrupt_after_checkpoint,
+                )
+            checkpoint = json.loads((
+                root / "partial" / "checkpoints" / "full"
+                / "event_000000.json"
+            ).read_text())
+            partial = json.loads((root / "partial" / "summary.json").read_text())
+
+        self.assertEqual(checkpoint["state"], "event_complete")
+        self.assertEqual(checkpoint["events_completed"], 1)
+        self.assertEqual(len(checkpoint["tables"]["episodes"]), 1)
+        self.assertEqual(partial["state"], "running")
+        self.assertEqual(partial["latest"]["event_index"], 0)
 
     def test_observation_logs_no_robot_prediction_or_turn_records(self):
         recipe_name, pair, agent = self._pair_and_agent()
@@ -332,7 +380,7 @@ class EvaluationRunnerContractTests(unittest.TestCase):
         self.assertEqual(after[2]["oracle_active_variants_after"], 0)
         self.assertEqual(
             after[2]["oracle_retention_policy"],
-            "future_filtered_with_full_fallback",
+            "future_filtered_after_first_exposure",
         )
 
     def test_oracle_retains_shared_variant_until_last_equivalent_pair(self):
@@ -449,22 +497,86 @@ class EvaluationRunnerContractTests(unittest.TestCase):
         self.assertEqual(result["oracle_reset_future_weights"], 1)
         self.assertGreater(len(agent.retrain_events), retrains_before)
 
-    def test_oracle_candidate_rejects_any_headline_regression(self):
-        reference = {
+    def test_recipe_active_variant_check_discriminates_by_recipe(self):
+        """Regression: the comprehension variable must not shadow the target.
+
+        Bound as ``recipe_id``, the test became ``recipe_id == recipe_id`` and
+        returned True whenever active memory was non-empty. That is the only
+        trigger for baseline-local re-observation, so the routing ablation
+        recorded zero extra observations for every baseline in every run.
+        """
+        builders = recipe_builders()
+        held = build_task("tomato_onion_soup", "default", builders["tomato_onion_soup"])
+        absent = build_task("simple_salad", "default", builders["simple_salad"])
+        agent = AdaptiveAgent(Settings(verbose=False, irl_cold_steps=1, irl_warm_steps=1))
+        agent.replay.register("R1", "v1", ("a",), now=1, cycle=0, pin_latest=False)
+        recipe_ids = {"tomato_onion_soup": "R1", "simple_salad": "R2"}
+
+        self.assertTrue(_recipe_has_active_variant(agent, held, recipe_ids))
+        self.assertFalse(_recipe_has_active_variant(agent, absent, recipe_ids))
+
+        # Empty memory cannot hold any recipe.
+        agent.replay.active.clear()
+        self.assertFalse(_recipe_has_active_variant(agent, held, recipe_ids))
+
+    def test_phase_retrain_latency_slices_fits_into_the_phase_they_ran_in(self):
+        class _StubAgent:
+            retrain_fit_wall_times = [1.0, 2.0, 3.0, 4.0, 100.0]
+
+        rows = [
+            {"event_index": 0, "phase_role": "climb", "phase_index": 0, "training_retrain_count": 2},
+            {"event_index": 1, "phase_role": "climb", "phase_index": 0, "training_retrain_count": 4},
+            {"event_index": 2, "phase_role": "settled", "phase_index": 1, "training_retrain_count": 5},
+        ]
+        by_phase, by_index = _phase_retrain_latency(_StubAgent(), rows, {"training_retrain_count": 0})
+
+        self.assertEqual(by_phase["climb"]["online_retrain_fit_count"], 4.0)
+        self.assertEqual(by_phase["climb"]["online_mean_retrain_fit_wall_s"], 2.5)
+        self.assertEqual(by_phase["climb"]["online_max_retrain_fit_wall_s"], 4.0)
+        # The outlier belongs to the settled phase and must not be averaged away.
+        self.assertEqual(by_phase["settled"]["online_retrain_fit_count"], 1.0)
+        self.assertEqual(by_phase["settled"]["online_p95_retrain_fit_wall_s"], 100.0)
+        self.assertEqual(by_index["settled"]["phase_01"]["online_max_retrain_fit_wall_s"], 100.0)
+
+    def test_phase_retrain_latency_ignores_events_with_no_new_fit(self):
+        class _StubAgent:
+            retrain_fit_wall_times = [1.0]
+
+        rows = [
+            {"event_index": 0, "phase_role": "climb", "phase_index": 0, "training_retrain_count": 1},
+            # A skipped retrain leaves the cumulative count unchanged.
+            {"event_index": 1, "phase_role": "climb", "phase_index": 0, "training_retrain_count": 1},
+        ]
+        by_phase, _ = _phase_retrain_latency(_StubAgent(), rows, {"training_retrain_count": 0})
+        self.assertEqual(by_phase["climb"]["online_retrain_fit_count"], 1.0)
+
+    def test_oracle_probe_rows_keep_the_future_filtered_outcome_when_worse(self):
+        """The oracle must be allowed to lose; it is a reference, not a maximum.
+
+        Selecting per event on realized metrics forced oracle_advantage >= 0 by
+        construction, which is the one thing a bounding reference may not do.
+        """
+        reference = [{
+            "pair": "soup/default",
             "teacher_forced_top_1": 0.8,
             "live_top_1": 0.75,
             "normalized_human_action_load": 0.5,
-            "commit_correct": True,
-        }
-        candidate = dict(reference)
-        candidate["live_top_1"] = 0.70
+        }]
+        candidate = [dict(reference[0], live_top_1=0.70, teacher_forced_top_1=0.60)]
 
-        accepted, regressions = _oracle_candidate_noninferior(
-            candidate, reference,
-        )
+        selected = _select_oracle_probe_rows(candidate, reference)
 
-        self.assertFalse(accepted)
-        self.assertEqual(regressions, ("live_top_1",))
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["oracle_probe_selection"], "future_filtered")
+        self.assertEqual(selected[0]["live_top_1"], 0.70)
+        self.assertEqual(selected[0]["teacher_forced_top_1"], 0.60)
+
+    def test_oracle_probe_rows_reject_misaligned_pairs(self):
+        reference = [{"pair": "soup/default", "live_top_1": 0.5}]
+        candidate = [{"pair": "salad/default", "live_top_1": 0.5}]
+
+        with self.assertRaises(RuntimeError):
+            _select_oracle_probe_rows(candidate, reference)
 
     def test_full_realized_schedule_forces_baseline_to_the_same_interaction_mode(self):
         recipe_name, pair, _agent = self._pair_and_agent()
@@ -588,7 +700,7 @@ class EvaluationRunnerContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "first stream exposure"):
             run_stream("bc", plan, _fast_eval_config())
 
-    def test_oracle_uses_full_schedule_and_dominates_full_eventwise(self):
+    def test_oracle_uses_full_schedule_and_may_lose_after_first_exposure(self):
         recipe_name = "tomato_onion_soup"
         builder = recipe_builders()[recipe_name]
         old_pair = build_task(recipe_name, "default", builder)
@@ -642,23 +754,13 @@ class EvaluationRunnerContractTests(unittest.TestCase):
         self.assertEqual(oracle[1]["full_realized_execution_mode"], "assist")
         self.assertTrue(oracle[1]["mode_matches_full_schedule"])
         self.assertEqual(oracle[1]["oracle_selection"], "full_for_unseen_pair")
-        for full_row, oracle_row in zip(full, oracle):
-            if full_row["mode"] != "assist":
-                continue
-            for metric in (
-                "teacher_forced_top_1",
-                "teacher_forced_top_k",
-                "live_top_1",
-                "live_top_k",
-            ):
-                self.assertGreaterEqual(oracle_row[metric], full_row[metric])
-            for metric in (
-                "teacher_forced_mean_nll",
-                "mean_nll_per_robot_turn",
-                "normalized_human_action_load",
-                "corrections_per_recipe_step",
-            ):
-                self.assertLessEqual(oracle_row[metric], full_row[metric])
+        # After a pair is learned the oracle keeps its own future-filtered
+        # outcome and is never reverted to Full's. It is a reference curve, not
+        # a per-event maximum over {Full, oracle}: constraining it to dominate
+        # made oracle_advantage non-negative by construction.
+        self.assertEqual(oracle[2]["oracle_selection"], "future_filtered")
+        self.assertFalse(oracle[2]["oracle_full_fallback"])
+        self.assertNotIn("oracle_regressed_metrics", oracle[2])
         unseen_metrics = (
             "teacher_forced_top_1",
             "teacher_forced_top_k",
@@ -688,19 +790,9 @@ class EvaluationRunnerContractTests(unittest.TestCase):
             for row in frozen_rows if row["baseline"] == MEMORY_ORACLE
         }
         self.assertEqual(set(oracle_probes), set(full_probes))
-        for key, oracle_row in oracle_probes.items():
-            full_row = full_probes[key]
-            for metric in (
-                "top_1", "top_k",
-                "closed_loop_live_top_1", "closed_loop_live_top_k",
-            ):
-                self.assertGreaterEqual(oracle_row[metric], full_row[metric])
-            for metric in (
-                "teacher_forced_mean_nll",
-                "normalized_human_action_load",
-                "corrections_per_recipe_step",
-            ):
-                self.assertLessEqual(oracle_row[metric], full_row[metric])
+        for oracle_row in oracle_probes.values():
+            self.assertEqual(oracle_row["oracle_probe_selection"], "future_filtered")
+            self.assertNotIn("oracle_probe_regressed_metrics", oracle_row)
 
     def test_offline_pretrained_frozen_baseline_trains_once_then_never_updates(self):
         (first_name, first_builder), (second_name, second_builder) = list(recipe_builders().items())[:2]
@@ -952,3 +1044,44 @@ class EvaluationRunnerContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CliDefaultsMatchDataclassDefaults(unittest.TestCase):
+    """A CLI default that restates a dataclass default silently overrides it.
+
+    `EvalSettings` is the documented source of truth for the evaluation
+    configuration, but every flag parsed with its own literal default wins over
+    it, so the two can drift apart and a config change appears to have no
+    effect. This asserts they agree for every flag that maps onto a field.
+    """
+
+    def test_no_cli_flag_default_contradicts_its_dataclass_field(self):
+        import dataclasses
+        import re
+        from pathlib import Path
+
+        from src.evaluation import EvalSettings, ScheduleSettings
+
+        source = (Path(__file__).resolve().parent.parent / "src" / "evaluation.py").read_text(encoding="utf-8")
+        fields = {}
+        for spec in (EvalSettings, ScheduleSettings):
+            for field in dataclasses.fields(spec):
+                if field.default is not dataclasses.MISSING:
+                    fields[field.name] = field.default
+
+        mismatched = []
+        for match in re.finditer(
+            r'add_argument\("--([a-z0-9-]+)"[^)]*?default=([^,)\s]+)', source,
+        ):
+            name = match.group(1).replace("-", "_")
+            if name not in fields:
+                continue
+            literal = match.group(2).strip()
+            try:
+                value = eval(literal, {"EvalSettings": EvalSettings, "ScheduleSettings": ScheduleSettings}, {})
+            except Exception:
+                continue
+            if value != fields[name]:
+                mismatched.append((name, value, fields[name]))
+
+        self.assertEqual(mismatched, [], f"CLI defaults contradict dataclass defaults: {mismatched}")

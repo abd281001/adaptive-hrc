@@ -1,36 +1,27 @@
-"""Adaptive-HRC's isolated runtime boundary for the Burrito simulator."""
+"""Adaptive-HRC integration for standard Overcooked and Burrito."""
 
-from .runtime import (
-    BurritoRuntime,
-    PinMismatchError,
-    SubmoduleMissingError,
-    UpstreamPaths,
-    verify_pins,
+from .catalog import (
+    BURRITO_RECIPE_IDS,
+    OVERCOOKED_RECIPE_IDS,
+    PREFERENCES,
+    RECIPES,
+    TALENTS_LIKE_PREFERENCES,
+    applicable_preferences,
+    get_recipe,
 )
 from .domain import (
     BurritoDomainAdapter,
+    CookingDomainAdapter,
     REWARD_FEATURE_VERSION,
     SEMANTIC_FALLBACK_MAX_RMS_DISTANCE,
     SEMANTIC_FEATURE_VERSION,
     STRATEGY_ROLE_VERSION,
+    TaskState,
 )
-from .macros import (
-    COLLECT_AND_STAGE_COOKED_RICE,
-    STAGE_CLEAN_PLATE,
-    START_BOILING_RICE,
-    assemble_action,
-    fetch_and_stage_action,
-    macro_actions,
-    prepare_and_stage_action,
-    serve_action,
-    start_cooking_action,
-)
-from .options import (
-    CONTROLLED_PARKING_POSITIONS,
-    BurritoOptionExecutor,
-    OptionExecution,
-    OptionExecutionError,
-)
+from .ladder import LadderSettings, SCENARIOS, generate_ladder, ladder_audit
+from .legacy_options import LegacyBurritoOptionExecutor
+from .options import BurritoOptionExecutor, OptionExecution, OptionExecutionError
+from .overcooked_options import OvercookedOptionExecutor
 from .protocol import (
     ASSIST,
     OBSERVE,
@@ -39,47 +30,26 @@ from .protocol import (
     BurritoHrcRunner,
     BurritoObservation,
     BurritoTask,
+    CookingDecision,
+    CookingEpisodeResult,
+    CookingHrcRunner,
+    CookingObservation,
+    CookingTask,
+)
+from .runtime import (
+    BurritoRuntime,
+    PinMismatchError,
+    SubmoduleMissingError,
+    UpstreamPaths,
+    verify_pins,
 )
 from .task_graph import (
     BurritoPreferencePolicy,
     BurritoTaskGraph,
+    CookingPreferencePolicy,
+    CookingTaskGraph,
     PREFERENCE_NAMES,
-    choose_acceptable_action,
 )
 
-__all__ = [
-    "BurritoRuntime",
-    "PinMismatchError",
-    "SubmoduleMissingError",
-    "UpstreamPaths",
-    "verify_pins",
-    "ASSIST",
-    "OBSERVE",
-    "BurritoDecision",
-    "BurritoDomainAdapter",
-    "BurritoEpisodeResult",
-    "BurritoHrcRunner",
-    "BurritoObservation",
-    "BurritoOptionExecutor",
-    "BurritoPreferencePolicy",
-    "BurritoTask",
-    "BurritoTaskGraph",
-    "COLLECT_AND_STAGE_COOKED_RICE",
-    "CONTROLLED_PARKING_POSITIONS",
-    "OptionExecution",
-    "OptionExecutionError",
-    "PREFERENCE_NAMES",
-    "REWARD_FEATURE_VERSION",
-    "STAGE_CLEAN_PLATE",
-    "START_BOILING_RICE",
-    "SEMANTIC_FALLBACK_MAX_RMS_DISTANCE",
-    "SEMANTIC_FEATURE_VERSION",
-    "STRATEGY_ROLE_VERSION",
-    "assemble_action",
-    "choose_acceptable_action",
-    "fetch_and_stage_action",
-    "macro_actions",
-    "prepare_and_stage_action",
-    "serve_action",
-    "start_cooking_action",
-]
+
+__all__ = [name for name in globals() if not name.startswith("_")]

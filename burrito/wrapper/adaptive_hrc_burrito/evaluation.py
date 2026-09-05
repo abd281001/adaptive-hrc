@@ -1,10 +1,14 @@
-"""Versioned, manifest-backed Burrito experiments and progressive validation."""
+"""Manifest-backed evaluation over natural Overcooked/Burrito ladders."""
 from __future__ import annotations
 
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
+from datetime import datetime, timezone
 import hashlib
-import importlib.metadata
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import platform
@@ -12,32 +16,76 @@ import statistics
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 import numpy as np
 
+from .catalog import (
+    BURRITO_RECIPE_IDS,
+    STRATA,
+    OVERCOOKED_RECIPE_IDS,
+    RECIPES,
+    TALENTS_LIKE_PREFERENCES,
+    applicable_preferences,
+    get_preference,
+    get_recipe,
+    preference_order,
+)
 from .domain import (
-    BurritoDomainAdapter,
+    CookingDomainAdapter,
     REWARD_FEATURE_VERSION,
     SEMANTIC_FALLBACK_MAX_RMS_DISTANCE,
     SEMANTIC_FEATURE_VERSION,
     STRATEGY_ROLE_VERSION,
 )
-from .macros import macro_actions
-from .options import (
-    CONTROLLED_PARKING_POSITIONS,
-    BurritoOptionExecutor,
-    OptionExecutionError,
+from .ladder import LadderSettings, SCENARIOS, generate_ladder, ladder_audit
+from .options import OptionExecutionError
+from .protocol import (
+    ASSIST,
+    CookingEpisodeResult,
+    CookingHrcRunner,
+    CookingObservation,
+    CookingTask,
 )
-from .protocol import ASSIST, BurritoEpisodeResult, BurritoHrcRunner, BurritoTask
 from .runtime import BurritoRuntime, UpstreamPaths, verify_pins
+from .task_graph import CookingPreferencePolicy, CookingTaskGraph, is_preference_discriminating
 
 
-CONFIG_SCHEMA_VERSION = 1
-RESULT_SCHEMA_VERSION = 2
-FULL_ARM = "latent_timing_lightweight"
-STORAGE_METRIC_VERSION = "adaptive_hrc_retained_payload_v1"
+CONFIG_SCHEMA_VERSION = 4
+RESULT_SCHEMA_VERSION = 6
+FULL_ARM = "full"
+ARM_NAMES: Tuple[str, ...] = (
+    FULL_ARM,
+    "frozen",
+    "offline_default",
+    "unpinned",
+    "latest",
+    "fixed",
+    "no_decay",
+    "bc",
+    "ewc",
+    "replay_bc",
+    "memory_oracle",
+)
+VALIDATION_REQUIREMENTS: Tuple[str, ...] = (
+    "adaptation_linkage",
+    "holdout_transfer_is_generalisation",
+    "stratum_separation",
+    "behavioral_preference_coverage",
+    "catalog_coverage",
+    "adaptive_hrc_baseline_parity",
+    "comparison_arms",
+    "cross_environment_adaptation",
+    "framework_components",
+    "multiple_seeds",
+    "natural_ladder",
+    "open_set_recipe_separation",
+    "post_update_recurrence",
+    "preference_discrimination",
+    "scenario_invariants",
+    "transfer_mechanisms_exercised",
+    "verified_shift_update",
+)
 
 
 def _utc_now() -> str:
@@ -60,13 +108,13 @@ def _atomic_json(path: Path, value: Any) -> None:
 
 
 def _git(repository: Path, *args: str) -> str:
-    completed = subprocess.run(
+    result = subprocess.run(
         ("git", "-C", str(repository), *args),
         check=True,
         capture_output=True,
         text=True,
     )
-    return completed.stdout.strip()
+    return result.stdout.strip()
 
 
 def _finite_mean(values: Iterable[Any]) -> float | None:
@@ -77,222 +125,409 @@ def _finite_mean(values: Iterable[Any]) -> float | None:
     return statistics.fmean(usable) if usable else None
 
 
+def _pooled_rate(
+    rows: Iterable[Mapping[str, Any]], numerator: str, denominator: str,
+) -> float | None:
+    usable = list(rows)
+    total = sum(int(row.get(denominator, 0) or 0) for row in usable)
+    if not total:
+        return None
+    return sum(int(row.get(numerator, 0) or 0) for row in usable) / total
+
+
+def _ladder_settings(value: Mapping[str, Any]) -> LadderSettings:
+    normalized = dict(value)
+    for name in ("active_size_weights", "lifecycle_weights"):
+        if name in normalized:
+            normalized[name] = tuple(normalized[name])
+    return LadderSettings(**normalized)
+
+
 def load_config(path: str | Path) -> Dict[str, Any]:
     resolved = Path(path).resolve()
     config = json.loads(resolved.read_text(encoding="utf-8"))
     if int(config.get("schema_version", -1)) != CONFIG_SCHEMA_VERSION:
+        raise ValueError(f"evaluation config schema must be {CONFIG_SCHEMA_VERSION}")
+    for key in (
+        "experiment", "output", "seeds", "scenarios", "recipe_ids", "arms",
+        "ladder",
+    ):
+        if key not in config:
+            raise ValueError(f"evaluation config is missing {key!r}")
+    if not config["seeds"] or not config["scenarios"] or not config["recipe_ids"]:
+        raise ValueError("seeds, scenarios, and recipe_ids must be non-empty")
+    unknown_scenarios = set(map(str, config["scenarios"])) - set(SCENARIOS)
+    if unknown_scenarios:
+        raise ValueError(f"unknown scenarios: {sorted(unknown_scenarios)}")
+    unknown_recipes = set(map(str, config["recipe_ids"])) - set(RECIPES)
+    if unknown_recipes:
+        raise ValueError(f"unknown recipes: {sorted(unknown_recipes)}")
+    unknown_arms = set(map(str, config["arms"])) - set(ARM_NAMES)
+    if unknown_arms:
+        raise ValueError(f"unknown arms: {sorted(unknown_arms)}")
+    requirements = set(map(str, config.get("validation_requirements", ())))
+    # Subset checking let the shipped config quietly drop a requirement, so the
+    # only check that verifies preference coverage never ran.  Require the
+    # exact set: opting out of a check must be a deliberate code change.
+    if requirements != set(VALIDATION_REQUIREMENTS):
         raise ValueError(
-            f"config schema must be {CONFIG_SCHEMA_VERSION}"
+            "validation_requirements must be exactly "
+            f"{sorted(VALIDATION_REQUIREMENTS)}; missing "
+            f"{sorted(set(VALIDATION_REQUIREMENTS) - requirements)}, unknown "
+            f"{sorted(requirements - set(VALIDATION_REQUIREMENTS))}"
         )
-    for field in ("experiment", "seeds", "layouts", "arms", "conditions"):
-        if not config.get(field):
-            raise ValueError(f"config field {field!r} must be non-empty")
+    ladder = _ladder_settings(config["ladder"])
+    ladder.validate(len(config["recipe_ids"]))
+    if ladder != LadderSettings():
+        raise ValueError("ladder settings must match the Adaptive-HRC publication defaults")
+    trivial = [
+        recipe_id for recipe_id in map(str, config["recipe_ids"])
+        if len(RECIPES[recipe_id].ingredients) < 2
+    ]
+    if trivial:
+        raise ValueError(f"single-ingredient recipes are prohibited: {trivial}")
+    if tuple(map(str, config["arms"])) != ARM_NAMES:
+        raise ValueError(
+            "the full cooking evaluation must use the Adaptive-HRC baseline "
+            f"roster in order: {ARM_NAMES}"
+        )
+    if tuple(map(int, config["seeds"])) != (1337, 2024, 7, 9001, 31415):
+        raise ValueError("the full evaluation uses the five Adaptive-HRC paper seeds")
+    if tuple(map(str, config["scenarios"])) != SCENARIOS:
+        raise ValueError("the full evaluation must contain all three scenarios")
+    if set(map(str, config["recipe_ids"])) != set(RECIPES):
+        raise ValueError("the full evaluation must use the complete nontrivial catalog")
+    expected_frozen_pairs = sum(
+        len(applicable_preferences(str(recipe_id)))
+        for recipe_id in config["recipe_ids"]
+    )
+    parity_flags = {
+        "shared_routing": True,
+        "pre_event_probes": True,
+        "frozen_pairs": expected_frozen_pairs,
+        "audit_period": 2,
+        "audit_prefixes": 16,
+        "audit_tolerance": 0.05,
+        "top_k": 3,
+        "offline_recipe_fraction": 0.50,
+        "offline_preference_fraction": 0.50,
+        "lead_actor_policy": "human_first",
+    }
+    mismatched = {
+        name: (config.get(name), expected)
+        for name, expected in parity_flags.items()
+        if config.get(name) != expected
+    }
+    if mismatched:
+        raise ValueError(f"Adaptive-HRC evaluation setting mismatch: {mismatched}")
+    model_contract = {
+        "irl_cold_steps": 100,
+        "irl_warm_steps": 40,
+        "irl_horizon": 45,
+        "initial_grace": 50,
+        "min_grace": 6,
+        "replay_capacity": 64,
+        "semantic_fallback_max_rms_distance": 0.20,
+    }
+    model_mismatch = {
+        name: (config.get("settings", {}).get(name), expected)
+        for name, expected in model_contract.items()
+        if config.get("settings", {}).get(name) != expected
+    }
+    if model_mismatch:
+        raise ValueError(f"Adaptive-HRC model setting mismatch: {model_mismatch}")
+    unexpected_model_overrides = set(config.get("settings", {})) - set(model_contract)
+    if unexpected_model_overrides:
+        raise ValueError(
+            "full evaluation may not override other Adaptive-HRC model settings: "
+            f"{sorted(unexpected_model_overrides)}"
+        )
+    if "arm_settings" in config:
+        raise ValueError("per-arm model overrides are prohibited in the full evaluation")
+    workers = int(config.get("workers", 0) or 0)
+    if workers < 0:
+        raise ValueError("workers must be zero (auto) or positive")
     config["_config_path"] = str(resolved)
     return config
 
 
-def _arm_overrides(name: str) -> Dict[str, Any]:
-    # Importing the registered symbolic arms guarantees Burrito uses the same
-    # model ablation definitions rather than a divergent local transcription.
-    from src.ablations import LATENT_STRATEGY_ABLATION_ARMS
+def _build_agent(arm: str, settings: Any, domain: CookingDomainAdapter) -> Any:
+    from src.adaptive_agent import AdaptiveAgent
 
-    arms = {arm.name: arm.model_overrides() for arm in LATENT_STRATEGY_ABLATION_ARMS}
-    if name == "full":
-        name = FULL_ARM
-    if name not in arms:
-        raise ValueError(f"unknown Burrito evaluation arm {name!r}")
-    return dict(arms[name])
+    if arm in {FULL_ARM, "memory_oracle"}:
+        agent = AdaptiveAgent(settings, domain=domain)
+        if arm == "memory_oracle":
+            from src.memory import ReplayMemory
 
-
-def _expanded_tasks(condition: Mapping[str, Any]) -> Tuple[BurritoTask, ...]:
-    tasks = []
-    for row in condition.get("tasks", ()):
-        repeat = max(1, int(row.get("repeat", 1)))
-        for _ in range(repeat):
-            tasks.append(BurritoTask.create(
-                str(row["protein"]),
-                str(row["preference"]),
-                recipe_id=row.get("recipe_id"),
-            ))
-    if not tasks:
-        raise ValueError(f"condition {condition.get('name')!r} has no tasks")
-    return tuple(tasks)
+            # As in Adaptive-HRC, the oracle differs from Full only in its
+            # future-aware retention policy.  It is not an action oracle.
+            agent.replay = ReplayMemory(agent.settings, policy="none")
+        return agent
+    from src.baselines import BASELINE_AGENTS
+    try:
+        agent_type = BASELINE_AGENTS[arm]
+    except KeyError as error:
+        raise ValueError(f"unknown evaluation arm {arm!r}") from error
+    return agent_type(settings, domain=domain)
 
 
-def _model_storage_metrics(agent: Any) -> Dict[str, int]:
-    """Return a deterministic lower bound on retained learner-state bytes.
+def _offline_subset(
+    values: Sequence[str], fraction: float, *, seed: int, axis: str,
+) -> Tuple[str, ...]:
+    """Use the same deterministic floor-based subset rule as Adaptive-HRC."""
+    if not 0.0 < float(fraction) <= 1.0:
+        raise ValueError(f"offline {axis} fraction must lie in (0, 1]")
+    candidates = sorted(set(map(str, values)))
+    if not candidates:
+        raise ValueError(f"cannot sample an empty offline {axis} set")
+    count = max(1, min(
+        len(candidates), int(math.floor(float(fraction) * len(candidates))),
+    ))
+    import random
 
-    This is an absolute post-episode footprint, not a recipe-length-normalized
-    proxy and not process RSS. It counts dense NumPy payloads exactly, then a
-    canonical int64/float64 representation of indexed states, actions, Q
-    entries, latent role sequences, and active/pruned replay records. Python
-    container overhead and simulator state are deliberately excluded.
-    """
-    model = agent.maxent
-    latent = model.latent_strategy
-    arrays = (
-        model.reward_weights,
-        model.features,
-        model.feature_mean,
-        model.feature_scale,
-        model.semantic_features,
-        model.values,
-        latent.mean,
-        latent.scale,
-        latent.components,
-        latent.codes,
-        latent.code_scale,
-        latent.fingerprints,
-        latent.role_counts,
-        latent.weights,
-    )
-    dense_values = sum(
-        int(value.size) for value in arrays
-        if isinstance(value, np.ndarray)
-    )
-    dense_bytes = sum(
-        int(value.nbytes) for value in arrays
-        if isinstance(value, np.ndarray)
-    )
-    replay_items = (
-        tuple(agent.replay.active.values())
-        + tuple(agent.replay.pruned.values())
-    )
-    states = {
-        tuple(state) for state in model.state_vectors.values()
+    rng = random.Random(f"frozen|{axis}|{int(seed)}")
+    return tuple(sorted(rng.sample(candidates, count)))
+
+
+def _observe_offline(
+    agent: Any,
+    domain: CookingDomainAdapter,
+    recipe_id: str,
+    preference: str,
+) -> None:
+    """Fit one semantic task-option trajectory without running a simulator."""
+    recipe = get_recipe(recipe_id)
+    ordering = preference_order(recipe, get_preference(preference))
+    domain.begin_task(recipe_id)
+    agent.start_demo()
+    completed: list[str] = []
+    for action in ordering:
+        before = domain.state_from_completed(recipe_id, completed)
+        completed.append(action)
+        after = domain.state_from_completed(recipe_id, completed)
+        agent.observe(
+            CookingObservation(before, action, after),
+            ground_truth_recipe=recipe_id,
+        )
+    agent.end_demo()
+
+
+def _prepare_offline_baseline(
+    arm: str,
+    agent: Any,
+    domain: CookingDomainAdapter,
+    tasks: Sequence[Any],
+    config: Mapping[str, Any],
+    *,
+    seed: int,
+    scenario: str,
+) -> Mapping[str, Any]:
+    """Match Adaptive-HRC's two frozen training regimes."""
+    if arm not in {"frozen", "offline_default"}:
+        return {}
+    started = time.perf_counter()
+    if scenario == "holdout":
+        source_tasks = [
+            task for task in tasks if task.strategy == "holdout_source_training"
+        ]
+        pairs = [(task.recipe_id, task.preference) for task in source_tasks]
+        design = "matched_holdout_source_progression"
+    elif arm == "frozen":
+        recipes = _offline_subset(
+            [task.recipe_id for task in tasks],
+            float(config.get("offline_recipe_fraction", 0.50)),
+            seed=seed,
+            axis="recipe",
+        )
+        preferences = _offline_subset(
+            [task.preference for task in tasks],
+            float(config.get("offline_preference_fraction", 0.50)),
+            seed=seed,
+            axis="preference",
+        )
+        pairs = [
+            (recipe, preference)
+            for recipe in recipes for preference in preferences
+            if preference in applicable_preferences(recipe)
+        ]
+        design = "subset_recipes_subset_preferences"
+    else:
+        recipes = sorted({task.recipe_id for task in tasks})
+        pairs = [(recipe, _canonical_preference(recipe)) for recipe in recipes]
+        design = "all_recipes_default_only"
+    if not pairs:
+        raise ValueError(f"{arm} has no effective offline training pairs")
+    for recipe, preference in pairs:
+        _observe_offline(agent, domain, recipe, preference)
+    metadata = {
+        "offline_training_design": design,
+        "offline_training_event_count": len(pairs),
+        "offline_training_unique_pair_count": len(set(pairs)),
+        "offline_training_recipe_count": len({recipe for recipe, _ in pairs}),
+        "offline_training_preference_count": len({preference for _, preference in pairs}),
+        "offline_training_end_to_end_wall_s": time.perf_counter() - started,
     }
-    actions = {str(action) for action in model.action_ids}
-    for item in replay_items:
-        actions.update(map(str, item.ordering))
-        for state, action, next_state in item.transitions:
-            states.add(tuple(state))
-            states.add(tuple(next_state))
-            actions.add(str(action))
+    lock = getattr(agent, "lock_deployment", None)
+    if not callable(lock):
+        raise TypeError(f"{arm} does not implement lock_deployment()")
+    return dict(lock(metadata))
 
-    index_bytes = np.dtype(np.int64).itemsize
-    value_bytes = np.dtype(np.float64).itemsize
-    state_coordinate_count = sum(len(state) for state in states)
-    state_table_bytes = state_coordinate_count * index_bytes
-    action_label_bytes = sum(len(action.encode("utf-8")) for action in actions)
-    q_value_count = len(model.q_values)
-    q_table_bytes = q_value_count * (2 * index_bytes + value_bytes)
-    latent_sequence_index_count = sum(
-        len(sequence) for sequence in latent.role_sequences
-    )
-    latent_sequence_bytes = latent_sequence_index_count * index_bytes
 
-    replay_ordering_index_count = sum(
-        len(item.ordering) for item in replay_items
-    )
-    replay_transition_count = sum(
-        len(item.transitions) for item in replay_items
-    )
-    replay_index_bytes = (
-        replay_ordering_index_count * index_bytes
-        + replay_transition_count * 3 * index_bytes
-    )
-    replay_identifier_bytes = sum(
-        len(item.recipe_id.encode("utf-8"))
-        + len(item.variant_id.encode("utf-8"))
-        + len(str(getattr(item, "source_mode", "")).encode("utf-8"))
-        for item in replay_items
-    )
-    # Active records retain one float and three integer fields; pruned records
-    # retain five integer fields. Keys and variable-length data are counted
-    # separately above.
-    replay_metadata_bytes = (
-        len(agent.replay.active) * (value_bytes + 3 * index_bytes)
-        + len(agent.replay.pruned) * (5 * index_bytes)
-    )
-    replay = agent.replay
-    adaptive_history_index_count = (
-        len(replay._reuse_gap_window)
-        + sum(
-            2 + len(gaps) for gaps in replay._pair_gap_window.values()
+def _canonical_preference(recipe_id: str) -> str:
+    return applicable_preferences(recipe_id)[0]
+
+
+def _apply_memory_oracle_pruning(
+    agent: Any,
+    future_tasks: Sequence[Any],
+    learner_recipe_by_task: Mapping[str, str],
+) -> Mapping[str, Any]:
+    """Retain only known variants that occur again in the future stream."""
+    from src.memory import make_variant_id
+
+    future_keys = {
+        (learner_recipe_by_task[task.recipe_id], make_variant_id(preference_order(
+            get_recipe(task.recipe_id), get_preference(task.preference),
+        )))
+        for task in future_tasks
+        if task.recipe_id in learner_recipe_by_task
+    }
+    active_before = set(agent.replay.active)
+    pruned_before = set(agent.replay.pruned)
+    discarded = sorted((active_before | pruned_before) - future_keys)
+    if discarded:
+        agent.discard(discarded)
+    weight_changed = False
+    for key in set(agent.replay.active) & future_keys:
+        entry = agent.replay.active[key]
+        weight_changed = weight_changed or not math.isclose(
+            float(entry.weight), 1.0, abs_tol=1e-12,
         )
-        + 3 * len(replay._pair_last_seen_step)
-        + sum(
-            1 + 3 * len(events)
-            for events in replay._recipe_gap_events.values()
-        )
-        + 3 * len(replay._global_gap_events)
-        + 4 * len(replay.reuse_gap_events)
-        + 4 * len(replay.reentry_events)
-        + 2 * len(replay.latest_by_recipe)
-        + 2 * len(replay.latest_keys)
-    )
-    adaptive_history_bytes = adaptive_history_index_count * index_bytes
-    retained_payload_bytes = (
-        dense_bytes
-        + state_table_bytes
-        + action_label_bytes
-        + q_table_bytes
-        + latent_sequence_bytes
-        + replay_index_bytes
-        + replay_identifier_bytes
-        + replay_metadata_bytes
-        + adaptive_history_bytes
-    )
+        entry.weight = 1.0
+    if (discarded or weight_changed) and agent.replay.active:
+        agent.refresh()
     return {
-        "learner_retained_payload_bytes": int(retained_payload_bytes),
-        "learner_dense_array_bytes": int(dense_bytes),
-        "learner_dense_value_count": int(dense_values),
-        "learner_unique_state_count": int(len(states)),
-        "learner_state_coordinate_count": int(state_coordinate_count),
-        "learner_action_label_count": int(len(actions)),
-        "learner_action_label_bytes": int(action_label_bytes),
-        "learner_q_value_count": int(q_value_count),
-        "learner_replay_variant_count": int(len(replay_items)),
-        "learner_replay_transition_count": int(replay_transition_count),
-        "learner_adaptive_history_index_count": int(
-            adaptive_history_index_count
+        "oracle_retention_policy": "future_filtered_known_variants",
+        "oracle_decay_policy": "binary_keep_until_final_occurrence",
+        "oracle_pruned_variant_count": len(discarded),
+        "oracle_future_variant_count": len(future_keys),
+        "oracle_active_variants_before": len(active_before),
+        "oracle_active_variants_after": len(agent.replay.active),
+    }
+
+
+def _frozen_probe(
+    agent: Any,
+    domain: CookingDomainAdapter,
+    task: Any,
+    *,
+    metadata: Mapping[str, Any],
+    probe_kind: str,
+    top_k: int = 3,
+) -> Dict[str, Any]:
+    """Evaluate an entire task-option trajectory without mutating the agent."""
+    graph = CookingTaskGraph.create(task.recipe_id)
+    policy = CookingPreferencePolicy.create(task.preference)
+    completed: list[str] = []
+    rows = []
+    agent.set_frozen(True)
+    try:
+        domain.begin_task(task.recipe_id)
+        while not graph.is_complete(completed):
+            legal = graph.frontier(completed)
+            truth = policy.choose_action(legal, graph)
+            distribution: Mapping[str, float] = {}
+            # Probe the opening move too.  It is the most preference-informative
+            # decision in these task graphs, and excluding it made the probe
+            # blind to exactly the strategies the holdout is built around.
+            state = domain.state_from_completed(task.recipe_id, completed)
+            distribution = agent.predict_actions(
+                tuple(completed), state=state, action_universe=legal,
+            )
+            ranked = tuple(agent.rank_actions(distribution, k=max(1, int(top_k))))
+            predicted = ranked[0] if ranked else None
+            rows.append({
+                "legal_count": len(legal),
+                "correct": predicted == truth,
+                "correct_top_k": truth in ranked,
+                "scored": predicted is not None,
+                "discriminating": bool(
+                    predicted is not None
+                    and is_preference_discriminating(legal, graph)
+                ),
+                "probability": float(distribution.get(truth, 0.0)),
+            })
+            completed.append(truth)
+    finally:
+        agent.set_frozen(False)
+        # AdaptiveAgent's generic freeze snapshot deep-copies its adapter.
+        # Restore the shared cooking adapter required by the physical runner.
+        agent.domain = domain
+        if hasattr(agent, "maxent"):
+            agent.maxent.domain = domain
+        if hasattr(agent, "cloner"):
+            agent.cloner.domain = domain
+    scored = [row for row in rows if row["scored"]]
+    discriminating = [row for row in rows if row["discriminating"]]
+    nontrivial = [row for row in scored if row["legal_count"] > 1]
+    return {
+        **dict(metadata),
+        "diagnostic_type": probe_kind,
+        "recipe_id": task.recipe_id,
+        "environment": RECIPES[task.recipe_id].stratum,
+        "preference": task.preference,
+        "decision_count": len(scored),
+        "top_1_hits": sum(row["correct"] for row in scored),
+        "top_1": _finite_mean(row["correct"] for row in scored),
+        "top_k_hits": sum(row["correct_top_k"] for row in scored),
+        "top_k": _finite_mean(row["correct_top_k"] for row in scored),
+        "preference_discriminating_decision_count": len(discriminating),
+        "preference_discriminating_top_1_hits": sum(
+            row["correct"] for row in discriminating
         ),
-        "learner_latent_sequence_index_count": int(
-            latent_sequence_index_count
+        "preference_discriminating_top_1": _finite_mean(
+            row["correct"] for row in discriminating
+        ),
+        "nontrivial_choice_decision_count": len(nontrivial),
+        "nontrivial_choice_top_1_hits": sum(row["correct"] for row in nontrivial),
+        "mean_ground_truth_probability": _finite_mean(
+            row["probability"] for row in scored
+        ),
+        "mutation_free": True,
+    }
+
+
+def _model_storage_metrics(agent: Any) -> Dict[str, Any]:
+    model = agent.maxent
+    fit_stats = dict(getattr(model, "last_fit_stats", {}) or {})
+    arrays = [
+        value for value in vars(model).values() if isinstance(value, np.ndarray)
+    ]
+    replay = tuple(agent.replay.active.values()) + tuple(agent.replay.pruned.values())
+    transition_count = sum(len(item.transitions) for item in replay)
+    return {
+        "learner_dense_array_bytes": sum(int(value.nbytes) for value in arrays),
+        "learner_replay_variant_count": len(replay),
+        "learner_replay_transition_count": transition_count,
+        "learner_registry_recipe_count": sum(
+            bool(slot) for slot in agent.library.variants.values()
+        ),
+        "learner_model_structure": str(fit_stats.get("model_structure", "unfitted")),
+        "latent_strategy_prototypes": int(
+            fit_stats.get("latent_strategy_prototypes", 0)
         ),
     }
 
 
 def _memory_metrics(agent: Any) -> Dict[str, Any]:
-    replay = agent.replay
-    weights = [float(item.weight) for item in replay.active.values()]
-    evidence = replay.horizon_evidence()
-    horizons = [float(row["horizon_demos"]) for row in evidence.values()]
+    weights = [float(item.weight) for item in agent.replay.active.values()]
     return {
-        "memory_active_variants": len(replay.active),
-        "memory_pruned_variants": len(replay.pruned),
+        "memory_active_variants": len(agent.replay.active),
+        "memory_pruned_variants": len(agent.replay.pruned),
         "memory_nonunit_weights": sum(
-            not math.isclose(weight, 1.0, rel_tol=0.0, abs_tol=1e-12)
-            for weight in weights
+            not math.isclose(weight, 1.0, abs_tol=1e-12) for weight in weights
         ),
         "memory_min_active_weight": min(weights) if weights else None,
-        "memory_reuse_gap_event_count": len(replay.reuse_gap_events),
-        "memory_reentry_event_count": len(replay.reentry_events),
-        "memory_pair_gap_sample_count": sum(
-            int(row["pair_gap_samples"]) for row in evidence.values()
-        ),
-        "memory_horizon_min_demos": min(horizons) if horizons else None,
-        "memory_horizon_max_demos": max(horizons) if horizons else None,
-    }
-
-
-def _recovery_metrics(decisions: Sequence[Any]) -> Dict[str, Any]:
-    robot = [
-        int(row.correct_top_1) for row in decisions
-        if row.mode == ASSIST and row.scheduled_actor == "robot"
-    ]
-    if not robot:
-        return {"adaptation_latency_robot_turns": None, "recovery_auc": None}
-    latency = None
-    for index in range(len(robot)):
-        window = robot[index:index + 2]
-        if len(window) == 2 and all(window):
-            latency = index + 1
-            break
-    running = [statistics.fmean(robot[:index]) for index in range(1, len(robot) + 1)]
-    return {
-        "adaptation_latency_robot_turns": latency,
-        "recovery_auc": statistics.fmean(running),
     }
 
 
@@ -303,23 +538,19 @@ def _decision_record(row: Any) -> Dict[str, Any]:
         "physical_actor_id": row.physical_actor_id,
         "executed_by": row.executed_by,
         "legal_actions": list(row.legal_actions),
-        "acceptable_actions": list(row.acceptable_actions),
-        "reference_action": row.reference_action,
+        "ground_truth_action": row.ground_truth_action,
         "executed_action": row.actual,
         "predicted_action": row.predicted,
-        "acceptable_top_1": row.correct_top_1,
-        "reference_top_1": row.exact_reference_match,
-        "reference_probability": row.reference_probability,
-        "reference_nll": (
-            row.reference_nll if math.isfinite(row.reference_nll) else None
+        "correct_top_1": row.correct_top_1,
+        "correct_top_k": row.correct_top_k,
+        "ground_truth_probability": row.ground_truth_probability,
+        "ground_truth_nll": (
+            row.ground_truth_nll if math.isfinite(row.ground_truth_nll) else None
         ),
-        "acceptable_probability_mass": row.acceptable_probability_mass,
-        "acceptable_nll": (
-            row.acceptable_nll if math.isfinite(row.acceptable_nll) else None
-        ),
-        "invalid_prediction": row.invalid_prediction,
+        "preference_discriminating": row.preference_discriminating,
         "human_corrected": row.human_corrected,
         "proposal_executed": row.proposal_executed,
+        "invalid_prediction": row.invalid_prediction,
         "prediction_wall_s": row.prediction_wall_s,
         "low_level_ticks": row.low_level_ticks,
         "passive_wait_ticks_before": row.passive_wait_ticks_before,
@@ -335,249 +566,652 @@ def _decision_record(row: Any) -> Dict[str, Any]:
 
 
 def _episode_record(
-    result: BurritoEpisodeResult,
+    result: CookingEpisodeResult,
     *,
     metadata: Mapping[str, Any],
     wall_s: float,
-    train_events: Sequence[Mapping[str, Any]],
-    storage_metrics: Mapping[str, int],
-    memory_metrics: Mapping[str, Any],
+    agent: Any,
 ) -> Dict[str, Any]:
-    decisions = [
-        row for row in result.decisions
-        if row.mode == ASSIST and row.predicted is not None
-    ]
-    recipe_steps = len(result.decisions)
-    train_wall = sum(float(row.get("total_wall_s", 0.0)) for row in train_events)
-    train_flops = sum(float(row.get("flop_estimate", 0.0)) for row in train_events)
-    human_turns = sum(row.scheduled_actor == "human" for row in result.decisions)
+    assist = [row for row in result.decisions if row.mode == ASSIST and row.predicted is not None]
+    robot = [row for row in assist if row.scheduled_actor == "robot"]
+    discriminating = [row for row in robot if row.preference_discriminating]
+    choice = [row for row in robot if len(row.legal_actions) > 1]
+    forced = [row for row in robot if len(row.legal_actions) == 1]
+    recipe = RECIPES[result.task.recipe_id]
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
         **dict(metadata),
         "recipe_id": result.task.recipe_id,
-        "protein": result.task.protein,
+        # Stratum, not raw environment: compatibility recipes are executed by
+        # wrapper-restored transitions and must never pool with natively
+        # executed Burrito recipes.
+        "environment": recipe.stratum,
+        "upstream_environment": recipe.environment,
+        "layout": recipe.layout,
+        "ingredients": list(recipe.ingredients),
+        "upstream_dish": recipe.upstream_dish,
         "preference": result.task.preference,
+        "strategy": result.task.strategy,
+        "adaptation_id": result.task.adaptation_id,
+        "holdout_target": result.task.holdout_target,
+        "phase": result.task.phase,
+        "schedule_step": result.task.schedule_step,
+        "phase_role": result.task.phase_role,
+        "lifecycle": result.task.lifecycle,
+        "preference_changed": result.task.preference_changed,
+        "exposure_after_change": result.task.exposure_after_change,
         "mode": result.mode,
-        "recipe_steps": recipe_steps,
+        "recipe_steps": len(result.decisions),
         "deliveries": result.deliveries,
-        "task_completed": result.deliveries == 1,
+        "expected_deliveries": recipe.expected_deliveries,
+        "task_completed": result.deliveries == recipe.expected_deliveries,
         "task_wall_s": wall_s,
         "task_low_level_ticks": result.low_level_ticks,
         "passive_wait_ticks": result.passive_wait_ticks,
-        "memory_age_delta": result.memory_age_delta,
-        "acceptable_set_accuracy": _finite_mean(
-            row.correct_top_1 for row in decisions
+        "robot_decision_count": len(robot),
+        "robot_top_1_hits": result.robot_top_1_hits,
+        "robot_top_1": result.robot_top_1,
+        "robot_top_k_hits": result.robot_top_k_hits,
+        "robot_top_k": result.robot_top_k,
+        "human_action_count": result.human_actions,
+        "robot_action_count": result.robot_actions,
+        "human_corrections": result.corrections,
+        "correction_free": result.corrections == 0,
+        "corrections_per_robot_decision": (
+            result.corrections / len(robot) if robot else None
         ),
-        "acceptable_set_nll": _finite_mean(
-            row.acceptable_nll for row in decisions
+        "preference_discriminating_robot_decisions": len(discriminating),
+        "preference_discriminating_top_1_hits": sum(
+            row.correct_top_1 for row in discriminating
         ),
-        "reference_top_1": _finite_mean(
-            row.exact_reference_match for row in decisions
+        "preference_discriminating_top_1": _finite_mean(
+            row.correct_top_1 for row in discriminating
         ),
-        "reference_nll": _finite_mean(row.reference_nll for row in decisions),
-        "robot_acceptable_top_1": result.robot_top_1,
-        "robot_reference_top_1": result.robot_exact_reference_top_1,
-        "human_shadow_acceptable_top_1": result.human_shadow_top_1,
-        "human_interventions": result.corrections,
-        "human_action_load": (
-            (human_turns + result.corrections) / recipe_steps
-            if recipe_steps else None
+        "teacher_forced_top_1": _finite_mean(row.correct_top_1 for row in assist),
+        "teacher_forced_decision_count": len(assist),
+        "teacher_forced_top_1_hits": sum(row.correct_top_1 for row in assist),
+        "teacher_forced_top_k_hits": sum(row.correct_top_k for row in assist),
+        "teacher_forced_nll": _finite_mean(row.ground_truth_nll for row in assist),
+        "teacher_forced_preference_discriminating_decisions": (
+            result.scored_discriminating_decisions
         ),
+        "teacher_forced_preference_discriminating_top_1_hits": (
+            result.scored_discriminating_top_1_hits
+        ),
+        "teacher_forced_preference_discriminating_top_1": (
+            result.scored_discriminating_top_1
+        ),
+        "nontrivial_choice_decision_count": len(choice),
+        "nontrivial_choice_top_1_hits": sum(row.correct_top_1 for row in choice),
+        "single_legal_action_decision_count": len(forced),
         "invalid_predictions": result.invalid_predictions,
-        "prediction_wall_s": result.prediction_wall_s,
-        "train_wall_s": train_wall,
-        "train_flops": train_flops,
-        "compute_wall_s_per_macro": (
-            (result.prediction_wall_s + train_wall) / recipe_steps
-            if recipe_steps else None
-        ),
-        "train_flops_per_macro": train_flops / max(1, recipe_steps),
-        **dict(storage_metrics),
-        **dict(memory_metrics),
+        "memory_age_delta": result.memory_age_delta,
+        "commit_kind": getattr(result.match, "kind", None),
+        "matched_recipe_id": getattr(result.match, "recipe_id", None),
+        "matched_variant_id": getattr(result.match, "variant_id", None),
+        "commit_applied": result.commit_applied,
+        "active_rehearsal": result.active_rehearsal,
+        "retrain_executed": result.retrain_executed,
+        "retrain_event_count": len(result.retrain_events),
+        "lead_actor_policy": result.lead_actor_policy,
         "semantic_fallback_decisions": sum(
-            bool(row.prediction_stats.get("semantic_fallback_used", False))
-            for row in decisions
+            row.prediction_stats.get("semantic_fallback_used", False) for row in assist
+        ),
+        # Semantic features are identity-masked, so every structurally
+        # identical recipe sits at distance zero and the fallback always fires
+        # between them.  Split accuracy by whether it fired, otherwise the
+        # mechanism is assumed to help rather than shown to.
+        "semantic_fallback_top_1_hits": sum(
+            row.correct_top_1 for row in assist
+            if row.prediction_stats.get("semantic_fallback_used", False)
+        ),
+        "semantic_fallback_discriminating_decisions": sum(
+            1 for row in assist
+            if row.prediction_stats.get("semantic_fallback_used", False)
+            and row.preference_discriminating
+        ),
+        "semantic_fallback_discriminating_top_1_hits": sum(
+            row.correct_top_1 for row in assist
+            if row.prediction_stats.get("semantic_fallback_used", False)
+            and row.preference_discriminating
+        ),
+        "own_model_decisions": sum(
+            1 for row in assist
+            if not row.prediction_stats.get("semantic_fallback_used", False)
+        ),
+        "own_model_top_1_hits": sum(
+            row.correct_top_1 for row in assist
+            if not row.prediction_stats.get("semantic_fallback_used", False)
+        ),
+        "own_model_discriminating_decisions": sum(
+            1 for row in assist
+            if not row.prediction_stats.get("semantic_fallback_used", False)
+            and row.preference_discriminating
+        ),
+        "own_model_discriminating_top_1_hits": sum(
+            row.correct_top_1 for row in assist
+            if not row.prediction_stats.get("semantic_fallback_used", False)
+            and row.preference_discriminating
         ),
         "latent_strategy_decisions": sum(
-            bool(row.prediction_stats.get("latent_strategy_used", False))
-            for row in decisions
+            row.prediction_stats.get("latent_strategy_used", False) for row in assist
         ),
-        **_recovery_metrics(result.decisions),
+        "compatibility_dynamics": result.compatibility_dynamics,
+        "compatibility_calls": list(result.compatibility_calls),
+        **_model_storage_metrics(agent),
+        **_memory_metrics(agent),
         "decisions": [_decision_record(row) for row in result.decisions],
     }
 
 
-def _condition_run(
+def _run_cell(
     runtime: BurritoRuntime,
     config: Mapping[str, Any],
-    condition: Mapping[str, Any],
     *,
     seed: int,
-    layout: str,
+    scenario: str,
     arm: str,
-) -> Tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
-    from src.adaptive_agent import AdaptiveAgent
+) -> Tuple[
+    list[Dict[str, Any]],
+    list[Dict[str, Any]],
+    list[Dict[str, Any]],
+    list[Dict[str, Any]],
+    Mapping[str, Any],
+]:
     from src.models import Settings
 
+    ladder_settings = _ladder_settings(config["ladder"])
+    tasks, generated_audit = generate_ladder(
+        seed=seed,
+        scenario=scenario,
+        recipe_ids=tuple(map(str, config["recipe_ids"])),
+        settings=ladder_settings,
+        return_audit=True,
+    )
     overrides = dict(config.get("settings", {}))
-    overrides.update(_arm_overrides(arm))
     overrides.update({
         "verbose": False,
         "seed": int(seed),
-        "semantic_fallback_max_rms_distance": float(
-            overrides.get(
-                "semantic_fallback_max_rms_distance",
-                SEMANTIC_FALLBACK_MAX_RMS_DISTANCE,
-            )
-        ),
+        "semantic_fallback_max_rms_distance": float(overrides.get(
+            "semantic_fallback_max_rms_distance",
+            SEMANTIC_FALLBACK_MAX_RMS_DISTANCE,
+        )),
     })
-    executor = BurritoOptionExecutor(
+    domain = CookingDomainAdapter()
+    agent = _build_agent(arm, Settings(**overrides), domain)
+    offline_context = _prepare_offline_baseline(
+        arm,
+        agent,
+        domain,
+        tasks,
+        config,
+        seed=seed,
+        scenario=scenario,
+    )
+    runner = CookingHrcRunner(
+        agent,
         runtime,
-        layout=layout,
-        horizon=int(config.get("horizon", 2400)),
-        seed=int(config.get("planner_seed", 11)),
+        domain,
+        horizon=int(config.get("horizon", 1800)),
+        planner_seed=int(config.get("planner_seed", 11)),
+        top_k=int(config.get("top_k", 3)),
+        memory_updates_enabled=arm not in {"frozen", "offline_default"},
+        require_shift_update=arm == FULL_ARM,
+        lead_actor_policy=str(config.get("lead_actor_policy", "human_first")),
     )
-    domain = BurritoDomainAdapter(
-        executor.state,
-        terrain_positions=executor.env.mdp.terrain_pos_dict,
-    )
-    agent = AdaptiveAgent(Settings(**overrides), domain=domain)
-    runner = BurritoHrcRunner(agent, executor, domain, seed=seed)
-
     episodes: list[Dict[str, Any]] = []
     failures: list[Dict[str, Any]] = []
-    observed_preferences: Dict[str, set[str]] = {}
-    global_preferences: set[str] = set()
-    last_preference: Dict[str, str] = {}
-    last_pair_index: Dict[Tuple[str, str], int] = {}
-    for event_index, task in enumerate(_expanded_tasks(condition)):
-        seen_recipe = task.recipe_id in runner.observed_recipes
-        seen_here = task.preference in observed_preferences.get(task.recipe_id, set())
-        cross_recipe = seen_recipe and not seen_here and task.preference in global_preferences
-        preference_switch = bool(
-            seen_recipe
-            and task.recipe_id in last_preference
-            and last_preference[task.recipe_id] != task.preference
-        )
-        pair = (task.recipe_id, task.preference)
-        recurrence_gap = (
-            event_index - last_pair_index[pair] - 1
-            if pair in last_pair_index else None
-        )
-        event_metadata = {
-            "condition": str(condition["name"]),
+    probes: list[Dict[str, Any]] = []
+    audits: list[Dict[str, Any]] = []
+    oracle_pruning: list[Mapping[str, Any]] = []
+    # The panel is every behaviourally distinct (recipe, preference) pair.
+    # It used to be truncated to a configured 48 while the catalog could only
+    # supply far fewer, so the audit reported a panel size that never existed.
+    # ``load_config`` now requires the declared size to equal the real one.
+    frozen_pair_tasks = [
+        CookingTask.create(recipe, preference)
+        for recipe in map(str, config["recipe_ids"])
+        for preference in applicable_preferences(recipe)
+    ]
+    isomorphic_targets = set(
+        generated_audit.get("holdout_isomorphic_target_recipe_ids", ())
+    )
+    for event_index, task in enumerate(tasks):
+        metadata = {
             "event_index": event_index,
+            # A holdout target whose task graph is isomorphic to its source is
+            # a relabelling of the container axis, not a generalisation of it.
+            "holdout_transfer_isomorphic": bool(
+                task.holdout_target and task.recipe_id in isomorphic_targets
+            ),
             "seed": int(seed),
             "planner_seed": int(config.get("planner_seed", 11)),
-            "layout": layout,
+            "scenario": scenario,
             "arm": arm,
-            "is_full_arm": arm in {"full", FULL_ARM},
-            "cross_recipe_transfer": cross_recipe,
-            "preference_switch": preference_switch,
-            "recurrence_gap": recurrence_gap,
+            "is_full_arm": arm == FULL_ARM,
+            "mode_schedule_policy": "matched_full_realized_execution_schedule",
+            **dict(offline_context),
         }
-        event_start = time.perf_counter()
-        train_before = len(agent.retrain_events)
+        started = time.perf_counter()
         try:
+            if (
+                bool(config.get("pre_event_probes", True))
+                and task.phase_role == "climb"
+                and task.recipe_id in runner.observed_recipes
+            ):
+                probes.append(_frozen_probe(
+                    agent,
+                    domain,
+                    task,
+                    metadata=metadata,
+                    probe_kind="pre_event_climb_probe",
+                    top_k=int(config.get("top_k", 3)),
+                ))
             result = runner.run_task(task)
-        except OptionExecutionError as error:
-            failures.append({
-                **event_metadata,
-                "failure_type": "planner_failure",
-                "error": str(error),
-            })
-            break
         except Exception as error:
             failures.append({
-                **event_metadata,
-                "failure_type": "system_failure",
+                **metadata,
+                "recipe_id": task.recipe_id,
+                "phase": task.phase,
+                "lifecycle": task.lifecycle,
+                "failure_type": (
+                    "planner_failure" if isinstance(error, OptionExecutionError)
+                    else "system_failure"
+                ),
                 "error": f"{type(error).__name__}: {error}",
             })
             break
         episodes.append(_episode_record(
             result,
-            metadata=event_metadata,
-            wall_s=time.perf_counter() - event_start,
-            train_events=agent.retrain_events[train_before:],
-            storage_metrics=_model_storage_metrics(agent),
-            memory_metrics=_memory_metrics(agent),
+            metadata=metadata,
+            wall_s=time.perf_counter() - started,
+            agent=agent,
         ))
-        observed_preferences.setdefault(task.recipe_id, set()).add(task.preference)
-        global_preferences.add(task.preference)
-        last_preference[task.recipe_id] = task.preference
-        last_pair_index[pair] = event_index
-    return episodes, failures
+        if arm == "memory_oracle":
+            oracle_pruning.append(_apply_memory_oracle_pruning(
+                agent,
+                tasks[event_index + 1:],
+                runner.learner_recipe_by_task,
+            ))
+        audit_period = int(config.get("audit_period", 2))
+        if audit_period > 0 and (event_index + 1) % audit_period == 0:
+            context = {
+                **metadata,
+                "diagnostic_type": "active_only_pruned_influence_audit",
+                "active_variants": len(agent.replay.active),
+                "pruned_variants": len(agent.replay.pruned),
+            }
+            try:
+                audit_result = dict(agent.audit_pruning(
+                    max_prefixes=int(config.get("audit_prefixes", 16)),
+                    tolerance=float(config.get("audit_tolerance", 0.05)),
+                ))
+                audits.append({**context, **audit_result, "audit_available": True})
+            except Exception as error:
+                audits.append({
+                    **context,
+                    "audit_available": False,
+                    "passed": False,
+                    "error": f"{type(error).__name__}: {error}",
+                })
+        phase_boundary = (
+            event_index + 1 == len(tasks)
+            or tasks[event_index + 1].schedule_step != task.schedule_step
+        )
+        if phase_boundary:
+            for frozen_task in frozen_pair_tasks:
+                probes.append(_frozen_probe(
+                    agent,
+                    domain,
+                    frozen_task,
+                    metadata=metadata,
+                    probe_kind="phase_boundary_frozen_panel_probe",
+                    top_k=int(config.get("top_k", 3)),
+                ))
+    # A cell that raised stops at the failing episode.  Mark every row so the
+    # pooled summary can exclude truncated cells instead of silently averaging
+    # a 20-episode cell against a 210-episode one.
+    cell_complete = not failures and len(episodes) == len(tasks)
+    for row in episodes:
+        row["cell_complete"] = cell_complete
+        row["cell_planned_episodes"] = len(tasks)
+    audit = dict(generated_audit)
+    audit.update({
+        "cell_complete": cell_complete,
+        "cell_planned_episodes": len(tasks),
+        "cell_completed_episodes": len(episodes),
+        "shared_routing": bool(config.get("shared_routing", True)),
+        "pre_event_probes": bool(config.get("pre_event_probes", True)),
+        "frozen_pairs": len(frozen_pair_tasks),
+        "audit_period": int(config.get("audit_period", 2)),
+        "audit_prefixes": int(config.get("audit_prefixes", 16)),
+        "audit_tolerance": float(config.get("audit_tolerance", 0.05)),
+        "offline_training": dict(offline_context),
+        "oracle_pruning_event_count": len(oracle_pruning),
+        "oracle_pruned_variant_count": sum(
+            int(row["oracle_pruned_variant_count"]) for row in oracle_pruning
+        ),
+        "pre_event_probe_count": sum(
+            row["diagnostic_type"] == "pre_event_climb_probe" for row in probes
+        ),
+        "frozen_panel_probe_count": sum(
+            row["diagnostic_type"] == "phase_boundary_frozen_panel_probe"
+            for row in probes
+        ),
+        "active_only_audit_count": len(audits),
+        "active_only_audit_failures": sum(
+            row.get("passed") is False for row in audits
+        ),
+    })
+    return episodes, failures, probes, audits, audit
 
 
-def _aggregate(episodes: Sequence[Mapping[str, Any]], failures: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    metric_names = (
-        "acceptable_set_accuracy", "acceptable_set_nll", "reference_top_1",
-        "reference_nll", "robot_acceptable_top_1", "human_action_load",
-        "human_interventions", "task_wall_s", "task_low_level_ticks",
-        "invalid_predictions", "adaptation_latency_robot_turns",
-        "recovery_auc", "compute_wall_s_per_macro", "train_flops_per_macro",
-        "learner_retained_payload_bytes", "learner_dense_array_bytes",
-        "learner_dense_value_count", "learner_unique_state_count",
-        "learner_q_value_count", "learner_replay_variant_count",
-        "learner_replay_transition_count", "memory_active_variants",
-        "memory_pruned_variants", "memory_nonunit_weights",
-        "memory_pair_gap_sample_count", "memory_horizon_min_demos",
-        "memory_horizon_max_demos",
+def _adaptation_records(episodes: Sequence[Mapping[str, Any]]) -> list[Dict[str, Any]]:
+    grouped: Dict[Tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in episodes:
+        adaptation_id = row.get("adaptation_id")
+        if adaptation_id is None or int(row.get("exposure_after_change", 0)) < 1:
+            continue
+        key = (
+            row["seed"], row["scenario"], row["arm"], str(adaptation_id),
+        )
+        grouped[key].append(row)
+    records = []
+    for key, rows in grouped.items():
+        acquisition = [row for row in rows if row["exposure_after_change"] == 1]
+        recurrence = [row for row in rows if row["exposure_after_change"] >= 2]
+        if len(acquisition) != 1 or not recurrence:
+            continue
+        first = acquisition[0]
+        records.append({
+            "seed": key[0],
+            "scenario": key[1],
+            "arm": key[2],
+            "adaptation_id": key[3],
+            "recipe_id": first["recipe_id"],
+            "acquisition_phase": first["phase"],
+            "last_recurrence_phase": max(row["phase"] for row in recurrence),
+            "preference": first["preference"],
+            "strategy": first["strategy"],
+            "acquisition_event_index": first["event_index"],
+            "first_recurrence_event_index": min(row["event_index"] for row in recurrence),
+            "intervening_episode_count": min(row["event_index"] for row in recurrence) - first["event_index"] - 1,
+            "update_verified": bool(
+                first["commit_applied"]
+                and first["active_rehearsal"]
+                and first["retrain_executed"]
+            ),
+            "acquisition_corrections": first["human_corrections"],
+            # Corrections only ever occur on robot turns, so a preference whose
+            # discriminating decision is the opening move shows zero
+            # corrections however badly the learner adapts.  Carry the
+            # teacher-forced discriminating accuracy alongside it.
+            "acquisition_teacher_forced_discriminating_top_1": first.get(
+                "teacher_forced_preference_discriminating_top_1"
+            ),
+            "post_update_teacher_forced_discriminating_top_1": _pooled_rate(
+                recurrence,
+                "teacher_forced_preference_discriminating_top_1_hits",
+                "teacher_forced_preference_discriminating_decisions",
+            ),
+            "post_update_episode_count": len(recurrence),
+            "post_update_correction_free_rate": _finite_mean(
+                row["correction_free"] for row in recurrence
+            ),
+            "post_update_corrections_per_robot_decision": _finite_mean(
+                row["corrections_per_robot_decision"] for row in recurrence
+            ),
+        })
+    return sorted(records, key=lambda row: (
+        row["seed"], row["scenario"], row["arm"],
+        row["acquisition_phase"], row["recipe_id"],
+    ))
+
+
+def _human_action_load(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Human action load, plus the floor the turn-taking protocol imposes.
+
+    The protocol is human-first strict alternation, so even a perfect robot
+    performs ceil(n/2) of an n-step recipe.  The raw ratio therefore lives in
+    roughly [0.5, 1.0] and looks saturated when it is merely bounded.
+    ``excess`` rescales it onto [0, 1], where 0 is a robot that took every turn
+    available to it and 1 is a robot that took none.
+    """
+    steps = sum(int(row["recipe_steps"]) for row in rows)
+    human = sum(int(row["human_action_count"]) for row in rows)
+    floor = sum(-(-int(row["recipe_steps"]) // 2) for row in rows)
+    if not steps:
+        return {
+            "normalized_human_action_load": None,
+            "normalized_human_action_load_floor": None,
+            "human_action_load_excess": None,
+        }
+    span = steps - floor
+    return {
+        "normalized_human_action_load": human / steps,
+        "normalized_human_action_load_floor": floor / steps,
+        "human_action_load_excess": (human - floor) / span if span else None,
+    }
+
+
+def _by_seed(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Per-seed rates plus their macro-average.
+
+    Pooling sums numerators and denominators across every row, so a seed whose
+    heterogeneous ladder ran 1,395 episodes outweighs one that ran 1,080.
+    Seeds are the unit of replication, so the seed-mean is the figure to draw
+    inferences from and the pooled value is descriptive.
+    """
+    grouped: Dict[Any, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[row["seed"]].append(row)
+    metrics = (
+        ("preference_discriminating_top_1",
+         "preference_discriminating_top_1_hits",
+         "preference_discriminating_robot_decisions"),
+        ("teacher_forced_preference_discriminating_top_1",
+         "teacher_forced_preference_discriminating_top_1_hits",
+         "teacher_forced_preference_discriminating_decisions"),
+        ("robot_top_1", "robot_top_1_hits", "robot_decision_count"),
     )
-    assist = [row for row in episodes if row["mode"] == ASSIST]
-    grouped: Dict[Tuple[str, str, str], list[Mapping[str, Any]]] = {}
-    for row in assist:
-        grouped.setdefault(
-            (str(row["arm"]), str(row["layout"]), str(row["condition"])), [],
-        ).append(row)
+    per_seed = []
+    for seed, seed_rows in sorted(grouped.items(), key=lambda item: str(item[0])):
+        entry: Dict[str, Any] = {"seed": seed, "n_episodes": len(seed_rows)}
+        for name, numerator, denominator in metrics:
+            entry[name] = _pooled_rate(seed_rows, numerator, denominator)
+        entry.update(_human_action_load(seed_rows))
+        per_seed.append(entry)
+    seed_means = {
+        f"{name}_seed_mean": _finite_mean(entry[name] for entry in per_seed)
+        for name, _numerator, _denominator in metrics
+    }
+    seed_means["normalized_human_action_load_seed_mean"] = _finite_mean(
+        entry["normalized_human_action_load"] for entry in per_seed
+    )
+    seed_means["human_action_load_excess_seed_mean"] = _finite_mean(
+        entry["human_action_load_excess"] for entry in per_seed
+    )
+    return {"per_seed": per_seed, **seed_means}
+
+
+def _aggregate(
+    episodes: Sequence[Mapping[str, Any]],
+    failures: Sequence[Mapping[str, Any]],
+    probes: Sequence[Mapping[str, Any]] = (),
+    audits: Sequence[Mapping[str, Any]] = (),
+) -> Dict[str, Any]:
+    # Truncated cells are reported but never pooled: their episode counts are
+    # not comparable and summing numerators across them biases every rate.
+    complete = [row for row in episodes if row.get("cell_complete", True)]
+    excluded = [row for row in episodes if not row.get("cell_complete", True)]
+    assist = [row for row in complete if row["mode"] == ASSIST]
+    post_update = [
+        row for row in assist if int(row["exposure_after_change"]) >= 2
+    ]
+    adaptation = _adaptation_records(complete)
     groups = []
-    for (arm, layout, condition), rows in sorted(grouped.items()):
+    grouped: Dict[Tuple[str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in assist:
+        grouped[(row["arm"], row["scenario"], row["environment"])].append(row)
+    for (arm, scenario, environment), rows in sorted(grouped.items()):
         groups.append({
             "arm": arm,
-            "layout": layout,
-            "condition": condition,
-            "n_assist_episodes": len(rows),
-            **{name: _finite_mean(row.get(name) for row in rows) for name in metric_names},
+            "scenario": scenario,
+            "environment": environment,
+            "n_episodes": len(rows),
+            "robot_top_1": _pooled_rate(
+                rows, "robot_top_1_hits", "robot_decision_count",
+            ),
+            "robot_top_k": _pooled_rate(
+                rows, "robot_top_k_hits", "robot_decision_count",
+            ),
+            "preference_discriminating_top_1": _pooled_rate(
+                rows,
+                "preference_discriminating_top_1_hits",
+                "preference_discriminating_robot_decisions",
+            ),
+            "nontrivial_choice_top_1": _pooled_rate(
+                rows, "nontrivial_choice_top_1_hits", "nontrivial_choice_decision_count",
+            ),
+            "single_legal_action_fraction": (
+                sum(row["single_legal_action_decision_count"] for row in rows)
+                / max(1, sum(row["robot_decision_count"] for row in rows))
+            ),
+            "teacher_forced_preference_discriminating_top_1": _pooled_rate(
+                rows,
+                "teacher_forced_preference_discriminating_top_1_hits",
+                "teacher_forced_preference_discriminating_decisions",
+            ),
+            **_human_action_load(rows),
+            "corrections_per_robot_decision": (
+                sum(row["human_corrections"] for row in rows)
+                / max(1, sum(row["robot_decision_count"] for row in rows))
+            ),
+            "correction_free_rate": _finite_mean(row["correction_free"] for row in rows),
         })
-    recurrence = [
-        row for row in assist
-        if isinstance(row.get("recurrence_gap"), int) and row["recurrence_gap"] > 0
+    full_post = [row for row in post_update if row["arm"] == FULL_ARM]
+    primary_probes = [
+        row for row in probes
+        if row.get("diagnostic_type") == "pre_event_climb_probe"
     ]
+    probe_groups = []
+    grouped_probes: Dict[Tuple[str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in primary_probes:
+        grouped_probes[(row["arm"], row["scenario"], row["environment"])].append(row)
+    for (arm, scenario, environment), rows in sorted(grouped_probes.items()):
+        probe_groups.append({
+            "arm": arm,
+            "scenario": scenario,
+            "environment": environment,
+            "n_probes": len(rows),
+            "preference_discriminating_top_1": _pooled_rate(
+                rows,
+                "preference_discriminating_top_1_hits",
+                "preference_discriminating_decision_count",
+            ),
+            "top_1": _pooled_rate(rows, "top_1_hits", "decision_count"),
+            "top_k": _pooled_rate(rows, "top_k_hits", "decision_count"),
+        })
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
         "status": "completed" if not failures else "completed_with_failures",
         "episode_count": len(episodes),
+        "pooled_episode_count": len(complete),
         "assist_episode_count": len(assist),
+        "post_update_episode_count": len(post_update),
         "failure_count": len(failures),
-        "planner_failure_count": sum(
-            row["failure_type"] == "planner_failure" for row in failures
-        ),
-        "system_failure_count": sum(
-            row["failure_type"] == "system_failure" for row in failures
-        ),
         "delivery_rate": _finite_mean(row["task_completed"] for row in episodes),
-        "retention_after_gap_accuracy": _finite_mean(
-            row["robot_acceptable_top_1"] for row in recurrence
+        "covered_recipe_count": len({row["recipe_id"] for row in episodes}),
+        "covered_recipe_count_by_stratum": {
+            stratum: len({
+                row["recipe_id"] for row in episodes
+                if row["environment"] == stratum
+            })
+            for stratum in STRATA
+        },
+        "covered_preference_count": len({row["preference"] for row in episodes}),
+        "covered_preference_ids": sorted({row["preference"] for row in episodes}),
+        "covered_strategy_count": len({row["strategy"] for row in episodes}),
+        "primary_metric": "normalized_human_action_load",
+        "primary_accuracy_metric": "preference_discriminating_top_1",
+        "teacher_forced_accuracy_metric": (
+            "teacher_forced_preference_discriminating_top_1"
         ),
-        "retention_episode_count": len(recurrence),
+        "metric_warning": (
+            "overall top-1 includes forced single-legal-action decisions; "
+            "use preference_discriminating_top_1 as the primary accuracy"
+        ),
+        "robot_top_1": _pooled_rate(
+            assist, "robot_top_1_hits", "robot_decision_count",
+        ),
+        "robot_top_k": _pooled_rate(
+            assist, "robot_top_k_hits", "robot_decision_count",
+        ),
+        "preference_discriminating_top_1": _pooled_rate(
+            assist,
+            "preference_discriminating_top_1_hits",
+            "preference_discriminating_robot_decisions",
+        ),
+        "nontrivial_choice_top_1": _pooled_rate(
+            assist, "nontrivial_choice_top_1_hits", "nontrivial_choice_decision_count",
+        ),
+        "single_legal_action_fraction": (
+            sum(row["single_legal_action_decision_count"] for row in assist)
+            / max(1, sum(row["robot_decision_count"] for row in assist))
+        ),
+        **_human_action_load(assist),
+        "teacher_forced_preference_discriminating_top_1": _pooled_rate(
+            assist,
+            "teacher_forced_preference_discriminating_top_1_hits",
+            "teacher_forced_preference_discriminating_decisions",
+        ),
+        "semantic_fallback_discriminating_top_1": _pooled_rate(
+            assist,
+            "semantic_fallback_discriminating_top_1_hits",
+            "semantic_fallback_discriminating_decisions",
+        ),
+        "own_model_discriminating_top_1": _pooled_rate(
+            assist,
+            "own_model_discriminating_top_1_hits",
+            "own_model_discriminating_decisions",
+        ),
+        "lead_actor_policies": sorted({
+            row.get("lead_actor_policy") for row in assist
+            if row.get("lead_actor_policy")
+        }),
+        # (recipe, preference) cells whose preference-discriminating decisions
+        # never fall on a robot turn: measured for prediction, not assistance.
+        "assistance_unscored_cells": sorted(
+            [recipe_id, preference]
+            for recipe_id, preference in {
+                (row["recipe_id"], row["preference"]) for row in assist
+            }
+            if not any(
+                row["preference_discriminating_robot_decisions"]
+                for row in assist
+                if row["recipe_id"] == recipe_id
+                and row["preference"] == preference
+            )
+        ),
+        "by_seed": _by_seed(assist),
+        "excluded_incomplete_cell_episode_count": len(excluded),
+        "excluded_incomplete_cells": sorted({
+            (row["seed"], row["scenario"], row["arm"]) for row in excluded
+        }),
+        "adaptation_record_count": len(adaptation),
+        "full_post_update_correction_free_rate": _finite_mean(
+            row["correction_free"] for row in full_post
+        ),
+        "full_post_update_corrections_per_robot_decision": _finite_mean(
+            row["corrections_per_robot_decision"] for row in full_post
+        ),
         "groups": groups,
-    }
-
-
-def _hardware() -> Dict[str, Any]:
-    memory_bytes = None
-    try:
-        memory_bytes = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
-    except (ValueError, OSError, AttributeError):
-        pass
-    return {
-        "platform": platform.platform(),
-        "machine": platform.machine(),
-        "processor": platform.processor(),
-        "cpu_count": os.cpu_count(),
-        "physical_memory_bytes": memory_bytes,
-        "python": sys.version,
-        "executable": sys.executable,
+        "pre_event_probe_groups": probe_groups,
+        "active_only_audit_count": len(audits),
+        "active_only_audit_pass_rate": _finite_mean(
+            row.get("passed") for row in audits
+        ),
+        "adaptation_records": adaptation,
     }
 
 
@@ -585,12 +1219,7 @@ def _manifest(config: Mapping[str, Any], run_dir: Path) -> Dict[str, Any]:
     paths = UpstreamPaths.discover()
     project = paths.integration_root.parent
     status = _git(project, "status", "--porcelain")
-    if bool(config.get("require_clean_git", False)) and status:
-        raise RuntimeError(
-            "publication config requires a clean Git commit; commit or stash "
-            "the current changes before running"
-        )
-    public_config = {key: value for key, value in config.items() if not key.startswith("_")}
+    public = {key: value for key, value in config.items() if not key.startswith("_")}
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
         "status": "running",
@@ -599,108 +1228,342 @@ def _manifest(config: Mapping[str, Any], run_dir: Path) -> Dict[str, Any]:
         "run_dir": str(run_dir),
         "command": list(sys.argv),
         "config_path": config["_config_path"],
-        "config_sha256": hashlib.sha256(_json_bytes(public_config)).hexdigest(),
-        "config": public_config,
+        "config_sha256": hashlib.sha256(_json_bytes(public)).hexdigest(),
+        "config": public,
         "repositories": {
             "adaptive_hrc": {
                 "commit": _git(project, "rev-parse", "HEAD"),
                 "dirty": bool(status),
                 "dirty_paths": status.splitlines(),
             },
-            **{
-                name: {"commit": commit}
-                for name, commit in verify_pins(paths).items()
+            **{name: {"commit": commit} for name, commit in verify_pins(paths).items()},
+        },
+        "catalog": {
+            "recipe_count": len(RECIPES),
+            "overcooked_recipe_ids": list(OVERCOOKED_RECIPE_IDS),
+            "burrito_recipe_ids": list(BURRITO_RECIPE_IDS),
+            "talents_like_preferences": list(TALENTS_LIKE_PREFERENCES),
+            "behaviorally_distinct_preference_ids": sorted({
+                preference for recipe_id in RECIPES
+                for preference in applicable_preferences(recipe_id)
+            }),
+            "behaviorally_distinct_preferences_by_recipe": {
+                recipe_id: list(applicable_preferences(recipe_id))
+                for recipe_id in RECIPES
             },
+            "compatibility_recipe_ids": [
+                recipe.recipe_id for recipe in RECIPES.values()
+                if recipe.compatibility_dynamics
+            ],
         },
         "features": {
             "reward": REWARD_FEATURE_VERSION,
             "semantic": SEMANTIC_FEATURE_VERSION,
-            "semantic_fallback_max_rms_distance": (
-                SEMANTIC_FALLBACK_MAX_RMS_DISTANCE
+            "semantic_fallback_max_rms_distance": SEMANTIC_FALLBACK_MAX_RMS_DISTANCE,
+            "strategy_roles": STRATEGY_ROLE_VERSION,
+        },
+        "protocol": {
+            "decision_level": "completion_checked_task_option",
+            "player_0": "human",
+            "player_1": "robot",
+            "human_first": True,
+            "wrong_robot_proposal_executed": False,
+            "robot_retries_after_correction": True,
+            "preference_policy": "deterministic_event_priority",
+            "learning_state": "actor_independent_recipe_progress",
+            "acquisition": "first_natural_exposure_after_preference_change",
+            "primary_adaptation_window": "later_natural_recurrences_after_retraining",
+            "adaptation_link": "persistent_shift_id_across_phase_boundaries",
+            "scripted_probe_episodes": False,
+            "pre_event_frozen_probes": bool(config.get("pre_event_probes", True)),
+            "phase_boundary_frozen_panel_size": int(config.get("frozen_pairs", 48)),
+            "shared_routing": bool(config.get("shared_routing", True)),
+            "action_mask": "exact completion-checked task frontier",
+            "accuracy_caveat": (
+                "single-legal-action decisions are structurally forced and are "
+                "excluded from the primary preference-discriminating metric"
+            ),
+            "primary_workload_metric": "normalized_human_action_load",
+            "primary_accuracy_metric": "preference_discriminating_top_1",
+        "teacher_forced_accuracy_metric": (
+            "teacher_forced_preference_discriminating_top_1"
+        ),
+        },
+        "scenario_design": {
+            "homogeneous": (
+                "seven ordered shared-strategy macro phases with a fixed "
+                "210-demonstration budget"
+            ),
+            "heterogeneous": (
+                "seven recipe-specific macro phases serialized into heavy-tailed "
+                "climb/settle steps; length may exceed 210"
+            ),
+            "holdout": (
+                "eight 45-episode source stages without container-first, followed "
+                "by six 45-episode held-out stages that introduce it cross-environment "
+                "and compose it with already-known target recipes"
             ),
         },
-        "strategy_roles": {
-            "version": STRATEGY_ROLE_VERSION,
-            "names": list(BurritoDomainAdapter.strategy_roles),
+        "adaptive_hrc_parity": {
+            "paired_seeds": list(config["seeds"]),
+            "scenarios": list(config["scenarios"]),
+            "baseline_roster": list(config["arms"]),
+            "offline_recipe_fraction": float(config.get("offline_recipe_fraction", 0.5)),
+            "offline_preference_fraction": float(config.get("offline_preference_fraction", 0.5)),
+            "model_overrides": dict(config.get("settings", {})),
+            "environment_specific_differences": [
+                "recipe catalog and task-option state/action representation",
+                "lifecycle operations conditioned on feasibility because each cooking recipe has only two or three distinct preferences",
+                "physical option execution and legality",
+            ],
         },
-        "metric_definitions": {
-            "learner_retained_payload_bytes": {
-                "version": STORAGE_METRIC_VERSION,
-                "unit": "bytes",
-                "normalization": "none",
-                "scope": (
-                    "dense learner arrays plus canonical indexed state, "
-                    "action, Q-value, latent-sequence, active/pruned replay, "
-                    "and adaptive-history payload"
-                ),
-                "excludes": (
-                    "Python container overhead, interpreter/runtime memory, "
-                    "and simulator state"
-                ),
-            },
-        },
-        "macros": {
-            protein: list(macro_actions(protein))
-            for protein in ("steak", "mushroom")
-        },
-        "parking_positions": {
-            layout: {
-                str(actor): list(position)
-                for actor, position in CONTROLLED_PARKING_POSITIONS.get(
-                    layout, {}
-                ).items()
-            }
-            for layout in map(str, config["layouts"])
-        },
-        "hardware": _hardware(),
-        "dependencies": {
-            distribution.metadata["Name"]: distribution.version
-            for distribution in importlib.metadata.distributions()
-            if distribution.metadata.get("Name")
+        "hardware": {
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "cpu_count": os.cpu_count(),
+            "python": sys.version,
+            "executable": sys.executable,
         },
     }
+
+
+def _mp_context() -> "multiprocessing.context.BaseContext":
+    # "spawn" so a worker never inherits the parent's copy of the upstream
+    # global recipe caches or NumPy RNG state.
+    return multiprocessing.get_context("spawn")
+
+
+def _worker_count(config: Mapping[str, Any], cells: int) -> int:
+    requested = int(config.get("workers", 0) or 0)
+    if requested <= 0:
+        requested = os.cpu_count() or 1
+    return max(1, min(requested, max(1, cells)))
+
+
+def _run_cell_job(
+    config_path: str, seed: int, scenario: str, arm: str,
+) -> Dict[str, Any]:
+    """Run one seed/scenario/arm cell in its own process.
+
+    Cells are independent -- each builds its own agent, runner and executors --
+    but they cannot share a process: the pinned environment keeps recipe
+    configuration, the shared ``complete_orders`` default and the planner's RNG
+    in process-global state, which is exactly what the executor locks guard.
+    Threads would serialise on that state and corrupt each other's planner
+    stream; separate processes have neither problem.
+    """
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    config = load_config(config_path)
+    runtime = BurritoRuntime.discover()
+    rows, errors, cell_probes, cell_audits, audit = _run_cell(
+        runtime, config, seed=int(seed), scenario=str(scenario), arm=str(arm),
+    )
+    return {
+        "seed": int(seed),
+        "scenario": str(scenario),
+        "arm": str(arm),
+        "episodes": rows,
+        "failures": errors,
+        "probes": cell_probes,
+        "audits": cell_audits,
+        "schedule": audit,
+    }
+
+
+def _cell_sort_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+    return (
+        str(row.get("seed")), str(row.get("scenario")), str(row.get("arm")),
+        int(row.get("event_index", 0) or 0),
+        str(row.get("diagnostic_type", "")),
+        str(row.get("recipe_id", "")), str(row.get("preference", "")),
+    )
+
+
+def _load_checkpoint(
+    checkpoint_dir: Path, seed: int, scenario: str, arm: str,
+) -> Dict[str, Any] | None:
+    path = checkpoint_dir / f"{seed}__{scenario}__{arm}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
 
 
 def run_experiment(
     config_path: str | Path,
     *,
     output_root: str | Path | None = None,
+    resume_from: str | Path | None = None,
+    workers: int | None = None,
+    progress: bool = False,
 ) -> Dict[str, Any]:
     config = load_config(config_path)
-    public_config = {key: value for key, value in config.items() if not key.startswith("_")}
-    digest = hashlib.sha256(_json_bytes(public_config)).hexdigest()[:10]
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    root = Path(output_root or config.get("output", "burrito/results")).resolve()
+    if workers is not None:
+        config = {**config, "workers": int(workers)}
+    public = {key: value for key, value in config.items() if not key.startswith("_")}
+    digest = hashlib.sha256(_json_bytes(public)).hexdigest()[:10]
+    root = Path(
+        config["output"] if output_root is None else output_root
+    ).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    run_dir = root / f"{config['experiment']}__{timestamp}__{digest}"
-    manifest = _manifest(config, run_dir)
-    run_dir.mkdir(parents=False, exist_ok=False)
-    _atomic_json(run_dir / "config.json", public_config)
+    # Cell checkpoints used to be written and never read, so an interrupted
+    # run of ~115k physical episodes had to start over.  Resuming replays the
+    # completed cells from disk and only re-runs what is missing; the config
+    # digest must match so a resumed run cannot mix two configurations.
+    if resume_from is not None:
+        run_dir = Path(resume_from).resolve()
+        if not run_dir.is_dir():
+            raise ValueError(f"cannot resume: {run_dir} is not a run directory")
+        previous = json.loads(
+            (run_dir / "config.json").read_text(encoding="utf-8")
+        )
+        if hashlib.sha256(_json_bytes(previous)).hexdigest()[:10] != digest:
+            raise ValueError(
+                "cannot resume: the run directory was produced by a different "
+                "configuration"
+            )
+        manifest = _manifest(config, run_dir)
+        manifest["resumed_from"] = str(run_dir)
+        checkpoint_dir = run_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        run_dir = root / f"{config['experiment']}__{timestamp}__{digest}"
+        manifest = _manifest(config, run_dir)
+        run_dir.mkdir(parents=False, exist_ok=False)
+        checkpoint_dir = run_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=False, exist_ok=False)
+    _atomic_json(run_dir / "config.json", public)
     _atomic_json(run_dir / "manifest.json", manifest)
-
-    runtime = BurritoRuntime.discover()
     episodes: list[Dict[str, Any]] = []
     failures: list[Dict[str, Any]] = []
+    probes: list[Dict[str, Any]] = []
+    audits: list[Dict[str, Any]] = []
+    schedules: list[Dict[str, Any]] = []
+    completed_cells: list[Dict[str, Any]] = []
+    reused_cells: list[Dict[str, Any]] = []
+    pending: list[Tuple[int, str, str]] = []
     try:
         for seed in map(int, config["seeds"]):
-            for layout in map(str, config["layouts"]):
+            for scenario in map(str, config["scenarios"]):
                 for arm in map(str, config["arms"]):
-                    for condition in config["conditions"]:
-                        rows, errors = _condition_run(
-                            runtime, config, condition,
-                            seed=seed, layout=layout, arm=arm,
-                        )
-                        episodes.extend(rows)
-                        failures.extend(errors)
-        summary = _aggregate(episodes, failures)
+                    pending.append((seed, scenario, arm))
+
+        def absorb(cell: Mapping[str, Any], *, reused: bool) -> None:
+            episodes.extend(cell["episodes"])
+            failures.extend(cell["failures"])
+            probes.extend(cell["probes"])
+            audits.extend(cell["audits"])
+            schedules.append({
+                "seed": cell["seed"], "scenario": cell["scenario"],
+                "arm": cell["arm"], **cell["schedule"],
+            })
+            record = {
+                "seed": cell["seed"], "scenario": cell["scenario"],
+                "arm": cell["arm"],
+            }
+            if reused:
+                reused_cells.append(record)
+            else:
+                _atomic_json(
+                    checkpoint_dir
+                    / f"{cell['seed']}__{cell['scenario']}__{cell['arm']}.json",
+                    dict(cell),
+                )
+            completed_cells.append({
+                **record,
+                "episode_count": len(cell["episodes"]),
+                "failure_count": len(cell["failures"]),
+                "reused_checkpoint": reused,
+            })
+            manifest["completed_cells"] = list(completed_cells)
+            manifest["completed_cell_count"] = len(completed_cells)
+            _atomic_json(run_dir / "manifest.json", manifest)
+            if progress:
+                print(
+                    f"[cooking] completed {len(completed_cells)}/{len(pending)} "
+                    f"seed={cell['seed']} scenario={cell['scenario']} "
+                    f"arm={cell['arm']} reused={reused}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        outstanding: list[Tuple[int, str, str]] = []
+        for seed, scenario, arm in pending:
+            cached = (
+                _load_checkpoint(checkpoint_dir, seed, scenario, arm)
+                if resume_from is not None else None
+            )
+            if cached is not None:
+                absorb(cached, reused=True)
+            else:
+                outstanding.append((seed, scenario, arm))
+
+        workers = _worker_count(config, len(outstanding))
+        manifest["workers"] = workers
+        config_path_text = str(config["_config_path"])
+        if workers <= 1 or len(outstanding) <= 1:
+            runtime = BurritoRuntime.discover()
+            for seed, scenario, arm in outstanding:
+                rows, errors, cell_probes, cell_audits, audit = _run_cell(
+                    runtime, config, seed=seed, scenario=scenario, arm=arm,
+                )
+                absorb({
+                    "seed": seed, "scenario": scenario, "arm": arm,
+                    "episodes": rows, "failures": errors, "probes": cell_probes,
+                    "audits": cell_audits, "schedule": audit,
+                }, reused=False)
+        else:
+            with ProcessPoolExecutor(
+                max_workers=workers, mp_context=_mp_context(),
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _run_cell_job, config_path_text, seed, scenario, arm,
+                    ): (seed, scenario, arm)
+                    for seed, scenario, arm in outstanding
+                }
+                for future in as_completed(futures):
+                    seed, scenario, arm = futures[future]
+                    try:
+                        absorb(future.result(), reused=False)
+                    except BrokenProcessPool as error:
+                        # Record the cell as lost rather than discarding the
+                        # whole run; _aggregate excludes incomplete cells.
+                        failures.append({
+                            "seed": seed, "scenario": scenario, "arm": arm,
+                            "failure_type": "worker_terminated",
+                            "error": f"{type(error).__name__}: {error}",
+                        })
+
+        # Completion order depends on worker scheduling, so sort before writing:
+        # the artefacts must be byte-identical whatever the worker count.
+        episodes.sort(key=_cell_sort_key)
+        probes.sort(key=_cell_sort_key)
+        audits.sort(key=_cell_sort_key)
+        failures.sort(key=_cell_sort_key)
+        schedules.sort(key=_cell_sort_key)
+        completed_cells.sort(key=_cell_sort_key)
+        reused_cells.sort(key=_cell_sort_key)
+        summary = _aggregate(episodes, failures, probes, audits)
         _atomic_json(run_dir / "episodes.json", episodes)
         _atomic_json(run_dir / "failures.json", failures)
+        _atomic_json(run_dir / "probes.json", probes)
+        _atomic_json(run_dir / "audits.json", audits)
+        _atomic_json(run_dir / "schedules.json", schedules)
         _atomic_json(run_dir / "summary.json", summary)
         manifest.update({
             "status": summary["status"],
             "completed_at": _utc_now(),
             "episode_count": len(episodes),
             "failure_count": len(failures),
+            "completed_cells": completed_cells,
+            "completed_cell_count": len(completed_cells),
+            "reused_checkpoint_cells": reused_cells,
+            "reused_checkpoint_cell_count": len(reused_cells),
         })
         _atomic_json(run_dir / "manifest.json", manifest)
         return {"run_dir": str(run_dir), "summary": summary}
@@ -714,58 +1577,210 @@ def run_experiment(
         raise
 
 
-def validate_result(result: Mapping[str, Any], config_path: str | Path) -> Dict[str, Any]:
+def validate_result(
+    result: Mapping[str, Any], config_path: str | Path,
+) -> Dict[str, Any]:
     config = load_config(config_path)
     summary = result["summary"]
+    episodes = json.loads(
+        (Path(result["run_dir"]) / "episodes.json").read_text(encoding="utf-8")
+    )
+    schedules = json.loads(
+        (Path(result["run_dir"]) / "schedules.json").read_text(encoding="utf-8")
+    )
+    probes = json.loads(
+        (Path(result["run_dir"]) / "probes.json").read_text(encoding="utf-8")
+    )
+    audits = json.loads(
+        (Path(result["run_dir"]) / "audits.json").read_text(encoding="utf-8")
+    )
+    requirements = set(config.get("validation_requirements", ()))
     failures = []
     if summary["failure_count"]:
         failures.append(f"{summary['failure_count']} execution failures")
     if summary["delivery_rate"] != 1.0:
         failures.append(f"delivery rate is {summary['delivery_rate']!r}")
-    requirements = set(config.get("validation_requirements", ()))
-    episodes = json.loads(
-        (Path(result["run_dir"]) / "episodes.json").read_text(encoding="utf-8")
-    )
-    if "cross_recipe_transfer" in requirements and not any(
-        row["cross_recipe_transfer"] and row["semantic_fallback_decisions"] > 0
-        for row in episodes
+    full = [row for row in episodes if row["arm"] == FULL_ARM]
+    acquisitions = [row for row in full if row["lifecycle"] == "acquire_shift"]
+    recurrences = [row for row in full if row["exposure_after_change"] >= 2]
+    if "verified_shift_update" in requirements and (
+        not acquisitions or not all(
+            row["commit_applied"] and row["active_rehearsal"] and row["retrain_executed"]
+            for row in acquisitions
+        )
     ):
-        failures.append("cross-recipe semantic fallback was never exercised")
-    if "preference_switch" in requirements and not any(
-        row["preference_switch"] for row in episodes
+        failures.append("not every natural acquisition committed, rehearsed, and retrained")
+    if "post_update_recurrence" in requirements and not recurrences:
+        failures.append("no natural post-update recurrence completed")
+    if "preference_discrimination" in requirements and not any(
+        row["preference_discriminating_robot_decisions"] > 0 for row in full
     ):
-        failures.append("no preference-switch assist episode was executed")
-    if "long_gap_recurrence" in requirements and not any(
-        isinstance(row.get("recurrence_gap"), int) and row["recurrence_gap"] > 0
-        for row in episodes
-    ):
-        failures.append("no positive-gap recurrence was executed")
-    if "memory_decay_adaptation" in requirements:
-        memory_rows = [
-            row for row in episodes
-            if row["condition"] == "long_gap_recurrence"
-        ]
-        if not any(
-            int(row["memory_pair_gap_sample_count"]) > 0
-            for row in memory_rows
-        ):
-            failures.append("long-gap run produced no adaptive-horizon evidence")
-        if not any(
-            int(row["memory_pruned_variants"]) > 0
-            or int(row["memory_nonunit_weights"]) > 0
-            or int(row["memory_reentry_event_count"]) > 0
-            for row in memory_rows
-        ):
-            failures.append("long-gap run never exercised decay or re-entry")
-    if "multiple_layouts" in requirements and len({row["layout"] for row in episodes}) < 2:
-        failures.append("fewer than two layouts completed")
+        failures.append("no preference-discriminating robot decision was scored")
     if "multiple_seeds" in requirements and len({row["seed"] for row in episodes}) < 2:
         failures.append("fewer than two seeds completed")
-    if "registered_ablations" in requirements:
-        expected = set(map(str, config["arms"]))
-        if {row["arm"] for row in episodes} != expected:
-            failures.append("not every registered ablation arm completed")
-    if any(int(row["invalid_predictions"]) for row in episodes):
+    if "comparison_arms" in requirements and {
+        row["arm"] for row in episodes
+    } != set(config["arms"]):
+        failures.append("not every configured arm completed")
+    if "adaptive_hrc_baseline_parity" in requirements:
+        if tuple(config["arms"]) != ARM_NAMES:
+            failures.append("baseline roster differs from Adaptive-HRC")
+        if not probes or not any(
+            row.get("diagnostic_type") == "pre_event_climb_probe" for row in probes
+        ):
+            failures.append("matched pre-event climb probes were not recorded")
+        if not audits:
+            failures.append("active-only replay audits were not recorded")
+        if any(row.get("passed") is False for row in audits):
+            failures.append("one or more active-only replay audits failed")
+        schedule_lengths = {
+            scenario: {int(row["episodes"]) for row in schedules if row["scenario"] == scenario}
+            for scenario in SCENARIOS
+        }
+        if schedule_lengths["homogeneous"] != {210}:
+            failures.append("homogeneous ladder is not 210 episodes")
+        if schedule_lengths["holdout"] != {630}:
+            failures.append("controlled holdout ladder is not 630 episodes")
+        if not schedule_lengths["heterogeneous"] or min(
+            schedule_lengths["heterogeneous"]
+        ) <= 210:
+            failures.append("heterogeneous ladder was not longitudinally serialized")
+        if any(
+            len(row.get("ingredients", ())) < 2 for row in episodes
+        ):
+            failures.append("single-ingredient episode entered the full evaluation")
+        if any(
+            decision.get("prediction_stats", {}).get("predictor")
+            == "ground_truth_oracle"
+            for row in episodes for decision in row.get("decisions", ())
+        ):
+            failures.append("ground-truth action oracle was used")
+    if "catalog_coverage" in requirements:
+        expected = set(config["recipe_ids"])
+        covered = {row["recipe_id"] for row in full}
+        if covered != expected:
+            failures.append(f"recipe coverage mismatch: missing {sorted(expected - covered)}")
+    if "behavioral_preference_coverage" in requirements:
+        expected_preferences = {
+            preference for recipe_id in config["recipe_ids"]
+            for preference in applicable_preferences(str(recipe_id))
+        }
+        covered_preferences = {row["preference"] for row in full}
+        if not expected_preferences <= covered_preferences:
+            failures.append(
+                "behavioral preference coverage mismatch: missing "
+                f"{sorted(expected_preferences - covered_preferences)}"
+            )
+    if "natural_ladder" in requirements and any(
+        row["lifecycle"] == "acquire_shift"
+        and (
+            row["exposure_after_change"] != 1
+            or not row["preference_changed"]
+            or row.get("adaptation_id") is None
+        ) for row in episodes
+    ):
+        failures.append("an acquisition was not a first natural post-shift exposure")
+    if "scenario_invariants" in requirements and (
+        not schedules or not all(
+            row.get("scenario_invariants_passed") is True for row in schedules
+        )
+    ):
+        failures.append("one or more generated ladders failed scenario invariants")
+    if "adaptation_linkage" in requirements:
+        full_acquisition_ids = {
+            row.get("adaptation_id") for row in acquisitions
+        }
+        linked_ids = {
+            row.get("adaptation_id")
+            for row in summary.get("adaptation_records", ())
+            if row.get("arm") == FULL_ARM
+        }
+        missing = full_acquisition_ids - linked_ids
+        if None in full_acquisition_ids or missing:
+            failures.append(
+                f"natural acquisitions missing post-update linkage: {sorted(map(str, missing))}"
+            )
+    if "cross_environment_adaptation" in requirements and not {
+        "overcooked", "burrito_native"
+    } <= {row["environment"] for row in acquisitions}:
+        failures.append(
+            "full-system acquisitions did not cover Overcooked and natively "
+            "executed Burrito"
+        )
+    if "holdout_transfer_is_generalisation" in requirements:
+        holdout_rows = [
+            row for row in full
+            if row["scenario"] == "holdout" and row.get("holdout_target")
+        ]
+        if not holdout_rows:
+            failures.append("the holdout scenario produced no target episodes")
+        else:
+            # Per stratum, not just overall: an Overcooked generalisation does
+            # not license a cross-environment claim if every Burrito target is
+            # a relabelling of its source.
+            for stratum in sorted({row["environment"] for row in holdout_rows}):
+                generalising = {
+                    row["recipe_id"] for row in holdout_rows
+                    if row["environment"] == stratum
+                    and not row.get("holdout_transfer_isomorphic")
+                }
+                if not generalising:
+                    failures.append(
+                        f"every {stratum} holdout target is isomorphic to its "
+                        "source; the container axis is relabelled there, not "
+                        "generalised"
+                    )
+    if "stratum_separation" in requirements:
+        # Wrapper-restored compatibility dynamics must never be pooled with
+        # natively executed episodes.
+        mixed = {
+            row["environment"] for row in episodes
+            if row["environment"] not in STRATA
+        }
+        if mixed:
+            failures.append(f"episodes carry unknown strata: {sorted(mixed)}")
+        for row in episodes:
+            expected = "burrito_compat" if row.get("compatibility_dynamics") else None
+            if expected is not None and row["environment"] != expected:
+                failures.append(
+                    "a compatibility episode was recorded outside the "
+                    "burrito_compat stratum"
+                )
+                break
+        if len({row["environment"] for row in full}) < len(STRATA):
+            failures.append("the full arm did not cover every reporting stratum")
+    if "framework_components" in requirements:
+        if not full or not all(
+            row["learner_model_structure"]
+            == "maxent_irl_with_latent_strategy_residual"
+            for row in full
+        ):
+            failures.append("full arm did not run MaxEnt IRL with latent strategy")
+        if not any(row["semantic_fallback_decisions"] > 0 for row in full):
+            failures.append("semantic-distance fallback was never exercised")
+        if not any(row["latent_strategy_prototypes"] > 0 for row in full):
+            failures.append("latent strategy was never fitted")
+        if not any(
+            row["memory_nonunit_weights"] > 0
+            or row["memory_pruned_variants"] > 0 for row in full
+        ):
+            failures.append("adaptive rehearsal weighting was never exercised")
+    if "transfer_mechanisms_exercised" in requirements:
+        if not any(row["semantic_fallback_decisions"] > 0 for row in full):
+            failures.append("semantic-distance transfer was never used")
+        if not any(row["latent_strategy_decisions"] > 0 for row in full):
+            failures.append("latent-strategy transfer was never used")
+    if "open_set_recipe_separation" in requirements:
+        cells: Dict[Tuple[Any, Any], list[Mapping[str, Any]]] = defaultdict(list)
+        for row in full:
+            cells[(row["seed"], row["scenario"])].append(row)
+        if not cells or any(
+            max(row["learner_registry_recipe_count"] for row in rows)
+            != len({row["recipe_id"] for row in rows})
+            for rows in cells.values()
+        ):
+            failures.append("open-set learner did not preserve one identity per recipe")
+    if any(row["invalid_predictions"] for row in episodes):
         failures.append("one or more task-graph-invalid predictions occurred")
     validation = {
         "status": "passed" if not failures else "failed",
@@ -774,13 +1789,11 @@ def validate_result(result: Mapping[str, Any], config_path: str | Path) -> Dict[
     }
     _atomic_json(Path(result["run_dir"]) / "validation.json", validation)
     if failures:
-        raise RuntimeError("Burrito validation failed: " + "; ".join(failures))
+        raise RuntimeError("evaluation validation failed: " + "; ".join(failures))
     return validation
 
 
 __all__ = [
-    "FULL_ARM",
-    "load_config",
-    "run_experiment",
-    "validate_result",
+    "ARM_NAMES", "FULL_ARM", "VALIDATION_REQUIREMENTS", "load_config",
+    "run_experiment", "validate_result",
 ]

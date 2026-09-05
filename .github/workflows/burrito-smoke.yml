@@ -24,10 +24,7 @@ jobs:
         run: ./burrito/bootstrap.sh
       - name: Verify upstream revisions
         run: ./burrito/.venv/bin/python -m adaptive_hrc_burrito verify
-      - name: Run authoritative observation-to-assist smoke
-        run: >-
-          ./burrito/.venv/bin/python -m adaptive_hrc_burrito validate
-          --config burrito/configs/ci-v1.json
-          --output /tmp/adaptive-hrc-burrito-ci
+      - name: Run bounded observation-to-assist protocol check
+        run: ./burrito/.venv/bin/python -m adaptive_hrc_burrito protocol-smoke
       - name: Run Burrito integration tests
         run: ./burrito/.venv/bin/python -m unittest discover -s burrito/tests -v

@@ -12,20 +12,25 @@ from __future__ import annotations
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+import re
 import threading
-from typing import Any, Dict, Iterable, Iterator, Mapping, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, Iterator, Mapping, Sequence, Tuple
+import zlib
 
 import numpy as np
 
+from .catalog import get_recipe
 from .runtime import BurritoRuntime
 from .macros import (
-    COLLECT_AND_STAGE_COOKED_RICE,
+    PLATE_COMPONENTS,
+    PLATE_RICE,
+    PLATE_TORTILLA,
     STAGE_CLEAN_PLATE,
     START_BOILING_RICE,
     action_protein,
-    assemble_action,
     fetch_and_stage_action,
     macro_actions,
+    plate_protein_action,
     prepare_and_stage_action,
     protein_name,
     serve_action,
@@ -38,8 +43,8 @@ _UPSTREAM_STATE_LOCK = threading.RLock()
 CONTROLLED_PARKING_POSITIONS: Mapping[
     str, Mapping[int, Tuple[int, int]]
 ] = {
-    # These handoff cells were validated across both actors, recipes, and all
-    # four preference policies. They avoid single-access station tiles.
+    # These handoff cells are validated across both actors and native Burrito
+    # recipes. They avoid single-access station tiles.
     "burrito_1-2_2p": {0: (1, 1), 1: (8, 1)},
     "burrito": {0: (2, 2), 1: (8, 2)},
 }
@@ -64,47 +69,161 @@ def _is_ready(obj: Any) -> bool:
     return bool(getattr(obj, "is_ready", False))
 
 
+COOKED_PROTEIN = {"steak": "chopped_steak", "mushroom": "fried_mushroom"}
+CHOPPED_PROTEIN = {"steak": "chopped_meat", "mushroom": "chopped_mushroom"}
+RAW_PROTEIN = {"steak": "meat", "mushroom": "mushroom"}
+_GRAB_PLATE_BY_COMPONENT_COUNT = {
+    0: "GRAB_CLEAN_PLATE",
+    1: "GRAB_ONE_INGREDIENT_PLATE",
+    2: "GRAB_TWO_INTREDIENT_PLATE",
+}
+
+
+def plate_components(name: str | None) -> FrozenSet[str] | None:
+    """Decompose an upstream plate object name into burrito components.
+
+    Returns ``None`` when the name is not a plate the recipe can build on.
+    The pinned environment encodes plate contents in the object name, e.g.
+    ``clean_plate`` -> {}, ``boiled_rice-tortilla-plate`` -> {rice, tortilla},
+    ``steak_burrito`` -> every component.
+
+    Parsing is deliberately protein-agnostic.  Resolving contents *against* a
+    protein is ambiguous -- ``tortilla-plate`` parses validly under either one
+    -- which previously let a mushroom episode be read as a steak episode.
+    """
+    if name is None:
+        return None
+    label = str(name)
+    if label in {f"{protein}_burrito" for protein in COOKED_PROTEIN}:
+        return frozenset(PLATE_COMPONENTS)
+    if label == "clean_plate":
+        return frozenset()
+    if not label.endswith("-plate"):
+        return None
+    parts = set(label.split("-"))
+    components = set()
+    if "boiled_rice" in parts:
+        components.add("rice")
+    if "tortilla" in parts:
+        components.add("tortilla")
+    if parts & set(COOKED_PROTEIN.values()):
+        components.add("protein")
+    return frozenset(components)
+
+
+def _staged_plate(state: Any) -> Tuple[Any, FrozenSet[str]] | None:
+    """The single plate the recipe is currently building.
+
+    Only one plate is ever in play: the pinned sink does not yield a second
+    addressable ``clean_plate``, and the upstream grab primitives select their
+    target by object name, so two same-named plates could not be told apart.
+    Multi-order recipes therefore serialise assembly and parallelise the
+    protein and rice branches instead.
+    """
+    for obj in state.objects.values():
+        components = plate_components(getattr(obj, "name", None))
+        if components is not None:
+            return obj, components
+    return None
+
+
+def _held_components(state: Any, actor_id: int) -> FrozenSet[str] | None:
+    return plate_components(_held_name(state, actor_id))
+
+
+ORDINAL_SUFFIX = re.compile(r"_(\d+)$")
+
+
+def base_token(action: str) -> str:
+    """Strip the ordinal that distinguishes repeats of one physical option.
+
+    A two-order recipe needs two ``STAGE_CLEAN_PLATE`` decisions that the task
+    graph must keep apart but the executor performs identically.
+    """
+    return ORDINAL_SUFFIX.sub("", str(action).upper())
+
+
+def _component_primitive(component: str, protein: str | None) -> str:
+    if component == "rice":
+        return "GET_BOILED_RICE"
+    if component == "tortilla":
+        return "GRAB_TORTILLA"
+    return (
+        "GET_STEAK_FROM_GRILLER" if protein == "steak"
+        else "GET_MURHSOOM_FROM_GRILLER"
+    )
+
+
 def _has_ready(state: Any, name: str) -> bool:
     return any(_is_ready(obj) for obj in _objects(state, name))
 
 
-def macro_is_legal(state: Any, action: str, actor_id: int = 0) -> bool:
-    """Preference-neutral macro preconditions at a handoff boundary."""
-    label = str(action).upper()
+def seed_upstream_rng(
+    seed: int, action: str, actor_id: int, attempt: int = 0,
+) -> None:
+    """Seed global ``np.random`` for one planner invocation.
+
+    The pinned Burrito planner samples from the global NumPy stream, so the
+    route a macro takes is only reproducible if the stream is pinned per
+    (option, actor, attempt).  Every executor uses this one implementation.
+    """
+    child = np.random.SeedSequence([
+        int(seed) & 0xFFFFFFFF,
+        zlib.crc32(str(action).encode("utf-8")) & 0xFFFFFFFF,
+        int(actor_id) & 0xFFFFFFFF,
+        int(attempt) & 0xFFFFFFFF,
+    ])
+    np.random.seed(int(child.generate_state(1, dtype=np.uint32)[0]))
+
+
+def macro_is_legal(
+    state: Any,
+    action: str,
+    actor_id: int = 0,
+    *,
+    pot_capacity: int = 1,
+) -> bool:
+    """Preference-neutral macro preconditions at a handoff boundary.
+
+    These are *physical* possibility checks only.  Single-firing of each task
+    option is guaranteed by the task graph, which the runner intersects with
+    this mask; encoding it here as well previously made ``FETCH_AND_STAGE_X``
+    illegal once the *other* protein had been plated.
+    """
+    label = base_token(action)
     if _held_name(state, actor_id) is not None:
         return False
+    staged = _staged_plate(state)
+    components = frozenset() if staged is None else staged[1]
+
     if label == STAGE_CLEAN_PLATE:
-        return (
-            not _has_object(state, "clean_plate")
-            and not _has_object(state, "boiled_rice-plate")
-            and _has_object(state, "dirty_plate")
-        )
+        return staged is None and _has_object(state, "dirty_plate")
     if label == START_BOILING_RICE:
+        return len(_objects(state, "boiled_rice")) < max(1, int(pot_capacity))
+    if label == PLATE_RICE:
         return (
-            not _has_object(state, "boiled_rice")
-            and not _has_object(state, "boiled_rice-plate")
-        )
-    if label == COLLECT_AND_STAGE_COOKED_RICE:
-        return (
-            _has_object(state, "clean_plate")
+            staged is not None
+            and "rice" not in components
             and _has_ready(state, "boiled_rice")
-            and not _has_object(state, "boiled_rice-plate")
         )
+    if label == PLATE_TORTILLA:
+        return staged is not None and "tortilla" not in components
 
     protein = action_protein(label)
     if protein is None:
         return False
-    chopped = "chopped_meat" if protein == "steak" else "chopped_mushroom"
-    cooked = "chopped_steak" if protein == "steak" else "fried_mushroom"
+    chopped = CHOPPED_PROTEIN[protein]
+    cooked = COOKED_PROTEIN[protein]
     if label == fetch_and_stage_action(protein):
         return not _has_object(state, chopped) and not _has_object(state, cooked)
     if label == prepare_and_stage_action(protein):
         return bool(_objects(state, chopped)) and not _has_ready(state, chopped)
     if label == start_cooking_action(protein):
         return _has_ready(state, chopped) and not _has_object(state, cooked)
-    if label == assemble_action(protein):
+    if label == plate_protein_action(protein):
         return (
-            _has_object(state, "boiled_rice-plate")
+            staged is not None
+            and "protein" not in components
             and _has_ready(state, cooked)
         )
     if label == serve_action(protein):
@@ -134,14 +253,26 @@ class BurritoOptionExecutor:
     def __init__(
         self,
         runtime: BurritoRuntime,
+        recipe_id: str = "burrito_steak_burrito",
         *,
-        layout: str = "burrito_1-2_2p",
         horizon: int = 1200,
         seed: int = 0,
         parking_positions: Mapping[int, Tuple[int, int]] | None = None,
     ):
+        recipe = get_recipe(recipe_id)
+        if recipe.environment != "burrito" or recipe.compatibility_dynamics:
+            raise ValueError(f"{recipe_id!r} is not a native Burrito recipe")
+        proteins = tuple(dict.fromkeys(
+            action_protein(token) for token in recipe.action_tokens
+            if action_protein(token) is not None
+        ))
+        if not proteins:
+            raise ValueError(f"{recipe_id!r} names no burrito protein")
+        self.recipe = recipe
+        self.proteins = proteins
+        self.protein = proteins[0]
         self.runtime = runtime
-        self.layout = str(layout)
+        self.layout = str(recipe.layout)
         self.seed = int(seed)
         self.env = runtime.create_environment(
             self.layout,
@@ -153,13 +284,16 @@ class BurritoOptionExecutor:
         if int(self.env.mdp.num_players) != 2:
             raise ValueError("Adaptive-HRC Burrito protocol requires two players")
         self._gridworld, self._environment, self.actions = runtime.upstream_types()
+        from burrito.mdp.burrito_mdp import Burrito_Recipe
         from overcooked_ai_py.mdp.actions import Action
 
+        self._recipe_type = Burrito_Recipe
         self._low_level_action = Action
         self._low_level_stay = int(Action.ACTION_TO_INDEX[Action.STAY])
-        self._episode_index = -1
-        self._option_index = 0
         self.execution_log: list[OptionExecution] = []
+        self.pot_capacity = max(
+            1, len(self.env.mdp.terrain_pos_dict.get("P", ()) or ())
+        )
         self.parking_positions = dict(
             parking_positions or self._default_parking_positions()
         )
@@ -169,10 +303,18 @@ class BurritoOptionExecutor:
     def state(self) -> Any:
         return self.env.state
 
-    def reset(self) -> Any:
-        self._episode_index += 1
-        self._option_index = 0
+    @property
+    def compatibility_dynamics(self) -> bool:
+        return False
+
+    def reset(self, recipe_id: str | None = None) -> Any:
+        if recipe_id is not None and recipe_id != self.recipe.recipe_id:
+            raise ValueError(
+                f"this executor is bound to {self.recipe.recipe_id!r}, "
+                f"not {recipe_id!r}"
+            )
         with _UPSTREAM_STATE_LOCK:
+            self._recipe_type.configure(self.env.mdp.recipe_config)
             self._shared_complete_orders().clear()
             self.env.reset()
             self._shared_complete_orders().clear()
@@ -185,6 +327,7 @@ class BurritoOptionExecutor:
         self.env.state.consecutive_orders = 0
         self.execution_log = []
         self.environment_wait_ticks = 0
+        self._current_primitive_ticks: list[int] = []
         # The fixed parking configuration removes station blocking from the
         # option boundary while retaining all physical navigation inside it.
         self._park(0)
@@ -202,6 +345,7 @@ class BurritoOptionExecutor:
     def _step(self, joint_action: Sequence[int]) -> Any:
         """Call upstream while isolating its shared completion-history list."""
         with _UPSTREAM_STATE_LOCK:
+            self._recipe_type.configure(self.env.mdp.recipe_config)
             shared = self._shared_complete_orders()
             shared.clear()
             shared.extend(self._episode_complete_orders)
@@ -222,15 +366,24 @@ class BurritoOptionExecutor:
         # silently introduce an alphabetical tie-break into the learner.
         return tuple(dict.fromkeys(
             str(action) for action in candidates
-            if macro_is_legal(self.state, str(action), actor_id=actor_id)
+            if macro_is_legal(
+                self.state, str(action), actor_id=actor_id,
+                pot_capacity=self.pot_capacity,
+            )
         ))
 
     def execute(self, action: str, *, actor_id: int) -> OptionExecution:
         actor = int(actor_id)
         if actor not in (0, 1):
             raise ValueError("actor_id must be 0 or 1")
-        label = str(action).upper()
-        if not macro_is_legal(self.state, label, actor_id=actor):
+        # Dispatch on the ordinal-stripped token: a two-order recipe repeats
+        # one physical option under distinct task-graph tokens.  The execution
+        # log keeps the original token so it lines up with the task graph.
+        token = str(action).upper()
+        label = base_token(token)
+        if not macro_is_legal(
+            self.state, label, actor_id=actor, pot_capacity=self.pot_capacity,
+        ):
             raise OptionExecutionError(
                 f"option {label} is not legal for actor {actor}"
             )
@@ -242,13 +395,15 @@ class BurritoOptionExecutor:
         ).sum()
         primitives: list[str] = []
         self._current_primitive_ticks: list[int] = []
-        with self._deterministic_upstream_rng():
+        with self._deterministic_upstream_rng(label, actor):
             if label == STAGE_CLEAN_PLATE:
                 self._stage_clean_plate(actor, primitives)
             elif label == START_BOILING_RICE:
                 self._start_rice(actor, primitives)
-            elif label == COLLECT_AND_STAGE_COOKED_RICE:
-                self._collect_and_stage_rice(actor, primitives)
+            elif label == PLATE_RICE:
+                self._add_plate_component(actor, None, "rice", primitives)
+            elif label == PLATE_TORTILLA:
+                self._add_plate_component(actor, None, "tortilla", primitives)
             else:
                 protein = action_protein(label)
                 if protein is None:
@@ -259,8 +414,10 @@ class BurritoOptionExecutor:
                     self._prepare_and_stage(actor, protein, primitives)
                 elif label == start_cooking_action(protein):
                     self._start_protein(actor, protein, primitives)
-                elif label == assemble_action(protein):
-                    self._assemble_and_stage(actor, protein, primitives)
+                elif label == plate_protein_action(protein):
+                    self._add_plate_component(
+                        actor, protein, "protein", primitives,
+                    )
                 elif label == serve_action(protein):
                     self._serve(actor, protein, primitives)
                 else:
@@ -276,7 +433,7 @@ class BurritoOptionExecutor:
             dtype=float,
         ).sum()
         execution = OptionExecution(
-            action=label,
+            action=token,
             actor_id=actor,
             low_level_ticks=int(self.state.timestep) - before_tick,
             primitive_calls=tuple(primitives),
@@ -286,25 +443,30 @@ class BurritoOptionExecutor:
             deliveries_after=self._delivery_count(),
         )
         self.execution_log.append(execution)
-        self._option_index += 1
         return execution
 
     @contextmanager
-    def _deterministic_upstream_rng(self) -> Iterator[None]:
+    def _deterministic_upstream_rng(
+        self, action: str, actor_id: int,
+    ) -> Iterator[None]:
         state = np.random.get_state()
-        # The simulator planner is a controlled executor, not an experimental
-        # variable. Its fixed seed deterministically derives a route stream;
-        # learner/ground-truth seeds remain independent.
-        child = np.random.SeedSequence([
-            self.seed & 0xFFFFFFFF,
-            self._episode_index & 0xFFFFFFFF,
-            self._option_index & 0xFFFFFFFF,
-        ])
-        np.random.seed(int(child.generate_state(1, dtype=np.uint32)[0]))
+        seed_upstream_rng(self.seed, action, actor_id, 0)
         try:
             yield
         finally:
             np.random.set_state(state)
+
+    def _reseed_attempt(self, primitive: str, actor_id: int, attempt: int) -> None:
+        """Give each retry its own reproducible planner stream.
+
+        The upstream planner draws from global ``np.random`` (it shuffles
+        ``high_level_action_priority`` and samples interaction counts), so
+        replaying an attempt without advancing the stream reproduces the same
+        route and the same failure.  Retries were therefore identical replays
+        and ``retries`` bought nothing; mixing the attempt index in keeps the
+        run reproducible while making a retry actually explore a new route.
+        """
+        seed_upstream_rng(self.seed, primitive, actor_id, attempt)
 
     def _primitive_valid(self, actor: int, primitive: str) -> bool:
         mask = self.actions.agent_action_mask(
@@ -328,7 +490,8 @@ class BurritoOptionExecutor:
                 f"upstream primitive {primitive} is invalid for actor {actor}"
             )
         elapsed = 0
-        for _attempt in range(max(1, int(retries))):
+        for attempt in range(max(1, int(retries))):
+            self._reseed_attempt(primitive, actor, attempt)
             # Both physical players participate in upstream collision-aware
             # planning. The non-acting player receives the upstream STAY
             # option; only ``actor`` receives the task primitive.
@@ -379,7 +542,8 @@ class BurritoOptionExecutor:
                 f"upstream primitive {primitive} is invalid for actor {actor}"
             )
         elapsed = 0
-        for _attempt in range(max(1, int(retries))):
+        for attempt in range(max(1, int(retries))):
+            self._reseed_attempt(primitive, actor, attempt)
             roles = ["A", "A"]
             self.env.setup_planner(
                 self.layout, roles, restrict_capability=False,
@@ -500,57 +664,50 @@ class BurritoOptionExecutor:
                 f"protein option did not start {cooked}"
             )
 
-    def _collect_and_stage_rice(
-        self, actor: int, primitives: list[str],
-    ) -> None:
+    def _grab_staged_plate(self, actor: int, primitives: list[str]) -> None:
+        staged = _staged_plate(self.state)
+        if staged is None:
+            raise OptionExecutionError("no plate is staged for assembly")
+        obj, components = staged
+        target = str(obj.name)
+        primitive = _GRAB_PLATE_BY_COMPONENT_COUNT.get(len(components))
+        if primitive is None:
+            raise OptionExecutionError(f"{target} is already a finished burrito")
         self._repeat_until(
-            actor, "GRAB_CLEAN_PLATE",
-            lambda: _held_name(self.state, actor) == "clean_plate",
-            primitives,
-        )
-        self._repeat_until(
-            actor, "GET_BOILED_RICE",
-            lambda: _held_name(self.state, actor) == "boiled_rice-plate",
-            primitives,
-        )
-        self._repeat_until(
-            actor, "PUT_DOWN_OBJECT",
-            lambda: (
-                _held_name(self.state, actor) is None
-                and _has_object(self.state, "boiled_rice-plate")
-            ),
+            actor, primitive,
+            lambda: _held_name(self.state, actor) == target,
             primitives,
         )
 
-    def _assemble_and_stage(
-        self, actor: int, protein: str, primitives: list[str],
+    def _add_plate_component(
+        self, actor: int, protein: str | None, component: str,
+        primitives: list[str],
     ) -> None:
-        cooked = "chopped_steak" if protein == "steak" else "fried_mushroom"
-        get_protein = (
-            "GET_STEAK_FROM_GRILLER" if protein == "steak"
-            else "GET_MURHSOOM_FROM_GRILLER"
-        )
-        final = f"{protein}_burrito"
+        """Add exactly one component to the staged plate, then re-stage it.
+
+        The pinned environment accepts rice, tortilla and the cooked protein in
+        any order, so each addition is an independently schedulable option.
+        Re-staging keeps the handoff invariant: every option ends with the
+        acting player empty-handed.
+        """
+        self._grab_staged_plate(actor, primitives)
         self._repeat_until(
-            actor, "GRAB_ONE_INGREDIENT_PLATE",
-            lambda: _held_name(self.state, actor) == "boiled_rice-plate",
+            actor, _component_primitive(component, protein),
+            lambda: component in (
+                _held_components(self.state, actor) or frozenset()
+            ),
             primitives,
         )
-        self._repeat_until(
-            actor, get_protein,
-            lambda: cooked in (_held_name(self.state, actor) or ""),
-            primitives,
-        )
-        self._repeat_until(
-            actor, "GRAB_TORTILLA",
-            lambda: _held_name(self.state, actor) == final,
-            primitives,
-        )
+        assembled = _held_name(self.state, actor)
+        if assembled is None:
+            raise OptionExecutionError(
+                f"adding {component} consumed the staged plate"
+            )
         self._repeat_until(
             actor, "PUT_DOWN_OBJECT",
             lambda: (
                 _held_name(self.state, actor) is None
-                and _has_object(self.state, final)
+                and _has_object(self.state, assembled)
             ),
             primitives,
         )
@@ -714,17 +871,21 @@ class BurritoOptionExecutor:
 
 __all__ = [
     "BurritoOptionExecutor",
-    "COLLECT_AND_STAGE_COOKED_RICE",
     "CONTROLLED_PARKING_POSITIONS",
+    "COOKED_PROTEIN",
     "OptionExecution",
     "OptionExecutionError",
+    "PLATE_COMPONENTS",
+    "PLATE_RICE",
+    "PLATE_TORTILLA",
     "STAGE_CLEAN_PLATE",
     "START_BOILING_RICE",
     "action_protein",
-    "assemble_action",
     "fetch_and_stage_action",
     "macro_actions",
     "macro_is_legal",
+    "plate_components",
+    "plate_protein_action",
     "prepare_and_stage_action",
     "serve_action",
     "start_cooking_action",

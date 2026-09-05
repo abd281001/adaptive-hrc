@@ -19,6 +19,7 @@ jupyterlab-widgets==3.0.17
 matplotlib-inline==0.2.2
 numpy==1.23.0
 opencv-python==4.10.0.84
+packaging==24.2
 parso==0.8.7
 pettingzoo==1.24.3
 pexpect==4.9.0

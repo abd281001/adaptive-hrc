@@ -142,8 +142,15 @@ class BurritoRuntime:
         """Return BurritoGridworld, BurritoEnv, and HighLevelActions lazily."""
         _activate_upstream_paths(self.paths)
         from burrito.mdp.burrito_env import BurritoEnv
-        from burrito.mdp.burrito_mdp import BurritoGridworld
+        from burrito.mdp.burrito_mdp import BurritoGridworld, Burrito_Recipe
         from burrito.planners.burrito_planner import HighLevelActions
+        from overcooked_ai_py.mdp.overcooked_mdp import Recipe
+
+        # Burrito inherits Overcooked's mutable recipe cache without defining
+        # its own.  Separate the two caches so onion/tomato and Burrito recipes
+        # can coexist in one process.
+        if Burrito_Recipe.ALL_RECIPES_CACHE is Recipe.ALL_RECIPES_CACHE:
+            Burrito_Recipe.ALL_RECIPES_CACHE = {}
 
         return BurritoGridworld, BurritoEnv, HighLevelActions
 
@@ -158,6 +165,10 @@ class BurritoRuntime:
     ) -> Any:
         """Build the unmodified upstream environment with its macro planner."""
         BurritoGridworld, BurritoEnv, _actions = self.upstream_types()
+        from burrito.mdp.burrito_mdp import Burrito_Recipe
+
+        Burrito_Recipe.ALL_RECIPES_CACHE.clear()
+        Burrito_Recipe._computed = False
         mdp = BurritoGridworld.from_layout_name(str(layout))
         if len(player_types) != int(mdp.num_players):
             raise ValueError(
@@ -174,3 +185,32 @@ class BurritoRuntime:
             restrict_capability=bool(restrict_capability),
         )
         return env
+
+    def create_overcooked_environment(
+        self,
+        layout: str,
+        ingredients: Sequence[str],
+        *,
+        horizon: int = 600,
+        info_level: int = 0,
+    ) -> Any:
+        """Build standard Overcooked with one explicit target recipe."""
+        _activate_upstream_paths(self.paths)
+        from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
+        from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
+        from overcooked_ai_py.mdp.overcooked_mdp import Recipe
+
+        order = {"ingredients": list(map(str, ingredients))}
+        Recipe.ALL_RECIPES_CACHE.clear()
+        Recipe._computed = False
+        mdp = OvercookedGridworld.from_layout_name(
+            str(layout),
+            start_all_orders=[order],
+            start_bonus_orders=[],
+            num_items_for_soup=len(order["ingredients"]),
+        )
+        if int(mdp.num_players) != 2:
+            raise ValueError("Adaptive-HRC Overcooked protocol requires two players")
+        return OvercookedEnv.from_mdp(
+            mdp, horizon=int(horizon), info_level=int(info_level),
+        )

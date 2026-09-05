@@ -1,4 +1,4 @@
-"""Small reproducibility CLI for the integration wrapper."""
+"""Reproducibility CLI for the cooking integration."""
 from __future__ import annotations
 
 import argparse
@@ -11,140 +11,126 @@ from .runtime import BurritoRuntime, verify_pins
 def main() -> int:
     parser = argparse.ArgumentParser(prog="adaptive_hrc_burrito")
     parser.add_argument(
-        "command", choices=(
-            "verify", "smoke", "protocol-smoke", "run", "validate",
-        ),
+        "command", choices=("verify", "smoke", "protocol-smoke", "run", "validate")
     )
     parser.add_argument("--layout", default="burrito_1-2_2p")
     parser.add_argument("--config")
     parser.add_argument("--output")
+    parser.add_argument(
+        "--workers", type=int,
+        help="parallel cell workers; 0 or omitted uses every CPU",
+    )
+    parser.add_argument(
+        "--resume",
+        help="existing run directory to resume; completed cells are reused",
+    )
     args = parser.parse_args()
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
     if args.command == "verify":
         print(json.dumps(verify_pins(), indent=2, sort_keys=True))
-    elif args.command == "smoke":
-        os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-        runtime = BurritoRuntime.discover()
-        env = runtime.create_environment(
-            args.layout,
-            horizon=80,
-            player_types=("H", "A"),
-            restrict_capability=False,
-        )
-        _gridworld, _environment, high_level_actions = runtime.upstream_types()
-        from overcooked_ai_py.mdp.actions import Action
+        return 0
+    if args.command == "smoke":
+        from .physical import create_executor
 
-        before = int(env.state.timestep)
-        human_stay = int(Action.ACTION_TO_INDEX[Action.STAY])
-        robot_macro = int(high_level_actions.GRAB_MEAT.action_index)
-        max_macro_ticks = 40
-        for macro_ticks in range(1, max_macro_ticks + 1):
-            transition = env.step([human_stay, robot_macro])
-            if transition is None:
-                raise RuntimeError(
-                    "BurritoEnv.step suppressed an upstream exception"
-                )
-            state, reward, done, info = transition
-            if bool(info["action_status"][1]["status"]):
-                break
-            if done:
-                raise RuntimeError("episode ended before GRAB_MEAT completed")
-        else:
-            raise RuntimeError(
-                f"GRAB_MEAT did not complete within {max_macro_ticks} ticks"
-            )
-        held_object = state.players[1].held_object
-        held_name = held_object.name if held_object is not None else None
-        if held_name != "meat":
-            raise RuntimeError(
-                f"GRAB_MEAT completed with unexpected held object {held_name!r}"
-            )
-        print(json.dumps({
-            "action_status": info.get("action_status"),
-            "done": bool(done),
-            "held_object": held_name,
-            "layout": args.layout,
-            "macro": high_level_actions.GRAB_MEAT.name,
-            "macro_index": robot_macro,
-            "macro_ticks": macro_ticks,
-            "num_players": int(env.mdp.num_players),
-            "reward": float(reward),
-            "solution_found": bool(info.get("solution_found")),
-            "timestep_before": before,
-            "timestep_after": int(state.timestep),
-        }, indent=2, sort_keys=True))
-    elif args.command == "protocol-smoke":
-        os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         runtime = BurritoRuntime.discover()
+        executor = create_executor(
+            runtime, "burrito_steak_burrito", horizon=800, seed=11
+        )
+        executor.reset()
+        print(json.dumps({
+            "layout": executor.layout,
+            "num_players": int(executor.env.mdp.num_players),
+            "timestep": int(executor.state.timestep),
+            "pins": verify_pins(),
+        }, indent=2, sort_keys=True))
+        return 0
+    if args.command == "protocol-smoke":
         from src.adaptive_agent import AdaptiveAgent
         from src.models import Settings
 
-        from .domain import BurritoDomainAdapter
-        from .domain import SEMANTIC_FALLBACK_MAX_RMS_DISTANCE
-        from .options import BurritoOptionExecutor
-        from .protocol import BurritoHrcRunner, BurritoTask
+        from .domain import CookingDomainAdapter, SEMANTIC_FALLBACK_MAX_RMS_DISTANCE
+        from .protocol import CookingHrcRunner, CookingTask
 
-        executor = BurritoOptionExecutor(
-            runtime, layout=args.layout, seed=1337,
-        )
-        domain = BurritoDomainAdapter(
-            executor.state,
-            terrain_positions=executor.env.mdp.terrain_pos_dict,
-        )
-        settings = Settings(
+        runtime = BurritoRuntime.discover()
+        domain = CookingDomainAdapter()
+        agent = AdaptiveAgent(Settings(
             verbose=False,
             seed=1337,
-            irl_cold_steps=8,
-            irl_warm_steps=4,
+            irl_cold_steps=4,
+            irl_warm_steps=2,
             irl_horizon=12,
-            semantic_fallback_max_rms_distance=(
-                SEMANTIC_FALLBACK_MAX_RMS_DISTANCE
+            initial_grace=2,
+            min_grace=1,
+            semantic_fallback_max_rms_distance=SEMANTIC_FALLBACK_MAX_RMS_DISTANCE,
+        ), domain=domain)
+        runner = CookingHrcRunner(agent, runtime, domain, planner_seed=11)
+        observation, acquisition, recurrence = runner.run_stream((
+            CookingTask.create("burrito_steak_burrito", "wash_plates_early"),
+            CookingTask.create(
+                "burrito_steak_burrito", "pot_rice_early",
+                phase=1, lifecycle="acquire_shift", preference_changed=True,
+                exposure_after_change=1,
             ),
-        )
-        agent = AdaptiveAgent(settings, domain=domain)
-        runner = BurritoHrcRunner(agent, executor, domain)
-        observation, assist = runner.run_stream((
-            BurritoTask.create("steak", "plate_early"),
-            BurritoTask.create("steak", "protein_first"),
+            CookingTask.create(
+                "burrito_steak_burrito", "pot_rice_early",
+                phase=1, lifecycle="post_update_recurrence",
+                exposure_after_change=2,
+            ),
         ))
         print(json.dumps({
-            "assist_corrections": assist.corrections,
-            "assist_mode": assist.mode,
-            "assist_robot_top_1": assist.robot_top_1,
-            "assist_robot_exact_reference_top_1": (
-                assist.robot_exact_reference_top_1
-            ),
-            "assist_robot_turns": assist.robot_turns,
-            "assist_memory_age_delta": assist.memory_age_delta,
-            "assist_passive_wait_ticks": assist.passive_wait_ticks,
-            "assist_preference_steps": len(assist.decisions),
-            "layout": args.layout,
-            "observation_memory_age_delta": observation.memory_age_delta,
             "observation_mode": observation.mode,
-            "observation_preference_steps": len(observation.decisions),
-            "observed_recipes": runner.observed_recipes,
-            "physical_deliveries": (
-                observation.deliveries + assist.deliveries
+            "acquisition_corrections": acquisition.corrections,
+            "acquisition_update_verified": bool(
+                acquisition.commit_applied
+                and acquisition.active_rehearsal
+                and acquisition.retrain_executed
             ),
-            "state_width": len(observation.observations[0].state),
+            "recurrence_corrections": recurrence.corrections,
+            "recurrence_robot_top_1": recurrence.robot_top_1,
+            "physical_deliveries": sum(
+                result.deliveries for result in (observation, acquisition, recurrence)
+            ),
         }, indent=2, sort_keys=True))
-    elif args.command in {"run", "validate"}:
-        if not args.config:
-            parser.error(f"{args.command} requires --config")
-        os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-        from .evaluation import run_experiment, validate_result
+        return 0
+    if not args.config:
+        parser.error(f"{args.command} requires --config")
+    from .evaluation import run_experiment, validate_result
 
-        result = run_experiment(args.config, output_root=args.output)
-        validation = (
-            validate_result(result, args.config)
-            if args.command == "validate" else None
-        )
-        print(json.dumps({
-            **result,
-            **({"validation": validation} if validation is not None else {}),
-        }, indent=2, sort_keys=True))
+    result = run_experiment(
+        args.config, output_root=args.output, resume_from=args.resume,
+        workers=args.workers, progress=True,
+    )
+    validation = (
+        validate_result(result, args.config) if args.command == "validate" else None
+    )
+    summary = result["summary"]
+    print(json.dumps({
+        "run_dir": result["run_dir"],
+        "status": summary["status"],
+        "episode_count": summary["episode_count"],
+        "failure_count": summary["failure_count"],
+        "primary_metric": summary["primary_metric"],
+        "normalized_human_action_load": summary["normalized_human_action_load"],
+        "normalized_human_action_load_floor": summary[
+            "normalized_human_action_load_floor"
+        ],
+        "human_action_load_excess": summary["human_action_load_excess"],
+        "primary_accuracy_metric": summary["primary_accuracy_metric"],
+        "preference_discriminating_top_1": summary[
+            "preference_discriminating_top_1"
+        ],
+        "robot_top_1_diagnostic": summary["robot_top_1"],
+        "teacher_forced_preference_discriminating_top_1": summary[
+            "teacher_forced_preference_discriminating_top_1"
+        ],
+        "single_legal_action_fraction": summary["single_legal_action_fraction"],
+        "excluded_incomplete_cells": summary["excluded_incomplete_cells"],
+        "groups": summary["groups"],
+        "pre_event_probe_groups": summary["pre_event_probe_groups"],
+        **({"validation": validation} if validation is not None else {}),
+    }, indent=2, sort_keys=True))
     return 0
 
 

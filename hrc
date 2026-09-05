@@ -4,6 +4,8 @@ set -euo pipefail
 PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 NORMAL_PYTHON="$PROJECT_ROOT/venv/bin/python"
 LLM_PYTHON="$PROJECT_ROOT/.venv-llm/bin/python"
+COOKING_PYTHON="$PROJECT_ROOT/burrito/.venv/bin/python"
+COOKING_CONFIG="$PROJECT_ROOT/burrito/configs/full.json"
 
 usage() {
     cat <<'EOF'
@@ -15,8 +17,9 @@ Commands:
   kernel      Register venv as the HRC Jupyter kernel
   test        Run the test suite
   run         Run the full normal evaluation
-  ablation    Run an ablation suite; pass --suite matcher|routing|latent
-  llm [scope] Run paired Full + LLM; scope: homogeneous|heterogeneous|holdout
+  cooking     Run and validate the full Overcooked/Burrito evaluation
+  ablation    Run all ablations; pass --suite matcher|routing|latent for one
+  llm [scope] Run full-schedule one-seed Full + LLM; scope: homogeneous|heterogeneous|holdout
   doctor      Check the normal and LLM runtimes without starting an experiment
 EOF
 }
@@ -31,6 +34,13 @@ ensure_normal_python() {
 ensure_llm_python() {
     if [[ ! -x "$LLM_PYTHON" ]]; then
         echo "Missing $LLM_PYTHON. Run ./hrc setup-llm first." >&2
+        exit 1
+    fi
+}
+
+ensure_cooking_python() {
+    if [[ ! -x "$COOKING_PYTHON" ]]; then
+        echo "Missing $COOKING_PYTHON. Run ./burrito/bootstrap.sh first." >&2
         exit 1
     fi
 }
@@ -67,14 +77,34 @@ case "$command" in
         ;;
     run)
         ensure_normal_python
+        run_args=()
+        if [[ -n "${HRC_WORKERS:-}" ]]; then
+            run_args+=(--workers "$HRC_WORKERS")
+        fi
         exec "$NORMAL_PYTHON" -X faulthandler -m src.evaluation \
-            --workers 1 \
-            --output eval_results \
+            "${run_args[@]}" \
+            "$@"
+        ;;
+    cooking)
+        ensure_cooking_python
+        cooking_args=()
+        if [[ -n "${HRC_COOKING_RESUME:-}" ]]; then
+            cooking_args+=(--resume "$HRC_COOKING_RESUME")
+        fi
+        if [[ -n "${HRC_COOKING_WORKERS:-}" ]]; then
+            cooking_args+=(--workers "$HRC_COOKING_WORKERS")
+        fi
+        exec "$COOKING_PYTHON" -X faulthandler \
+            -m adaptive_hrc_burrito validate \
+            --config "$COOKING_CONFIG" \
+            "${cooking_args[@]}" \
             "$@"
         ;;
     ablation)
         ensure_normal_python
-        exec "$NORMAL_PYTHON" -X faulthandler -m src.ablations "$@"
+        exec "$NORMAL_PYTHON" -X faulthandler -m src.ablations \
+            --workers "${HRC_ABLATION_WORKERS:-1}" \
+            "$@"
         ;;
     llm)
         ensure_llm_python
@@ -113,6 +143,21 @@ case "$command" in
         ensure_llm_python
         "$NORMAL_PYTHON" -c 'import matplotlib, numpy, pytest; print("normal runtime: OK")'
         "$LLM_PYTHON" -c 'from src.llm_baseline import preflight_llm_runtime; print("LLM runtime:", preflight_llm_runtime())'
+        # The prompt grows with replay memory, so a card shared with a desktop
+        # can run for hours and then stop. Report the budget before that.
+        "$LLM_PYTHON" - <<'PY'
+from src.llm_baseline import report_vram_budget
+b = report_vram_budget()
+print(
+    "LLM VRAM budget: "
+    f"total={b['total_gib']:.2f}GiB "
+    f"other_clients={b['other_clients_gib']:.2f}GiB "
+    f"display_reserve={b['headroom_gib']:.2f}GiB "
+    f"weights={b['weights_gib']:.2f}GiB "
+    f"-> ~{b['prompt_token_estimate']} prompt tokens "
+    f"(~{b['prompt_token_estimate_if_gpu_exclusive']} with this GPU to itself)"
+)
+PY
         ;;
     help|-h|--help)
         usage
