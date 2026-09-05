@@ -61,8 +61,11 @@ def execute_grasp_and_return_base(
     stable_frames_required=3,
     max_position_jump_m=0.035,
     max_frame_age_s=0.30,
+    max_translation_drift_m=0.025,
+    max_heading_error_deg=3.0,
     velocity_scale=1.0,
     cancel_event=None,
+    controller_status_callback=None,
     show_visualization=False,
     verbose=False,
 ):
@@ -93,6 +96,8 @@ def execute_grasp_and_return_base(
         controller = nvc.NormalizedVelocityControl(
             robot, command_watchdog_s=command_watchdog_s
         )
+        if controller_status_callback is not None:
+            controller_status_callback(controller.status())
         controller.reset_base_odometry()
         time.sleep(0.2)
 
@@ -133,6 +138,12 @@ def execute_grasp_and_return_base(
         while True:
             loop_timer.start_of_iteration()
 
+            try:
+                controller.assert_healthy()
+            finally:
+                if controller_status_callback is not None:
+                    controller_status_callback(controller.status())
+
             if cancel_event is not None and cancel_event.is_set():
                 log("Grasp cancelled by stop request.")
                 if controller is not None:
@@ -162,6 +173,8 @@ def execute_grasp_and_return_base(
                 color_image is None or depth_image is None
                 or frame_age_s is None or frame_age_s > max_frame_age_s
             ):
+                stable_marker_frames = 0
+                last_positions = None
                 if controller is not None:
                     controller.set_command(zero_vel.copy())
                 time.sleep(0.01)
@@ -534,6 +547,8 @@ def execute_grasp_and_return_base(
 
         if controller is not None:
             controller.stop()
+            if controller_status_callback is not None:
+                controller_status_callback(controller.status())
             time.sleep(0.3)
             controller = None
 
@@ -546,6 +561,8 @@ def execute_grasp_and_return_base(
             return_base_to_saved_pose(
                 robot, table1_pregrasp_pose, timeout=command_timeout_s,
                 deadline=deadline, cancel_event=cancel_event,
+                translation_tolerance_m=max_translation_drift_m,
+                heading_tolerance_rad=math.radians(max_heading_error_deg),
             )
             return 0, grasp_snapshot
 
@@ -561,4 +578,8 @@ def execute_grasp_and_return_base(
                 pass
 
         if controller is not None:
-            controller.stop()
+            try:
+                controller.stop()
+            finally:
+                if controller_status_callback is not None:
+                    controller_status_callback(controller.status())

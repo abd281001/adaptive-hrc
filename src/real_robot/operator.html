@@ -65,6 +65,21 @@ async function post(path, payload) {
   } catch (error) { document.getElementById('message').textContent = error.message; }
 }
 function button(text, cls, handler) { return `<button class="${cls}" onclick="${handler}">${esc(text)}</button>`; }
+function startFreeform(recipeId) {
+  const trialId = document.getElementById('trialId').value.trim();
+  const preferenceId = document.getElementById('preferenceId').value.trim();
+  const condition = document.getElementById('condition').value.trim();
+  if (!trialId || !preferenceId || !condition) {
+    document.getElementById('message').textContent = 'Trial ID, preference ID, and condition are required.';
+    return;
+  }
+  post('/api/episode/start', {recipe_id:recipeId,props_reset:document.getElementById('propsReset').checked,trial_metadata:{trial_id:trialId,preference_id:preferenceId,condition}});
+}
+function startScheduled() {
+  const next = state.schedule?.next;
+  if (!next) return;
+  post('/api/episode/start', {recipe_id:next.recipe_id,props_reset:document.getElementById('propsReset').checked,trial_metadata:next.trial_metadata});
+}
 function actionButtons(path, exclude=null, checkbox='physicalComplete') {
   return `<div class="row">${state.available_human_actions.filter(token => token !== exclude).map(token => button(label(token), path.includes('correct')?'correct':'action', `post('${path}', {action:'${token}',physical_completed:document.getElementById('${checkbox}').checked})`)).join('')}</div>`;
 }
@@ -80,16 +95,25 @@ function render() {
   document.getElementById('completed').innerHTML = state.completed.length ? state.completed.map(x => `<span class="token">${esc(label(x))}</span>`).join(' → ') : 'None';
   const controlSignature = JSON.stringify([
     state.phase, state.pending_prediction, state.completed,
-    state.error, state.next_placement_slot, hw.ready
+    state.error, state.next_placement_slot, hw.ready, state.schedule
   ]);
   if (controlSignature === lastControlSignature) return;
   lastControlSignature = controlSignature;
   let html = '';
   if (state.phase === 'idle' || state.phase === 'complete') {
     html += '<label><input id="propsReset" type="checkbox"> I verified every proxy object is at its source and all workspace slots are empty.</label>';
-    html += '<div class="row" style="margin-top:12px"><label>Trial ID <input id="trialId" size="12"></label><label>Preference/condition ID <input id="preferenceId" size="18"></label></div><div class="row" style="margin-top:12px">';
-    for (const [id, recipe] of Object.entries(cfg.recipes)) html += button(`Start ${recipe.label}`, 'action', `post('/api/episode/start',{recipe_id:'${id}',props_reset:document.getElementById('propsReset').checked,trial_metadata:{trial_id:document.getElementById('trialId').value,preference_id:document.getElementById('preferenceId').value}})`);
-    html += '</div>';
+    if (state.schedule) {
+      const next = state.schedule.next;
+      html += `<p>Frozen schedule <span class="token">${esc(state.schedule.schedule_id)}</span> · ${state.schedule.index}/${state.schedule.total} complete.</p>`;
+      if (next) {
+        html += `<p>Next: ${esc(next.trial_metadata.trial_id)} · ${esc(cfg.recipes[next.recipe_id].label)} · ${esc(next.expected_mode)} · preference ${esc(next.trial_metadata.preference_id)} · ${esc(next.trial_metadata.condition)}</p>`;
+        html += button('Start scheduled episode', 'action', 'startScheduled()');
+      } else html += '<p>Frozen schedule complete. Stop the run and generate the report.</p>';
+    } else {
+      html += '<div class="row" style="margin-top:12px"><label>Trial ID <input id="trialId" required size="12"></label><label>Preference ID <input id="preferenceId" required size="12"></label><label>Condition <input id="condition" required size="12"></label></div><div class="row" style="margin-top:12px">';
+      for (const [id, recipe] of Object.entries(cfg.recipes)) html += button(`Start ${recipe.label}`, 'action', `startFreeform('${id}')`);
+      html += '</div>';
+    }
     if (state.last_match) html += `<p>Last learner classification: <span class="token">${esc(state.last_match.kind)}</span> / ${esc(state.last_match.recipe_id || 'none')}</p>`;
   } else if (state.phase === 'human_turn') {
     html = `<p>After the participant places the intended object in <strong>${esc(cfg.placement_slots?.[state.next_placement_slot]?.label || state.next_placement_slot || 'the next slot')}</strong>, record it:</p><label><input id="physicalComplete" type="checkbox"> I directly verified the physical action is complete.</label>` + actionButtons('/api/human-action');

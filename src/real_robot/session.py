@@ -11,6 +11,7 @@ import uuid
 from .config import LabConfig
 from .domain import PhysicalObservation, PhysicalTaskDomain, StateVector
 from .hardware import ExecutionResult, HardwareExecutor
+from .schedule import StudySchedule
 
 
 IDLE = "idle"
@@ -43,6 +44,7 @@ class LiveHrcSession:
         self, agent: Any, domain: PhysicalTaskDomain, config: LabConfig,
         executor: HardwareExecutor, *,
         event_sink: Optional[Callable[[Mapping[str, Any]], None]] = None,
+        schedule: StudySchedule | None = None,
     ):
         if getattr(agent, "domain", None) is not domain:
             raise ValueError("agent and live session must share one domain adapter")
@@ -51,6 +53,7 @@ class LiveHrcSession:
         self.config = config
         self.executor = executor
         self.event_sink = event_sink
+        self.schedule = schedule
         self._lock = threading.RLock()
         self._event_index = 0
         self._observed_recipes: set[str] = set()
@@ -58,6 +61,8 @@ class LiveHrcSession:
         self._worker: Optional[threading.Thread] = None
         self._generation = 0
         self._pending_commit: Optional[Dict[str, Any]] = None
+        self._schedule_index = 0
+        self._used_trial_ids: set[str] = set()
         self.phase = IDLE
         self.mode: Optional[str] = None
         self.recipe_id: Optional[str] = None
@@ -93,16 +98,50 @@ class LiveHrcSession:
                 raise SessionStateError("operator must confirm that all proxy objects and placement slots were reset")
             if recipe_id not in self.config.recipes:
                 raise SessionStateError(f"unknown recipe {recipe_id!r}")
+            expected_trial = None
+            if self.schedule is not None:
+                if self._schedule_index >= len(self.schedule.episodes):
+                    raise SessionStateError("the frozen study schedule is complete")
+                expected_trial = self.schedule.episodes[self._schedule_index]
+                if recipe_id != expected_trial.recipe_id:
+                    raise SessionStateError(
+                        f"next scheduled recipe is {expected_trial.recipe_id!r}, not {recipe_id!r}"
+                    )
             if self.agent.current_prefix:
                 raise SessionStateError("agent has an unfinished online prefix")
             hardware = dict(self.executor.status())
             if not hardware.get("ready", True):
                 raise SessionStateError(f"hardware is not ready: {hardware.get('error') or hardware.get('last_error') or 'unknown reason'}")
+            next_mode = OBSERVE if recipe_id not in self._observed_recipes else ASSIST
+            if expected_trial is not None:
+                expected_metadata = {
+                    **dict(expected_trial.trial_metadata),
+                    "schedule_id": self.schedule.schedule_id,
+                    "participant_id": self.schedule.participant_id,
+                    "counterbalance_id": self.schedule.counterbalance_id,
+                    "schedule_index": self._schedule_index,
+                }
+                supplied = self._validate_trial_metadata(trial_metadata) if trial_metadata else None
+                if supplied is not None and any(
+                    supplied.get(key) != value
+                    for key, value in expected_trial.trial_metadata.items()
+                ):
+                    raise SessionStateError("trial metadata disagrees with the frozen study schedule")
+                if next_mode != expected_trial.expected_mode:
+                    raise SessionStateError(
+                        f"scheduled mode is {expected_trial.expected_mode}, but protocol state requires {next_mode}"
+                    )
+                next_metadata = expected_metadata
+            else:
+                next_metadata = self._validate_trial_metadata(trial_metadata)
+            trial_id = str(next_metadata["trial_id"])
+            if trial_id in self._used_trial_ids:
+                raise SessionStateError(f"trial_id {trial_id!r} has already been used in this run")
             self._generation += 1
             self._agent_snapshot = self.agent.snapshot()
             self.recipe_id = recipe_id
-            self.mode = OBSERVE if recipe_id not in self._observed_recipes else ASSIST
-            self.trial_metadata = self._validate_trial_metadata(trial_metadata or {})
+            self.mode = next_mode
+            self.trial_metadata = next_metadata
             self.phase = HUMAN_TURN
             self.state = self.domain.initial_state()
             self.completed = []
@@ -121,8 +160,9 @@ class LiveHrcSession:
                     "trial_metadata": dict(self.trial_metadata),
                     "config_digest": self.config.digest,
                 })
+                self._used_trial_ids.add(trial_id)
             except Exception:
-                self.agent.restore_from(self._agent_snapshot)
+                self._restore_agent(self._agent_snapshot)
                 self._reset_runtime_state()
                 raise
         return self.snapshot()
@@ -216,7 +256,7 @@ class LiveHrcSession:
                 self.phase = IDLE
             else:
                 if self._agent_snapshot is not None:
-                    self.agent.restore_from(self._agent_snapshot)
+                    self._restore_agent(self._agent_snapshot)
                 aborted = self.recipe_id
                 self._generation += 1
                 self._reset_runtime_state()
@@ -356,6 +396,7 @@ class LiveHrcSession:
         phase_before = self.phase
         match_before = self.last_match
         observed_before = set(self._observed_recipes)
+        schedule_index_before = self._schedule_index
         episode_agent_snapshot_before = self._agent_snapshot
         try:
             observation = PhysicalObservation(before, token, after)
@@ -394,7 +435,7 @@ class LiveHrcSession:
                 **record, "episode": episode_summary,
             })
         except Exception:
-            self.agent.restore_from(agent_before)
+            self._restore_agent(agent_before)
             self.state = state_before
             self.completed = completed_before
             self.decisions = decisions_before
@@ -403,6 +444,7 @@ class LiveHrcSession:
             self.phase = phase_before
             self.last_match = match_before
             self._observed_recipes = observed_before
+            self._schedule_index = schedule_index_before
             self._agent_snapshot = episode_agent_snapshot_before
             raise
 
@@ -423,6 +465,8 @@ class LiveHrcSession:
         human_actions = sum(row["executed_by"] in {"human", "human_correction"} for row in self.decisions)
         shadow_rows = [row for row in self.decisions if row.get("prediction_kind") == "human_turn_shadow" and row.get("predicted") is not None]
         self.phase = COMPLETE
+        if self.schedule is not None:
+            self._schedule_index += 1
         self._agent_snapshot = None
         return {
             "external_recipe_id": recipe_id, "mode": mode,
@@ -457,7 +501,11 @@ class LiveHrcSession:
         return tuple(action for action in self.config.recipes[self.recipe_id].actions if action not in complete)
 
     @staticmethod
-    def _validate_trial_metadata(value: Mapping[str, Any]) -> Dict[str, Any]:
+    def _validate_trial_metadata(value: Mapping[str, Any] | None) -> Dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise SessionStateError(
+                "trial_metadata must include non-empty trial_id, preference_id, and condition"
+            )
         if len(value) > 16:
             raise SessionStateError("trial_metadata has too many fields")
         output: Dict[str, Any] = {}
@@ -468,7 +516,21 @@ class LiveHrcSession:
             if isinstance(item, str) and len(item) > 256:
                 raise SessionStateError("trial_metadata string is too long")
             output[name] = item
+        for required in ("trial_id", "preference_id", "condition"):
+            item = output.get(required)
+            if not isinstance(item, str) or not item.strip():
+                raise SessionStateError(f"trial_metadata.{required} must be a non-empty string")
+            output[required] = item.strip()
         return output
+
+    def _restore_agent(self, snapshot: Any) -> None:
+        self.agent.restore_from(snapshot)
+        # AdaptiveAgent snapshots deep-copy their domain. Keep the session and
+        # its fitted predictor bound to one canonical physical adapter.
+        self.agent.domain = self.domain
+        maxent = getattr(self.agent, "maxent", None)
+        if maxent is not None:
+            maxent.domain = self.domain
 
     def _reset_runtime_state(self) -> None:
         self.phase = IDLE
@@ -509,6 +571,9 @@ class LiveHrcSession:
                 }
             return {
                 "schema_version": 1, "event_index": self._event_index,
+                "schedule_digest": self.schedule.digest if self.schedule is not None else None,
+                "schedule_index": self._schedule_index,
+                "used_trial_ids": list(sorted(self._used_trial_ids)),
                 "observed_recipes": list(sorted(self._observed_recipes)),
                 "phase": self.phase, "mode": self.mode, "recipe_id": self.recipe_id,
                 "trial_metadata": dict(self.trial_metadata), "state": list(self.state),
@@ -525,10 +590,16 @@ class LiveHrcSession:
         with self._lock:
             if int(row.get("schema_version", 0)) != 1:
                 raise SessionStateError("unsupported live-session checkpoint")
+            checkpoint_schedule = row.get("schedule_digest")
+            active_schedule = self.schedule.digest if self.schedule is not None else None
+            if checkpoint_schedule != active_schedule:
+                raise SessionStateError("checkpoint study schedule does not match the active schedule")
             recipe_id = row.get("recipe_id")
             if recipe_id is not None and recipe_id not in self.config.recipes:
                 raise SessionStateError("checkpoint references an unknown recipe")
             self._event_index = int(row.get("event_index", 0))
+            self._schedule_index = int(row.get("schedule_index", 0))
+            self._used_trial_ids = set(map(str, row.get("used_trial_ids", ())))
             self._observed_recipes = set(map(str, row.get("observed_recipes", ())))
             self.phase = str(row.get("phase", IDLE))
             if self.phase == ROBOT_EXECUTING:
@@ -593,6 +664,23 @@ class LiveHrcSession:
                 "last_execution": self.last_execution.as_dict() if self.last_execution else None,
                 "last_match": dict(self.last_match) if self.last_match else None,
                 "error": self.error, "observed_recipes": list(sorted(self._observed_recipes)),
+                "schedule": {
+                    "schedule_id": self.schedule.schedule_id,
+                    "participant_id": self.schedule.participant_id,
+                    "counterbalance_id": self.schedule.counterbalance_id,
+                    "digest": self.schedule.digest,
+                    "index": self._schedule_index,
+                    "total": len(self.schedule.episodes),
+                    "complete": self._schedule_index >= len(self.schedule.episodes),
+                    "next": (
+                        None if self._schedule_index >= len(self.schedule.episodes)
+                        else {
+                            "recipe_id": self.schedule.episodes[self._schedule_index].recipe_id,
+                            "expected_mode": self.schedule.episodes[self._schedule_index].expected_mode,
+                            "trial_metadata": dict(self.schedule.episodes[self._schedule_index].trial_metadata),
+                        }
+                    ),
+                } if self.schedule is not None else None,
                 "reconciliation_execution_id": None if self._pending_commit is None else self._pending_commit["execution"].metadata.get("execution_id"),
                 "session_worker_alive": self._worker is not None and self._worker.is_alive(),
                 "config_digest": self.config.digest,

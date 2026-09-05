@@ -155,17 +155,47 @@ Keep `motion.calibrated` false while measuring:
    those values under `reference_marker.expected_position_by_station_m`.
    Normal live startup and every station arrival require stable agreement with
    these measurements; calibration mode deliberately bypasses this gate.
-7. Copy `robot_configs/calibration_record.template.json`, record the raw trials
-   and frozen acceptance thresholds, and set a unique `motion.calibration_id`.
-   Set `motion.calibration_record` to that file (relative paths resolve from
-   the config directory), compute its SHA-256 with `sha256sum`, and enter the
-   digest as `motion.calibration_record_sha256`. Only then set
-   `motion.calibrated` true. Live config loading verifies the file and digest.
+7. Before collecting acceptance trials, copy
+   `robot_configs/calibration_record.template.json` and freeze its thresholds.
+   The template is deliberately incomplete and cannot unlock motion. Record at
+   least `min_trials_per_pose` observations for every required cell:
+
+   - station headings and reference-marker poses for every station;
+   - placement outcome and `marker_xyz_m` for every workspace slot;
+   - marker quality for every object at its source station, and for the table
+     reference and both fingertips at every station. Every marker-quality row
+     contains `station_id`, `min_marker_pixels`, `reprojection_error_px`, and
+     `depth_m`;
+   - grasp success for every object;
+   - `heading_error_deg` and `translation_drift_m` under
+     `canonical_return_trials_by_station` for every station round trip; and
+   - exactly the stale-velocity, camera-disconnect, command-timeout, and
+     emergency-stop fault tests. The emergency-stop result also records the
+     measured `latency_s`.
+
+   The configured `motion.rotation_tolerance_deg` and
+   `motion.max_translation_drift_m` may not be looser than the frozen
+   thresholds. Failed trials stay in the record; do not retain only successful
+   repetitions.
+8. Copy `robot_configs/stretch_runtime.lock.template.json`. Enter the exact
+   Python, Stretch Body, RealSense, OpenCV, NumPy, and SciPy versions plus the
+   `HELLO_FLEET_ID`, D405 serial, and D405 firmware observed on the final robot.
+   `unknown`, `available`, placeholders, and version ranges are rejected.
+   `./hrc robot-doctor --check-robot-runtime` reports the import versions and
+   attached D405 identity. A live bridge performs the final robot-ID and camera
+   identity match.
+9. Set a unique `motion.calibration_id`; use the same ID in the calibration
+   record. Set `motion.calibration_record` and `motion.runtime_lock` to the two
+   files (relative paths resolve from the config directory), compute both
+   SHA-256 values with `sha256sum`, and enter the digests. Only then set
+   `motion.calibrated` true. Loading a live config verifies the bytes, the full
+   evidence schema, the frozen thresholds, per-station coverage, and agreement
+   between both hardware identities.
 
 The configuration parser rejects unknown keys, out-of-range markers and poses,
 too-close station headings, missing slots, recipe/slot mismatches, and a live
-calibration without an ID, matching calibration record, or both fingertip
-markers.
+calibration without an ID, complete semantic evidence, an exact runtime lock,
+or both fingertip markers.
 
 ## Read-only preflight
 
@@ -216,6 +246,35 @@ Start the learner/UI in a second terminal:
   --bind 127.0.0.1
 ```
 
+That command is appropriate for commissioning and informal demonstrations. A
+paper run additionally requires a participant-specific frozen schedule and
+the explicit publication gate:
+
+```bash
+cp robot_configs/study_schedule.template.json /path/to/frozen/P001.json
+# Edit IDs/order/conditions before the session; do not edit it after collection starts.
+./hrc robot-ui \
+  --config /path/to/frozen/lab_site.json \
+  --hardware-url http://127.0.0.1:9100 \
+  --require-motion --publication-run \
+  --schedule /path/to/frozen/P001.json \
+  --bind 127.0.0.1
+```
+
+The schedule loader enforces one initial observation for each of exactly three
+or four recipes, a contiguous observation block before all assist trials, and
+at least one later assist trial for every observed recipe. Trial IDs are unique;
+participant, counterbalance, intended preference, condition, recipe, and mode
+are fixed by the schedule and shown by the UI. The included schedule is a
+format example, not a substitute for a preregistered counterbalancing plan.
+Publication mode also refuses an uncalibrated configuration, dry bridge, or
+dirty/unidentified Git revision. It requires a fresh continuous event log and
+therefore refuses `--resume-checkpoint`; preserve interrupted and resumed runs
+as failure/recovery evidence, but do not label either segment as the complete
+scheduled trial. Keep participant schedules and run outputs in the ignored
+output directories or another immutable data location so they do not make the
+software checkout dirty.
+
 Keep the bridge loopback-only. For remote desktop, open the browser on Stretch.
 If a lab PC must open the page directly, expose only the operator UI on the lab
 LAN and protect its printed token; do not expose port 9100.
@@ -247,6 +306,9 @@ Each UI launch creates a new directory under `real_robot_runs/` containing:
 - `manifest.json`: live/dry gate, full config digest, calibration/hardware
   preflight, git commit/dirty-state hash, Python/platform, timing, and lineage;
 - `config.snapshot.json`: exact normalized configuration;
+- `schedule.snapshot.json`: exact participant/counterbalance trial schedule;
+- `calibration.record.json` and `runtime.lock.json`: byte-for-byte copies of
+  the digest-verified deployment evidence;
 - `events.jsonl`: append-only, fsynced protocol and execution events with wall
   and monotonic timestamps;
 - `checkpoint.pkl`: action-level learner/session recovery state.
@@ -256,12 +318,24 @@ Generate a deterministic integrity/outcome summary after a run:
 
 ```bash
 ./hrc robot-report real_robot_runs/RUN_DIRECTORY \
-  --output real_robot_runs/RUN_DIRECTORY/report.json
+  --output real_robot_runs/RUN_DIRECTORY/report.json \
+  --require-publication-eligible
 ```
 
-A run with non-contiguous events, unresolved reconciliation, dry motion, an
-uncalibrated config, or a dirty/unidentified software snapshot is not final
-publication evidence.
+The report emits per-episode rows and pooled metrics by condition, intended
+preference, and recipe. It also replays `Latest`, `NoDecay`, and behavior
+cloning as teacher-forced shadow comparators on the realized action trace;
+these are prediction baselines, not baseline-controlled robot trials or causal
+human-effort estimates.
+
+With `--require-publication-eligible`, the command exits nonzero for any
+non-contiguous or truncated event log, schedule/episode mismatch, unresolved
+execution, failed or aborted episode, missing physical postcondition, invalid
+calibration/runtime artifact, dry or unqualified hardware preflight,
+dirty/unidentified software snapshot, missing comparator score, or unclean
+terminal state. A successful report is an integrity check over recorded
+software evidence; it is not evidence that unobserved physical hazards were
+safe.
 
 ## Acceptance before a study or recorded paper demo
 

@@ -474,6 +474,8 @@ class NormalizedVelocityControl():
         self.command_watchdog_s = max(0.05, float(command_watchdog_s))
         self.stop_loop = False
         self.lock = threading.Lock()
+        self._controller_error = None
+        self._controller_safety_stop_error = None
         self._init_command()
         self.controller_thread = None
         self._start_controller()
@@ -486,28 +488,69 @@ class NormalizedVelocityControl():
             self.watchdog_stop_count = 0
 
     def stop(self):
+        stop_error = None
         with self.lock:
             self.stop_loop = True
             self.new_command_received = False
             self.command['num'] = self.command['num'] + 1
             self.command['time'] = time.monotonic()
             self.command['cmd'] = zero_vel.copy()
-            self._execute(self.command)
+            try:
+                self._execute(self.command)
+            except BaseException as exc:
+                stop_error = exc
+                if self._controller_safety_stop_error is None:
+                    self._controller_safety_stop_error = self._format_error(exc)
         if self.controller_thread is not None and self.controller_thread is not threading.current_thread():
             self.controller_thread.join(timeout=2.0)
+        if stop_error is not None:
+            raise RuntimeError(
+                f"velocity controller could not issue its final zero command: {self._format_error(stop_error)}"
+            ) from stop_error
+
+    @staticmethod
+    def _format_error(exc):
+        return f"{type(exc).__name__}: {exc}"
+
+    def status(self):
+        with self.lock:
+            thread = self.controller_thread
+            return {
+                'thread_alive': bool(thread is not None and thread.is_alive()),
+                'stop_requested': bool(self.stop_loop),
+                'error': self._controller_error,
+                'safety_stop_error': self._controller_safety_stop_error,
+                'watchdog_stop_count': int(self.watchdog_stop_count),
+                'last_command_age_s': max(0.0, time.monotonic() - self.command['time']),
+                'last_command_nonzero': bool(self._last_executed_nonzero),
+            }
+
+    def assert_healthy(self):
+        status = self.status()
+        if status['error']:
+            raise RuntimeError(f"velocity controller thread failed: {status['error']}")
+        if not status['thread_alive'] and not status['stop_requested']:
+            raise RuntimeError("velocity controller thread exited unexpectedly")
+        if status['stop_requested']:
+            raise RuntimeError("velocity controller is stopped")
             
     def set_command(self, cmd):
+        self.assert_healthy()
         with self.lock:
+            if self._controller_error is not None or self.stop_loop:
+                raise RuntimeError("velocity controller is not accepting commands")
             self.command['num'] = self.command['num'] + 1
             self.command['time'] = time.monotonic()
             self.command['cmd'] = cmd.copy()
             self.new_command_received = True
 
     def reset_base_odometry(self):
+        self.assert_healthy()
         with self.lock:
             self.robot.base.reset_odometry()
             
     def get_joint_state(self):
+        self.assert_healthy()
         with self.lock:
             
             arm_pos = self.robot.arm.status['pos']
@@ -575,31 +618,53 @@ class NormalizedVelocityControl():
             return(state)
             
     def controller_loop(self):
-        while True: 
+        try:
+            while True:
+                with self.lock:
+                    if self.stop_loop:
+                        return
+                    if self.new_command_received:
+                        self._execute(self.command)
+                        self.new_command_received = False
+                    elif (
+                        self._last_executed_nonzero
+                        and time.monotonic() - self.command['time'] >= self.command_watchdog_s
+                    ):
+                        # A stale perception/control loop must never leave a prior
+                        # non-zero velocity latched in the Stretch SDK.
+                        self._execute({
+                            'num': self.command['num'] + 1,
+                            'time': time.monotonic(),
+                            'cmd': zero_vel.copy(),
+                        })
+                        self._last_executed_nonzero = False
+                        self.watchdog_stop_count += 1
+                time.sleep(self.wait_between_executions)
+        except BaseException as exc:
+            # A daemon-thread traceback is not an actionable safety signal.
+            # Latch the failure, reject every later command, and make one
+            # best-effort zero command before the grasp owner surfaces it.
             with self.lock:
-                if self.stop_loop:
-                    #exit()
-                    return
-                if self.new_command_received:
-                    self._execute(self.command)
-                    self.new_command_received = False
-                elif (
-                    self._last_executed_nonzero
-                    and time.monotonic() - self.command['time'] >= self.command_watchdog_s
-                ):
-                    # A stale perception/control loop must never leave a prior
-                    # non-zero velocity latched in the Stretch SDK.
+                self._controller_error = self._format_error(exc)
+                self.stop_loop = True
+                self.new_command_received = False
+            try:
+                with self.lock:
                     self._execute({
                         'num': self.command['num'] + 1,
                         'time': time.monotonic(),
                         'cmd': zero_vel.copy(),
                     })
-                    self._last_executed_nonzero = False
-                    self.watchdog_stop_count += 1
-            time.sleep(self.wait_between_executions)
+            except BaseException as stop_exc:
+                with self.lock:
+                    self._controller_safety_stop_error = self._format_error(stop_exc)
 
     def _start_controller(self):
-        self.controller_thread = threading.Thread(target=self.controller_loop, daemon=True)
+        self.controller_thread = threading.Thread(
+            target=self.controller_loop,
+            daemon=True,
+            name='hrc-normalized-velocity-controller',
+        )
         self.controller_thread.start()
         
         

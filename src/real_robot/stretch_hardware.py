@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import os
 import platform
 import sys
 import threading
@@ -14,6 +15,7 @@ import time
 from typing import Any, Mapping
 
 from .config import ActionSpec, LabConfig, PlacementSlotSpec
+from .runtime_qualification import require_qualified_runtime
 
 
 class StretchHardwareController:
@@ -41,6 +43,10 @@ class StretchHardwareController:
         self._phase = "startup"
         self._last_successful_phase: str | None = None
         self._last_reference_evidence: Mapping[str, Any] | None = None
+        self._velocity_controller_status: Mapping[str, Any] = {
+            "thread_alive": False, "stop_requested": True,
+            "error": None, "state": "not_started",
+        }
         self._pose_confident = False
         self.current_station: str | None = None
         self.robot: Any = None
@@ -49,6 +55,10 @@ class StretchHardwareController:
         self._runtime_provenance: dict[str, Any] = {
             "python": sys.version, "platform": platform.platform(),
         }
+        self._runtime_qualification: Mapping[str, Any] = {
+            "qualified": False,
+            "reason": "uncalibrated calibration probe" if calibration_mode else "not checked",
+        }
         self._startup(confirmed_start_station)
 
     def _set_phase(self, phase: str, *, successful: bool = False) -> None:
@@ -56,6 +66,10 @@ class StretchHardwareController:
             self._phase = phase
             if successful:
                 self._last_successful_phase = phase
+
+    def _set_velocity_controller_status(self, status: Mapping[str, Any]) -> None:
+        with self._state_lock:
+            self._velocity_controller_status = dict(status)
 
     def _startup(self, confirmed_start_station: str) -> None:
         try:
@@ -81,8 +95,20 @@ class StretchHardwareController:
             if runstop:
                 raise RuntimeError("Stretch runstop is active")
             robot_params = getattr(self.robot, "params", {})
+            if not isinstance(robot_params, Mapping):
+                robot_params = {}
+            nested_robot_params = robot_params.get("robot", {})
+            if not isinstance(nested_robot_params, Mapping):
+                nested_robot_params = {}
+            robot_id = (
+                os.environ.get("HELLO_FLEET_ID", "").strip()
+                or str(robot_params.get("serial_no", "")).strip()
+                or str(nested_robot_params.get("serial_no", "")).strip()
+                or "unknown"
+            )
             self._runtime_provenance.update({
-                "robot_serial": robot_params.get("serial_no", "unknown"),
+                "robot_id": robot_id,
+                "robot_serial": robot_params.get("serial_no", robot_id),
                 "robot_batch": robot_params.get("batch_name", "unknown"),
                 "robot_tool": robot_params.get("tool", "unknown"),
             })
@@ -95,8 +121,19 @@ class StretchHardwareController:
                 stale_after_s=p.max_frame_age_s,
             )
             self.camera_service.start()
-            if not self.camera_service.get_status().get("ready"):
+            camera_status = self.camera_service.get_status()
+            if not camera_status.get("ready"):
                 raise RuntimeError("D405 did not become ready")
+            if self.config.motion.calibrated:
+                self._runtime_qualification = require_qualified_runtime(
+                    self.config.runtime_lock_data,
+                    robot_id=robot_id,
+                    camera_identity=dict(camera_status.get("device_identity", {})),
+                )
+                self._runtime_provenance.update({
+                    "runtime_lock_sha256": self.config.motion.runtime_lock_sha256,
+                    "calibration_record_sha256": self.config.motion.calibration_record_sha256,
+                })
             self.current_station = confirmed_start_station
             if self.config.motion.calibrated and not self._calibration_mode:
                 self._verify_station_reference(
@@ -253,8 +290,12 @@ class StretchHardwareController:
                     stable_frames_required=p.stable_frames,
                     max_position_jump_m=p.max_position_jump_m,
                     max_frame_age_s=p.max_frame_age_s,
+                    max_translation_drift_m=self.config.motion.max_translation_drift_m,
+                    max_heading_error_deg=self.config.motion.rotation_tolerance_deg,
                     velocity_scale=(min(self.config.motion.velocity_scale, 0.25) if self._calibration_mode else self.config.motion.velocity_scale),
-                    cancel_event=self._stop_event, show_visualization=False,
+                    cancel_event=self._stop_event,
+                    controller_status_callback=self._set_velocity_controller_status,
+                    show_visualization=False,
                 )
                 if result != 0:
                     raise RuntimeError(f"grasp failed for marker {item.marker_id}")
@@ -367,10 +408,20 @@ class StretchHardwareController:
                 "calibration_mode": self._calibration_mode,
                 "config_digest": self.config.digest,
                 "runtime": dict(self._runtime_provenance),
+                "runtime_qualification": dict(self._runtime_qualification),
+                "velocity_controller": dict(self._velocity_controller_status),
                 "last_reference_evidence": None if self._last_reference_evidence is None else dict(self._last_reference_evidence),
             }
         state["camera"] = self.camera_service.get_status() if self.camera_service is not None else None
         if state["camera"] is not None and not state["camera"].get("ready"):
+            state["ready"] = False
+        if self.config.motion.calibrated and not state["runtime_qualification"].get("qualified"):
+            state["ready"] = False
+        velocity = state["velocity_controller"]
+        if velocity.get("error") or (
+            not velocity.get("stop_requested", True)
+            and not velocity.get("thread_alive", False)
+        ):
             state["ready"] = False
         return state
 

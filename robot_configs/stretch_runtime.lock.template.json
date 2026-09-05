@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "python_version": "REPLACE_WITH_EXACT_VERSION",
+  "modules": {
+    "stretch_body": "REPLACE_WITH_EXACT_VERSION",
+    "pyrealsense2": "REPLACE_WITH_EXACT_VERSION",
+    "cv2": "REPLACE_WITH_EXACT_VERSION",
+    "numpy": "REPLACE_WITH_EXACT_VERSION",
+    "scipy": "REPLACE_WITH_EXACT_VERSION"
+  },
+  "robot_id": "REPLACE_WITH_STRETCH_SERIAL",
+  "d405_serial": "REPLACE_WITH_D405_SERIAL",
+  "d405_firmware": "REPLACE_WITH_D405_FIRMWARE"
+}

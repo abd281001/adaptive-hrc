@@ -116,6 +116,9 @@ Use `./hrc robot-doctor` for a read-only deployment preflight and
 `./hrc robot-report RUN_DIRECTORY` for an integrity/outcome summary. Live UI
 startup requires the explicit `--require-motion` handshake, a matching full
 configuration digest, and a ready motion-enabled bridge.
+Publication collection additionally requires `--publication-run` and
+`--schedule PARTICIPANT.json`; its report validates the frozen schedule, calibration and
+runtime artifacts, per-episode metadata/postconditions, and shadow baselines.
 Uncalibrated supervised hardware trials use the isolated
 `./hrc robot-calibration-probe` path; a calibration-mode bridge is rejected by
 the experiment UI.

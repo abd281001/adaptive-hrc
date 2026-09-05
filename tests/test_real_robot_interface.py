@@ -3,16 +3,21 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+import hashlib
+import importlib
+import json
 from pathlib import Path
+import sys
 import threading
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
 
 from src.adaptive_agent import AdaptiveAgent
 from src.models import Settings
+from src.real_robot.cancellable_wait import wait_command_cancellable
 from src.real_robot.config import ConfigurationError, LabConfig, load_lab_config
 from src.real_robot.app import EventJournal, _load_checkpoint, _load_checkpoint_full
 from src.real_robot.bridge import (
@@ -23,6 +28,8 @@ from src.real_robot.bridge import (
 from src.real_robot.domain import PhysicalObservation, PhysicalTaskDomain
 from src.real_robot.hardware import DryRunExecutor, ExecutionResult, HttpStretchExecutor
 from src.real_robot.report import build_report
+from src.real_robot.runtime_qualification import qualify_runtime
+from src.real_robot.schedule import StudySchedule, load_study_schedule
 from src.real_robot.stretch_runtime.perception import wait_for_stable_marker
 from src.real_robot.stretch_runtime.fingertip_geometry import fingertip_transforms
 from src.real_robot.stretch_hardware import StretchHardwareController
@@ -108,6 +115,125 @@ def wait_until(predicate, timeout=2.0):
             return
         time.sleep(0.005)
     raise AssertionError("condition did not become true")
+
+
+def trial_metadata(trial_id, preference_id="A", condition="test"):
+    return {
+        "trial_id": trial_id,
+        "preference_id": preference_id,
+        "condition": condition,
+    }
+
+
+def calibrated_config(tmp_path, base_config):
+    raw = copy.deepcopy(base_config.as_dict())
+    calibration_id = "test-calibration-v1"
+    minimum_trials = 3
+    marker_stations = {
+        str(base_config.reference_marker.marker_id): tuple(base_config.stations),
+        **{
+            str(value): tuple(base_config.stations)
+            for value in base_config.fingertip_marker_ids
+        },
+        **{
+            str(value.marker_id): (value.source_station,)
+            for value in base_config.objects.values()
+        },
+    }
+    quality = {
+        "min_marker_pixels": base_config.perception.min_marker_pixels + 1.0,
+        "reprojection_error_px": base_config.perception.max_reprojection_error_px - 0.1,
+        "depth_m": (
+            base_config.perception.min_marker_depth_m
+            + base_config.perception.max_marker_depth_m
+        ) / 2.0,
+    }
+    record = {
+        "schema_version": 1,
+        "calibration_id": calibration_id,
+        "date_utc": "2026-09-05T12:00:00+00:00",
+        "robot_id": "stretch-test-1",
+        "d405_serial": "d405-test-1",
+        "operator": "test-operator",
+        "apparatus_revision": "table-v1",
+        "config_file": "lab.json",
+        "station_heading_trials_deg": {
+            key: [row.heading_deg] * minimum_trials
+            for key, row in base_config.stations.items()
+        },
+        "reference_marker_pose_trials_by_station_m": {
+            key: [list(value)] * minimum_trials
+            for key, value in base_config.reference_marker.expected_position_by_station_m.items()
+        },
+        "slot_pose_trials": {
+            key: [
+                {"success": True, "marker_xyz_m": list(value.verify_marker_xyz_m)}
+                for _ in range(minimum_trials)
+            ]
+            for key, value in base_config.placement_slots.items()
+        },
+        "marker_quality_trials": {
+            marker_id: [
+                {**quality, "station_id": station_id}
+                for station_id in station_ids
+                for _ in range(minimum_trials)
+            ]
+            for marker_id, station_ids in marker_stations.items()
+        },
+        "object_grasp_trials": {
+            key: [{"success": True} for _ in range(minimum_trials)]
+            for key in base_config.objects
+        },
+        "canonical_return_trials_by_station": {
+            station_id: [
+                {"heading_error_deg": 0.5, "translation_drift_m": 0.005}
+                for _ in range(minimum_trials)
+            ]
+            for station_id in base_config.stations
+        },
+        "fault_injection_results": {
+            "stale_velocity_command": {"passed": True},
+            "camera_disconnect": {"passed": True},
+            "command_timeout": {"passed": True},
+            "emergency_stop": {"passed": True, "latency_s": 0.1},
+        },
+        "acceptance_thresholds_frozen_before_test": {
+            "min_trials_per_pose": minimum_trials,
+            "max_heading_error_deg": 3.0,
+            "max_translation_drift_m": 0.025,
+            "min_grasp_success_rate": 0.9,
+            "min_placement_success_rate": 0.9,
+            "max_software_stop_latency_s": 0.25,
+        },
+        "notes": "synthetic unit-test evidence",
+    }
+    runtime_lock = {
+        "schema_version": 1,
+        "python_version": "3.10.0",
+        "modules": {
+            "stretch_body": "1", "pyrealsense2": "2", "cv2": "3",
+            "numpy": "4", "scipy": "5",
+        },
+        "robot_id": record["robot_id"],
+        "d405_serial": record["d405_serial"],
+        "d405_firmware": "firmware-test-1",
+    }
+    record_path = tmp_path / "calibration.json"
+    runtime_path = tmp_path / "runtime.json"
+    record_path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    runtime_path.write_text(json.dumps(runtime_lock, sort_keys=True), encoding="utf-8")
+    raw["motion"].update({
+        "calibrated": True,
+        "rotation_tolerance_deg": 3.0,
+        "calibration_id": calibration_id,
+        "calibration_record": record_path.name,
+        "calibration_record_sha256": hashlib.sha256(record_path.read_bytes()).hexdigest(),
+        "runtime_lock": runtime_path.name,
+        "runtime_lock_sha256": hashlib.sha256(runtime_path.read_bytes()).hexdigest(),
+    })
+    config_path = tmp_path / "lab.json"
+    config_path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+    return load_lab_config(config_path), config_path, record_path, runtime_path
 
 
 @pytest.fixture
@@ -302,7 +428,10 @@ def test_real_adaptive_agent_trains_and_predicts_with_physical_domain(config, do
 
 
 def _complete_first_observation(session, config, recipe_id="garden_salad"):
-    session.start_episode(recipe_id, props_reset=True)
+    session.start_episode(
+        recipe_id, props_reset=True,
+        trial_metadata=trial_metadata(f"{recipe_id}-observation", condition="observation"),
+    )
     for action in config.recipes[recipe_id].actions:
         session.record_human_action(action)
     assert session.snapshot()["phase"] == COMPLETE
@@ -314,7 +443,7 @@ def test_live_protocol_vetoes_wrong_prediction_and_keeps_robot_turn(config, doma
     session = LiveHrcSession(agent, domain, config, executor)
     _complete_first_observation(session, config)
 
-    session.start_episode("garden_salad", props_reset=True)
+    session.start_episode("garden_salad", props_reset=True, trial_metadata=trial_metadata("garden-assist"))
     assert session.snapshot()["mode"] == ASSIST
     # First human action -> wrong/out-of-recipe robot proposal.  After the
     # correction, the second queued prediction must be proposed immediately.
@@ -348,7 +477,7 @@ def test_failed_hardware_action_is_not_observed_by_learner(config, domain):
     agent = FakeAgent(domain)
     session = LiveHrcSession(agent, domain, config, FailingExecutor())
     _complete_first_observation(session, config)
-    session.start_episode("garden_salad", props_reset=True)
+    session.start_episode("garden_salad", props_reset=True, trial_metadata=trial_metadata("failed-assist"))
     agent.predictions = [{"STAGE_BOWL": 1.0}, {"FETCH_LETTUCE": 1.0}]
     session.record_human_action("STAGE_BOWL")
     observations_before = len(agent.observations)
@@ -363,7 +492,7 @@ def test_episode_requires_prop_reset_confirmation_and_abort_restores_agent(confi
     session = LiveHrcSession(agent, domain, config, DryRunExecutor())
     with pytest.raises(SessionStateError, match="proxy objects"):
         session.start_episode("garden_salad", props_reset=False)
-    session.start_episode("garden_salad", props_reset=True)
+    session.start_episode("garden_salad", props_reset=True, trial_metadata=trial_metadata("aborted-observation"))
     session.record_human_action("STAGE_BOWL")
     assert agent.current_prefix == ["STAGE_BOWL"]
     session.abort_episode()
@@ -389,7 +518,7 @@ def test_action_level_checkpoint_resumes_observation_without_double_commit(tmp_p
     journal = EventJournal(tmp_path / "run", config, hardware_backend="dry_run")
     session = LiveHrcSession(agent, domain, config, DryRunExecutor(), event_sink=journal.append)
     journal.bind(agent, session)
-    session.start_episode("garden_salad", props_reset=True)
+    session.start_episode("garden_salad", props_reset=True, trial_metadata=trial_metadata("checkpoint-observation"))
     session.record_human_action("STAGE_BOWL")
 
     restored_agent, observed, session_state = _load_checkpoint_full(journal.root / "checkpoint.pkl", config)
@@ -424,12 +553,12 @@ def test_config_is_strict_and_requires_separated_headings(config):
 def test_human_completion_and_clearance_are_explicit_gates(config, domain):
     agent = FakeAgent(domain)
     session = LiveHrcSession(agent, domain, config, DryRunExecutor())
-    session.start_episode("garden_salad", props_reset=True)
+    session.start_episode("garden_salad", props_reset=True, trial_metadata=trial_metadata("clearance-observation"))
     with pytest.raises(SessionStateError, match="physical completion"):
         session.record_human_action("STAGE_BOWL", physical_completed=False)
     session.abort_episode()
     _complete_first_observation(session, config)
-    session.start_episode("garden_salad", props_reset=True)
+    session.start_episode("garden_salad", props_reset=True, trial_metadata=trial_metadata("clearance-assist"))
     agent.predictions = [{"STAGE_BOWL": 1.0}, {"FETCH_LETTUCE": 1.0}]
     session.record_human_action("STAGE_BOWL")
     with pytest.raises(SessionStateError, match="bystanders are clear"):
@@ -549,7 +678,7 @@ def test_successful_motion_with_commit_failure_requires_no_second_motion(config,
     executor = DryRunExecutor()
     session = LiveHrcSession(agent, domain, config, executor)
     _complete_first_observation(session, config)
-    session.start_episode("garden_salad", props_reset=True)
+    session.start_episode("garden_salad", props_reset=True, trial_metadata=trial_metadata("commit-failure-assist"))
     agent.predictions = [{"STAGE_BOWL": 1.0}, {"FETCH_LETTUCE": 1.0}]
     session.record_human_action("STAGE_BOWL")
     agent.fail_next = True
@@ -574,7 +703,7 @@ def test_journal_sink_failure_after_physical_success_uses_commit_only_recovery(c
     executor = DryRunExecutor()
     session = LiveHrcSession(agent, domain, config, executor, event_sink=FailSuccessEventOnce())
     _complete_first_observation(session, config)
-    session.start_episode("garden_salad", props_reset=True)
+    session.start_episode("garden_salad", props_reset=True, trial_metadata=trial_metadata("journal-failure-assist"))
     agent.predictions = [{"STAGE_BOWL": 1.0}, {"FETCH_LETTUCE": 1.0}]
     session.record_human_action("STAGE_BOWL")
     session.approve_robot_proposal(human_clear=True)
@@ -699,3 +828,299 @@ def test_run_report_checks_integrity_and_outcomes(tmp_path, config, domain):
     assert report["integrity"]["event_indices_contiguous"]
     assert report["outcomes"]["episodes_completed"] == 1
     assert report["outcomes"]["actions_committed"] == len(config.recipes["garden_salad"].actions)
+    assert report["outcomes"]["by_condition"]["observation"]["episodes"] == 1
+    assert len(report["episodes"]) == 1
+    assert set(report["shadow_baselines"]) == {"latest", "no_decay", "bc"}
+    assert not report["integrity"]["publication_eligible"]
+
+
+def test_publication_report_requires_exact_schedule_and_physical_evidence(
+    tmp_path, config,
+):
+    live_config, _config_path, _record_path, _runtime_path = calibrated_config(
+        tmp_path, config,
+    )
+    recipe_ids = tuple(live_config.recipes)[:3]
+    schedule_rows = []
+    for index, recipe_id in enumerate(recipe_ids, 1):
+        schedule_rows.append({
+            "trial_id": f"P900-{index:03d}", "recipe_id": recipe_id,
+            "preference_id": "A", "condition": "observation",
+            "expected_mode": "observe",
+        })
+    for index, recipe_id in enumerate(recipe_ids, len(recipe_ids) + 1):
+        schedule_rows.append({
+            "trial_id": f"P900-{index:03d}", "recipe_id": recipe_id,
+            "preference_id": "B", "condition": "drift",
+            "expected_mode": "assist",
+        })
+    schedule = StudySchedule.from_mapping({
+        "schema_version": 1, "schedule_id": "publication-test",
+        "participant_id": "P900", "counterbalance_id": "order-test",
+        "episodes": schedule_rows,
+    }, live_config)
+    hardware = {
+        "backend": "stretch3_packaged_runtime", "motion_enabled": True,
+        "ready": True, "config_digest": live_config.digest,
+        "calibration_id": live_config.motion.calibration_id,
+        "runtime_qualification": {"qualified": True},
+    }
+    journal = EventJournal(
+        tmp_path / "publication-run", live_config,
+        hardware_backend="stretch_http_bridge", hardware_preflight=hardware,
+        require_motion=True, schedule=schedule, publication_run=True,
+    )
+    domain = PhysicalTaskDomain(live_config)
+    agent = FakeAgent(domain)
+    session = LiveHrcSession(
+        agent, domain, live_config, DryRunExecutor(),
+        event_sink=journal.append, schedule=schedule,
+    )
+    journal.bind(agent, session)
+    for scheduled in schedule.episodes:
+        actions = live_config.recipes[scheduled.recipe_id].actions
+        session.start_episode(scheduled.recipe_id, props_reset=True)
+        if scheduled.expected_mode == "observe":
+            for action in actions:
+                session.record_human_action(action)
+        else:
+            agent.predictions = [{action: 1.0} for action in actions]
+            for index, action in enumerate(actions):
+                if index % 2 == 0:
+                    session.record_human_action(action)
+                else:
+                    assert session.snapshot()["pending_prediction"] == action
+                    session.approve_robot_proposal(human_clear=True)
+                    wait_until(lambda: session.snapshot()["phase"] != "robot_executing")
+        assert session.snapshot()["phase"] == COMPLETE
+    journal.close()
+    manifest = json.loads(journal.manifest_path.read_text(encoding="utf-8"))
+    manifest["software"].update({"git_commit": "a" * 40, "git_dirty": False})
+    journal.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True), encoding="utf-8",
+    )
+
+    report = build_report(journal.root)
+    assert report["integrity"]["publication_eligible"]
+    assert report["integrity"]["schedule_complete"]
+    assert report["integrity"]["robot_postconditions_complete"]
+    assert all(
+        row["overall"]["teacher_forced_predictions"] > 0
+        for row in report["shadow_baselines"].values()
+    )
+
+    event_lines = journal.events_path.read_text(encoding="utf-8").splitlines()
+    final_event = json.loads(event_lines[-1])
+    final_event["payload"]["episode"]["trial_metadata"]["preference_id"] = "tampered"
+    event_lines[-1] = json.dumps(final_event, sort_keys=True)
+    journal.events_path.write_text("\n".join(event_lines) + "\n", encoding="utf-8")
+    tampered = build_report(journal.root)
+    assert not tampered["integrity"]["schedule_complete"]
+    assert not tampered["integrity"]["publication_eligible"]
+
+
+def test_trial_metadata_is_required_nonempty_and_unique(config, domain):
+    session = LiveHrcSession(FakeAgent(domain), domain, config, DryRunExecutor())
+    with pytest.raises(SessionStateError, match="trial_metadata"):
+        session.start_episode("garden_salad", props_reset=True)
+    with pytest.raises(SessionStateError, match="preference_id"):
+        session.start_episode(
+            "garden_salad", props_reset=True,
+            trial_metadata={"trial_id": "t1", "preference_id": "", "condition": "settled"},
+        )
+    _complete_first_observation(session, config)
+    with pytest.raises(SessionStateError, match="already been used"):
+        session.start_episode(
+            "garden_salad", props_reset=True,
+            trial_metadata=trial_metadata("garden_salad-observation"),
+        )
+
+
+def test_frozen_schedule_enforces_observation_block_and_next_trial(config, domain):
+    schedule = load_study_schedule(
+        PROJECT_ROOT / "robot_configs" / "study_schedule.template.json", config,
+    )
+    assert len(schedule.episodes) == 16
+    session = LiveHrcSession(
+        FakeAgent(domain), domain, config, DryRunExecutor(), schedule=schedule,
+    )
+    with pytest.raises(SessionStateError, match="next scheduled recipe"):
+        session.start_episode("fruit_bowl", props_reset=True)
+    session.start_episode("garden_salad", props_reset=True)
+    assert session.snapshot()["trial_metadata"]["trial_id"] == "P001-001"
+    for action in config.recipes["garden_salad"].actions:
+        session.record_human_action(action)
+    state = session.snapshot()
+    assert state["schedule"]["index"] == 1
+    assert state["schedule"]["next"]["recipe_id"] == "fruit_bowl"
+
+    bad = copy.deepcopy(schedule.as_dict())
+    bad["episodes"][1]["expected_mode"] = "assist"
+    with pytest.raises(ConfigurationError, match="assist before observation"):
+        StudySchedule.from_mapping(bad, config)
+
+
+def test_cancellable_wait_checks_stop_between_short_sdk_waits():
+    stop = threading.Event()
+
+    class Robot:
+        timeouts = []
+
+        def wait_command(self, timeout):
+            self.timeouts.append(timeout)
+            stop.set()
+            return False
+
+    robot = Robot()
+    started = time.monotonic()
+    assert not wait_command_cancellable(
+        robot, timeout_s=10.0, cancel_event=stop, poll_s=0.05,
+    )
+    assert time.monotonic() - started < 0.5
+    assert len(robot.timeouts) == 1
+    assert robot.timeouts[0] <= 0.05
+
+
+def test_stable_marker_sequence_restarts_after_stale_frame():
+    bundles = [
+        {"frame_id": 1, "age_s": 0.0},
+        {"frame_id": 2, "age_s": 1.0},
+        {"frame_id": 3, "age_s": 0.0},
+        {"frame_id": 4, "age_s": 0.0},
+        {"frame_id": 5, "age_s": 0.0},
+    ]
+
+    class Camera:
+        def get_latest_bundle(self):
+            row = bundles.pop(0) if len(bundles) > 1 else bundles[0]
+            return {
+                **row,
+                "color": np.zeros((2, 2, 3), dtype=np.uint8),
+                "color_camera_info": {},
+            }
+
+    class Detector:
+        def __init__(self, **_kwargs):
+            pass
+
+        def update(self, _color, _camera_info):
+            pass
+
+        def get_detected_marker_dict(self):
+            return {10: {
+                "pos": np.array([0.0, 0.0, 0.3]),
+                "min_dist_between_corners": 30.0,
+                "reprojection_error_px": 0.2,
+            }}
+
+    evidence = wait_for_stable_marker(
+        camera_service=Camera(), marker_info={}, marker_id=10,
+        expected_xyz_m=[0.0, 0.0, 0.3], tolerance_m=0.02,
+        stable_frames=3, max_position_jump_m=0.02,
+        max_frame_age_s=0.3, deadline=time.monotonic() + 1.0,
+        _detector_type=Detector,
+    )
+    assert evidence["frame_id"] == 5
+
+
+def test_calibrated_config_requires_semantic_evidence_and_runtime_lock(tmp_path, config):
+    loaded, config_path, record_path, _runtime_path = calibrated_config(tmp_path, config)
+    assert loaded.motion.calibrated
+    assert loaded.calibration_record_data["robot_id"] == "stretch-test-1"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["station_heading_trials_deg"]["produce"] = []
+    record_path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["motion"]["calibration_record_sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
+    config_path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="recorded trials"):
+        load_lab_config(config_path)
+
+
+def test_runtime_qualification_checks_versions_and_hardware(monkeypatch):
+    observed = {
+        "python_version": "3.10.0",
+        "modules": {
+            "stretch_body": "1", "pyrealsense2": "2", "cv2": "3",
+            "numpy": "4", "scipy": "5",
+        },
+        "import_errors": {},
+    }
+    monkeypatch.setattr(
+        "src.real_robot.runtime_qualification.inspect_runtime", lambda: observed,
+    )
+    lock = {
+        **observed,
+        "schema_version": 1,
+        "robot_id": "stretch-1", "d405_serial": "camera-1",
+        "d405_firmware": "firmware-1",
+    }
+    lock.pop("import_errors")
+    result = qualify_runtime(
+        lock, robot_id="stretch-1",
+        camera_identity={"serial_number": "camera-1", "firmware_version": "firmware-1"},
+    )
+    assert result["qualified"]
+    mismatch = qualify_runtime(
+        lock, robot_id="stretch-2",
+        camera_identity={"serial_number": "camera-1", "firmware_version": "firmware-1"},
+    )
+    assert not mismatch["qualified"]
+    assert "robot_id" in mismatch["mismatches"][0]
+
+
+def test_velocity_controller_thread_failure_is_latched(monkeypatch):
+    stretch = ModuleType("stretch_body")
+    stretch.__path__ = []
+    robot_module = ModuleType("stretch_body.robot")
+    hello_module = ModuleType("stretch_body.hello_utils")
+    params_module = ModuleType("stretch_body.robot_params")
+    params_module.RobotParams = type("RobotParams", (), {})
+    monkeypatch.setitem(sys.modules, "stretch_body", stretch)
+    monkeypatch.setitem(sys.modules, "stretch_body.robot", robot_module)
+    monkeypatch.setitem(sys.modules, "stretch_body.hello_utils", hello_module)
+    monkeypatch.setitem(sys.modules, "stretch_body.robot_params", params_module)
+    module_name = "src.real_robot.stretch_runtime.normalized_velocity_control"
+    sys.modules.pop(module_name, None)
+    module = importlib.import_module(module_name)
+    control = module.NormalizedVelocityControl.__new__(module.NormalizedVelocityControl)
+    control.lock = threading.Lock()
+    control.stop_loop = False
+    control.new_command_received = True
+    control.command = {"num": 1, "time": time.monotonic(), "cmd": {"arm_out": 1.0}}
+    control.command_watchdog_s = 0.1
+    control.wait_between_executions = 0.001
+    control._last_executed_nonzero = False
+    control.watchdog_stop_count = 0
+    control._controller_error = None
+    control._controller_safety_stop_error = None
+    control.controller_thread = None
+
+    def fail_execute(_command):
+        raise RuntimeError("injected SDK failure")
+
+    control._execute = fail_execute
+    control._start_controller()
+    wait_until(lambda: not control.controller_thread.is_alive())
+    status = control.status()
+    assert "injected SDK failure" in status["error"]
+    assert status["safety_stop_error"] is not None
+    with pytest.raises(RuntimeError, match="thread failed"):
+        control.set_command({"arm_out": 0.0})
+
+
+def test_abort_rebinds_real_agent_to_session_domain(config, domain):
+    settings = Settings(
+        seed=7, verbose=False, irl_cold_steps=1, irl_warm_steps=1,
+        irl_horizon=6, latent_strategy_enabled=False,
+    )
+    agent = AdaptiveAgent(settings=settings, domain=domain)
+    session = LiveHrcSession(agent, domain, config, DryRunExecutor())
+    session.start_episode(
+        "garden_salad", props_reset=True,
+        trial_metadata=trial_metadata("domain-rebind", condition="observation"),
+    )
+    session.record_human_action("STAGE_BOWL")
+    session.abort_episode()
+    assert agent.domain is session.domain
+    assert agent.maxent.domain is session.domain

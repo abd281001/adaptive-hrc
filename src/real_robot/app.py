@@ -25,6 +25,7 @@ from src.models import Settings
 from .config import LabConfig, load_lab_config
 from .domain import PhysicalTaskDomain
 from .hardware import DryRunExecutor, HttpStretchExecutor
+from .schedule import StudySchedule, load_study_schedule
 from .session import LiveHrcSession, SessionStateError
 
 
@@ -36,6 +37,8 @@ class EventJournal:
         resumed_from: str | None = None,
         hardware_preflight: Mapping[str, Any] | None = None,
         require_motion: bool = False,
+        schedule: StudySchedule | None = None,
+        publication_run: bool = False,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=False)
@@ -50,8 +53,23 @@ class EventJournal:
             self.root / "config.snapshot.json",
             json.dumps(config.as_dict(), indent=2, sort_keys=True) + "\n",
         )
+        if schedule is not None:
+            _atomic_write_text(
+                self.root / "schedule.snapshot.json",
+                json.dumps(schedule.as_dict(), indent=2, sort_keys=True) + "\n",
+            )
+        calibration_artifacts: dict[str, Any] = {}
+        if config.motion.calibrated:
+            artifacts = (
+                ("calibration_record", config.calibration_record_path, config.motion.calibration_record_sha256, "calibration.record.json"),
+                ("runtime_lock", config.runtime_lock_path, config.motion.runtime_lock_sha256, "runtime.lock.json"),
+            )
+            for label, source_path, digest, filename in artifacts:
+                _atomic_write_bytes(self.root / filename, Path(source_path).read_bytes())
+                calibration_artifacts[label] = {"file": filename, "sha256": digest}
+        software = _software_provenance()
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "run_id": self.root.name,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "status": "running",
@@ -65,8 +83,20 @@ class EventJournal:
             ),
             "parent_run_id": Path(resumed_from).resolve().parent.name if resumed_from else None,
             "require_motion": bool(require_motion),
+            "publication_run": bool(publication_run),
+            "seed": int(config.agent_settings.get("seed", 1337)),
+            "study_schedule": (
+                None if schedule is None else {
+                    "schedule_id": schedule.schedule_id,
+                    "participant_id": schedule.participant_id,
+                    "counterbalance_id": schedule.counterbalance_id,
+                    "digest": schedule.digest,
+                    "episode_count": len(schedule.episodes),
+                }
+            ),
+            "calibration_artifacts": calibration_artifacts,
             "hardware_preflight": dict(hardware_preflight or {}),
-            "software": _software_provenance(),
+            "software": software,
             "pid": os.getpid(),
         }
         _atomic_write_text(
@@ -137,6 +167,16 @@ def _fsync_directory(path: Path) -> None:
 def _atomic_write_text(path: Path, value: str) -> None:
     temporary = path.with_name(f".{path.name}-{os.getpid()}-{threading.get_ident()}.tmp")
     with temporary.open("w", encoding="utf-8") as stream:
+        stream.write(value)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    _fsync_directory(path.parent)
+
+
+def _atomic_write_bytes(path: Path, value: bytes) -> None:
+    temporary = path.with_name(f".{path.name}-{os.getpid()}-{threading.get_ident()}.tmp")
+    with temporary.open("wb") as stream:
         stream.write(value)
         stream.flush()
         os.fsync(stream.fileno())
@@ -374,12 +414,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="real_robot_runs")
     parser.add_argument("--run", default="")
     parser.add_argument("--resume-checkpoint", default="", help="Trusted local action-level checkpoint.pkl")
+    parser.add_argument("--schedule", default="", help="Frozen participant-specific study schedule JSON")
+    parser.add_argument("--publication-run", action="store_true", help="Require live calibrated hardware, a frozen schedule, and a clean identified revision")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = load_lab_config(args.config)
+    schedule = load_study_schedule(args.schedule, config) if args.schedule else None
+    if args.publication_run:
+        if not args.require_motion:
+            raise SystemExit("--publication-run requires --require-motion")
+        if schedule is None:
+            raise SystemExit("--publication-run requires --schedule")
+        if args.resume_checkpoint:
+            raise SystemExit(
+                "--publication-run requires a fresh continuous run; preserve resumed runs as failure/recovery evidence"
+            )
+        if not config.motion.calibrated:
+            raise SystemExit("--publication-run requires a calibrated configuration")
+        software = _software_provenance()
+        if software["git_commit"] == "unavailable" or software["git_dirty"]:
+            raise SystemExit("--publication-run requires a clean, identified Git revision")
     observed: tuple[str, ...] = ()
     session_state: Mapping[str, Any] | None = None
     if args.resume_checkpoint:
@@ -408,8 +465,13 @@ def main(argv: list[str] | None = None) -> int:
         resumed_from=args.resume_checkpoint or None,
         hardware_preflight=hardware_preflight,
         require_motion=args.require_motion,
+        schedule=schedule,
+        publication_run=args.publication_run,
     )
-    session = LiveHrcSession(agent, domain, config, executor, event_sink=journal.append)
+    session = LiveHrcSession(
+        agent, domain, config, executor, event_sink=journal.append,
+        schedule=schedule,
+    )
     session.restore_observed_recipes(observed)
     journal.bind(agent, session)
     if session_state is not None:
