@@ -5,6 +5,8 @@ import gzip
 import json
 import tempfile
 import unittest
+
+from src.evaluation import summarize_decision_regimes
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -117,3 +119,67 @@ class EvaluationResultLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecisionRegimeSummaryTests(unittest.TestCase):
+    """The regime split is what keeps a memorisation term from hiding the rest.
+
+    An aggregate Top-1 over this stream is dominated by decisions where only
+    one action was ever demonstrated at the state, which any predictor that
+    memorised the state graph answers correctly. These tests pin the split so
+    that term stays separable.
+    """
+
+    @staticmethod
+    def _turn(count, correct, *, legacy=False):
+        key = "exact_state_learned_action_count" if legacy else "observed_actions_at_state"
+        return {"turn_kind": "robot", key: count, "correct_top_1": correct, "correct_top_k": correct}
+
+    def test_regimes_are_split_by_observed_choice(self):
+        rows = [
+            self._turn(1, True), self._turn(1, True), self._turn(1, False),
+            self._turn(3, True), self._turn(2, False),
+            self._turn(0, False),
+        ]
+        summary = summarize_decision_regimes(rows)
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["n_classified"], 6)
+        by = summary["by_regime"]
+        self.assertEqual(by["single_option_lookup"]["n"], 3)
+        self.assertEqual(by["branching"]["n"], 2)
+        self.assertEqual(by["unseen_state_fallback"]["n"], 1)
+        self.assertAlmostEqual(by["single_option_lookup"]["top_1"], 2 / 3)
+        self.assertAlmostEqual(by["branching"]["top_1"], 0.5)
+        self.assertAlmostEqual(by["unseen_state_fallback"]["top_1"], 0.0)
+        self.assertAlmostEqual(sum(by[r]["share"] for r in by), 1.0)
+
+    def test_shares_are_reported_so_the_weighting_is_visible(self):
+        # Two arms with identical conditional accuracy but different regime
+        # mixes must be distinguishable: the aggregate alone would hide that
+        # one arm simply faced fewer hard decisions.
+        easy = [self._turn(1, True)] * 90 + [self._turn(0, False)] * 10
+        hard = [self._turn(1, True)] * 50 + [self._turn(0, False)] * 50
+        a, b = summarize_decision_regimes(easy), summarize_decision_regimes(hard)
+        self.assertAlmostEqual(a["by_regime"]["single_option_lookup"]["top_1"],
+                               b["by_regime"]["single_option_lookup"]["top_1"])
+        self.assertGreater(a["aggregate_top_1_over_classified"],
+                           b["aggregate_top_1_over_classified"])
+        self.assertNotAlmostEqual(a["by_regime"]["unseen_state_fallback"]["share"],
+                                  b["by_regime"]["unseen_state_fallback"]["share"])
+
+    def test_earlier_runs_stratify_through_the_legacy_key(self):
+        rows = [self._turn(1, True, legacy=True), self._turn(2, False, legacy=True)]
+        summary = summarize_decision_regimes(rows)
+        self.assertEqual(summary["n_classified"], 2)
+        self.assertEqual(summary["by_regime"]["branching"]["n"], 1)
+
+    def test_unclassifiable_turns_are_counted_not_silently_dropped(self):
+        rows = [self._turn(1, True), {"turn_kind": "robot", "correct_top_1": True}]
+        summary = summarize_decision_regimes(rows)
+        self.assertEqual(summary["n_classified"], 1)
+        self.assertEqual(summary["n_unclassified"], 1)
+
+    def test_no_usable_turns_reports_not_run(self):
+        summary = summarize_decision_regimes([{"turn_kind": "robot"}])
+        self.assertEqual(summary["status"], "not_run")
+        self.assertEqual(summary["by_regime"], {})

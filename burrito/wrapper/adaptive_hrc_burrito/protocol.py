@@ -1,4 +1,4 @@
-"""Adaptive-HRC observation/assist protocol in the physical Burrito domain."""
+"""Natural-stream human/robot protocol for Overcooked and Burrito."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,75 +6,111 @@ import math
 import time
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-import numpy as np
-
-from .domain import BurritoDomainAdapter, StateVector
-from .macros import macro_actions, protein_name
-from .options import BurritoOptionExecutor
+from .catalog import get_preference, get_recipe
+from .domain import CookingDomainAdapter, StateVector
+from .physical import create_executor
+from .runtime import BurritoRuntime
 from .task_graph import (
-    BurritoPreferencePolicy,
-    BurritoTaskGraph,
-    choose_acceptable_action,
-    preference_name,
+    CookingPreferencePolicy,
+    CookingTaskGraph,
+    is_preference_discriminating,
 )
 
 
 OBSERVE = "observe"
 ASSIST = "assist"
 
+# Which actor takes the opening move of an assist episode.  ``human_first`` is
+# the Adaptive-HRC protocol and stays the default.  It has a consequence worth
+# naming: the opening move is never a robot turn, and in the shallower cooking
+# task graphs it is sometimes the only preference-discriminating decision, so
+# those cells are scored for prediction but never for assistance.
+# ``counterbalanced`` alternates the lead across a recipe's assist exposures so
+# the opening move is also exercised as a robot decision.
+HUMAN_FIRST = "human_first"
+COUNTERBALANCED = "counterbalanced"
+LEAD_ACTOR_POLICIES = (HUMAN_FIRST, COUNTERBALANCED)
+
 
 @dataclass(frozen=True)
-class BurritoTask:
-    """One recipe/preference episode; its action order is state-generated."""
+class CookingTask:
+    """One naturally scheduled recipe exposure in a ladder stream."""
 
     recipe_id: str
-    protein: str
     preference: str
+    scenario: str
+    phase: int
+    schedule_step: int
+    phase_role: str
+    lifecycle: str
+    preference_changed: bool
+    exposure_after_change: int
+    strategy: str
+    adaptation_id: Optional[str]
+    holdout_target: bool
 
     @classmethod
     def create(
-        cls, protein: str, preference: str = "plate_early",
-        *, recipe_id: str | None = None,
-    ) -> "BurritoTask":
-        normalized = protein_name(protein)
+        cls,
+        recipe_id: str,
+        preference: str,
+        *,
+        scenario: str = "manual",
+        phase: int = 0,
+        schedule_step: int = 0,
+        phase_role: str = "ordinary",
+        lifecycle: str = "retain",
+        preference_changed: bool = False,
+        exposure_after_change: int = 0,
+        strategy: str = "manual",
+        adaptation_id: Optional[str] = None,
+        holdout_target: bool = False,
+    ) -> "CookingTask":
+        recipe = get_recipe(recipe_id)
+        selected = get_preference(preference)
         return cls(
-            recipe_id=recipe_id or f"{normalized}_burrito",
-            protein=normalized,
-            preference=preference_name(preference),
+            recipe.recipe_id,
+            selected.name,
+            str(scenario),
+            int(phase),
+            int(schedule_step),
+            str(phase_role),
+            str(lifecycle),
+            bool(preference_changed),
+            max(0, int(exposure_after_change)),
+            str(strategy),
+            None if adaptation_id is None else str(adaptation_id),
+            bool(holdout_target),
         )
 
     @property
     def action_space(self) -> Tuple[str, ...]:
-        return macro_actions(self.protein)
+        return get_recipe(self.recipe_id).action_tokens
 
 
 @dataclass(frozen=True)
-class BurritoObservation:
-    """Duck-typed equivalent of src.representations.Observation."""
-
+class CookingObservation:
     state: StateVector
     action: str
     next_state: StateVector
 
 
 @dataclass(frozen=True)
-class BurritoDecision:
+class CookingDecision:
     recipe_step: int
     mode: str
     scheduled_actor: str
     physical_actor_id: int
     executed_by: str
     legal_actions: Tuple[str, ...]
-    acceptable_actions: Tuple[str, ...]
-    reference_action: str
+    ground_truth_action: str
     actual: str
     predicted: Optional[str]
     correct_top_1: bool
-    exact_reference_match: bool
-    reference_probability: float
-    reference_nll: float
-    acceptable_probability_mass: float
-    acceptable_nll: float
+    correct_top_k: bool
+    ground_truth_probability: float
+    ground_truth_nll: float
+    preference_discriminating: bool
     invalid_prediction: bool
     prediction_wall_s: float
     prediction_stats: Mapping[str, Any]
@@ -88,229 +124,252 @@ class BurritoDecision:
 
 
 @dataclass(frozen=True)
-class BurritoEpisodeResult:
-    task: BurritoTask
+class CookingEpisodeResult:
+    task: CookingTask
     mode: str
-    decisions: Tuple[BurritoDecision, ...]
-    observations: Tuple[BurritoObservation, ...]
+    decisions: Tuple[CookingDecision, ...]
+    observations: Tuple[CookingObservation, ...]
     match: Any
     robot_turns: int
     robot_top_1_hits: int
-    robot_exact_reference_hits: int
-    human_shadow_top_1_hits: int
-    human_shadow_exact_reference_hits: int
+    robot_top_k_hits: int
     corrections: int
     human_actions: int
     robot_actions: int
     invalid_predictions: int
+    # Teacher-forced totals span every scored decision -- robot turns, human
+    # turns and the opening move -- so a preference whose only discriminating
+    # decision is step 0 is still measured.
+    scored_turns: int
+    scored_top_1_hits: int
+    scored_top_k_hits: int
+    scored_discriminating_decisions: int
+    scored_discriminating_top_1_hits: int
     prediction_wall_s: float
     low_level_ticks: int
     passive_wait_ticks: int
     sparse_reward: float
     deliveries: int
     memory_age_delta: int
+    commit_applied: bool
+    active_rehearsal: bool
+    retrain_executed: bool
+    retrain_events: Tuple[Mapping[str, Any], ...]
+    compatibility_dynamics: bool
+    compatibility_calls: Tuple[str, ...]
+    lead_actor_policy: str
 
     @property
     def robot_top_1(self) -> float:
-        """Acceptable-set top-1 accuracy on scheduled robot turns."""
-        return (
-            self.robot_top_1_hits / self.robot_turns
-            if self.robot_turns else 0.0
-        )
+        return self.robot_top_1_hits / self.robot_turns if self.robot_turns else 0.0
 
     @property
-    def robot_exact_reference_top_1(self) -> float:
-        """Diagnostic match to the sampled human fallback, not correctness."""
-        return (
-            self.robot_exact_reference_hits / self.robot_turns
-            if self.robot_turns else 0.0
-        )
+    def robot_top_k(self) -> float:
+        return self.robot_top_k_hits / self.robot_turns if self.robot_turns else 0.0
 
     @property
-    def human_shadow_top_1(self) -> float:
-        human_turns = sum(
-            decision.scheduled_actor == "human"
-            for decision in self.decisions
-            if decision.mode == ASSIST
-        )
+    def scored_discriminating_top_1(self) -> Optional[float]:
+        if not self.scored_discriminating_decisions:
+            return None
         return (
-            self.human_shadow_top_1_hits / human_turns
-            if human_turns else 0.0
+            self.scored_discriminating_top_1_hits
+            / self.scored_discriminating_decisions
         )
 
     @property
     def preference_sequence(self) -> Tuple[str, ...]:
         return tuple(decision.actual for decision in self.decisions)
 
+    @property
+    def post_update_recurrence(self) -> bool:
+        return self.task.exposure_after_change >= 2
 
-class BurritoHrcRunner:
-    """Run dynamic ground truth with the existing learner and memory clock.
 
-    A wrong robot proposal is scored but never applied. The human performs a
-    sampled acceptable action and the next decision remains a robot turn.
-    Native movement and cooking frames never enter the preference sequence.
+class CookingHrcRunner:
+    """Execute a stream with player 0 as human and player 1 as robot.
+
+    On an incorrect robot proposal, the proposal is vetoed, player 0 performs
+    the ground-truth option, and the next scheduled turn remains with the
+    robot.  A recipe's first occurrence is a natural human demonstration;
+    later occurrences are assistance episodes.
     """
 
     def __init__(
         self,
         agent: Any,
-        executor: BurritoOptionExecutor,
-        domain: BurritoDomainAdapter,
+        runtime: BurritoRuntime,
+        domain: CookingDomainAdapter,
         *,
-        seed: int | None = None,
+        horizon: int = 1600,
+        planner_seed: int = 0,
         max_passive_wait_ticks: int = 400,
+        top_k: int = 3,
+        memory_updates_enabled: bool = True,
+        require_shift_update: bool = True,
+        lead_actor_policy: str = HUMAN_FIRST,
     ):
         if getattr(agent, "domain", None) is not domain:
-            raise ValueError(
-                "agent and BurritoHrcRunner must share one domain adapter"
-            )
+            raise ValueError("agent and runner must share one domain adapter")
         self.agent = agent
-        self.executor = executor
+        self.runtime = runtime
         self.domain = domain
+        self.horizon = int(horizon)
+        self.planner_seed = int(planner_seed)
         self.max_passive_wait_ticks = max(1, int(max_passive_wait_ticks))
-        resolved_seed = (
-            int(seed) if seed is not None
-            else int(getattr(getattr(agent, "settings", None), "seed", 0))
-        )
-        self._ground_truth_rng = np.random.default_rng(
-            np.random.SeedSequence((resolved_seed, 0x42555252))
-        )
+        self.top_k = max(1, int(top_k))
+        self.memory_updates_enabled = bool(memory_updates_enabled)
+        self.require_shift_update = bool(require_shift_update)
+        if lead_actor_policy not in LEAD_ACTOR_POLICIES:
+            raise ValueError(
+                f"lead_actor_policy must be one of {LEAD_ACTOR_POLICIES}"
+            )
+        self.lead_actor_policy = str(lead_actor_policy)
+        self._assist_exposures: Dict[str, int] = {}
         self._observed_recipes: set[str] = set()
+        self._learner_recipe_by_task: Dict[str, str] = {}
+        self._executors: Dict[str, Any] = {}
 
     @property
     def observed_recipes(self) -> Tuple[str, ...]:
         return tuple(sorted(self._observed_recipes))
 
-    def run_task(
-        self, task: BurritoTask, *, force_mode: str | None = None,
-    ) -> BurritoEpisodeResult:
-        graph = BurritoTaskGraph.create(task.protein)
-        policy = BurritoPreferencePolicy.create(task.preference)
-        natural_mode = (
-            OBSERVE if task.recipe_id not in self._observed_recipes else ASSIST
-        )
-        mode = natural_mode if force_mode is None else str(force_mode)
-        if mode not in {OBSERVE, ASSIST}:
-            raise ValueError("mode must be 'observe' or 'assist'")
-        if force_mode == OBSERVE and task.recipe_id in self._observed_recipes:
-            raise ValueError(
-                "normal evaluation forbids a second observation of a recipe"
-            )
-        if mode == ASSIST and task.recipe_id not in self._observed_recipes:
-            raise ValueError(
-                "a recipe must receive exactly one observation before assist"
-            )
+    @property
+    def learner_recipe_by_task(self) -> Mapping[str, str]:
+        """Read-only external-to-internal identity map for evaluator audits."""
+        return dict(self._learner_recipe_by_task)
 
-        self.executor.reset()
-        self.domain.bind_initial_state(self.executor.state, actor_id=0)
+    def _executor(self, recipe_id: str) -> Any:
+        if recipe_id not in self._executors:
+            self._executors[recipe_id] = create_executor(
+                self.runtime,
+                recipe_id,
+                horizon=self.horizon,
+                seed=self.planner_seed,
+            )
+        return self._executors[recipe_id]
+
+    def run_task(self, task: CookingTask) -> CookingEpisodeResult:
+        graph = CookingTaskGraph.create(task.recipe_id)
+        policy = CookingPreferencePolicy.create(task.preference)
+        mode = OBSERVE if task.recipe_id not in self._observed_recipes else ASSIST
+        executor = self._executor(task.recipe_id)
+        executor.reset()
+        self.domain.begin_task(task.recipe_id)
         if mode == OBSERVE:
             self.agent.start_demo()
 
-        decisions: list[BurritoDecision] = []
-        observations: list[BurritoObservation] = []
+        decisions: list[CookingDecision] = []
+        observations: list[CookingObservation] = []
         completed: list[str] = []
-        robot_turn_next = False
-        robot_turns = robot_hits = robot_reference_hits = 0
-        human_shadow_hits = human_shadow_reference_hits = corrections = 0
+        exposure = self._assist_exposures.get(task.recipe_id, 0)
+        robot_turn_next = bool(
+            mode == ASSIST
+            and self.lead_actor_policy == COUNTERBALANCED
+            and exposure % 2 == 1
+        )
+        robot_turns = robot_hits = robot_top_k_hits = corrections = 0
+        scored_turns = scored_hits = scored_top_k_hits = 0
+        scored_discriminating = scored_discriminating_hits = 0
         human_actions = robot_actions = macro_ticks = passive_wait_ticks = 0
         invalid_predictions = 0
-        prediction_wall_s = 0.0
-        reward = 0.0
-        deliveries_before = self._delivery_count()
+        prediction_wall_s = reward = 0.0
+        deliveries_before = executor._delivery_count()
         demo_counter_before = int(self.agent.demo_counter)
+        train_before = len(self.agent.retrain_events)
 
         while not graph.is_complete(completed):
-            if len(completed) >= len(graph.actions):
-                raise RuntimeError("task graph exhausted without a delivery")
             scheduled_actor = (
                 "human" if mode == OBSERVE or not robot_turn_next else "robot"
             )
-            decision_actor_id = 0 if scheduled_actor == "human" else 1
+            decision_actor = 0 if scheduled_actor == "human" else 1
             waited = 0
+            structural = graph.frontier(completed)
+            # A preference ranges over the task-graph frontier, not over
+            # whatever happens to be cooked yet.  "Plate the protein first"
+            # means waiting for the protein; picking greedily from the
+            # currently-legal subset instead lets readiness timing dictate the
+            # order, which collapsed every assembly preference into one
+            # realized behaviour.  Every structural precondition here is
+            # satisfied by elapsed time alone (a plate action is only in the
+            # frontier once its pot or grill has been started), so this
+            # terminates; max_passive_wait_ticks remains the backstop.
+            ground_truth = policy.choose_action(structural, graph)
             while True:
-                state = self.domain.state_key(
-                    self.executor.state, actor_id=decision_actor_id,
-                )
-                acceptable = policy.acceptable_actions(
-                    graph, state, completed, self.domain,
-                )
-                if acceptable:
-                    legal = graph.available_actions(
-                        state, completed, self.domain,
-                    )
+                physical = executor.legal_actions(structural, actor_id=decision_actor)
+                legal = graph.available_actions(completed, physical)
+                if ground_truth in legal:
                     break
                 if waited >= self.max_passive_wait_ticks:
                     raise RuntimeError(
-                        "no acceptable task-graph action became physically "
-                        "legal before the passive-wait limit"
+                        f"{task.recipe_id}: preferred option {ground_truth} "
+                        f"never became physically legal (legal now: {legal})"
                     )
-                self.executor.advance_environment(1)
+                executor.advance_environment(1)
                 waited += 1
             passive_wait_ticks += waited
-            reference = choose_acceptable_action(
-                acceptable, self._ground_truth_rng,
-            )
+            state = self.domain.state_from_completed(task.recipe_id, completed)
 
-            prefix = tuple(
-                self.agent.pending_demo
-                if mode == OBSERVE else self.agent.current_prefix
-            )
             distribution: Dict[str, float] = {}
             predicted: Optional[str] = None
-            acceptable_hit = False
-            reference_hit = False
-            acceptable_mass = 0.0
-            acceptable_nll = math.nan
-            reference_probability = 0.0
-            reference_nll = math.nan
+            correct = False
+            correct_top_k = False
+            ground_truth_probability = 0.0
+            ground_truth_nll = math.nan
             prediction_elapsed = 0.0
             invalid_prediction = False
             prediction_stats: Dict[str, Any] = {}
+            # Every assist decision is scored, including the opening move and
+            # the human's own turns.  ``src.hrc_simulation.simulate_episode``
+            # records exactly these shadow predictions (it calls ``_predict``
+            # on human turns, index 0 included, with an empty prefix), and
+            # skipping them here was not parity: in these task graphs the first
+            # decision is the single most preference-informative move, so for
+            # several recipe/preference pairs it was the *only* discriminating
+            # decision and no reported metric could see it.  Shadow predictions
+            # never control execution.
             if mode == ASSIST:
-                prediction_started = time.perf_counter()
+                started = time.perf_counter()
                 distribution = dict(self.agent.predict_actions(
-                    prefix,
-                    state=self.executor.state,
-                    actor_id=decision_actor_id,
-                    # The recipe DAG is the task-level feasibility mask;
-                    # physical preconditions alone would permit starting a
-                    # second burrito after assembly.
+                    tuple(self.agent.current_prefix),
+                    state=state,
                     action_universe=legal,
                 ))
-                ranked = self.agent.rank_actions(distribution, k=1)
-                prediction_elapsed = time.perf_counter() - prediction_started
+                ranked = self.agent.rank_actions(distribution, k=self.top_k)
+                prediction_stats = dict(self.agent.policy_stats())
+                prediction_elapsed = time.perf_counter() - started
                 prediction_wall_s += prediction_elapsed
                 predicted = ranked[0] if ranked else None
-                prediction_stats = dict(self.agent.policy_stats())
-                invalid_prediction = bool(
-                    predicted is not None and predicted not in legal
-                )
+                invalid_prediction = predicted is not None and predicted not in legal
                 invalid_predictions += int(invalid_prediction)
-                acceptable_hit = predicted in acceptable
-                reference_hit = predicted == reference
-                reference_probability = max(
-                    0.0, float(distribution.get(reference, 0.0)),
+                correct = predicted == ground_truth
+                correct_top_k = ground_truth in ranked
+                ground_truth_probability = max(
+                    0.0, float(distribution.get(ground_truth, 0.0))
                 )
-                reference_nll = -math.log(max(reference_probability, 1e-12))
-                acceptable_mass = float(sum(
-                    max(0.0, float(distribution.get(action, 0.0)))
-                    for action in acceptable
-                ))
-                acceptable_nll = -math.log(max(acceptable_mass, 1e-12))
+                ground_truth_nll = -math.log(max(ground_truth_probability, 1e-12))
+
+            discriminating = is_preference_discriminating(legal, graph)
+            if predicted is not None:
+                scored_turns += 1
+                scored_hits += int(correct)
+                scored_top_k_hits += int(correct_top_k)
+                if discriminating:
+                    scored_discriminating += 1
+                    scored_discriminating_hits += int(correct)
 
             corrected = False
             if scheduled_actor == "robot":
                 robot_turns += 1
-                robot_hits += int(acceptable_hit)
-                robot_reference_hits += int(reference_hit)
-                if acceptable_hit and predicted is not None:
+                robot_hits += int(correct)
+                robot_top_k_hits += int(correct_top_k)
+                if correct and predicted is not None:
                     executed_action = predicted
                     physical_actor = 1
                     executed_by = "robot"
                     robot_actions += 1
                     robot_turn_next = False
                 else:
-                    executed_action = reference
+                    executed_action = ground_truth
                     physical_actor = 0
                     executed_by = "human_correction"
                     corrected = True
@@ -318,68 +377,50 @@ class BurritoHrcRunner:
                     human_actions += 1
                     robot_turn_next = True
             else:
-                executed_action = reference
+                executed_action = ground_truth
                 physical_actor = 0
                 executed_by = "human"
                 human_actions += 1
                 if mode == ASSIST:
-                    human_shadow_hits += int(acceptable_hit)
-                    human_shadow_reference_hits += int(reference_hit)
                     robot_turn_next = True
 
-            before = self.domain.state_key(
-                self.executor.state, actor_id=decision_actor_id,
-            )
-            execution = self.executor.execute(
-                executed_action, actor_id=physical_actor,
-            )
+            before = state
+            execution = executor.execute(executed_action, actor_id=physical_actor)
             macro_ticks += execution.low_level_ticks
             reward += execution.sparse_reward
             completed.append(executed_action)
-            next_actor_id = (
-                0 if mode == OBSERVE or not robot_turn_next else 1
-            )
-            after = self.domain.state_key(
-                self.executor.state, actor_id=next_actor_id,
-            )
-            self.domain.record_transition(before, executed_action, after)
-            observation = BurritoObservation(before, executed_action, after)
+            after = self.domain.state_from_completed(task.recipe_id, completed)
+            if self.domain.successor(before, executed_action) != after:
+                raise RuntimeError("task transition disagrees with physical option")
+            observation = CookingObservation(before, executed_action, after)
             observations.append(observation)
             self.agent.observe(
                 observation,
                 ground_truth_recipe=task.recipe_id,
-                precomputed_distribution=(
-                    distribution if mode == ASSIST else None
-                ),
-                precomputed_prediction=(
-                    predicted if mode == ASSIST else None
-                ),
+                precomputed_distribution=(distribution or None),
+                precomputed_prediction=predicted,
             )
-            decisions.append(BurritoDecision(
+            decisions.append(CookingDecision(
                 recipe_step=len(completed) - 1,
                 mode=mode,
                 scheduled_actor=scheduled_actor,
                 physical_actor_id=physical_actor,
                 executed_by=executed_by,
                 legal_actions=tuple(legal),
-                acceptable_actions=tuple(acceptable),
-                reference_action=reference,
+                ground_truth_action=ground_truth,
                 actual=executed_action,
                 predicted=predicted,
-                correct_top_1=bool(acceptable_hit),
-                exact_reference_match=bool(reference_hit),
-                reference_probability=reference_probability,
-                reference_nll=reference_nll,
-                acceptable_probability_mass=acceptable_mass,
-                acceptable_nll=acceptable_nll,
+                correct_top_1=correct,
+                correct_top_k=correct_top_k,
+                ground_truth_probability=ground_truth_probability,
+                ground_truth_nll=ground_truth_nll,
+                preference_discriminating=discriminating,
                 invalid_prediction=invalid_prediction,
                 prediction_wall_s=prediction_elapsed,
                 prediction_stats=prediction_stats,
                 distribution=distribution,
                 human_corrected=corrected,
-                proposal_executed=bool(
-                    scheduled_actor != "robot" or acceptable_hit
-                ),
+                proposal_executed=scheduled_actor == "robot" and correct,
                 low_level_ticks=execution.low_level_ticks,
                 passive_wait_ticks_before=waited,
                 primitive_calls=execution.primitive_calls,
@@ -387,20 +428,83 @@ class BurritoHrcRunner:
             ))
 
         match = self.agent.end_demo()
+        learned_recipe = getattr(match, "recipe_id", None)
+        if mode == OBSERVE and learned_recipe is not None:
+            owner = next((
+                recipe_id for recipe_id, internal_id
+                in self._learner_recipe_by_task.items()
+                if internal_id == learned_recipe and recipe_id != task.recipe_id
+            ), None)
+            if owner is not None:
+                raise RuntimeError(
+                    f"open-set learner merged {task.recipe_id} with {owner} "
+                    f"as {learned_recipe}"
+                )
+            self._learner_recipe_by_task[task.recipe_id] = str(learned_recipe)
+        elif mode == ASSIST and self.memory_updates_enabled:
+            expected_recipe = self._learner_recipe_by_task.get(task.recipe_id)
+            if (
+                expected_recipe is not None
+                and learned_recipe is not None
+                and str(learned_recipe) != expected_recipe
+            ):
+                raise RuntimeError(
+                    f"assist episode for {task.recipe_id} was committed to "
+                    f"{learned_recipe}, expected {expected_recipe}"
+                )
+        new_retrain_events = tuple(
+            dict(event) for event in self.agent.retrain_events[train_before:]
+        )
         memory_age_delta = int(self.agent.demo_counter) - demo_counter_before
-        if memory_age_delta != 1:
+        deployment_locked = bool(getattr(self.agent, "_deployment_locked", False))
+        expected_delta = int(
+            (mode == OBSERVE and not deployment_locked)
+            or (mode == ASSIST and self.memory_updates_enabled)
+        )
+        if memory_age_delta != expected_delta:
             raise RuntimeError(
-                "one completed Burrito recipe must age memory exactly once; "
-                f"observed delta {memory_age_delta}"
+                f"unexpected memory age delta {memory_age_delta}; expected {expected_delta}"
             )
         if mode == OBSERVE:
             self._observed_recipes.add(task.recipe_id)
-        deliveries = self._delivery_count() - deliveries_before
-        if deliveries != 1:
+        else:
+            self._assist_exposures[task.recipe_id] = exposure + 1
+
+        match_key = (
+            (match.recipe_id, match.variant_id)
+            if getattr(match, "recipe_id", None) is not None
+            and getattr(match, "variant_id", None) is not None else None
+        )
+        commit_applied = bool(
+            (mode == OBSERVE and memory_age_delta == 1)
+            or self.agent.last_commit_stats.get("commit_applied", False)
+        )
+        active_rehearsal = bool(
+            match_key is not None and match_key in self.agent.replay.active
+        )
+        retrain_executed = any(
+            not bool(event.get("skipped", False)) for event in new_retrain_events
+        )
+        if (
+            mode == ASSIST
+            and task.preference_changed
+            and task.exposure_after_change == 1
+            and self.require_shift_update
+            and self.memory_updates_enabled
+            and not (commit_applied and active_rehearsal and retrain_executed)
+        ):
             raise RuntimeError(
-                f"Burrito task should deliver exactly one dish, got {deliveries}"
+                "first natural post-shift exposure did not commit, rehearse, and retrain"
             )
-        return BurritoEpisodeResult(
+
+        deliveries = executor._delivery_count() - deliveries_before
+        expected_deliveries = get_recipe(task.recipe_id).expected_deliveries
+        if deliveries != expected_deliveries:
+            raise RuntimeError(
+                f"{task.recipe_id} should deliver {expected_deliveries} dish(es), "
+                f"got {deliveries}"
+            )
+        return CookingEpisodeResult(
             task=task,
             mode=mode,
             decisions=tuple(decisions),
@@ -408,41 +512,47 @@ class BurritoHrcRunner:
             match=match,
             robot_turns=robot_turns,
             robot_top_1_hits=robot_hits,
-            robot_exact_reference_hits=robot_reference_hits,
-            human_shadow_top_1_hits=human_shadow_hits,
-            human_shadow_exact_reference_hits=human_shadow_reference_hits,
+            robot_top_k_hits=robot_top_k_hits,
             corrections=corrections,
             human_actions=human_actions,
             robot_actions=robot_actions,
             invalid_predictions=invalid_predictions,
+            scored_turns=scored_turns,
+            scored_top_1_hits=scored_hits,
+            scored_top_k_hits=scored_top_k_hits,
+            scored_discriminating_decisions=scored_discriminating,
+            scored_discriminating_top_1_hits=scored_discriminating_hits,
             prediction_wall_s=prediction_wall_s,
             low_level_ticks=macro_ticks + passive_wait_ticks,
             passive_wait_ticks=passive_wait_ticks,
             sparse_reward=reward,
             deliveries=deliveries,
             memory_age_delta=memory_age_delta,
+            commit_applied=commit_applied,
+            active_rehearsal=active_rehearsal,
+            retrain_executed=retrain_executed,
+            retrain_events=new_retrain_events,
+            compatibility_dynamics=bool(executor.compatibility_dynamics),
+            compatibility_calls=tuple(getattr(executor, "compatibility_calls", ())),
+            lead_actor_policy=self.lead_actor_policy,
         )
 
     def run_stream(
-        self, tasks: Sequence[BurritoTask],
-    ) -> Tuple[BurritoEpisodeResult, ...]:
+        self, tasks: Sequence[CookingTask],
+    ) -> Tuple[CookingEpisodeResult, ...]:
         return tuple(self.run_task(task) for task in tasks)
 
-    def _delivery_count(self) -> int:
-        return int(sum(
-            len(events)
-            for events in self.executor.env.game_stats.get(
-                "dish_delivery", (),
-            )
-        ))
+
+BurritoTask = CookingTask
+BurritoObservation = CookingObservation
+BurritoDecision = CookingDecision
+BurritoEpisodeResult = CookingEpisodeResult
+BurritoHrcRunner = CookingHrcRunner
 
 
 __all__ = [
-    "ASSIST",
-    "OBSERVE",
-    "BurritoDecision",
-    "BurritoEpisodeResult",
-    "BurritoHrcRunner",
-    "BurritoObservation",
-    "BurritoTask",
+    "ASSIST", "COUNTERBALANCED", "HUMAN_FIRST", "LEAD_ACTOR_POLICIES", "OBSERVE", "BurritoDecision", "BurritoEpisodeResult",
+    "BurritoHrcRunner", "BurritoObservation", "BurritoTask",
+    "CookingDecision", "CookingEpisodeResult", "CookingHrcRunner",
+    "CookingObservation", "CookingTask",
 ]

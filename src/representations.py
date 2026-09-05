@@ -1,13 +1,11 @@
-"""Semantic action observations and transition-effect validation helpers."""
+"""Semantic action observations."""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
-import numpy as np
 
 from .environment import StateTracker, parse_action_label
 
 StateVector = Tuple[int, ...]
-TransitionDelta = Tuple[int, ...]
 ACTION_REPRESENTATION = "semantic_actions"
 
 @dataclass(frozen=True)
@@ -19,14 +17,6 @@ class Observation:
 
     def __post_init__(self) -> None:
         parse_action_label(self.action)
-
-def state_delta(before: Sequence[int], after: Sequence[int]) -> TransitionDelta:
-    """Return an effect signature used only to validate state changes."""
-    before_array = np.asarray(before, dtype=np.int8)
-    after_array = np.asarray(after, dtype=np.int8)
-    turned_on = ((before_array == 0) & (after_array == 1)).astype(np.int8)
-    turned_off = ((before_array == 1) & (after_array == 0)).astype(np.int8)
-    return tuple(np.concatenate([turned_on, turned_off]).astype(int).tolist())
 
 def observe_actions(actions: Sequence[str]) -> List[Observation]:
     """Execute semantic actions and retain each observed state transition."""

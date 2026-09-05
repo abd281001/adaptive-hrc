@@ -9,6 +9,9 @@ import numpy as np
 StateVector = Tuple[int, ...]
 
 
+# runtime_checkable is load-bearing: tests/test_domain.py asserts structural
+# conformance of each adapter (symbolic, cooking, physical) against this
+# Protocol, which is what keeps the domain boundary honest.
 @runtime_checkable
 class DomainAdapter(Protocol):
     """Minimal contract required by the existing learning stack.
@@ -86,6 +89,13 @@ class SymbolicDomainAdapter:
         state = self.initial_state()
         for action in actions: state = self.replay_transition(state, str(action))
         return state
+
+    def predicate_names(self) -> Tuple[str, ...]:
+        """Name each state bit, for predictors that read states as text.
+        Optional across adapters, so it stays off the DomainAdapter Protocol: only the in-context LLM baseline renders a state rather than featurizing it.
+        """
+        from .environment import StateTracker
+        return tuple(StateTracker._build_feature_map())
 
     def successor(self, state: StateVector, action: str) -> Optional[StateVector]:
         # Lazy import avoids a module cycle while preserving the tested legacy transition function as the single symbolic source of truth.

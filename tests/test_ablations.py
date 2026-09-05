@@ -1,8 +1,12 @@
 """Reviewer-facing contracts for matcher and self-training audits."""
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.ablations import (
     COMMIT_FULL,
@@ -20,6 +24,7 @@ from src.ablations import (
     multiset_jaccard,
     partial_order_similarity,
     run_matcher_ablation,
+    run_all_ablations,
     run_routing_ablation,
     latent_strategy_ablation_design,
     summarize_commit_decisions,
@@ -28,6 +33,55 @@ from src.ablations import (
     teaching_metrics,
     _trend,
 )
+
+
+class AllAblationRunnerTests(unittest.TestCase):
+    def test_collection_runner_owns_outputs_manifest_and_validation(self):
+        scenarios = ("homogeneous", "heterogeneous", "holdout")
+        arms = {arm.name for arm in LATENT_STRATEGY_ABLATION_ARMS}
+
+        def complete(name, command, run_dir, _environment):
+            if name == "matcher":
+                payload = {"summary_by_matcher": {"graph": {}}}
+            elif name == "routing":
+                payload = {
+                    "rows": [
+                        {"scenario": scenario, "seed": 1337, "trend": [{}]}
+                        for scenario in scenarios
+                    ]
+                }
+            else:
+                payload = {
+                    "rows": [
+                        {"scenario": scenario, "seed": 1337, "arm": arm}
+                        for scenario in scenarios for arm in arms
+                    ]
+                }
+            output = Path(run_dir) / f"{name}.json"
+            output.write_text(json.dumps(payload), encoding="utf-8")
+            return {
+                "name": name,
+                "command": list(command),
+                "started_at_utc": "2026-01-01T00:00:00Z",
+                "completed_at_utc": "2026-01-01T00:00:01Z",
+                "return_code": 0,
+                "wall_s": 1.0,
+                "output": str(output),
+                "stdout": str(Path(run_dir) / f"{name}.stdout.log"),
+                "stderr": str(Path(run_dir) / f"{name}.stderr.log"),
+            }
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "src.ablations._run_ablation_process", side_effect=complete,
+        ):
+            result = run_all_ablations(directory, workers=1)
+            manifest = json.loads(Path(result["manifest"]).read_text())
+
+        self.assertEqual(result["state"], "complete")
+        self.assertEqual(set(result["outputs"]), {"matcher", "routing", "latent"})
+        self.assertEqual(manifest["state"], "complete")
+        self.assertEqual(set(manifest["jobs"]), {"matcher", "routing", "latent"})
+        self.assertEqual(manifest["longitudinal_scenarios"], list(scenarios))
 
 
 class LatentStrategyComponentAblationTests(unittest.TestCase):

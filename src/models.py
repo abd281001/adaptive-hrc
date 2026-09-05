@@ -14,14 +14,6 @@ StateVector = Tuple[int, ...]
 Demonstration = List[Tuple[StateVector, str]]
 
 
-def _soft_value(values: Sequence[float], temp: float) -> float:
-    if not values: return 0.0
-    safe_temperature = max(float(temp), 1e-8)
-    peak = max(float(value) for value in values)
-    mass = sum(math.exp((float(value) - peak) / safe_temperature) for value in values)
-    return peak + safe_temperature * math.log(max(mass, 1e-12))
-
-
 def _softmax_probs(values: Sequence[float], temp: float) -> List[float]:
     if not values: return []
     safe_temperature = max(float(temp), 1e-8)
@@ -65,14 +57,19 @@ class Settings:
     # MaxEnt IRL
     irl_discount: float = 0.9
     irl_temperature: float = 0.5
-    irl_learning_rate: float = 0.05
+    # 0.05 oscillated: the gradient norm plateaued at ~8.5 regardless of the
+    # iteration budget, leaving the fit non-stationary and its weights
+    # sensitive to perturbations below float32 epsilon. At 0.01 the norm falls
+    # with the budget and the fit is stable.
+    irl_learning_rate: float = 0.01
     irl_l2: float = 0.01
     # Engineered reward representation used by the MaxEnt policy.
     irl_features: str = "engineered"
     predictor: str = "maxent"
     irl_horizon: int = 45
-    irl_cold_steps: int = 100
-    irl_warm_steps: int = 40
+    # 100 truncated the fit before its own stale-progress criterion fired.
+    irl_cold_steps: int = 200
+    irl_warm_steps: int = 80
     expand_actions: bool = False
 
     # Semantic value interpolation is a separate out-of-support fallback; it does not change the MaxEnt reward representation above.
@@ -93,6 +90,28 @@ class Settings:
     llm_model: str = ""
     llm_context_tokens: int = 32768
     llm_candidate_batch: int = 1
+    # Spare VRAM left unclaimed for everything outside this process. On a
+    # desktop the display server, compositor and browser share the GPU, their
+    # demand is spiky and outside this run's control, and a GPU that cannot
+    # serve them takes the whole session down rather than failing this process.
+    # This is headroom for that spikiness only: memory those clients already
+    # hold is measured and excluded separately, so the total reserve is their
+    # current usage plus this. Set to 0 only on a GPU driving no display.
+    llm_vram_headroom_gib: float = 1.25
+    # Prefill the prompt this many positions at a time. Chunking bounds the
+    # attention intermediates that peak alongside the key/value cache, which
+    # raises the prompt budget on a GPU shared with a display by about half
+    # (measured 8571 -> 12827 tokens). It costs prefill wall time roughly in
+    # proportion to the chunk count, and it perturbs candidate probabilities by
+    # up to a few percent relative, because a chunk boundary changes the order
+    # of a bf16 reduction. Zero keeps the single-forward prefill and today's
+    # exact scores.
+    llm_prefill_chunk_tokens: int = 0
+    # "auto" annotates demonstrations with per-step state and sheds that
+    # annotation only when the prompt stops fitting, so a long run can change
+    # encoding partway through. Pin "state_delta" or "action_only" to hold one
+    # encoding for a whole run; "action_only" is about 2.7x smaller.
+    llm_context_encoding: str = "auto"
 
     # Agent and retraining.
     top_k: int = 1
@@ -116,8 +135,6 @@ class Settings:
     profile: bool = False
 
     # Online classification and commit policy.
-    new_recipe_threshold: float = 0.30
-    min_classify_length: int = 6
     # Full default and policy evidence promote directly.
     commit_threshold: float = 0.70
     tentative_threshold: float = 0.45
@@ -138,11 +155,14 @@ class Settings:
     empty_score_cap: float = 0.40
 
     def __post_init__(self) -> None:
-        self.rng = np.random.default_rng(int(self.seed))
+        # Settings is a pure value object: it declares `seed` but owns no
+        # generator. Randomness is owned by the consumer that draws from it
+        # (see AdaptiveAgent._init_rng), so two agents can never share a
+        # stream by accidentally sharing one Settings instance.
         unit_fields = (
             "match_threshold", "match_margin",
             "overlap_weight", "order_weight",
-            "new_recipe_threshold", "commit_threshold",
+            "commit_threshold",
             "tentative_threshold", "provisional_weight",
             "provisional_cap", "confirm_accuracy",
             "confirm_similarity", "match_weight",
@@ -166,6 +186,9 @@ class Settings:
         if self.predictor not in {"maxent", "in_context_llm"}:                      raise ValueError("predictor must be 'maxent' or 'in_context_llm'")
         if int(self.llm_context_tokens) < 0:                                        raise ValueError("llm_context_tokens cannot be negative")
         if int(self.llm_candidate_batch) < 1:                                       raise ValueError("llm_candidate_batch must be positive")
+        if float(self.llm_vram_headroom_gib) < 0.0:                                 raise ValueError("llm_vram_headroom_gib cannot be negative")
+        if int(self.llm_prefill_chunk_tokens) < 0:                                  raise ValueError("llm_prefill_chunk_tokens cannot be negative")
+        if self.llm_context_encoding not in {"auto", "state_delta", "action_only"}: raise ValueError("llm_context_encoding must be 'auto', 'state_delta', or 'action_only'")
         for name in ("irl_cold_steps", "irl_warm_steps"):
             if int(getattr(self, name)) < 1:                                        raise ValueError(f"{name} must be positive")
         if int(self.semantic_knn) < 1:                                              raise ValueError("semantic_knn must be positive")
@@ -195,11 +218,6 @@ def index_demos(demonstrations: Sequence[Demonstration], unique_actions: Optiona
 def feasible_actions(state: StateVector, actions: Sequence[str]) -> Tuple[str, ...]:
     """Retain every effectful, precondition-valid action in the grounded task."""
     return tuple(sorted({str(action) for action in actions if action != "stop" and _apply_action(tuple(state), str(action)) is not None}))
-
-
-def _safe_feat(state: np.ndarray, key: str) -> int:
-    # Feature names are generated from the same canonical environment schema; fail loudly if that contract drifts instead of silently dropping a term.
-    return int(state[_FEAT[key]])
 
 
 @dataclass
@@ -274,6 +292,133 @@ def _normalize_feature_rows(raw: np.ndarray, known_mean: Optional[np.ndarray], k
     return features.astype(np.float32), mean.astype(np.float32), scale.astype(np.float32)
 
 
+KEY_INGREDIENTS = ("tomato", "onion", "mushroom", "rice", "meat", "chicken", "fish", "egg", "banana", "strawberries", "lettuce", "cheese", "garlic", "yoghurt", "milk", "oil")
+KEY_CONTAINERS  = ("pot", "pan", "plate", "bowl")
+KEY_LOCATIONS   = ("prep_station", "cooking_station", "plating_station", "blending_station")
+CONTAINER_ANCHORS = (
+    ("pot", "cooking_station"), ("pot", "washing_station"), ("pan", "cooking_station"), ("pan", "washing_station"),
+    ("plate", "plating_station"), ("plate", "serving_station"), ("plate", "washing_station"),
+    ("bowl", "prep_station"), ("bowl", "cooking_station"), ("bowl", "plating_station"), ("bowl", "washing_station"),
+    ("glass", "blending_station"), ("glass", "serving_station"), ("glass", "washing_station"),
+    ("measuring_cup", "blending_station"), ("measuring_cup", "washing_station"),
+)
+
+
+@dataclass(frozen=True)
+class FeatureTerm:
+    """One named column of the reward representation.
+
+    ``op`` is ``"sum"`` (add the named state bits) or ``"product"`` (multiply the
+    first group's single bit by the sum of the second group).  Making the
+    representation declarative rather than implicit in nested loops means a
+    given reward weight can be attributed to a named term when reporting which
+    features drive the learned reward.
+    """
+    name: str
+    op: str
+    keys: Tuple[str, ...]
+    factor_keys: Tuple[str, ...] = ()
+
+
+def _feature_plan(feature_mode: str) -> Tuple[FeatureTerm, ...]:
+    """Declare the engineered/semantic reward columns, in their fixed order."""
+    engineered = feature_mode == "engineered"
+    terms: List[FeatureTerm] = []
+    add = terms.append
+    # 1) Item density by location.
+    for location in LOCATIONS: add(FeatureTerm(f"items_at_{location}", "sum", tuple(f"{item}_at_{location}" for item in ITEMS)))
+    # 2) Container-location anchors + composite counts.
+    for container, location in CONTAINER_ANCHORS: add(FeatureTerm(f"{container}_at_{location}", "sum", (f"{container}_at_{location}",)))
+    add(FeatureTerm("cookware_at_cooking_station", "sum", ("pot_at_cooking_station", "pan_at_cooking_station")))
+    add(FeatureTerm("items_at_prep_station_total", "sum", tuple(f"{item}_at_prep_station" for item in ITEMS)))
+    add(FeatureTerm("items_at_blending_station_total", "sum", tuple(f"{item}_at_blending_station" for item in ITEMS)))
+    # 3) Containment aggregates.
+    add(FeatureTerm("contained_total", "sum", tuple(f"{c}_contains_{i}" for c in CONTAINERS for i in INGREDIENTS)))
+    for container in CONTAINERS: add(FeatureTerm(f"{container}_contents_total", "sum", tuple(f"{container}_contains_{i}" for i in INGREDIENTS)))
+    add(FeatureTerm("containers_holding_mixture", "sum", tuple(f"{c}_contains_mixture" for c in CONTAINERS)))
+    # 4) Processing features.
+    if engineered:
+        for item in CUTTABLES:  add(FeatureTerm(f"{item}_cut", "sum", (f"{item}_cut",)))
+        for item in COOKABLES:  add(FeatureTerm(f"{item}_cooked", "sum", (f"{item}_cooked",)))
+    add(FeatureTerm("cut_total",      "sum", tuple(f"{i}_cut" for i in CUTTABLES)))
+    add(FeatureTerm("grated_total",   "sum", tuple(f"{i}_grated" for i in GRATABLE)))
+    add(FeatureTerm("cooked_total",   "sum", tuple(f"{i}_cooked" for i in COOKABLES)))
+    add(FeatureTerm("seasoned_total", "sum", tuple(f"{i}_seasoned" for i in INGREDIENTS)))
+    add(FeatureTerm("washed_total",   "sum", tuple(f"{i}_washed" for i in ITEMS)))
+    if engineered:
+        for ingredient in ("chicken", "fish", "mixture"): add(FeatureTerm(f"{ingredient}_seasoned", "sum", (f"{ingredient}_seasoned",)))
+    # 5) Tool and serving status.
+    for key in ("stove_on", "sink_on", "blender_on", "dish_served"): add(FeatureTerm(key, "sum", (key,)))
+    # Literal identity is useful for the engineered representation but is deliberately absent from the transferable semantic reward.
+    if engineered:
+        # 6) Key ingredient x location grid.
+        for ingredient in KEY_INGREDIENTS:
+            for location in KEY_LOCATIONS: add(FeatureTerm(f"{ingredient}_at_{location}", "sum", (f"{ingredient}_at_{location}",)))
+        # 7) Key ingredient containment in key containers.
+        for container in KEY_CONTAINERS:
+            for ingredient in KEY_INGREDIENTS: add(FeatureTerm(f"{container}_contains_{ingredient}", "sum", (f"{container}_contains_{ingredient}",)))
+    # 8) Seasoning signatures.
+    for seasoning in SEASONINGS: add(FeatureTerm(f"seasoned_with_{seasoning}_total", "sum", tuple(f"{i}_seasoned_with_{seasoning}" for i in KEY_INGREDIENTS)))
+    # 9) Interaction composites.
+    add(FeatureTerm("stove_on_x_cookware_present",  "product", ("stove_on",),   ("pot_at_cooking_station", "pan_at_cooking_station")))
+    add(FeatureTerm("blender_on_x_glass_present",   "product", ("blender_on",), ("glass_at_blending_station",)))
+    add(FeatureTerm("sink_on_x_dishes_present",     "product", ("sink_on",),    ("plate_at_washing_station", "bowl_at_washing_station")))
+    return tuple(terms)
+
+
+@dataclass(frozen=True)
+class _CompiledPlan:
+    """A feature plan reduced to one integer matmul plus the product columns.
+
+    ``matrix`` accumulates every sum term, so the whole sum block is a single
+    ``states @ matrix``.  Doing it as one operation rather than one call per
+    column keeps the cost flat whether a caller builds features for a single
+    candidate successor or for a whole fitted state graph.
+    """
+    names: Tuple[str, ...]
+    matrix: np.ndarray                                        # (state_width, n_features), integer
+    products: Tuple[Tuple[int, int, np.ndarray], ...]         # (column, left index, factor indices)
+
+
+def _compiled_plan(feature_mode: str) -> Tuple[Tuple[FeatureTerm, ...], _CompiledPlan]:
+    """Resolve a plan's feature names to state indices once, then memoize it.
+    Every term is validated here rather than at build time, so a malformed
+    column fails at import instead of quietly contributing a wrong value to
+    the reward representation.
+    """
+    terms = _feature_plan(feature_mode)
+    state_width = len(_FEAT)
+    matrix = np.zeros((state_width, len(terms)), dtype=np.int64)
+    products: List[Tuple[int, int, np.ndarray]] = []
+    for column, term in enumerate(terms):
+        if term.op not in {"sum", "product"}:               raise ValueError(f"feature term {term.name!r} has unknown op {term.op!r}")
+        if not term.keys:                                   raise ValueError(f"feature term {term.name!r} has no state keys")
+        if term.op == "sum" and term.factor_keys:           raise ValueError(f"sum term {term.name!r} must not declare factor keys")
+        # A product multiplies one indicator by a group sum; more than one
+        # left-hand key would be silently ignored by the vectorised form.
+        if term.op == "product" and len(term.keys) != 1:    raise ValueError(f"product term {term.name!r} needs exactly one left-hand key")
+        if term.op == "product" and not term.factor_keys:   raise ValueError(f"product term {term.name!r} has no factor keys")
+        if term.op == "sum":
+            for key in term.keys: matrix[_FEAT[key], column] += 1
+        else:
+            products.append((column, _FEAT[term.keys[0]], np.asarray([_FEAT[key] for key in term.factor_keys], dtype=np.intp)))
+    names = tuple(term.name for term in terms)
+    if len(set(names)) != len(names):                       raise ValueError("feature term names must be unique")
+    return terms, _CompiledPlan(names=names, matrix=matrix, products=tuple(products))
+
+
+_PLANS: Dict[str, Tuple[Tuple[FeatureTerm, ...], _CompiledPlan]] = {
+    mode: _compiled_plan(mode) for mode in ("engineered", "semantic")
+}
+
+
+def feature_names(feature_mode: str = "engineered") -> Tuple[str, ...]:
+    """Names of the reward columns, aligned with ``reward_weights`` positions."""
+    if feature_mode == "raw_state": return tuple(sorted(_FEAT, key=_FEAT.__getitem__))
+    if feature_mode not in _PLANS:  raise ValueError("feature_mode must be 'semantic', 'engineered', or 'raw_state'")
+    return _PLANS[feature_mode][1].names
+
+
 def build_features(state_vectors: Dict[int, StateVector], known_mean: Optional[np.ndarray] = None, known_scale: Optional[np.ndarray] = None, normalizer: Optional[RunningScaler] = None,
                    update_normalizer: bool = False, *, feature_mode: str = "engineered", normalize: bool = True):
     """Build identity-masked semantic, engineered, or raw state features."""
@@ -285,67 +430,16 @@ def build_features(state_vectors: Dict[int, StateVector], known_mean: Optional[n
             return raw, np.zeros(width, dtype=np.float32), np.ones(width, dtype=np.float32)
         return _normalize_feature_rows(raw, known_mean, known_scale, normalizer, update_normalizer)
 
-    key_ingredients = ["tomato", "onion", "mushroom", "rice", "meat", "chicken", "fish", "egg", "banana", "strawberries", "lettuce", "cheese", "garlic", "yoghurt", "milk", "oil"]
-    key_containers  = ["pot", "pan", "plate", "bowl"]
-    key_locations = ["prep_station", "cooking_station", "plating_station", "blending_station"]
-
-    feature_rows = []
-    for index in range(len(state_vectors)):
-        state = np.asarray(state_vectors[index], dtype=np.int32)
-        row: List[float] = []
-
-        # 1) Item density by location.
-        for location in LOCATIONS: row.append(sum(_safe_feat(state, f"{item}_at_{location}") for item in ITEMS))
-        # 2) Container-location anchors + composite counts.
-        container_anchors = [
-            ("pot", "cooking_station"), ("pot", "washing_station"), ("pan", "cooking_station"), ("pan", "washing_station"),
-            ("plate", "plating_station"), ("plate", "serving_station"), ("plate", "washing_station"),
-            ("bowl", "prep_station"), ("bowl", "cooking_station"), ("bowl", "plating_station"), ("bowl", "washing_station"),
-            ("glass", "blending_station"), ("glass", "serving_station"), ("glass", "washing_station"),
-            ("measuring_cup", "blending_station"), ("measuring_cup", "washing_station"),
-        ]
-        for container, location in container_anchors: row.append(_safe_feat(state, f"{container}_at_{location}"))
-        row.append(_safe_feat(state, "pot_at_cooking_station") + _safe_feat(state, "pan_at_cooking_station"))
-        row.append(sum(_safe_feat(state, f"{item}_at_prep_station")     for item in ITEMS))
-        row.append(sum(_safe_feat(state, f"{item}_at_blending_station") for item in ITEMS))
-        # 3) Containment aggregates.
-        total_contained = sum(_safe_feat(state, f"{container}_contains_{ingredient}") for container in CONTAINERS for ingredient in INGREDIENTS)
-        row.append(total_contained)
-        for container in CONTAINERS: row.append(sum(_safe_feat(state, f"{container}_contains_{ingredient}") for ingredient in INGREDIENTS))
-        row.append(sum(_safe_feat(state, f"{container}_contains_mixture") for container in CONTAINERS))
-        # 4) Processing features.
-        cut_values = [_safe_feat(state, f"{item}_cut")          for item in CUTTABLES]
-        cooked_values = [_safe_feat(state, f"{item}_cooked")    for item in COOKABLES]
-        if feature_mode == "engineered":
-            row.extend(cut_values)
-            row.extend(cooked_values)
-        total_cut =     sum(cut_values)
-        total_grated =  sum(_safe_feat(state, f"{item}_grated") for item in GRATABLE)
-        total_cooked =  sum(cooked_values)
-        total_seasoned= sum(_safe_feat(state, f"{item}_seasoned") for item in INGREDIENTS)
-        total_washed =  sum(_safe_feat(state, f"{item}_washed") for item in ITEMS)
-        row.extend([total_cut, total_grated, total_cooked, total_seasoned, total_washed])
-        if feature_mode == "engineered":
-            for ingredient in ["chicken", "fish", "mixture"]: row.append(_safe_feat(state, f"{ingredient}_seasoned"))
-        # 5) Tool and serving status.
-        for key in ["stove_on", "sink_on", "blender_on", "dish_served"]: row.append(_safe_feat(state, key))
-        # Literal identity is useful for the engineered representation but is deliberately absent from the transferable semantic reward.
-        if feature_mode == "engineered":
-            # 6) Key ingredient x location grid.
-            for ingredient in key_ingredients:
-                for location in key_locations: row.append(_safe_feat(state, f"{ingredient}_at_{location}"))
-            # 7) Key ingredient containment in key containers.
-            for container in key_containers:
-                for ingredient in key_ingredients: row.append(_safe_feat(state, f"{container}_contains_{ingredient}"))
-        # 8) Seasoning signatures.
-        for seasoning in SEASONINGS: row.append(sum(_safe_feat(state, f"{ingredient}_seasoned_with_{seasoning}") for ingredient in key_ingredients))
-        # 9) Interaction composites.
-        row.append(_safe_feat(state, "stove_on") * (_safe_feat(state, "pot_at_cooking_station") + _safe_feat(state, "pan_at_cooking_station")))
-        row.append(_safe_feat(state, "blender_on") * _safe_feat(state, "glass_at_blending_station"))
-        row.append(_safe_feat(state, "sink_on") * (_safe_feat(state, "plate_at_washing_station") + _safe_feat(state, "bowl_at_washing_station")))
-        feature_rows.append(row)
-
-    raw = np.asarray(feature_rows, dtype=np.float32)
+    # Integer accumulation, then a single float32 cast, so the result is
+    # identical to evaluating each term independently.
+    states = np.asarray([state_vectors[index] for index in range(len(state_vectors))], dtype=np.int64)
+    if states.ndim != 2: raise ValueError("state vectors must all have the same width")
+    _terms, plan = _PLANS[feature_mode]
+    if states.shape[1] != plan.matrix.shape[0]: raise ValueError(f"state width {states.shape[1]} does not match the feature schema width {plan.matrix.shape[0]}")
+    columns = states @ plan.matrix
+    for column, left, factors in plan.products:
+        columns[:, column] = states[:, left] * states[:, factors].sum(axis=1)
+    raw = columns.astype(np.float32)
     if not normalize:
         width = raw.shape[1] if raw.ndim == 2 else 0
         return raw, np.zeros(width, dtype=np.float32), np.ones(width, dtype=np.float32)
@@ -353,8 +447,20 @@ def build_features(state_vectors: Dict[int, StateVector], known_mean: Optional[n
 
 
 def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray, state_ids: Dict[StateVector, int], action_ids: Dict[str, int], settings: Settings, init_weights: Optional[np.ndarray] = None,
-                   demo_weights: Optional[Sequence[float]] = None, ewc_anchor: Optional[np.ndarray] = None, ewc_fisher: Optional[np.ndarray] = None, extra_transitions: Optional[Dict[Tuple[StateVector, str], StateVector]] = None):
-    """Importance-weighted MaxEnt IRL on the demonstrated state graph."""
+                   demo_weights: Optional[Sequence[float]] = None, ewc_anchor: Optional[np.ndarray] = None, ewc_fisher: Optional[np.ndarray] = None, extra_transitions: Optional[Dict[Tuple[StateVector, str], StateVector]] = None,
+                   rng: Optional[np.random.Generator] = None):
+    """Importance-weighted MaxEnt IRL on the demonstrated state graph.
+
+    The demonstrated graph is small and ragged (a few hundred states, a handful
+    of actions each), so it is held as one padded ``(rows, actions)`` grid and
+    the soft-Bellman sweep, the policy and the discounted occupancy are all
+    array operations over that grid.
+
+    ``rng`` supplies cold-start weight initialization. Callers pass the owning
+    agent's generator so one agent is one reproducible stream; omitting it
+    derives a fresh stream from ``settings.seed``.
+    """
+    if rng is None: rng = np.random.default_rng(int(settings.seed))
     n_states, n_features = features.shape
     n_actions = len(action_ids)
     if n_states == 0 or n_features == 0 or n_actions == 0:
@@ -364,8 +470,14 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
     weights = (np.ones(len(demonstrations), dtype=np.float32) if demo_weights is None else np.asarray(demo_weights, dtype=np.float32))
     if float(weights.sum()) <= 0.0: weights = np.ones(len(demonstrations), dtype=np.float32)
 
-    if init_weights is not None and init_weights.shape == (n_features):    reward_weights = init_weights.astype(np.float32).copy()
-    else:                                                                   reward_weights = settings.rng.standard_normal(n_features).astype(np.float32) * 0.1
+    # One predicate decides the initialization, the iteration budget, and the
+    # reported flag, so a warm start cannot be claimed while random weights are
+    # actually used. `(n_features,)` is a 1-tuple: without the comma this test
+    # compared a shape against an int and never held, which silently turned
+    # every warm retrain into a truncated random restart.
+    warm_start = init_weights is not None and init_weights.shape == (n_features,)
+    if warm_start:  reward_weights = init_weights.astype(np.float32).copy()
+    else:           reward_weights = rng.standard_normal(n_features).astype(np.float32) * 0.1
 
     state_action_pairs: set[Tuple[int, int]] = set()
     transitions: Dict[Tuple[int, int], int] = {}
@@ -401,81 +513,93 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
         for step, (state, _action) in enumerate(demo): empirical_features += (float(weights[index]) * (discount ** step) * features[state_ids[state]])
     empirical_features /= max(float(len(demonstrations)), 1.0)
 
-    def policy_loss(policy: Dict[int, Tuple[List[int], List[float]]]) -> float:
-        total = mass = 0.0
-        for demo, weight in zip(demonstrations, weights):
-            weight = max(0.0, float(weight))
-            if weight <= 0.0: continue
-            for state, action in demo:
-                state_id = state_ids[state]
-                action_id = action_ids[action]
-                actions, probs = policy.get(state_id, ([], []))
-                probability = next((max(float(prob), 1e-12) for candidate, prob in zip(actions, probs) if candidate == action_id), 1e-12)
-                total -= weight * math.log(probability)
-                mass += weight
-        return total / max(mass, 1e-9)
+    # --- padded (row, action) grid over the states that have a policy ---------
+    policy_states = sorted(action_ids_by_state)
+    n_rows = len(policy_states)
+    grid_width = max(len(action_ids_by_state[state_id]) for state_id in policy_states)
+    row_of_state = {state_id: row for row, state_id in enumerate(policy_states)}
+    row_states = np.asarray(policy_states, dtype=np.intp)
+    grid_actions = np.full((n_rows, grid_width), -1, dtype=np.intp)
+    grid_next = np.zeros((n_rows, grid_width), dtype=np.intp)
+    grid_valid = np.zeros((n_rows, grid_width), dtype=bool)
+    for row, state_id in enumerate(policy_states):
+        for column, action_id in enumerate(action_ids_by_state[state_id]):
+            grid_actions[row, column] = action_id
+            grid_valid[row, column] = True
+            # A pair with no recorded successor contributes only its own reward,
+            # which is what routing it to the zero-reward sink reproduces.
+            grid_next[row, column] = transitions.get((state_id, action_id), sink_state_id)
+    grid_column_of = {(policy_states[row], int(grid_actions[row, column])): (row, column)
+                      for row in range(n_rows) for column in range(grid_width) if grid_valid[row, column]}
+    # Expert (row, column) index arrays for the weighted log-loss.
+    expert_rows: List[int] = []
+    expert_columns: List[int] = []
+    expert_weights: List[float] = []
+    for index, demo in enumerate(demonstrations):
+        weight = max(0.0, float(weights[index]))
+        if weight <= 0.0: continue
+        for state, action in demo:
+            row, column = grid_column_of[(state_ids[state], action_ids[action])]
+            expert_rows.append(row)
+            expert_columns.append(column)
+            expert_weights.append(weight)
+    expert_row_index = np.asarray(expert_rows, dtype=np.intp)
+    expert_column_index = np.asarray(expert_columns, dtype=np.intp)
+    expert_weight = np.asarray(expert_weights, dtype=np.float64)
+    expert_mass = float(expert_weight.sum())
 
-    def expected_features(policy: Dict[int, Tuple[List[int], List[float]]]) -> Tuple[np.ndarray, int]:
-        expected_features_vector = np.zeros(n_features, dtype=np.float32)
-        update_count = 0
-        normalizer = max(float(len(demonstrations)), 1.0)
-        for demo_index, start in enumerate(start_states):
-            weight = max(0.0, float(weights[demo_index])) / normalizer
-            if weight <= 0.0: continue
-            occupancy: Dict[int, float] = {start: 1.0}
-            step_discount = 1.0
-            for _step in range(int(settings.irl_horizon)):
-                next_occupancy: Dict[int, float] = {}
-                for state_id, state_mass in occupancy.items():
-                    if state_mass <= 0.0: continue
-                    update_count += 1
-                    if state_id < n_states: expected_features_vector += (weight * step_discount * float(state_mass) * features[state_id])
-                    actions, probs = policy.get(state_id, ([], []))
-                    for action_id, probability in zip(actions, probs):
-                        if action_id == deviation_action_id: continue
-                        next_state = transitions.get((state_id, action_id))
-                        if next_state is None: continue
-                        next_occupancy[next_state] = (next_occupancy.get(next_state, 0.0) + float(state_mass) * float(probability))
-                if not next_occupancy: break
-                occupancy = next_occupancy
-                step_discount *= discount
-        return expected_features_vector, update_count
+    temperature = max(float(settings.irl_temperature), 1e-8)
+    iterations = int(settings.irl_warm_steps if warm_start else settings.irl_cold_steps)
+    horizon = int(settings.irl_horizon)
+    demo_mass = np.maximum(weights.astype(np.float64), 0.0) / max(float(len(demonstrations)), 1.0)
+    start_rows = np.asarray(start_states, dtype=np.intp)
 
-    temperature = float(settings.irl_temperature)
-    iterations = int(settings.irl_warm_steps if init_weights is not None else settings.irl_cold_steps)
-    rewards = features @ reward_weights
-    values = rewards.copy()
-    q_values: Dict[Tuple[int, int], float] = {}
+    def soft_backup(rewards: np.ndarray, values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """One soft-Bellman backup over the whole grid."""
+        base = rewards[row_states].astype(np.float64)
+        q_grid = base[:, None] + discount * values[grid_next].astype(np.float64)
+        peak = np.where(grid_valid, q_grid, -np.inf).max(axis=1)
+        mass = np.where(grid_valid, np.exp((q_grid - peak[:, None]) / temperature), 0.0).sum(axis=1)
+        updated = rewards.copy()
+        updated[row_states] = peak + temperature * np.log(np.maximum(mass, 1e-12))
+        return updated, q_grid
+
+    def converge_values(rewards: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
+        values = rewards.copy()
+        q_grid = np.zeros((n_rows, grid_width), dtype=np.float64)
+        sweeps = 0
+        for _sweep in range(50):
+            sweeps += 1
+            updated, q_grid = soft_backup(rewards, values)
+            gap = float(np.max(np.abs(updated - values)))
+            values = updated
+            if gap < 1e-6: break
+        return values, q_grid, sweeps
+
+    def grid_policy(q_grid: np.ndarray) -> np.ndarray:
+        peak = np.where(grid_valid, q_grid, -np.inf).max(axis=1)
+        weight_grid = np.where(grid_valid, np.exp((q_grid - peak[:, None]) / temperature), 0.0)
+        total = weight_grid.sum(axis=1, keepdims=True)
+        return weight_grid / np.where(total > 0.0, total, 1.0)
+
     best_weights = reward_weights.copy()
     best_loss = float("inf")
     best_gradient_norm = float("inf")
     stale_steps = 0
     momentum = np.zeros(n_features, dtype=np.float32)
     iterations_run = value_sweeps = occupancy_updates = 0
+    ewc_active = ewc_anchor is not None and ewc_fisher is not None
 
     for iteration in range(iterations):
         iterations_run = iteration + 1
         learning_rate = float(settings.irl_learning_rate) * (0.97 ** (stale_steps // 20))
         rewards = features @ reward_weights
-        for _sweep in range(50):
-            value_sweeps += 1
-            updated = rewards.copy()
-            for state_id, action_id in state_action_pairs:
-                next_state = transitions.get((state_id, action_id))
-                q_values[(state_id, action_id)] = float(rewards[state_id]) + (discount * float(values[next_state]) if next_state is not None else 0.0)
-            for state_id in action_ids_by_state:
-                q_values[(state_id, deviation_action_id)] = (float(rewards[state_id]) + discount * float(values[sink_state_id]))
-            for state_id, actions in action_ids_by_state.items():
-                updated[state_id] = _soft_value([q_values.get((state_id, action), rewards[state_id]) for action in actions], temperature)
-            value_gap = float(np.max(np.abs(updated - values)))
-            values = updated
-            if value_gap < 1e-6: break
+        values, q_grid, sweeps = converge_values(rewards)
+        value_sweeps += sweeps
+        policy = grid_policy(q_grid)
 
-        policy: Dict[int, Tuple[List[int], List[float]]] = {}
-        for state_id, actions in action_ids_by_state.items():
-            values_at_actions = [q_values.get((state_id, action), rewards[state_id]) for action in actions]
-            policy[state_id] = (actions, _softmax_probs(values_at_actions, temperature))
-        current_loss = policy_loss(policy)
+        probabilities = policy[expert_row_index, expert_column_index]
+        current_loss = float(-(expert_weight * np.log(np.maximum(probabilities, 1e-12))).sum() / max(expert_mass, 1e-9))
         if current_loss < best_loss:
             best_loss = current_loss
             best_weights = reward_weights.copy()
@@ -483,46 +607,52 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
         else:
             stale_steps += 1
 
-        expected_features_vector, update_count = expected_features(policy)
-        occupancy_updates += update_count
+        # Discounted occupancy. Occupancy is linear in the start distribution
+        # and the dynamics are shared, so the per-demonstration walks pool into
+        # one weighted vector: sum_d w_d (occ_d @ T) == (sum_d w_d occ_d) @ T.
+        # The deviation action absorbs into the zero-reward sink and therefore
+        # leaks its mass, exactly as the per-state walk did.
+        transition_mass = np.where(grid_valid & (grid_actions != deviation_action_id), policy, 0.0)
+        pooled = np.zeros(n_states + 1, dtype=np.float64)
+        np.add.at(pooled, start_rows, demo_mass)
+        expected_features_vector = np.zeros(n_features, dtype=np.float32)
+        step_discount = 1.0
+        for _step in range(horizon):
+            occupancy_updates += int(np.count_nonzero(pooled))
+            expected_features_vector += (step_discount * pooled[:n_states] @ features[:n_states]).astype(np.float32)
+            contribution = pooled[row_states][:, None] * transition_mass
+            next_pooled = np.zeros_like(pooled)
+            np.add.at(next_pooled, grid_next.reshape(-1), contribution.reshape(-1))
+            if not next_pooled.any(): break
+            pooled = next_pooled
+            step_discount *= discount
+
         gradient = empirical_features - expected_features_vector - float(settings.irl_l2) * reward_weights
-        if ewc_anchor is not None and ewc_fisher is not None:
+        if ewc_active:
             size = min(len(reward_weights), len(ewc_anchor), len(ewc_fisher))
             if size: gradient[:size] -= (float(settings.ewc_strength) * ewc_fisher[:size].astype(np.float32) * (reward_weights[:size] - ewc_anchor[:size].astype(np.float32)))
         best_gradient_norm = min(best_gradient_norm, float(np.linalg.norm(gradient)))
         momentum = 0.9 * momentum + 0.1 * gradient
-        reward_weights += learning_rate * momentum
+        reward_weights = reward_weights + learning_rate * momentum
         if stale_steps > 60: break
 
     best_rewards = features @ best_weights
-    best_values = best_rewards.copy()
-    best_q_values: Dict[Tuple[int, int], float] = {}
-    final_value_sweeps = 0
-    for _sweep in range(50):
-        final_value_sweeps += 1
-        updated = best_rewards.copy()
-        for state_id, action_id in state_action_pairs:
-            next_state = transitions.get((state_id, action_id))
-            best_q_values[(state_id, action_id)] = float(best_rewards[state_id]) + (discount * float(best_values[next_state]) if next_state is not None else 0.0)
-        for state_id in action_ids_by_state:
-            best_q_values[(state_id, deviation_action_id)] = (float(best_rewards[state_id]) + discount * float(best_values[sink_state_id]))
-        for state_id, actions in action_ids_by_state.items():
-            updated[state_id] = _soft_value([best_q_values.get((state_id, action), best_rewards[state_id]) for action in actions], temperature)
-        value_gap = float(np.max(np.abs(updated - best_values)))
-        best_values = updated
-        if value_gap < 1e-6: break
+    best_values, best_q_grid, final_value_sweeps = converge_values(best_rewards)
 
     policy_actions = {state_id: [action for action in actions if action != deviation_action_id] for state_id, actions in action_ids_by_state.items()}
-    policy_q_values = {key: value for key, value in best_q_values.items() if key[1] != deviation_action_id}
+    policy_q_values: Dict[Tuple[int, int], float] = {}
+    for (state_id, action_id), (row, column) in grid_column_of.items():
+        if action_id == deviation_action_id: continue
+        policy_q_values[(state_id, action_id)] = float(best_q_grid[row, column])
+    deviation_column = {row: column for (state_id, action_id), (row, column) in grid_column_of.items() if action_id == deviation_action_id}
     deviation_margins: List[float] = []
     for demo in demonstrations:
         for state, action in demo:
             if action == "stop": continue
-            state_id = state_ids[state]
-            action_id = action_ids[action]
-            expert_q_value = best_q_values.get((state_id, action_id))
-            deviation_q_value = best_q_values.get((state_id, deviation_action_id))
-            if expert_q_value is not None and deviation_q_value is not None: deviation_margins.append(float(expert_q_value) - float(deviation_q_value))
+            row, column = grid_column_of[(state_ids[state], action_ids[action])]
+            deviation = deviation_column.get(row)
+            if deviation is None: continue
+            deviation_margins.append(float(best_q_grid[row, column]) - float(best_q_grid[row, deviation]))
     if deviation_margins:
         deviation_margin_min = float(min(deviation_margins))
         deviation_margin_mean = float(sum(deviation_margins) / len(deviation_margins))
@@ -537,8 +667,8 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
             "n_policy_state_actions": float(sum(len(row) for row in action_ids_by_state.values())), "n_transition_edges": float(len(transitions)), "n_extra_transition_edges": float(len(extra_transitions or {})),
             "iterations_requested": float(iterations), "iterations_run": float(iterations_run), "value_sweeps": float(value_sweeps), "final_value_sweeps": float(final_value_sweeps), "occupancy_updates": float(occupancy_updates),
             "occupancy_method": "finite_horizon_dp", "best_demo_log_loss": float(best_loss), "best_gradient_norm": float(best_gradient_norm), "deviation_margin_n": float(len(deviation_margins)),
-            "deviation_margin_min": deviation_margin_min, "deviation_margin_mean": deviation_margin_mean, "deviation_margin_negative_frac": deviation_margin_negative_frac, "warm_start": 1.0 if init_weights is not None else 0.0,
-            "ewc_enabled": 1.0 if ewc_anchor is not None and ewc_fisher is not None else 0.0}
+            "deviation_margin_min": deviation_margin_min, "deviation_margin_mean": deviation_margin_mean, "deviation_margin_negative_frac": deviation_margin_negative_frac, "warm_start": 1.0 if warm_start else 0.0,
+            "ewc_enabled": 1.0 if ewc_active else 0.0}
     stats["estimated_flops"] = _estimate_maxent_flops(stats)
     return (best_weights.astype(np.float32), best_rewards[:n_states], best_values[:n_states], policy_q_values, policy_actions, stats)
 
@@ -591,9 +721,11 @@ def _estimate_maxent_flops(stats: Mapping[str, Any]) -> float:
 class MaxEntIrl:
     """Tested replay-weighted MaxEnt IRL on demonstrated transitions."""
 
-    def __init__(self, settings: Settings = DEFAULT_SETTINGS, domain: Optional[DomainAdapter] = None):
+    def __init__(self, settings: Settings = DEFAULT_SETTINGS, domain: Optional[DomainAdapter] = None, rng: Optional[np.random.Generator] = None):
         self.settings = settings
         self.domain = domain or default_domain()
+        # Assigned before reset() so a re-fit after reset keeps the same stream.
+        self.init_rng = rng if rng is not None else np.random.default_rng(int(settings.seed))
         self.reset()
 
     def reset(self) -> None:
@@ -608,7 +740,11 @@ class MaxEntIrl:
         self.action_ids:        Dict[str, int] = {}
         self.values:            Optional[np.ndarray] = None
         self.q_values:          Dict[Tuple[int, int], float] = {}
+        # Demonstrated (state, action) -> successor, mirroring the graph the fit
+        # actually optimizes over. Consumed by the Fisher estimator.
+        self.transitions:       Dict[Tuple[StateVector, str], StateVector] = {}
         self.last_prediction_stats: Dict[str, Any] = {}
+        self.last_fisher_stats: Dict[str, Any] = {}
         self._fallback_counts = (0, 0, 0)  # attempted, accepted, rejected
         self._last_exact_learned_action_count = 0
         self.latent_strategy =  LatentStrategyResidual(self.settings, domain=self.domain)
@@ -641,6 +777,13 @@ class MaxEntIrl:
             unique_actions=actions,
         )
         extra_transitions = self._expand_actions(demonstrations)
+        self.transitions = {
+            (state, action): demo[index + 1][0]
+            for demo in demonstrations
+            for index, (state, action) in enumerate(demo)
+            if index + 1 < len(demo)
+        }
+        self.transitions.update(extra_transitions)
         for next_state in extra_transitions.values():
             if next_state not in self.state_ids:
                 index = len(self.state_ids)
@@ -654,7 +797,8 @@ class MaxEntIrl:
         if self.settings.semantic_fallback_enabled: semantic_features, _, _ = self.domain.semantic_features(self.state_vectors, normalize=False)
         initial_weights = (self.reward_weights if self.reward_weights is not None and self.reward_weights.shape == (features.shape[1],) else None)
         (reward_weights, _reward_values, values, q_values, _action_ids_by_state, stats) = fit_maxent_irl(
-            demonstrations, features, self.state_ids, self.action_ids, self.settings, init_weights=initial_weights, demo_weights=demo_weights, ewc_anchor=ewc_anchor, ewc_fisher=ewc_fisher, extra_transitions=extra_transitions)
+            demonstrations, features, self.state_ids, self.action_ids, self.settings, init_weights=initial_weights, demo_weights=demo_weights, ewc_anchor=ewc_anchor, ewc_fisher=ewc_fisher, extra_transitions=extra_transitions,
+            rng=self.init_rng)
         self.reward_weights = reward_weights.astype(np.float32)
         self.features = features
         self.feature_mean = mean
@@ -778,23 +922,93 @@ class MaxEntIrl:
         score = self.latent_strategy.score(corrected_prefix, candidates, decision_prefix=corrected_prefix[:-1])
         return self.latent_strategy.supports_correction(actual, predicted)
 
+    def _successor_features(self, state: StateVector, action: str) -> np.ndarray:
+        """Return phi(s') for a state-action, or the zero-reward sink row.
+
+        ``fit_maxent_irl`` routes any pair without a recorded successor to an
+        absorbing zero-feature sink, so an unrecorded edge contributes a zero
+        row here for exactly the same reason.
+        """
+        assert self.features is not None
+        successor = self.transitions.get((tuple(state), str(action)))
+        if successor is None: return np.zeros(self.features.shape[1], dtype=np.float32)
+        successor_id = self.state_ids.get(successor)
+        if successor_id is None or successor_id >= len(self.features): return np.zeros(self.features.shape[1], dtype=np.float32)
+        return self.features[successor_id]
+
     def fisher(self, trajectories: Sequence[Demonstration], demo_weights: Optional[Sequence[float]] = None) -> Optional[np.ndarray]:
+        """Diagonal empirical Fisher of the softmax policy's log-likelihood.
+
+        The quantity EWC needs is the curvature of ``log pi(a|s)`` in the reward
+        weights, not the magnitude of the state features.  Writing
+        ``Q(s,a) = w.phi(s) + gamma V(s'_a)`` and linearizing one step
+        (``dQ/dw ~= phi(s) + gamma phi(s'_a)``, dropping the recursive tail of
+        ``dV/dw``), the score of the softmax policy is
+
+            d log pi(a|s) / dw  ~=  (gamma / T) * [ phi(s'_a) - E_pi phi(s'_.) ]
+
+        because the state's own ``phi(s)`` is common to every action and cancels
+        in the centering.  The diagonal empirical Fisher is the replay-weighted
+        mean of that score squared.  The candidate set includes the deviation
+        action (``Q = w.phi(s)`` with a zero-feature successor) so that a state
+        with a single demonstrated action still carries curvature, matching the
+        action set the fit itself normalizes over.
+
+        A state whose successor features coincide with the policy mean
+        contributes nothing: EWC then protects only the directions in which the
+        policy's action choice is actually sensitive to the reward weights.
+        """
         if self.reward_weights is None or self.features is None: return None
+        n_features = int(self.features.shape[1])
         sample_weights = ([1.0] * len(trajectories) if demo_weights is None else list(demo_weights))
-        fisher = np.zeros(len(self.reward_weights), dtype=np.float32)
+        temperature = max(float(self.settings.irl_temperature), 1e-8)
+        discount = float(self.settings.irl_discount)
+        fisher = np.zeros(n_features, dtype=np.float64)
         total = 0.0
+        n_visits = n_degenerate = 0
+        # Candidate actions per state, cached across repeated visits.
+        candidates_by_state: Dict[int, Tuple[str, ...]] = {}
         for trajectory, weight in zip(trajectories, sample_weights):
             weight = float(weight)
             if weight <= 0.0: continue
-            for state, _action in trajectory:
+            for state, action in trajectory:
                 state_id = self.state_ids.get(state)
                 if state_id is None or state_id >= len(self.features): continue
-                feature = self.features[state_id]
-                fisher += weight * feature * feature
+                if state_id not in candidates_by_state:
+                    candidates_by_state[state_id] = tuple(sorted(
+                        name for name, action_id in self.action_ids.items()
+                        if (state_id, action_id) in self.q_values
+                    ))
+                candidates = candidates_by_state[state_id]
+                if action not in candidates: continue
+                # Deviation action: Q = reward(s) because the sink is zero-valued.
+                state_reward = float(self.features[state_id] @ self.reward_weights)
+                q_values = [float(self.q_values[(state_id, self.action_ids[name])]) for name in candidates]
+                q_values.append(state_reward)
+                probabilities = np.asarray(_softmax_probs(q_values, temperature), dtype=np.float64)
+                successors = np.vstack([
+                    *(self._successor_features(state, name) for name in candidates),
+                    np.zeros(n_features, dtype=np.float32),
+                ]).astype(np.float64)
+                mean_successor = probabilities @ successors
+                taken = successors[candidates.index(action)]
+                score = (discount / temperature) * (taken - mean_successor)
+                fisher += weight * score * score
                 total += weight
+                n_visits += 1
+                n_degenerate += int(not np.any(score))
         if total > 0.0: fisher /= total
         fisher_cap = float(self.settings.fisher_cap)
-        return np.clip(fisher, 0.0, fisher_cap).astype(np.float32)
+        capped = np.clip(fisher, 0.0, fisher_cap).astype(np.float32)
+        self.last_fisher_stats = {
+            "fisher_estimator": "diagonal_empirical_fisher_one_step_q_linearization",
+            "fisher_scored_visits": float(n_visits),
+            "fisher_zero_score_visits": float(n_degenerate),
+            "fisher_nonzero_features": float(int(np.count_nonzero(capped))),
+            "fisher_mean": float(capped.mean()) if capped.size else 0.0,
+            "fisher_max": float(capped.max()) if capped.size else 0.0,
+        }
+        return capped
 
 
 def top_probability_tie_size(distribution: Mapping[str, float]) -> int:

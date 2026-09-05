@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
-from .adaptive_agent import AdaptiveAgent, BASELINE_TRAIN_POLICY, MODE_ONLINE, StepResult
+from .adaptive_agent import ACTION_MASK_CONTRACT, AdaptiveAgent, BASELINE_TRAIN_POLICY, MODE_ONLINE, StepResult
 from .domain import DomainAdapter, default_domain
 from .memory import MatchResult, ReplayMemory, StateTransition, MemoryItem, VariantKey
 from .models import (Settings, DEFAULT_SETTINGS, Demonstration, RunningScaler, index_demos)
@@ -21,12 +21,6 @@ class ReplayItem:
     ordering: Tuple[str, ...]
     transitions: Tuple[StateTransition, ...] = ()
     key: Optional[VariantKey] = None
-
-
-def _symbolic_fit_stats(model_family: str, trajectories: Sequence[Demonstration], estimated_flops: float = 0.0) -> Dict[str, object]:
-    n_examples = sum(1 for demo in trajectories for _state, action in demo if action != "stop")
-    n_actions = len({action for demo in trajectories for _state, action in demo if action != "stop"})
-    return {"model_family": model_family, "estimated_flops": float(estimated_flops), "n_demonstrations": float(len(trajectories)), "n_examples": float(n_examples), "n_actions": float(n_actions), "flop_accounting_scope": f"{model_family}_fit_symbolic_counter_only", "flop_cross_model_comparable": False}
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -166,8 +160,8 @@ class BehaviorCloner:
 
         learning_rate = float(self.settings.bc_learning_rate)
         l2_penalty = float(self.settings.bc_l2)
-        batch_size = max(1, int(getattr(self.settings, "bc_batch", 64)))
-        rng = np.random.default_rng(int(getattr(self.settings, "seed", 1337)))
+        batch_size = max(1, int(self.settings.bc_batch))
+        rng = np.random.default_rng(int(self.settings.seed))
         indices = np.arange(len(targets), dtype=np.int64)
 
         for _ in range(max(1, epochs)):
@@ -281,7 +275,7 @@ class FrozenAgent(BaselineAgent):
             "entropy_basis": "prediction_support", "predictor": source or "maxent", "final_confidence": confidence, "final_margin": margin, "final_entropy": entropy, "reason": reason}
 
     def policy_stats(self) -> Dict[str, Any]:
-        if self._deployment_locked: return {**dict(self._deployment_action_policy), **dict(self._last_action_mask_stats), **dict(getattr(self.maxent, "last_prediction_stats", {}) or {})}
+        if self._deployment_locked: return {**ACTION_MASK_CONTRACT, **dict(self._deployment_action_policy), **dict(self._last_action_mask_stats), **dict(getattr(self.maxent, "last_prediction_stats", {}) or {})}
         return super().policy_stats()
 
     def start_demo(self) -> None:
@@ -379,19 +373,70 @@ class BehaviorCloningAgent(BaselineAgent):
         self.cloner = BehaviorCloner(settings=self.settings, domain=self.domain)
 
     def audit_pruning(self, max_prefixes: int = 24, tolerance: float = 5e-2) -> Dict[str, object]:
-        entries = self.replay.active_items()
-        if not entries: return {"max_l1": 0.0, "mean_l1": 0.0, "n_prefixes": 0, "passed": True, "tolerance": float(tolerance), "model_family": "behavior_cloning"}
-        weights = self._demo_weights(entries, [float(entry.weight) for entry in entries])
-        trajectories, _ = self._build_demos(entries)
-        fresh_cloner = BehaviorCloner(settings=self.settings, domain=self.domain)
-        fresh_cloner.fit(trajectories, weights)
-        return self._compare_policies(entries,lambda state, prefix: self.cloner.predict(state, prefix), lambda state, prefix: fresh_cloner.predict(state, prefix), max_prefixes=max_prefixes, tolerance=tolerance, model_family="behavior_cloning")
+        """Behaviour-cloning form of the audit in AdaptiveAgent.
 
-    def predict_actions(self, prefix=None) -> Dict[str, float]:
+        Same three quantities and the same key names, so the arms are directly
+        comparable. Cloner fits are deterministic, so ``deployed_path_dependence``
+        is structurally zero here rather than merely small.
+        """
+        entries = self.replay.active_items()
+        pruned_records = list(self.replay.pruned.values())
+        active_keys = {entry.key for entry in entries}
+        pruned_keys = {record.key for record in pruned_records}
+        inputs_verified = not (active_keys & pruned_keys)
+        base: Dict[str, object] = {"passed": bool(inputs_verified), "active_only_training_inputs_verified": bool(inputs_verified),
+                "comparison": "cold_active_vs_cold_active_plus_pruned", "model_family": "behavior_cloning",
+                "n_active_variants": len(entries), "n_pruned_variants": len(pruned_records), "tolerance": float(tolerance)}
+        if not entries:
+            return {**base, "max_l1": 0.0, "mean_l1": 0.0, "n_prefixes": 0, "pruned_available": False,
+                    "redundancy_max_l1": 0.0, "redundancy_mean_l1": 0.0,
+                    "deployed_path_dependence_max_l1": 0.0, "deployed_path_dependence_mean_l1": 0.0}
+
+        def cold_fit(records, record_weights) -> BehaviorCloner:
+            trajectories, _dropped = self._build_demos(records)
+            cloner = BehaviorCloner(settings=self.settings, domain=self.domain)
+            cloner.fit(trajectories, self._demo_weights(records, record_weights))
+            return cloner
+
+        active_reference = cold_fit(entries, [float(entry.weight) for entry in entries])
+        path_dependence = self._compare_policies(entries, lambda state, prefix: self.cloner.predict(state, prefix), lambda state, prefix: active_reference.predict(state, prefix),
+            max_prefixes=max_prefixes, tolerance=tolerance)
+        deployed = {"deployed_path_dependence_max_l1": float(path_dependence["max_l1"]),
+                    "deployed_path_dependence_mean_l1": float(path_dependence["mean_l1"])}
+
+        if not pruned_records:
+            return {**base, **deployed, "max_l1": 0.0, "mean_l1": 0.0, "n_prefixes": int(path_dependence["n_prefixes"]),
+                    "pruned_available": False, "redundancy_max_l1": 0.0, "redundancy_mean_l1": 0.0}
+
+        combined = list(entries) + pruned_records
+        restored_reference = cold_fit(combined, [float(entry.weight) for entry in entries] + [1.0] * len(pruned_records))
+        redundancy = self._compare_policies(entries, lambda state, prefix: active_reference.predict(state, prefix), lambda state, prefix: restored_reference.predict(state, prefix),
+            max_prefixes=max_prefixes, tolerance=tolerance)
+        return {**base, **deployed, **redundancy, "pruned_available": True,
+                "redundancy_max_l1": float(redundancy["max_l1"]), "redundancy_mean_l1": float(redundancy["mean_l1"])}
+
+    def predict_actions(
+        self,
+        prefix=None,
+        *,
+        state=None,
+        actor_id: int = 0,
+        action_universe=None,
+    ) -> Dict[str, float]:
+        """Use the same state and action mask interface as every other arm."""
         prefix_actions = list(prefix) if prefix is not None else list(self.current_prefix)
-        state = self._replay_prefix(prefix_actions)
-        distribution = self.cloner.predict(state, prefix_actions)
-        distribution = self._apply_shared_action_mask(state, distribution)
+        encoded_state = (
+            self._replay_prefix(prefix_actions)
+            if state is None else self.domain.state_key(state, actor_id=actor_id)
+        )
+        distribution = self.cloner.predict(encoded_state, prefix_actions)
+        if action_universe is not None:
+            allowed = set(map(str, action_universe))
+            distribution = {
+                action: probability for action, probability in distribution.items()
+                if action in allowed
+            }
+        distribution = self._apply_shared_action_mask(encoded_state, distribution)
         if distribution:
             confidence, entropy, _margin = self._prediction_stats(distribution)
             self._set_policy_stats(confidence, entropy, "baseline_policy")
@@ -429,9 +474,17 @@ class EwcAgent(BaselineAgent):
         else: self._pending_demos.append({"ordering": tuple(ordering), "transitions": tuple(transitions)})
 
     @staticmethod
-    def _estimate_fisher_flops(trajectories: Sequence[Demonstration], feature_count: int) -> float:
+    def _estimate_fisher_flops(trajectories: Sequence[Demonstration], feature_count: int, mean_candidates: float = 2.0) -> float:
+        """Cost of the diagonal empirical Fisher.
+
+        Per demonstrated visit the estimator forms a policy-weighted mean over
+        ``mean_candidates`` successor feature rows, subtracts it from the taken
+        row, then squares and accumulates: roughly ``2*k + 4`` feature-width
+        operations rather than the 3 the feature-second-moment version needed.
+        """
         state_visits = sum(len(demo) for demo in trajectories)
-        return float(3.0 * max(0, state_visits) * max(1, int(feature_count)))
+        per_visit = 2.0 * max(1.0, float(mean_candidates)) + 4.0
+        return float(per_visit * max(0, state_visits) * max(1, int(feature_count)))
 
     def _record_costs(self, auxiliary_stats: Dict[str, Any], fisher_flops: float) -> None:
         primary_stats = dict(getattr(self.maxent, "last_fit_stats", {}) or {})
@@ -464,7 +517,9 @@ class EwcAgent(BaselineAgent):
         else:
             task_trajectories = list(trajectories)
             task_weights = [float(w) for w in weights]
-        task_maxent = type(self.maxent)(settings=self.settings, domain=self.domain)
+        # Same stream as the primary model, so the auxiliary fit consumes
+        # initializations in the agent's single reproducible sequence.
+        task_maxent = type(self.maxent)(settings=self.settings, domain=self.domain, rng=self._init_rng)
         task_maxent.fit(task_trajectories,task_weights, ewc_anchor=self._anchor, ewc_fisher=self._fisher)
         auxiliary_stats = dict(getattr(task_maxent, "last_fit_stats", {}) or {})
         if task_maxent.reward_weights is None:
@@ -475,6 +530,7 @@ class EwcAgent(BaselineAgent):
         fisher_flops = self._estimate_fisher_flops(task_trajectories, int(new_reward_weights.shape[0]))
         new_fisher = task_maxent.fisher(task_trajectories, task_weights)
         self._record_costs(auxiliary_stats, fisher_flops)
+        self._custom_fit_stats.update(dict(getattr(task_maxent, "last_fisher_stats", {}) or {}))
         if new_fisher is None: return
         new_fisher = new_fisher.astype(np.float32)
 
@@ -500,7 +556,7 @@ class ReplayBcAgent(BehaviorCloningAgent):
         super().__init__(settings=settings, **kwargs)
         self._buffer: List[ReplayItem] = []
         self._seen: int = 0
-        self._rng = random.Random(getattr(settings, "seed", 1337))
+        self._rng = random.Random(int(self.settings.seed))
 
     def predictor_name(self) -> str:
         return "experience_replay_behavior_cloning"
@@ -546,6 +602,10 @@ class ReplayBcAgent(BehaviorCloningAgent):
         demos = self._rng.sample(eligible, k)
         build_t0 = time.perf_counter()
         trajectories, dropped_total = self._build_demos(demos)
+        # This arm fits from its own sampled buffer rather than active replay,
+        # so it must index the decision regimes from the same trajectories it
+        # actually trained on, or its decisions would look uniformly unseen.
+        self._index_observed_actions(trajectories)
         build_wall_s = time.perf_counter() - build_t0
         base_weights = [float(self.replay.active[record.key].weight) if record.key in self.replay.active else 1.0 for record in demos]
         weights = self._demo_weights(demos, base_weights)
@@ -554,6 +614,7 @@ class ReplayBcAgent(BehaviorCloningAgent):
         self._fit_predictors(trajectories, weights, warm_start=False, records=demos)
         fit_wall_s = time.perf_counter() - fit_t0
         self._log_training(dropped_actions=dropped_total, active_demos=len(demos), total_wall_s=time.perf_counter() - retrain_t0, build_wall_s=build_wall_s, fit_wall_s=fit_wall_s, flop_estimate=self._estimate_flops(trajectories))
+
 
 BASELINE_AGENTS = {
     "frozen": FrozenAgent,

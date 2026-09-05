@@ -1,0 +1,18 @@
+{
+  "calibration_id": "YYYYMMDD-stretch3-site-v1",
+  "date_utc": "",
+  "robot_id": "",
+  "d405_serial": "",
+  "operator": "",
+  "apparatus_revision": "",
+  "config_file": "lab_site.json",
+  "station_heading_trials_deg": {},
+  "reference_marker_pose_trials_by_station_m": {},
+  "slot_pose_trials": {},
+  "marker_quality_trials": {},
+  "object_grasp_trials": {},
+  "canonical_return_trials_deg": [],
+  "fault_injection_results": {},
+  "acceptance_thresholds_frozen_before_test": {},
+  "notes": ""
+}
