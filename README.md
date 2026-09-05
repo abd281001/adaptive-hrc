@@ -92,6 +92,37 @@ protocol used by the symbolic evaluation. Its sole publication experiment is
 removed. `HRC.ipynb` remains a thin ordered launcher: all cooking settings,
 validation, checkpoints, and reporting stay in the wrapper.
 
+### Stretch 3 real-robot interface
+
+The repository also includes an operator-mediated Stretch 3 interface for a
+reduced marker-object task. Both learner and hardware processes run locally on
+the robot, but the Stretch SDK remains isolated behind a loopback bridge so it
+does not alter the normal `venv`. Start with a motion-disabled dry run:
+
+```bash
+./hrc robot-bridge
+./hrc robot-ui --hardware-url http://127.0.0.1:9100
+```
+
+The operator UI requires explicit approval before every robot action. A
+hardware transition reaches replay memory only after completion is confirmed.
+The Stretch/D405/ArUco motion runtime is self-contained under
+`src/real_robot/stretch_runtime`; deployment does not require the prior lab
+demo directory.
+The sample station geometry is intentionally uncalibrated and cannot enable
+motion. See [`docs/real_robot.md`](docs/real_robot.md) for the architecture,
+calibration checklist, remote-GUI options, safety gates, and robot commands.
+Use `./hrc robot-doctor` for a read-only deployment preflight and
+`./hrc robot-report RUN_DIRECTORY` for an integrity/outcome summary. Live UI
+startup requires the explicit `--require-motion` handshake, a matching full
+configuration digest, and a ready motion-enabled bridge.
+Publication collection additionally requires `--publication-run` and
+`--schedule PARTICIPANT.json`; its report validates the frozen schedule, calibration and
+runtime artifacts, per-episode metadata/postconditions, and shadow baselines.
+Uncalibrated supervised hardware trials use the isolated
+`./hrc robot-calibration-probe` path; a calibration-mode bridge is rejected by
+the experiment UI.
+
 ## Experiment design
 
 - Three scenarios cover homogeneous deployment, heterogeneous deployment, and
@@ -334,6 +365,8 @@ terminal prints one concise line per LLM event and at Full phase boundaries.
 - `src/ablations.py`: matcher, routing, and latent-strategy diagnostics.
 - `src/plotting.py`: figures and paired holdout inference.
 - `src/hrc_simulation.py`: alternating human–robot interaction simulator.
+- `src/real_robot/`: physical task domain, live protocol, operator UI, and local Stretch bridge.
+- `robot_configs/stretch3_lab.json`: uncalibrated five-station pilot catalog and marker map.
 - `src/llm_baseline.py`: optional frozen in-context action predictor.
 - `burrito/wrapper/adaptive_hrc_burrito/`: physical-domain adapter,
   completion-checked task options, and the two-player HRC protocol.

@@ -19,6 +19,11 @@ Commands:
   run         Run the full normal evaluation
   cooking     Run and validate the full Overcooked/Burrito evaluation
   ablation    Run all ablations; pass --suite matcher|routing|latent for one
+  robot-ui    Run the real-robot operator UI (dry-run unless --hardware-url is set)
+  robot-bridge Run the local Stretch hardware bridge (motion off unless --enable-motion)
+  robot-doctor Check robot config/runtime/bridge without commanding motion
+  robot-report Summarize and integrity-check a completed robot run
+  robot-calibration-probe Run one explicitly confirmed calibration-mode action
   llm [scope] Run full-schedule one-seed Full + LLM; scope: homogeneous|heterogeneous|holdout
   doctor      Check the normal and LLM runtimes without starting an experiment
 EOF
@@ -105,6 +110,36 @@ case "$command" in
         exec "$NORMAL_PYTHON" -X faulthandler -m src.ablations \
             --workers "${HRC_ABLATION_WORKERS:-1}" \
             "$@"
+        ;;
+    robot-ui)
+        ensure_normal_python
+        exec "$NORMAL_PYTHON" -X faulthandler -m src.real_robot.app "$@"
+        ;;
+    robot-bridge)
+        # The live bridge must use the Stretch SDK environment on the robot.
+        # Override HRC_STRETCH_PYTHON there; venv is suitable for bridge dry-runs.
+        STRETCH_PYTHON="${HRC_STRETCH_PYTHON:-$NORMAL_PYTHON}"
+        if [[ ! -x "$STRETCH_PYTHON" ]]; then
+            echo "Missing Stretch Python: $STRETCH_PYTHON" >&2
+            exit 1
+        fi
+        exec "$STRETCH_PYTHON" -X faulthandler -m src.real_robot.bridge "$@"
+        ;;
+    robot-doctor)
+        DOCTOR_PYTHON="${HRC_STRETCH_PYTHON:-$NORMAL_PYTHON}"
+        if [[ ! -x "$DOCTOR_PYTHON" ]]; then
+            echo "Missing robot Python: $DOCTOR_PYTHON" >&2
+            exit 1
+        fi
+        exec "$DOCTOR_PYTHON" -X faulthandler -m src.real_robot.doctor "$@"
+        ;;
+    robot-report)
+        ensure_normal_python
+        exec "$NORMAL_PYTHON" -X faulthandler -m src.real_robot.report "$@"
+        ;;
+    robot-calibration-probe)
+        ensure_normal_python
+        exec "$NORMAL_PYTHON" -X faulthandler -m src.real_robot.calibration_probe "$@"
         ;;
     llm)
         ensure_llm_python
