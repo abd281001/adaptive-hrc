@@ -34,9 +34,18 @@ def wait_for_stable_marker(
         camera_info = bundle.get("color_camera_info")
         if (
             color is None or camera_info is None or age_s is None
-            or age_s > max_frame_age_s or frame_id == last_frame_id
+            or age_s > max_frame_age_s
         ):
+            # A stable run must be uninterrupted by missing or stale evidence.
+            accepted = 0
+            previous = None
             last_reason = "missing, stale, or repeated camera frame"
+            time.sleep(0.01)
+            continue
+        if frame_id == last_frame_id:
+            # Polling can outpace the camera. A still-fresh repeated frame is
+            # neither new evidence nor a discontinuity; never count it twice.
+            last_reason = "waiting for a new camera frame"
             time.sleep(0.01)
             continue
         last_frame_id = frame_id

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "schedule_id": "pilot-p001-order-a",
+  "participant_id": "P001",
+  "counterbalance_id": "order-a",
+  "episodes": [
+    {"trial_id": "P001-001", "recipe_id": "garden_salad", "preference_id": "A", "condition": "observation", "expected_mode": "observe"},
+    {"trial_id": "P001-002", "recipe_id": "fruit_bowl", "preference_id": "A", "condition": "observation", "expected_mode": "observe"},
+    {"trial_id": "P001-003", "recipe_id": "caprese_plate", "preference_id": "A", "condition": "observation", "expected_mode": "observe"},
+    {"trial_id": "P001-004", "recipe_id": "breakfast_bowl", "preference_id": "A", "condition": "observation", "expected_mode": "observe"},
+
+    {"trial_id": "P001-005", "recipe_id": "garden_salad", "preference_id": "A", "condition": "settled", "expected_mode": "assist"},
+    {"trial_id": "P001-006", "recipe_id": "fruit_bowl", "preference_id": "A", "condition": "settled", "expected_mode": "assist"},
+    {"trial_id": "P001-007", "recipe_id": "caprese_plate", "preference_id": "A", "condition": "settled", "expected_mode": "assist"},
+    {"trial_id": "P001-008", "recipe_id": "breakfast_bowl", "preference_id": "A", "condition": "settled", "expected_mode": "assist"},
+
+    {"trial_id": "P001-009", "recipe_id": "garden_salad", "preference_id": "A", "condition": "concurrent", "expected_mode": "assist"},
+    {"trial_id": "P001-010", "recipe_id": "fruit_bowl", "preference_id": "B", "condition": "concurrent", "expected_mode": "assist"},
+    {"trial_id": "P001-011", "recipe_id": "caprese_plate", "preference_id": "A", "condition": "concurrent", "expected_mode": "assist"},
+    {"trial_id": "P001-012", "recipe_id": "breakfast_bowl", "preference_id": "B", "condition": "concurrent", "expected_mode": "assist"},
+
+    {"trial_id": "P001-013", "recipe_id": "garden_salad", "preference_id": "B", "condition": "drift", "expected_mode": "assist"},
+    {"trial_id": "P001-014", "recipe_id": "fruit_bowl", "preference_id": "A", "condition": "drift", "expected_mode": "assist"},
+    {"trial_id": "P001-015", "recipe_id": "caprese_plate", "preference_id": "B", "condition": "drift", "expected_mode": "assist"},
+    {"trial_id": "P001-016", "recipe_id": "breakfast_bowl", "preference_id": "A", "condition": "drift", "expected_mode": "assist"}
+  ]
+}

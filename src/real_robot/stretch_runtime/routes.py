@@ -2,6 +2,7 @@
 
 import math
 import time
+from ..cancellable_wait import wait_command_cancellable
 from .config import (
     BASE_ROTATION_SPEED_RADPS, BASE_ROTATION_ACCEL_RADPS2
 )
@@ -18,14 +19,26 @@ def _remaining_timeout(deadline=None, timeout=60.0):
     return max(0.0, min(float(timeout), float(deadline) - time.monotonic()))
 
 
-def push_and_wait(robot, label="", timeout=60.0, deadline=None, cancel_event=None):
+def push_and_wait(
+    robot, label="", timeout=60.0, deadline=None, cancel_event=None,
+    cancel_poll_s=0.10,
+):
+    """Push one command and wait in bounded slices so cancellation is observed.
+
+    Stretch ``wait_command`` is allowed to time out while the command remains
+    active, so repeated short waits are used instead of one long uninterruptible
+    wait.  The action thread remains the sole SDK owner throughout.
+    """
     if cancel_event is not None and cancel_event.is_set():
         return False
     wait_timeout = _remaining_timeout(deadline, timeout)
     if wait_timeout <= 0.0:
         return False
     robot.push_command()
-    ok = bool(robot.wait_command(timeout=wait_timeout))
+    ok = wait_command_cancellable(
+        robot, timeout_s=wait_timeout,
+        cancel_event=cancel_event, poll_s=cancel_poll_s,
+    )
     print_base_status(robot, label)
     if not ok:
         print(f"WARNING: command wait timed out during: {label}")

@@ -81,6 +81,7 @@
     "banana": {"label": "banana proxy", "marker_id": 13, "marker_length_mm": 40.0, "source_station": "produce"},
     "strawberries": {"label": "strawberries proxy", "marker_id": 14, "marker_length_mm": 40.0, "source_station": "produce"},
     "basil": {"label": "basil proxy", "marker_id": 15, "marker_length_mm": 40.0, "source_station": "produce"},
+    "apple": {"label": "apple proxy", "marker_id": 16, "marker_length_mm": 40.0, "source_station": "produce"},
     "cheese": {"label": "cheese proxy", "marker_id": 20, "marker_length_mm": 40.0, "source_station": "chilled"},
     "yoghurt": {"label": "yoghurt proxy", "marker_id": 21, "marker_length_mm": 40.0, "source_station": "chilled"},
     "dressing": {"label": "dressing proxy", "marker_id": 30, "marker_length_mm": 40.0, "source_station": "pantry"},
@@ -97,6 +98,7 @@
     "FETCH_BANANA": {"label": "fetch banana", "role": "produce", "object_id": "banana", "destination_station": "workspace"},
     "FETCH_STRAWBERRIES": {"label": "fetch strawberries", "role": "produce", "object_id": "strawberries", "destination_station": "workspace"},
     "FETCH_BASIL": {"label": "fetch basil", "role": "produce", "object_id": "basil", "destination_station": "workspace"},
+    "FETCH_APPLE": {"label": "fetch apple", "role": "produce", "object_id": "apple", "destination_station": "workspace"},
     "FETCH_CHEESE": {"label": "fetch cheese", "role": "chilled", "object_id": "cheese", "destination_station": "workspace"},
     "FETCH_YOGHURT": {"label": "fetch yoghurt", "role": "chilled", "object_id": "yoghurt", "destination_station": "workspace"},
     "FETCH_DRESSING": {"label": "fetch dressing", "role": "pantry", "object_id": "dressing", "destination_station": "workspace"},
@@ -106,7 +108,7 @@
   },
   "recipes": {
     "garden_salad": {"label": "Garden salad", "actions": ["STAGE_BOWL", "FETCH_LETTUCE", "FETCH_TOMATO", "FETCH_CUCUMBER", "FETCH_CHEESE", "FETCH_DRESSING"]},
-    "fruit_bowl": {"label": "Fruit bowl", "actions": ["STAGE_BOWL", "FETCH_BANANA", "FETCH_STRAWBERRIES", "FETCH_YOGHURT", "FETCH_HONEY", "FETCH_BASIL"]},
+    "fruit_bowl": {"label": "Fruit bowl", "actions": ["STAGE_BOWL", "FETCH_BANANA", "FETCH_STRAWBERRIES", "FETCH_YOGHURT", "FETCH_HONEY", "FETCH_APPLE"]},
     "caprese_plate": {"label": "Caprese plate", "actions": ["STAGE_PLATE", "FETCH_TOMATO", "FETCH_CHEESE", "FETCH_BASIL", "FETCH_CUCUMBER", "FETCH_OIL"]},
     "breakfast_bowl": {"label": "Breakfast bowl", "actions": ["STAGE_BOWL", "FETCH_CEREAL", "FETCH_BANANA", "FETCH_YOGHURT", "FETCH_STRAWBERRIES", "FETCH_HONEY"]}
   },
@@ -115,10 +117,13 @@
     "calibration_id": "",
     "calibration_record": "",
     "calibration_record_sha256": "",
+    "runtime_lock": "",
+    "runtime_lock_sha256": "",
     "action_timeout_s": 120.0,
     "command_timeout_s": 15.0,
     "grasp_timeout_s": 45.0,
     "rotation_tolerance_deg": 8.0,
+    "max_translation_drift_m": 0.025,
     "min_station_separation_deg": 15.0,
     "placement_settle_s": 0.75,
     "velocity_scale": 0.35

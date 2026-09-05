@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "calibration_id": "YYYYMMDD-stretch3-site-v1",
   "date_utc": "",
   "robot_id": "",
@@ -6,13 +7,85 @@
   "operator": "",
   "apparatus_revision": "",
   "config_file": "lab_site.json",
-  "station_heading_trials_deg": {},
-  "reference_marker_pose_trials_by_station_m": {},
-  "slot_pose_trials": {},
-  "marker_quality_trials": {},
-  "object_grasp_trials": {},
-  "canonical_return_trials_deg": [],
-  "fault_injection_results": {},
-  "acceptance_thresholds_frozen_before_test": {},
+  "station_heading_trials_deg": {
+    "workspace": [],
+    "produce": [],
+    "chilled": [],
+    "pantry": [],
+    "equipment": []
+  },
+  "reference_marker_pose_trials_by_station_m": {
+    "workspace": [],
+    "produce": [],
+    "chilled": [],
+    "pantry": [],
+    "equipment": []
+  },
+  "slot_pose_trials": {
+    "slot_1": [],
+    "slot_2": [],
+    "slot_3": [],
+    "slot_4": [],
+    "slot_5": [],
+    "slot_6": []
+  },
+  "marker_quality_trials": {
+    "1": [],
+    "2": [],
+    "10": [],
+    "11": [],
+    "12": [],
+    "13": [],
+    "14": [],
+    "15": [],
+    "16": [],
+    "20": [],
+    "21": [],
+    "30": [],
+    "31": [],
+    "32": [],
+    "33": [],
+    "199": [],
+    "200": [],
+    "201": []
+  },
+  "object_grasp_trials": {
+    "bowl": [],
+    "plate": [],
+    "lettuce": [],
+    "tomato": [],
+    "cucumber": [],
+    "strawberries": [],
+    "banana": [],
+    "basil": [],
+    "apple": [],
+    "cheese": [],
+    "yoghurt": [],
+    "dressing": [],
+    "oil": [],
+    "honey": [],
+    "cereal": []
+  },
+  "canonical_return_trials_by_station": {
+    "workspace": [],
+    "produce": [],
+    "chilled": [],
+    "pantry": [],
+    "equipment": []
+  },
+  "fault_injection_results": {
+    "stale_velocity_command": {"passed": false},
+    "camera_disconnect": {"passed": false},
+    "command_timeout": {"passed": false},
+    "emergency_stop": {"passed": false, "latency_s": null}
+  },
+  "acceptance_thresholds_frozen_before_test": {
+    "min_trials_per_pose": 5,
+    "max_heading_error_deg": 3.0,
+    "max_translation_drift_m": 0.025,
+    "min_grasp_success_rate": 0.9,
+    "min_placement_success_rate": 0.9,
+    "max_software_stop_latency_s": 0.25
+  },
   "notes": ""
 }

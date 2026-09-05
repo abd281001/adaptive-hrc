@@ -11,9 +11,12 @@ from typing import Any
 
 from .config import load_lab_config
 from .hardware import HttpStretchExecutor
+from .runtime_qualification import (
+    RUNTIME_MODULES, inspect_runtime, module_version, qualify_runtime,
+)
 
 
-ROBOT_MODULES = ("stretch_body.robot", "pyrealsense2", "cv2", "numpy", "scipy")
+ROBOT_MODULES = ("stretch_body.robot", *RUNTIME_MODULES)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +46,8 @@ def run_checks(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
             "calibration_id": config.motion.calibration_id,
             "calibration_record": config.motion.calibration_record,
             "calibration_record_sha256": config.motion.calibration_record_sha256,
+            "runtime_lock": config.motion.runtime_lock,
+            "runtime_lock_sha256": config.motion.runtime_lock_sha256,
         })
     except Exception as exc:
         record("configuration", False, str(exc))
@@ -59,7 +64,10 @@ def run_checks(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
             try:
                 module = importlib.import_module(module_name)
                 loaded[module_name] = module
-                versions[module_name] = getattr(module, "__version__", "available")
+                versions[module_name] = (
+                    module_version(module, module_name)
+                    if module_name in RUNTIME_MODULES else "available"
+                )
                 record(f"import:{module_name}", True, versions[module_name])
             except Exception as exc:
                 record(f"import:{module_name}", False, str(exc))
@@ -67,12 +75,38 @@ def run_checks(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         aruco_ok = bool(cv2 is not None and hasattr(cv2, "aruco") and hasattr(cv2.aruco, "DICT_6X6_250"))
         record("opencv_aruco_dictionary", aruco_ok, "DICT_6X6_250 available" if aruco_ok else "OpenCV ArUco DICT_6X6_250 unavailable")
         rs = loaded.get("pyrealsense2")
+        d405_devices = []
         if rs is not None:
             try:
-                devices = [device.get_info(rs.camera_info.name) for device in rs.context().devices]
-                record("d405_connected", any(name.endswith("D405") for name in devices), devices)
+                for device in rs.context().devices:
+                    identity = {
+                        "name": device.get_info(rs.camera_info.name),
+                        "serial_number": device.get_info(rs.camera_info.serial_number),
+                        "firmware_version": device.get_info(rs.camera_info.firmware_version),
+                    }
+                    if identity["name"].endswith("D405"):
+                        d405_devices.append(identity)
+                record("d405_connected", bool(d405_devices), d405_devices)
             except Exception as exc:
                 record("d405_connected", False, str(exc))
+        runtime = inspect_runtime()
+        record("runtime_imports", not runtime["import_errors"], runtime)
+        if config.motion.calibrated:
+            locked_serial = str(config.runtime_lock_data.get("d405_serial", ""))
+            locked_camera = next(
+                (
+                    item for item in d405_devices
+                    if item.get("serial_number") == locked_serial
+                ),
+                d405_devices[0] if len(d405_devices) == 1 else None,
+            )
+            qualification = qualify_runtime(
+                config.runtime_lock_data, camera_identity=locked_camera,
+            )
+            record(
+                "runtime_lock_versions_and_camera", qualification["qualified"],
+                qualification,
+            )
 
     if args.hardware_url:
         executor = HttpStretchExecutor(args.hardware_url, timeout_s=10.0)
