@@ -3,6 +3,8 @@
 prompts/
 /talents-zsc/
 eval_results/
+real_robot_runs/
+real_robot_bridge_state/
 
 # Python environments and caches
 .venv-llm/
@@ -20,3 +22,7 @@ __pycache__/
 # Local cache/output
 .cache/
 results/
+
+# Unrelated dropped-in code
+/Gabriel/
+/Gabriel.zip

@@ -15,8 +15,20 @@ from src.baselines import (
     FrozenAgent,
 )
 from src.models import Settings
-from src.representations import Observation
+from src.representations import Observation, observe_actions
 from src.llm_baseline import InContextLlmAgent
+
+
+def _trace(*actions):
+    """Observed transitions for `actions`, as the live protocol records them.
+
+    Replay items must carry the transitions that were actually observed; the
+    learner refuses to reconstruct states from action labels alone.
+    """
+    return tuple(
+        (observation.state, observation.action, observation.next_state)
+        for observation in observe_actions(actions)
+    )
 
 
 def _fast_config(**overrides):
@@ -95,7 +107,7 @@ class RunnableBaselineTests(unittest.TestCase):
     def test_offline_pretrained_frozen_agent_has_no_deployment_learning_path(self):
         agent = FrozenAgent(_fast_config())
         known = "transfer (pot, from=storage, to=cooking_station)"
-        agent.replay.register("recipe", "variant", (known,), now=0, cycle=0)
+        agent.replay.register("recipe", "variant", (known,), now=0, cycle=0, transitions=_trace(known))
         agent._retrain()
         metadata = agent.lock_deployment()
 
@@ -230,7 +242,7 @@ class RunnableBaselineTests(unittest.TestCase):
         agent = BehaviorCloningAgent(_fast_config())
         first = "transfer (pot, from=storage, to=cooking_station)"
         second = "turn_on (stove, cooking_station)"
-        agent.replay.register("recipe", "variant", (first, second), now=0, cycle=0)
+        agent.replay.register("recipe", "variant", (first, second), now=0, cycle=0, transitions=_trace(first, second))
         agent._retrain()
 
         distribution = agent.predict_actions([first])
@@ -247,7 +259,7 @@ class RunnableBaselineTests(unittest.TestCase):
         agent = EwcAgent(_fast_config())
         first = "transfer (pot, from=storage, to=cooking_station)"
         second = "turn_on (stove, cooking_station)"
-        agent.replay.register("recipe", "variant", (first, second), now=0, cycle=0)
+        agent.replay.register("recipe", "variant", (first, second), now=0, cycle=0, transitions=_trace(first, second))
         agent._retrain()
 
         self.assertIsNotNone(agent._anchor)
@@ -259,9 +271,11 @@ class RunnableBaselineTests(unittest.TestCase):
         second = "turn_on (stove, cooking_station)"
         agent.replay.register(
             "recipe", "variant", (first, second), now=0, cycle=0,
+            transitions=_trace(first, second),
         )
         agent._record_demo(
-            "recipe", "variant", (first, second), demo_step=1, action_step=1, source_mode="observe"
+            "recipe", "variant", (first, second), transitions=_trace(first, second),
+            demo_step=1, action_step=1, source_mode="observe"
         )
         agent._retrain()
 

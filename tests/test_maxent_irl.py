@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 
 import numpy as np
@@ -8,6 +9,7 @@ from src.models import (
     MaxEntIrl,
     build_features,
     feasible_actions,
+    feature_names,
     index_demos,
     top_actions,
     top_probability_tie_size,
@@ -350,5 +352,139 @@ class MaxEntIrlTests(unittest.TestCase):
         self.assertFalse(np.array_equal(first.reward_weights, other.reward_weights))
 
 
+class RewardFeaturePlanTests(unittest.TestCase):
+    """Pin the reward representation so a learned weight keeps its meaning.
+
+    ``reward_weights`` is indexed positionally, so silently reordering,
+    inserting, or renaming a column would reinterpret every previously
+    reported weight while leaving every accuracy number intact.  These
+    hashes fail loudly instead.
+    """
+
+    EXPECTED = {
+        "engineered": (199, "4fbf0803ddd69b8096b9ee08ca445927b33d35e3a088df65249545b4eca33637"),
+        "semantic": (50, "5dd5f6a8dc3f0ac13253c87aec87bdaafbbf746031f36111fc0546955c8105cd"),
+    }
+
+    def test_feature_plan_order_and_width_are_frozen(self):
+        for mode, (width, digest) in self.EXPECTED.items():
+            with self.subTest(feature_mode=mode):
+                names = feature_names(mode)
+                self.assertEqual(len(names), width)
+                self.assertEqual(len(set(names)), width, "feature names must be unique")
+                self.assertEqual(
+                    hashlib.sha256("\n".join(names).encode()).hexdigest(), digest,
+                )
+
+    def test_feature_names_align_with_built_columns(self):
+        tracker = StateTracker()
+        tracker.apply_action("transfer (pot, from=storage, to=cooking_station)")
+        state = tuple(tracker.get_state_vector().astype(int).tolist())
+        for mode in ("engineered", "semantic", "raw_state"):
+            with self.subTest(feature_mode=mode):
+                raw, _mean, _scale = build_features(
+                    {0: state}, feature_mode=mode, normalize=False,
+                )
+                self.assertEqual(raw.shape[1], len(feature_names(mode)))
+
+    def test_named_columns_evaluate_to_their_definition(self):
+        tracker = StateTracker()
+        for action in (
+            "transfer (pot, from=storage, to=cooking_station)",
+            "turn_on (stove, cooking_station)",
+        ):
+            tracker.apply_action(action)
+        state = tuple(tracker.get_state_vector().astype(int).tolist())
+        raw, _mean, _scale = build_features(
+            {0: state}, feature_mode="engineered", normalize=False,
+        )
+        column = dict(zip(feature_names("engineered"), raw[0].tolist()))
+        self.assertEqual(column["stove_on"], 1.0)
+        self.assertEqual(column["pot_at_cooking_station"], 1.0)
+        # Interaction composite: stove on AND cookware present.
+        self.assertEqual(column["stove_on_x_cookware_present"], 1.0)
+        self.assertEqual(column["blender_on_x_glass_present"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class FisherTests(unittest.TestCase):
+    """The Fisher must measure policy curvature, not feature magnitude.
+
+    The previous estimator returned the replay-weighted mean of ``phi(s)**2``,
+    which is the feature second moment: it is large wherever the state features
+    are large, regardless of whether the reward weights influence the action
+    choice there at all. EWC built on it anchored the wrong directions.
+    """
+
+    def _fitted(self, **overrides):
+        actions = [
+            "transfer (pot, from=storage, to=cooking_station)",
+            "transfer (tomato, from=storage, to=prep_station)",
+            "cut (tomato, prep_station)",
+        ]
+        alternative = [actions[1], actions[0], actions[2]]
+        demos = [_demo(actions), _demo(alternative)]
+        model = MaxEntIrl(_settings(**overrides))
+        model.fit(demos)
+        return model, demos
+
+    def test_fisher_records_its_estimator_and_stays_finite_and_nonnegative(self):
+        model, demos = self._fitted()
+        fisher = model.fisher(demos)
+
+        self.assertIsNotNone(fisher)
+        self.assertEqual(fisher.shape, model.reward_weights.shape)
+        self.assertTrue(np.all(np.isfinite(fisher)))
+        self.assertTrue(np.all(fisher >= 0.0))
+        self.assertLessEqual(float(fisher.max()), float(model.settings.fisher_cap))
+        self.assertEqual(
+            model.last_fisher_stats["fisher_estimator"],
+            "diagonal_empirical_fisher_one_step_q_linearization",
+        )
+        self.assertGreater(model.last_fisher_stats["fisher_scored_visits"], 0.0)
+
+    def test_fisher_is_not_the_feature_second_moment(self):
+        model, demos = self._fitted()
+        fisher = model.fisher(demos)
+
+        # The quantity the old implementation returned.
+        second_moment = np.zeros_like(fisher)
+        total = 0.0
+        for demo in demos:
+            for state, _action in demo:
+                state_id = model.state_ids.get(state)
+                if state_id is None:
+                    continue
+                feature = model.features[state_id]
+                second_moment += feature * feature
+                total += 1.0
+        if total:
+            second_moment /= total
+
+        self.assertFalse(np.allclose(fisher, second_moment))
+        # Nor a rescaling of it: the two weight the feature directions
+        # differently, which is the whole point.
+        def unit(vector):
+            norm = float(np.linalg.norm(vector))
+            return vector / norm if norm > 0.0 else vector
+
+        self.assertFalse(np.allclose(unit(fisher), unit(second_moment), atol=1e-3))
+        # Visits where the policy cannot discriminate contribute no curvature at
+        # all, while the second moment charges them their full feature mass.
+        self.assertGreater(model.last_fisher_stats["fisher_zero_score_visits"], 0.0)
+
+    def test_fisher_scales_with_the_policy_temperature(self):
+        """The score carries a 1/T factor, so the Fisher carries 1/T**2."""
+        cold, demos = self._fitted(irl_temperature=0.25)
+        warm, _ = self._fitted(irl_temperature=1.0)
+
+        cold_fisher = cold.fisher(demos)
+        warm_fisher = warm.fisher(demos)
+
+        self.assertGreater(float(cold_fisher.sum()), float(warm_fisher.sum()))
+
+    def test_fisher_returns_none_before_any_fit(self):
+        self.assertIsNone(MaxEntIrl(_settings()).fisher([]))

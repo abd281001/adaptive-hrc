@@ -884,7 +884,6 @@ class ResultLayoutTests(unittest.TestCase):
 
     def test_reentry_metrics_separate_pruned_recovery_from_active_control(self):
         common = {
-            "scheduled_reentry_probe": True,
             "hrc_robot_turn_count": 2,
             "hrc_robot_correct_count": 1,
             "hrc_robot_top_k_hit_count": 2,
@@ -904,16 +903,43 @@ class ResultLayoutTests(unittest.TestCase):
             },
             {
                 **common,
+                "mode": "assist",
+                "reentry_probe_target_state_before": "known_recipe_no_exact_variant",
+                "actual_reentry_from_pruned": False,
+            },
+            # Observation episodes are excluded: nothing is predicted there.
+            {
+                **common,
                 "mode": "observe",
                 "reentry_probe_target_state_before": "pruned_exact_variant",
                 "actual_reentry_from_pruned": False,
             },
         ])
-        self.assertEqual(summary["n_scheduled_reentry_probes"], 3)
-        self.assertEqual(summary["n_target_pruned_before_probe"], 2)
-        self.assertEqual(summary["n_target_active_before_probe_control"], 1)
+        self.assertEqual(summary["n_assist_episodes"], 3)
+        self.assertEqual(summary["n_target_pruned_before_episode"], 1)
+        self.assertEqual(summary["n_target_active_before_episode_control"], 1)
+        self.assertEqual(summary["n_target_known_recipe_new_variant"], 1)
         self.assertEqual(summary["n_confirmed_reentry_from_pruned"], 1)
         self.assertEqual(summary["confirmed_reentry_from_pruned"]["live_top_1"], 0.5)
+
+    def test_reentry_metrics_report_no_pruned_episodes_for_a_retaining_agent(self):
+        """An agent that never prunes must show an empty recovery cell, not a
+        zero-probe diagnostic: the control cell still has to populate."""
+        summary = summarize_reentry([
+            {
+                "mode": "assist",
+                "reentry_probe_target_state_before": "active_exact_variant",
+                "actual_reentry_from_pruned": False,
+                "hrc_robot_turn_count": 2,
+                "hrc_robot_correct_count": 2,
+                "hrc_robot_top_k_hit_count": 2,
+            },
+        ])
+        self.assertEqual(summary["n_target_pruned_before_episode"], 0)
+        self.assertEqual(summary["n_target_active_before_episode_control"], 1)
+        self.assertEqual(
+            summary["target_active_before_episode_control"]["live_top_1"], 1.0,
+        )
 
     def test_paired_bootstrap_preserves_pairs_and_metric_directions(self):
         def summary(

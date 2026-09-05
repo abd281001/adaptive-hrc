@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Adaptive-HRC Operator</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 980px; margin: 0 auto; padding: 24px; background: #111827; color: #f3f4f6; }
+    h1 { margin-bottom: 4px; } h2 { margin-top: 0; }
+    .panel { border: 1px solid #374151; border-radius: 12px; padding: 18px; margin: 14px 0; background: #1f2937; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    button { padding: 12px 16px; border: 0; border-radius: 8px; cursor: pointer; font-weight: 650; }
+    button.action { background: #2563eb; color: white; }
+    button.approve { background: #059669; color: white; }
+    button.correct { background: #d97706; color: white; }
+    button.danger { background: #dc2626; color: white; }
+    button.secondary { background: #4b5563; color: white; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .status { font-size: 1.25rem; font-weight: 700; }
+    .warning { color: #fbbf24; } .error { color: #fca5a5; white-space: pre-wrap; }
+    .token { font-family: ui-monospace, monospace; background: #111827; padding: 3px 7px; border-radius: 5px; }
+    .bar { height: 10px; background: #374151; border-radius: 5px; overflow: hidden; }
+    .bar > span { display: block; height: 100%; background: #60a5fa; }
+    #camera { display: none; width: 100%; max-height: 480px; object-fit: contain; border-radius: 8px; background: #111827; }
+    label { display: flex; gap: 8px; align-items: center; }
+    #message { min-height: 1.5em; }
+  </style>
+</head>
+<body>
+  <h1>Adaptive-HRC Operator</h1>
+  <div class="warning">The physical emergency stop remains authoritative. Never rely only on this page.</div>
+  <div id="message" class="error"></div>
+  <section class="panel">
+    <div class="row"><span class="status" id="phase">Loading…</span><span id="backend"></span></div>
+    <p id="episode"></p><p id="progress"></p><div class="bar"><span id="progressBar"></span></div>
+  </section>
+  <section class="panel" id="controls"><h2>Controls</h2><div id="controlBody"></div></section>
+  <section class="panel"><h2>Wrist camera</h2><img id="camera" alt="Latest D405 frame"><div id="cameraStatus">Camera preview unavailable in dry-run.</div></section>
+  <section class="panel"><h2>Completed actions</h2><div id="completed"></div></section>
+  <section class="panel">
+    <div class="row">
+      <button class="danger" onclick="post('/api/emergency-stop', {})">Emergency stop</button>
+      <button class="secondary" onclick="post('/api/episode/abort', {})">Abort episode</button>
+    </div>
+  </section>
+<script>
+let cfg = null;
+let state = null;
+let lastControlSignature = '';
+let operatorToken = sessionStorage.getItem('hrcOperatorToken') || '';
+if (!operatorToken) {
+  operatorToken = prompt('Enter the operator token printed by the HRC process:') || '';
+  sessionStorage.setItem('hrcOperatorToken', operatorToken);
+}
+const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const label = token => cfg?.actions?.[token]?.label || token;
+async function post(path, payload) {
+  document.getElementById('message').textContent = '';
+  try {
+    const response = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json','X-HRC-Operator-Token':operatorToken}, body:JSON.stringify(payload)});
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    state = body; render();
+  } catch (error) { document.getElementById('message').textContent = error.message; }
+}
+function button(text, cls, handler) { return `<button class="${cls}" onclick="${handler}">${esc(text)}</button>`; }
+function actionButtons(path, exclude=null, checkbox='physicalComplete') {
+  return `<div class="row">${state.available_human_actions.filter(token => token !== exclude).map(token => button(label(token), path.includes('correct')?'correct':'action', `post('${path}', {action:'${token}',physical_completed:document.getElementById('${checkbox}').checked})`)).join('')}</div>`;
+}
+function render() {
+  if (!state || !cfg) return;
+  document.getElementById('phase').textContent = state.phase.replaceAll('_',' ').toUpperCase();
+  const hw = state.hardware || {};
+  document.getElementById('backend').textContent = `${hw.backend || 'hardware'} · ${hw.motion_enabled ? 'LIVE MOTION' : 'DRY RUN'} · ${hw.ready ? 'ready' : 'NOT READY'} · cfg ${String(state.config_digest).slice(0,12)}${hw.calibration_id ? ` · cal ${hw.calibration_id}` : ''}`;
+  document.getElementById('episode').textContent = state.recipe_label ? `${state.recipe_label} · ${state.mode}` : 'No active episode';
+  const total = state.completed.length + state.remaining_actions.length;
+  document.getElementById('progress').textContent = `${state.completed.length} / ${total || 0} actions complete`;
+  document.getElementById('progressBar').style.width = `${total ? 100*state.completed.length/total : 0}%`;
+  document.getElementById('completed').innerHTML = state.completed.length ? state.completed.map(x => `<span class="token">${esc(label(x))}</span>`).join(' → ') : 'None';
+  const controlSignature = JSON.stringify([
+    state.phase, state.pending_prediction, state.completed,
+    state.error, state.next_placement_slot, hw.ready
+  ]);
+  if (controlSignature === lastControlSignature) return;
+  lastControlSignature = controlSignature;
+  let html = '';
+  if (state.phase === 'idle' || state.phase === 'complete') {
+    html += '<label><input id="propsReset" type="checkbox"> I verified every proxy object is at its source and all workspace slots are empty.</label>';
+    html += '<div class="row" style="margin-top:12px"><label>Trial ID <input id="trialId" size="12"></label><label>Preference/condition ID <input id="preferenceId" size="18"></label></div><div class="row" style="margin-top:12px">';
+    for (const [id, recipe] of Object.entries(cfg.recipes)) html += button(`Start ${recipe.label}`, 'action', `post('/api/episode/start',{recipe_id:'${id}',props_reset:document.getElementById('propsReset').checked,trial_metadata:{trial_id:document.getElementById('trialId').value,preference_id:document.getElementById('preferenceId').value}})`);
+    html += '</div>';
+    if (state.last_match) html += `<p>Last learner classification: <span class="token">${esc(state.last_match.kind)}</span> / ${esc(state.last_match.recipe_id || 'none')}</p>`;
+  } else if (state.phase === 'human_turn') {
+    html = `<p>After the participant places the intended object in <strong>${esc(cfg.placement_slots?.[state.next_placement_slot]?.label || state.next_placement_slot || 'the next slot')}</strong>, record it:</p><label><input id="physicalComplete" type="checkbox"> I directly verified the physical action is complete.</label>` + actionButtons('/api/human-action');
+  } else if (state.phase === 'robot_proposal') {
+    const token = state.pending_prediction;
+    html = `<p>Robot proposes <strong>${esc(label(token))}</strong>. Approve only if this is the participant’s intended next action.</p>`;
+    if (!state.pending_prediction_in_recipe) html += '<p class="warning">This proposal is outside the selected recipe and cannot be approved.</p>';
+    else html += '<label><input id="humanClear" type="checkbox"> Participant, operator, and bystanders are outside the swept volume.</label>' + button('Approve and execute', 'approve', `post('/api/robot/approve',{human_clear:document.getElementById('humanClear').checked})`);
+    html += `<h3>Incorrect proposal: participant completes one correction in ${esc(cfg.placement_slots?.[state.next_placement_slot]?.label || state.next_placement_slot || 'the next slot')}</h3><label><input id="physicalComplete" type="checkbox"> I directly verified the correction is physically complete.</label>` + actionButtons('/api/robot/correct', token);
+  } else if (state.phase === 'correction_required') {
+    html = '<p>No valid robot prediction was available. Record the participant correction:</p><label><input id="physicalComplete" type="checkbox"> I directly verified the correction is physically complete.</label>' + actionButtons('/api/robot/correct');
+  } else if (state.phase === 'robot_executing') {
+    html = `<p>Robot is executing <strong>${esc(label(state.pending_prediction))}</strong>. Keep the physical E-stop in reach.</p>`;
+  } else if (state.phase === 'execution_failed') {
+    html = `<p class="error">Hardware failed: ${esc(state.error || 'unknown failure')}</p><p>Do not retry. Inspect the robot and object state, abort the episode, reset the scene, and restart the latched bridge.</p>`;
+  } else if (state.phase === 'reconciliation_required') {
+    html = `<p class="error">Execution ${esc(state.reconciliation_execution_id || 'unknown')} requires reconciliation: ${esc(state.error || '')}</p><label><input id="sceneVerified" type="checkbox"> I inspected the bridge ledger, robot pose, gripper, object, and destination slot.</label><div class="row">`;
+    html += button('Verified completed — commit only', 'correct', `post('/api/robot/reconcile',{execution_completed:true,physical_scene_verified:document.getElementById('sceneVerified').checked})`);
+    html += button('Verified not completed — fail', 'danger', `post('/api/robot/reconcile',{execution_completed:false,physical_scene_verified:document.getElementById('sceneVerified').checked})`) + '</div>';
+  } else if (state.phase === 'emergency_stopped') {
+    html = '<p class="error">Emergency stop requested. Abort this episode and restart/reinitialize the hardware bridge before continuing.</p>';
+  }
+  document.getElementById('controlBody').innerHTML = html;
+}
+async function refresh() {
+  try {
+    const options = {cache:'no-store', headers:{'X-HRC-Operator-Token':operatorToken}};
+    if (!cfg) cfg = await (await fetch('/api/config',options)).json();
+    state = await (await fetch('/api/state',options)).json(); render();
+  } catch (error) { document.getElementById('message').textContent = `Connection error: ${error.message}`; }
+}
+function refreshCamera() {
+  const image = document.getElementById('camera');
+  image.onload = () => { image.style.display='block'; document.getElementById('cameraStatus').textContent=''; };
+  image.onerror = () => { image.style.display='none'; document.getElementById('cameraStatus').textContent='Camera preview unavailable.'; };
+  image.src = `/api/camera.jpg?t=${Date.now()}&token=${encodeURIComponent(operatorToken)}`;
+}
+refresh(); setInterval(refresh, 750); setInterval(refreshCamera, 1000);
+</script>
+</body>
+</html>

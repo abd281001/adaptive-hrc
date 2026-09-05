@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 import sys
 import tempfile
@@ -19,15 +20,24 @@ from src.evaluation import EvalSettings, assist_demo, build_agent, build_task, o
 from src.llm_baseline import (
     InContextLlmAgent,
     PromptDemo,
+    PromptTooLongError,
     ScoreResult,
     QwenActionScorer,
     _bitsandbytes_kernel_policy,
     _install_direct_4bit_inference,
     _materialize_nested_absmax,
+    build_candidate_prompt,
+    build_context_prompt,
     build_prompt,
+    build_query_prompt,
     candidate_actions,
+    kv_cache_bytes_per_token,
     main,
+    make_prompt_demos,
+    report_vram_budget,
+    reserve_display_vram,
     resolve_model_path,
+    state_predicates,
 )
 from src.models import Settings
 
@@ -37,18 +47,23 @@ class DemoScorer:
 
     def __init__(self):
         self.prompts = []
+        self.calls = []
 
     def score(self, context_prompt, query_prompt, candidates):
         prompt = context_prompt + "\n" + query_prompt
         self.prompts.append(prompt)
+        self.calls.append((context_prompt, query_prompt, tuple(candidates)))
         context = json.loads(context_prompt.split("CONTEXT:\n", 1)[1])
-        query = json.loads(
-            query_prompt.split("QUERY:\n", 1)[1].rsplit("\nANSWER:", 1)[0]
-        )
+        query = json.loads(query_prompt.split("QUERY:\n", 1)[1])
         prefix = query["observed_actions"]
         predicted = None
         for demonstration in context["previous_demonstrations"]:
-            actions = demonstration["actions"]
+            # Accepts both context encodings: annotated steps, and the
+            # action-only form used when the annotated prompt does not fit.
+            actions = (
+                [step["action"] for step in demonstration["steps"]]
+                if "steps" in demonstration else list(demonstration["actions"])
+            )
             if actions[:len(prefix)] == prefix and len(actions) > len(prefix):
                 predicted = actions[len(prefix)]
                 break
@@ -484,6 +499,400 @@ class InContextLlmTests(unittest.TestCase):
         self.assertEqual(rendered_messages[0][0][0]["role"], "system")
         self.assertIn("action one", rendered_messages[0][0][1]["content"])
 
+    @staticmethod
+    def _vram_torch(total_gib, free_gib):
+        """Minimal CUDA surface for the VRAM budget helpers."""
+        recorded = {}
+
+        def set_fraction(fraction):
+            recorded["fraction"] = float(fraction)
+
+        return SimpleNamespace(
+            cuda=SimpleNamespace(
+                mem_get_info=lambda: (
+                    int(free_gib * 1024 ** 3), int(total_gib * 1024 ** 3),
+                ),
+                set_per_process_memory_fraction=set_fraction,
+                synchronize=lambda: None,
+                empty_cache=lambda: None,
+                memory_allocated=lambda: 0,
+            ),
+        ), recorded
+
+    def test_display_vram_is_reserved_from_the_process_cap(self):
+        """A GPU that cannot serve the compositor takes the session down, so
+        this process must never be allowed to claim the whole device."""
+        torch, recorded = self._vram_torch(total_gib=12.0, free_gib=11.3)
+
+        budget = reserve_display_vram(torch, headroom_gib=2.0)
+
+        self.assertAlmostEqual(budget["external_gib"], 0.7, places=2)
+        self.assertAlmostEqual(budget["headroom_gib"], 2.0, places=6)
+        self.assertAlmostEqual(budget["allowed_gib"], 9.3, places=2)
+        # The cap must exclude both the display reserve and memory already held.
+        self.assertAlmostEqual(recorded["fraction"], 9.3 / 12.0, places=3)
+        self.assertLess(recorded["fraction"], 1.0)
+
+    def test_exhausted_vram_is_refused_before_any_allocation(self):
+        torch, recorded = self._vram_torch(total_gib=12.0, free_gib=1.0)
+
+        with self.assertRaisesRegex(RuntimeError, "no VRAM budget remains"):
+            reserve_display_vram(torch, headroom_gib=2.0)
+        self.assertNotIn("fraction", recorded)
+
+    def test_headroom_of_zero_still_excludes_other_processes(self):
+        torch, recorded = self._vram_torch(total_gib=12.0, free_gib=9.0)
+
+        budget = reserve_display_vram(torch, headroom_gib=0.0)
+
+        self.assertAlmostEqual(budget["allowed_gib"], 9.0, places=2)
+        self.assertAlmostEqual(recorded["fraction"], 0.75, places=3)
+
+    def test_kv_cache_per_token_matches_the_checkpoint_geometry(self):
+        config = SimpleNamespace(
+            num_hidden_layers=36,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+            head_dim=128,
+        )
+
+        per_token = kv_cache_bytes_per_token(config)
+
+        # 2 (K+V) * 36 layers * 8 kv heads * 128 dim * 2 bytes.
+        self.assertEqual(per_token, 147456)
+        # A full 32k prompt is 4.5GiB of cache, which is the whole problem.
+        self.assertAlmostEqual(per_token * 32768 / 1024 ** 3, 4.5, places=2)
+
+    def test_head_dim_is_derived_when_the_config_omits_it(self):
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size=256,
+        )
+
+        self.assertEqual(kv_cache_bytes_per_token(config), 2 * 2 * 2 * 64 * 2)
+
+    def test_unsizable_config_is_refused_rather_than_run_unbounded(self):
+        with self.assertRaisesRegex(RuntimeError, "cannot size the key/value"):
+            kv_cache_bytes_per_token(SimpleNamespace())
+
+    def test_context_limit_is_capped_by_the_vram_budget(self):
+        """The model window is not a memory bound; free VRAM is."""
+        torch, _recorded = self._vram_torch(total_gib=12.0, free_gib=4.5)
+        scorer = QwenActionScorer(context_tokens=32768, vram_headroom_gib=2.0)
+        scorer.torch = torch
+        scorer.model = SimpleNamespace(config=SimpleNamespace(
+            max_position_embeddings=40960,
+            num_hidden_layers=36,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+            head_dim=128,
+        ))
+        # A cap generous enough that device-free memory is the binding ceiling.
+        scorer.vram_budget = {"headroom_gib": 2.0, "fraction": 1.0}
+
+        token_limit = scorer._vram_token_limit()
+        scorer.vram_context_limit = token_limit
+
+        # 2.5GiB free, less the reserve, the measured fixed prefill cost and
+        # the allocator slack, divided by the measured per-token cost.
+        per_token, fixed = scorer._prefill_cost_model()
+        self.assertEqual(
+            token_limit,
+            (int(2.5 * 1024 ** 3) - fixed - 384 * 1024 ** 2) // per_token,
+        )
+        self.assertLess(token_limit, 32768)
+        self.assertEqual(scorer._context_limit(), token_limit)
+        # Without a measured budget the previous behaviour is unchanged.
+        scorer.vram_context_limit = 0
+        self.assertEqual(scorer._context_limit(), 32768)
+
+    def test_doctor_budget_report_separates_display_from_capacity(self):
+        """`./hrc doctor` has to answer "will a full run fit" before one starts."""
+        fake_torch = ModuleType("torch")
+        fake_torch.cuda = SimpleNamespace(
+            mem_get_info=lambda: (
+                int(10.54 * 1024 ** 3), int(11.5 * 1024 ** 3),
+            ),
+        )
+        fake_transformers = ModuleType("transformers")
+        fake_transformers.AutoConfig = SimpleNamespace(
+            from_pretrained=lambda *_a, **_k: SimpleNamespace(
+                num_hidden_layers=36, num_attention_heads=32,
+                num_key_value_heads=8, hidden_size=4096, head_dim=128,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            weights = Path(directory) / "model-00001-of-00001.safetensors"
+            weights.write_bytes(b"\0" * (7 * 1024 ** 2))
+            with (
+                patch.dict(sys.modules, {
+                    "torch": fake_torch, "transformers": fake_transformers,
+                }),
+                patch(
+                    "src.llm_baseline.resolve_model_path",
+                    return_value=(directory, "snapshot"),
+                ),
+            ):
+                report = report_vram_budget(headroom_gib=1.25)
+
+        self.assertAlmostEqual(report["other_clients_gib"], 0.96, places=2)
+        self.assertEqual(report["bytes_per_prompt_token"], 2 * 147456)
+        # Reclaiming the display's memory has to show as more prompt capacity.
+        self.assertGreater(
+            report["prompt_token_estimate_if_gpu_exclusive"],
+            report["prompt_token_estimate"],
+        )
+
+    def test_weights_larger_than_the_cap_are_refused_before_loading(self):
+        """A busy GPU must not fail half-way through materializing weights."""
+        scorer = QwenActionScorer()
+        with tempfile.TemporaryDirectory() as directory:
+            weights = Path(directory) / "model-00001-of-00001.safetensors"
+            weights.write_bytes(b"\0" * (8 * 1024 ** 2))
+
+            # A budget smaller than the checkpoint on disk.
+            scorer.vram_budget = {"allowed_gib": 4 / 1024, "headroom_gib": 1.25}
+            with self.assertRaisesRegex(RuntimeError, "do not fit"):
+                scorer._check_weights_fit_the_cap(directory)
+
+            # A budget that holds the weights proceeds.
+            scorer.vram_budget = {"allowed_gib": 1.0, "headroom_gib": 1.25}
+            scorer._check_weights_fit_the_cap(directory)
+
+            # An uninspectable source cannot block a load it knows nothing about.
+            scorer._check_weights_fit_the_cap("publisher/model")
+
+    def test_chunked_prefill_carries_the_cache_and_keeps_one_forward_path(self):
+        """Each chunk must attend over every key already cached, and a prompt
+        that fits one chunk must issue exactly the call it issued before."""
+        calls = []
+
+        class FakeTensor:
+            def __init__(self, shape):
+                self.shape = shape
+
+            def __getitem__(self, _index):
+                return self
+
+            def float(self):
+                return self
+
+        def fake_forward(**kwargs):
+            calls.append(kwargs)
+            length = kwargs["input_ids"].shape[-1]
+            prior = (
+                kwargs["past_key_values"].length
+                if kwargs.get("past_key_values") is not None else 0
+            )
+            cache = SimpleNamespace(length=prior + length)
+            cache.get_seq_length = lambda cache=cache: cache.length
+            return SimpleNamespace(
+                logits=FakeTensor((1, 1, 4)), past_key_values=cache,
+            )
+
+        scorer = QwenActionScorer(prefill_chunk_tokens=4)
+        scorer.torch = SimpleNamespace(
+            long="long",
+            inference_mode=nullcontext,
+            tensor=lambda values, **_k: FakeTensor((1, len(values[0]))),
+            ones=lambda shape, **_k: FakeTensor(shape),
+            log_softmax=lambda values, dim: values,
+        )
+        scorer.model = MagicMock(side_effect=fake_forward)
+
+        cache, _log_probs, chunks = scorer._prefill(list(range(10)), "cuda")
+
+        self.assertEqual(chunks, 3)
+        self.assertEqual(cache.get_seq_length(), 10)
+        self.assertNotIn("past_key_values", calls[0])
+        # The attention mask must span everything cached so far, not the chunk.
+        self.assertEqual([call["attention_mask"].shape for call in calls],
+                         [(1, 4), (1, 8), (1, 10)])
+        for call in calls[1:]:
+            self.assertIsNotNone(call["past_key_values"])
+
+        # A prompt inside one chunk keeps the unchunked call signature.
+        calls.clear()
+        scorer.prefill_chunk_tokens = 1024
+        _cache, _lp, chunks = scorer._prefill(list(range(10)), "cuda")
+        self.assertEqual(chunks, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("past_key_values", calls[0])
+
+    def test_allocator_cap_bounds_the_limit_even_with_free_device_memory(self):
+        """Device-free memory does not know this process is capped; using it
+        alone reported a limit that then failed to allocate."""
+        torch, _recorded = self._vram_torch(total_gib=12.0, free_gib=11.0)
+        scorer = QwenActionScorer(context_tokens=32768, vram_headroom_gib=0.5)
+        scorer.torch = torch
+        scorer.model = SimpleNamespace(config=SimpleNamespace(
+            max_position_embeddings=40960, num_hidden_layers=36,
+            num_attention_heads=32, num_key_value_heads=8,
+            hidden_size=4096, head_dim=128,
+        ))
+        # Weights already hold most of a cap well below device-free memory.
+        torch.cuda.memory_allocated = lambda: int(7.23 * 1024 ** 3)
+        scorer.vram_budget = {"headroom_gib": 0.5, "fraction": 8.0 / 12.0}
+
+        capped = scorer._vram_token_limit()
+
+        # Raising only the cap must raise the limit, proving the cap binds.
+        scorer.vram_budget = {"headroom_gib": 0.5, "fraction": 10.0 / 12.0}
+        self.assertGreater(scorer._vram_token_limit(), capped)
+        # A cap fully consumed by the weights leaves no prompt budget.
+        scorer.vram_budget = {"headroom_gib": 0.5, "fraction": 7.3 / 12.0}
+        self.assertEqual(scorer._vram_token_limit(), 0)
+
+    def test_prefill_cost_model_reflects_the_chunking_mode(self):
+        """Chunking changes the slope; the chunk sets the intercept."""
+        scorer = QwenActionScorer()
+        scorer.model = SimpleNamespace(config=SimpleNamespace(
+            num_hidden_layers=36, num_attention_heads=32,
+            num_key_value_heads=8, hidden_size=4096, head_dim=128,
+        ))
+
+        scorer.prefill_chunk_tokens = 0
+        unchunked_slope, unchunked_fixed = scorer._prefill_cost_model()
+        scorer.prefill_chunk_tokens = 1024
+        chunked_slope, chunked_fixed = scorer._prefill_cost_model()
+
+        self.assertAlmostEqual(unchunked_slope / 1024, 240.5, places=0)
+        self.assertAlmostEqual(chunked_slope / 1024, 153.0, places=0)
+        self.assertLess(chunked_slope, unchunked_slope)
+        self.assertGreater(chunked_fixed, unchunked_fixed)
+        # Both must charge more than the bare cache.
+        self.assertGreater(chunked_slope, 147456)
+
+    def test_pinned_encoding_is_not_silently_shed(self):
+        """A pin exists so one run cannot mix encodings; honour it."""
+        builders = recipe_builders()
+        name = next(iter(builders))
+
+        class RefusingScorer(DemoScorer):
+            def score(self, context_prompt, query_prompt, candidates):
+                raise PromptTooLongError(99999, 100)
+
+        for policy, expect_raise in (
+            ("auto", False), ("state_delta", True), ("action_only", True),
+        ):
+            with self.subTest(policy=policy):
+                agent = InContextLlmAgent(
+                    replace(_settings(), llm_context_encoding=policy),
+                    scorer=RefusingScorer(),
+                )
+                observe_demo(agent, build_task(name, "default", builders[name]), {})
+                prefix = [next(iter(agent.llm_actions))]
+                if expect_raise:
+                    with self.assertRaises(PromptTooLongError):
+                        agent.predict_actions(prefix)
+                else:
+                    # "auto" retries on the compact context, which also refuses.
+                    with self.assertRaises(PromptTooLongError):
+                        agent.predict_actions(prefix)
+                    self.assertEqual(len(agent.scorer.calls), 0)
+
+    def test_pinned_action_only_never_sends_state_annotation(self):
+        builders = recipe_builders()
+        name = next(iter(builders))
+        agent = InContextLlmAgent(
+            replace(_settings(), llm_context_encoding="action_only"),
+            scorer=DemoScorer(),
+        )
+        observe_demo(agent, build_task(name, "default", builders[name]), {})
+
+        agent.predict_actions([next(iter(agent.llm_actions))])
+
+        sent = agent.scorer.calls[-1][0]
+        self.assertNotIn("state_delta", sent)
+        self.assertEqual(
+            agent.last_score_stats["llm_context_encoding"], "action_only_pinned",
+        )
+        self.assertEqual(
+            agent.baseline_stats()["context_encoding_policy"], "action_only",
+        )
+
+    def test_missing_logits_contract_fails_the_load(self):
+        """Losing logits_to_keep materializes logits for every position."""
+        class WithoutContract:
+            def forward(self, input_ids=None, **kwargs):
+                return None
+
+        class WithContract:
+            def forward(self, input_ids=None, logits_to_keep=None, **kwargs):
+                return None
+
+        scorer = QwenActionScorer()
+        scorer.model = WithoutContract()
+        with self.assertRaisesRegex(RuntimeError, "logits_to_keep"):
+            scorer._verify_logits_contract()
+
+        scorer.model = WithContract()
+        scorer._verify_logits_contract()
+
+    def test_device_out_of_memory_becomes_a_prompt_budget_overrun(self):
+        """The cap makes OOM reachable; the agent then sheds the annotation
+        instead of the run dying or the display hanging."""
+        class FakeOom(RuntimeError):
+            pass
+
+        released = []
+        torch, _recorded = self._vram_torch(total_gib=12.0, free_gib=4.5)
+        torch.OutOfMemoryError = FakeOom
+        torch.cuda.empty_cache = lambda: released.append("empty_cache")
+        scorer = QwenActionScorer(vram_headroom_gib=2.0)
+        scorer.torch = torch
+        scorer.model = SimpleNamespace(config=SimpleNamespace(
+            num_hidden_layers=36, num_attention_heads=32,
+            num_key_value_heads=8, hidden_size=4096, head_dim=128,
+        ))
+        scorer.vram_budget = {"headroom_gib": 2.0}
+        scorer._last_prompt_tokens = 12345
+
+        def boom(*_args, **_kwargs):
+            raise FakeOom("CUDA out of memory")
+
+        scorer._score = boom
+
+        with self.assertRaises(PromptTooLongError) as caught:
+            scorer.score("context", "query", ("a",))
+
+        self.assertEqual(caught.exception.required_tokens, 12345)
+        self.assertGreater(caught.exception.context_limit, 0)
+        # The allocator's memory must be recovered before the retry.
+        self.assertIn("empty_cache", released)
+
+    def test_scoring_runtime_errors_are_not_disguised_as_budget_overruns(self):
+        """A cache-integrity failure must not be hidden by a smaller prompt."""
+        class FakeOom(RuntimeError):
+            pass
+
+        torch, _recorded = self._vram_torch(total_gib=12.0, free_gib=4.5)
+        torch.OutOfMemoryError = FakeOom
+        scorer = QwenActionScorer()
+        scorer.torch = torch
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("candidate scoring mutated the shared prompt cache")
+
+        scorer._score = boom
+
+        with self.assertRaisesRegex(RuntimeError, "mutated the shared prompt cache"):
+            scorer.score("context", "query", ("a",))
+
+    def test_agent_passes_the_configured_vram_headroom_to_the_scorer(self):
+        agent = build_agent(
+            "in_context_llm", replace(_settings(), llm_vram_headroom_gib=3.5),
+        )
+
+        self.assertEqual(agent.scorer.vram_headroom_gib, 3.5)
+        self.assertEqual(
+            agent.baseline_stats()["vram_headroom_gib"], 3.5,
+        )
+
     def test_message_ids_accepts_list_and_batch_encoding_contracts(self):
         cases = (
             ([11, 12, 13], [11, 12, 13]),
@@ -523,7 +932,14 @@ class InContextLlmTests(unittest.TestCase):
 
     def test_uncached_hub_model_is_allowed_to_download(self):
         fake_torch = ModuleType("torch")
-        fake_torch.cuda = SimpleNamespace(is_available=lambda: True)
+        fake_torch.cuda = SimpleNamespace(
+            is_available=lambda: True,
+            mem_get_info=lambda: (int(11.3 * 1024 ** 3), int(12 * 1024 ** 3)),
+            set_per_process_memory_fraction=lambda _fraction: None,
+            synchronize=lambda: None,
+            empty_cache=lambda: None,
+            memory_allocated=lambda: int(6.5 * 1024 ** 3),
+        )
         fake_transformers = ModuleType("transformers")
         tokenizer_loader = MagicMock()
         tokenizer_loader.from_pretrained.return_value = SimpleNamespace(
@@ -531,6 +947,19 @@ class InContextLlmTests(unittest.TestCase):
             eos_token_id=0,
         )
         model = MagicMock()
+        # The load path now sizes a VRAM budget and verifies the logits
+        # contract, so the double needs a real config and forward signature.
+        model.config = SimpleNamespace(
+            max_position_embeddings=40960,
+            num_hidden_layers=36,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+            head_dim=128,
+        )
+        model.forward = (
+            lambda input_ids=None, logits_to_keep=None, **kwargs: None
+        )
         model_loader = MagicMock()
         model_loader.from_pretrained.return_value = model
         fake_transformers.AutoTokenizer = tokenizer_loader
@@ -566,9 +995,12 @@ class InContextLlmTests(unittest.TestCase):
         model.eval.assert_called_once_with()
 
     def test_prompt_contains_replay_examples_but_no_task_oracle(self):
-        state = tuple(int(value) for value in StateTracker().get_state_vector())
-        action = "turn_on (stove)"
-        demonstrations = (PromptDemo(0.75, ((state, action),)),)
+        tracker = StateTracker()
+        state = tuple(int(value) for value in tracker.get_state_vector())
+        action = "turn_on (stove, cooking_station)"
+        tracker.apply_action(action)
+        reached = tuple(int(value) for value in tracker.get_state_vector())
+        demonstrations = (PromptDemo(0.75, ((state, action),), reached),)
 
         prompt = build_prompt(
             demonstrations,
@@ -580,7 +1012,7 @@ class InContextLlmTests(unittest.TestCase):
         self.assertIn(action, prompt)
         self.assertIn('"memory_weight":0.75', prompt)
         context_text, query_text = prompt.split("\nQUERY:\n", 1)
-        self.assertNotIn("state_predicates", context_text)
+        self.assertIn("initial_state_predicates", context_text)
         self.assertIn("current_state_predicates", query_text)
         for forbidden in (
             "goal_predicates",
@@ -590,6 +1022,148 @@ class InContextLlmTests(unittest.TestCase):
             "preconditions/effects",
         ):
             self.assertNotIn(forbidden, prompt.lower())
+
+    def test_context_carries_the_state_change_each_action_caused(self):
+        """The other arms train on (state, action) pairs; so must this one."""
+        tracker = StateTracker()
+        state = tuple(int(value) for value in tracker.get_state_vector())
+        action = "turn_on (stove, cooking_station)"
+        tracker.apply_action(action)
+        reached = tuple(int(value) for value in tracker.get_state_vector())
+        self.assertNotEqual(state, reached)
+        demonstrations = (PromptDemo(0.75, ((state, action),), reached),)
+
+        context = json.loads(
+            build_context_prompt(
+                demonstrations, candidate_actions(demonstrations),
+            ).split("CONTEXT:\n", 1)[1]
+        )
+
+        steps = context["previous_demonstrations"][0]["steps"]
+        self.assertEqual([step["action"] for step in steps], [action])
+        # The rendered delta must reconstruct the state the action reached.
+        rebuilt = set(context["initial_state_predicates"])
+        rebuilt -= set(steps[0]["state_delta"].get("-", ()))
+        rebuilt |= set(steps[0]["state_delta"].get("+", ()))
+        self.assertEqual(rebuilt, set(state_predicates(reached)))
+        self.assertTrue(steps[0]["state_delta"])
+
+    def test_state_annotation_is_shed_before_any_demonstration_is(self):
+        """Memory coverage is the experimental variable; annotation is not."""
+        builders = recipe_builders()
+
+        class OverflowingScorer(DemoScorer):
+            def __init__(self, limit):
+                super().__init__()
+                self.limit = limit
+
+            def score(self, context_prompt, query_prompt, candidates):
+                if len(context_prompt) > self.limit:
+                    raise PromptTooLongError(len(context_prompt), self.limit)
+                return super().score(context_prompt, query_prompt, candidates)
+
+        llm = InContextLlmAgent(_settings(), scorer=DemoScorer())
+        for name in list(builders)[:3]:
+            observe_demo(llm, build_task(name, "default", builders[name]), {})
+        annotated = build_context_prompt(
+            llm.prompt_demos, llm.llm_actions, llm.domain,
+        )
+        compact = build_context_prompt(
+            llm.prompt_demos, llm.llm_actions, llm.domain,
+            include_state_deltas=False,
+        )
+        self.assertGreater(len(annotated), len(compact))
+
+        llm.scorer = OverflowingScorer(len(annotated) - 1)
+        prefix = [next(iter(llm.llm_actions))]
+        self.assertTrue(llm.predict_actions(prefix))
+
+        sent, _query, _candidates = llm.scorer.calls[-1]
+        self.assertEqual(sent, compact)
+        self.assertEqual(
+            llm.last_score_stats["llm_context_encoding"],
+            "action_only_context_budget_exceeded",
+        )
+        # Every retained demonstration still reaches the model.
+        payload = json.loads(sent.split("CONTEXT:\n", 1)[1])
+        self.assertEqual(
+            len(payload["previous_demonstrations"]), len(llm.prompt_demos),
+        )
+        self.assertEqual(llm.baseline_stats()["memory_coverage"], 1.0)
+
+    def test_annotated_context_is_the_default_encoding(self):
+        builders = recipe_builders()
+        name = next(iter(builders))
+        llm = InContextLlmAgent(_settings(), scorer=DemoScorer())
+        observe_demo(llm, build_task(name, "default", builders[name]), {})
+
+        llm.predict_actions([next(iter(llm.llm_actions))])
+
+        self.assertEqual(
+            llm.last_score_stats["llm_context_encoding"], "per_step_state_delta",
+        )
+        self.assertIn("state_delta", llm.scorer.calls[-1][0])
+
+    def test_rendering_a_demo_without_its_final_state_is_refused(self):
+        """The last action's effect must not be silently dropped."""
+        state = tuple(int(value) for value in StateTracker().get_state_vector())
+        demonstrations = (PromptDemo(0.75, ((state, "turn_on (stove, cooking_station)"),)),)
+
+        with self.assertRaisesRegex(ValueError, "final state"):
+            build_context_prompt(
+                demonstrations, candidate_actions(demonstrations),
+            )
+
+    def test_make_prompt_demos_keeps_the_terminal_state(self):
+        tracker = StateTracker()
+        first = tuple(int(value) for value in tracker.get_state_vector())
+        action = "turn_on (stove, cooking_station)"
+        tracker.apply_action(action)
+        reached = tuple(int(value) for value in tracker.get_state_vector())
+        # _build_demos terminates every trajectory with a "stop" token.
+        trajectory = [(first, action), (reached, "stop")]
+
+        demos = make_prompt_demos([trajectory], [0.5])
+
+        self.assertEqual(len(demos), 1)
+        self.assertEqual(demos[0].steps, ((first, action),))
+        self.assertEqual(demos[0].final_state, reached)
+
+    def test_answer_boundary_follows_the_candidate_actions(self):
+        """An answer marker ahead of the options it constrains is stranded."""
+        query = build_query_prompt(
+            tuple(int(value) for value in StateTracker().get_state_vector()), (),
+        )
+
+        rendered = build_candidate_prompt(query, ("a", "b"))
+
+        self.assertNotIn("ANSWER:", query)
+        self.assertLess(
+            rendered.index("CANDIDATE_ACTIONS:"), rendered.index("ANSWER:"),
+        )
+        self.assertTrue(rendered.rstrip().endswith("ANSWER:"))
+        self.assertEqual(rendered.count("ANSWER:"), 1)
+
+    def test_prompt_instructions_name_the_sections_they_reference(self):
+        state = tuple(int(value) for value in StateTracker().get_state_vector())
+        tracker = StateTracker()
+        action = "turn_on (stove, cooking_station)"
+        tracker.apply_action(action)
+        demonstrations = (PromptDemo(
+            0.75,
+            ((state, action),),
+            tuple(int(value) for value in tracker.get_state_vector()),
+        ),)
+
+        prompt = build_prompt(
+            demonstrations, state, (), candidate_actions(demonstrations),
+        )
+
+        instructions = prompt.split("CONTEXT:", 1)[0]
+        for section in ("previous_demonstrations", "CANDIDATE_ACTIONS", "memory_weight", "initial_state_predicates"):
+            with self.subTest(section=section):
+                self.assertIn(section, instructions)
+                self.assertIn(section, prompt.split("CONTEXT:", 1)[1])
 
     def test_agent_is_lazy_and_uses_full_memory_policy(self):
         agent = build_agent("in_context_llm", _settings())
@@ -630,18 +1204,145 @@ class InContextLlmTests(unittest.TestCase):
         self.assertTrue(agent.audit_pruning()["passed"])
         stats = agent.policy_stats()
         self.assertEqual(stats["predictor"], "in_context_llm")
-        self.assertFalse(stats["llm_task_conditioned"])
-        self.assertEqual(stats["llm_memory_coverage"], 1.0)
+        # Contract invariants belong in the run manifest, not on every turn row.
+        for invariant in ("llm_task_conditioned", "llm_memory_coverage"):
+            self.assertNotIn(invariant, stats)
+        self.assertFalse(agent.baseline_stats()["task_conditioned"])
+        self.assertEqual(agent.baseline_stats()["memory_coverage"], 1.0)
 
-    def test_conditioned_candidates_match_full_prediction_support(self):
-        recipe_name, builder = next(iter(recipe_builders().items()))
-        pair = build_task(recipe_name, "default", builder)
+    def test_prompt_weights_are_the_replay_retention_weights(self):
+        """One number stands for a whole demonstration, so it must not be
+        divided by episode length the way per-example fit weights are."""
+        builders = recipe_builders()
+        llm = InContextLlmAgent(_settings(), scorer=DemoScorer())
+        for name in list(builders)[:4]:
+            observe_demo(llm, build_task(name, "default", builders[name]), {})
+
+        entries = llm.replay.active_items()
+        self.assertEqual(len(llm.prompt_demos), len(entries))
+        self.assertEqual(
+            [round(demo.weight, 9) for demo in llm.prompt_demos],
+            [round(float(entry.weight), 9) for entry in entries],
+        )
+        # The length-equalized weights the numeric arms fit against are a
+        # different quantity, and demos here differ in length.
+        fit_weights = llm._demo_weights(
+            entries, [float(entry.weight) for entry in entries],
+        )
+        self.assertNotEqual(
+            [round(w, 9) for w in fit_weights],
+            [round(demo.weight, 9) for demo in llm.prompt_demos],
+        )
+        self.assertGreater(len({len(demo.steps) for demo in llm.prompt_demos}), 1)
+
+    def test_build_prompt_reproduces_the_prompt_that_is_scored(self):
+        builders = recipe_builders()
+        scorer = DemoScorer()
+        llm = InContextLlmAgent(_settings(), scorer=scorer)
+        for name in list(builders)[:3]:
+            observe_demo(llm, build_task(name, "default", builders[name]), {})
+        prefix = [next(iter(llm.llm_actions))]
+
+        llm.predict_actions(prefix)
+
+        context_prompt, query_prompt, candidates = scorer.calls[-1]
+        scored = context_prompt + "\n" + QwenActionScorer._semantic_action_query(
+            query_prompt, candidates,
+        )
+        rendered = build_prompt(
+            llm.prompt_demos,
+            llm._replay_prefix(prefix),
+            prefix,
+            candidates,
+            llm.domain,
+        )
+        self.assertEqual(rendered, scored)
+        # The audit must show the conditioned candidates, not the full support.
+        self.assertLess(len(candidates), len(llm.llm_actions))
+
+    def test_predict_actions_accepts_the_shared_predictor_interface(self):
+        """Every other arm takes state=/action_universe=; real_robot passes them."""
+        builders = recipe_builders()
+        name = next(iter(builders))
+        pair = build_task(name, "default", builders[name])
         llm = InContextLlmAgent(_settings(), scorer=DemoScorer())
         full = build_agent("full", _settings())
-        observe_demo(llm, pair, {})
-        observe_demo(full, pair, {})
+        bc = build_agent("bc", _settings())
+        for agent in (llm, full, bc):
+            observe_demo(agent, pair, {})
         actions = [observation.action for observation in pair.observations]
-        for prefix in ((), tuple(actions[:1]), tuple(actions[:3])):
+        prefix = actions[:1]
+        state = llm._replay_prefix(prefix)
+
+        for label, agent in (("full", full), ("bc", bc), ("llm", llm)):
+            with self.subTest(agent=label):
+                self.assertTrue(agent.predict_actions(
+                    prefix, state=state, action_universe=tuple(llm.llm_actions),
+                ))
+        # A narrowed universe must narrow the scored support.
+        narrowed = llm.predict_actions(
+            prefix, state=state, action_universe=(actions[1],),
+        )
+        self.assertEqual(set(narrowed), {actions[1]})
+
+    def test_empty_feasible_support_degrades_instead_of_raising(self):
+        """Full returns {} here; raising would end a run where others miss."""
+        builders = recipe_builders()
+        name = next(iter(builders))
+        pair = build_task(name, "default", builders[name])
+        llm = InContextLlmAgent(_settings(), scorer=DemoScorer())
+        full = build_agent("full", _settings())
+        for agent in (llm, full):
+            observe_demo(agent, pair, {})
+        prefix = [observation.action for observation in pair.observations][:1]
+        state = llm._replay_prefix(prefix)
+
+        self.assertEqual(
+            full.predict_actions(prefix, state=state, action_universe=()), {},
+        )
+        self.assertEqual(
+            llm.predict_actions(prefix, state=state, action_universe=()), {},
+        )
+        self.assertEqual(llm.policy_stats()["reason"], "no_feasible_actions")
+
+    def test_cache_hit_reports_both_measured_and_uncached_inference_time(self):
+        builders = recipe_builders()
+        name = next(iter(builders))
+        llm = InContextLlmAgent(_settings(), scorer=DemoScorer())
+        observe_demo(llm, build_task(name, "default", builders[name]), {})
+        prefix = [next(iter(llm.llm_actions))]
+
+        llm.predict_actions(prefix)
+        stats = dict(llm.last_score_stats)
+
+        self.assertEqual(
+            stats["llm_uncached_inference_wall_s"],
+            stats["llm_inference_wall_s"] + 0.0,
+        )
+        self.assertIn("llm_score_cache_hit", stats)
+
+    def test_conditioned_candidates_match_full_prediction_support(self):
+        builders = recipe_builders()
+        llm = InContextLlmAgent(_settings(), scorer=DemoScorer())
+        full = build_agent("full", _settings())
+        pairs = [
+            build_task(name, "default", builders[name])
+            for name in list(builders)[:4]
+        ]
+        for pair in pairs:
+            observe_demo(llm, pair, {})
+            observe_demo(full, pair, {})
+        # The prompt's scoreable support must not be narrower than the shared
+        # mask's universe, or this arm would face fewer distractors than Full.
+        self.assertEqual(
+            set(llm.llm_actions), set(llm._known_action_universe()),
+        )
+        prefixes = [
+            tuple(observation.action for observation in pair.observations)[:length]
+            for pair in pairs
+            for length in (0, 1, 3, 7)
+        ]
+        for prefix in prefixes:
             with self.subTest(prefix_length=len(prefix)):
                 state = llm._replay_prefix(prefix)
                 self.assertEqual(
@@ -670,6 +1371,14 @@ class InContextLlmTests(unittest.TestCase):
         self.assertTrue(config.shared_routing)
         self.assertFalse(config.include_oracle)
         self.assertEqual(config.workers, 1)
+        self.assertEqual(config.seeds, (1337,))
+        self.assertEqual(config.recipe_count, 20)
+        self.assertEqual(config.frozen_pairs, 48)
+        self.assertEqual(config.schedule.phases, 7)
+        self.assertEqual(config.schedule.demos, 210)
+        self.assertEqual(config.schedule.min_recipes, 5)
+        self.assertEqual(config.schedule.max_recipes, 8)
+        self.assertEqual(config.experiment, "llm_single_seed_evaluation")
 
         with self.assertRaisesRegex(ValueError, "shared Full interaction"):
             main(["--local-routing"])
@@ -704,6 +1413,14 @@ class InContextLlmTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires --local-routing"):
             main(["--baselines", "in_context_llm"])
+
+    def test_dedicated_runner_rejects_multiple_seeds(self):
+        with (
+            patch("src.llm_baseline.preflight_llm_runtime") as preflight,
+            self.assertRaisesRegex(ValueError, "exactly one seed"),
+        ):
+            main(["--seeds", "1337,2024"])
+        preflight.assert_not_called()
 
 
 if __name__ == "__main__":

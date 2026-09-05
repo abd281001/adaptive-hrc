@@ -1,0 +1,147 @@
+{
+  "schema_version": 2,
+  "tag_dictionary": "DICT_6X6_250",
+  "home_station": "workspace",
+  "fingertip_marker_ids": [200, 201],
+  "stations": {
+    "workspace": {"label": "Shared workspace", "heading_deg": 0.0},
+    "produce": {"label": "Produce station", "heading_deg": -48.0},
+    "chilled": {"label": "Chilled station", "heading_deg": -24.0},
+    "pantry": {"label": "Pantry station", "heading_deg": 24.0},
+    "equipment": {"label": "Container station", "heading_deg": 48.0}
+  },
+  "reference_marker": {
+    "marker_id": 199,
+    "marker_length_mm": 80.0,
+    "expected_position_by_station_m": {
+      "workspace": [0.0, 0.0, 0.40],
+      "produce": [0.0, 0.0, 0.40],
+      "chilled": [0.0, 0.0, 0.40],
+      "pantry": [0.0, 0.0, 0.40],
+      "equipment": [0.0, 0.0, 0.40]
+    },
+    "tolerance_m": 0.05
+  },
+  "placement_slots": {
+    "slot_1": {
+      "label": "Workspace slot 1",
+      "heading_offset_deg": -20.0,
+      "arm_extension_m": 0.15,
+      "lift_height_m": 0.91,
+      "verify_marker_xyz_m": [0.0, 0.0, 0.30],
+      "verify_tolerance_m": 0.05
+    },
+    "slot_2": {
+      "label": "Workspace slot 2",
+      "heading_offset_deg": -12.0,
+      "arm_extension_m": 0.15,
+      "lift_height_m": 0.91,
+      "verify_marker_xyz_m": [0.0, 0.0, 0.30],
+      "verify_tolerance_m": 0.05
+    },
+    "slot_3": {
+      "label": "Workspace slot 3",
+      "heading_offset_deg": -4.0,
+      "arm_extension_m": 0.15,
+      "lift_height_m": 0.91,
+      "verify_marker_xyz_m": [0.0, 0.0, 0.30],
+      "verify_tolerance_m": 0.05
+    },
+    "slot_4": {
+      "label": "Workspace slot 4",
+      "heading_offset_deg": 4.0,
+      "arm_extension_m": 0.15,
+      "lift_height_m": 0.91,
+      "verify_marker_xyz_m": [0.0, 0.0, 0.30],
+      "verify_tolerance_m": 0.05
+    },
+    "slot_5": {
+      "label": "Workspace slot 5",
+      "heading_offset_deg": 12.0,
+      "arm_extension_m": 0.15,
+      "lift_height_m": 0.91,
+      "verify_marker_xyz_m": [0.0, 0.0, 0.30],
+      "verify_tolerance_m": 0.05
+    },
+    "slot_6": {
+      "label": "Workspace slot 6",
+      "heading_offset_deg": 20.0,
+      "arm_extension_m": 0.15,
+      "lift_height_m": 0.91,
+      "verify_marker_xyz_m": [0.0, 0.0, 0.30],
+      "verify_tolerance_m": 0.05
+    }
+  },
+  "objects": {
+    "bowl": {"label": "bowl proxy", "marker_id": 1, "marker_length_mm": 40.0, "source_station": "equipment"},
+    "plate": {"label": "plate proxy", "marker_id": 2, "marker_length_mm": 40.0, "source_station": "equipment"},
+    "lettuce": {"label": "lettuce proxy", "marker_id": 10, "marker_length_mm": 40.0, "source_station": "produce"},
+    "tomato": {"label": "tomato proxy", "marker_id": 11, "marker_length_mm": 40.0, "source_station": "produce"},
+    "cucumber": {"label": "cucumber proxy", "marker_id": 12, "marker_length_mm": 40.0, "source_station": "produce"},
+    "banana": {"label": "banana proxy", "marker_id": 13, "marker_length_mm": 40.0, "source_station": "produce"},
+    "strawberries": {"label": "strawberries proxy", "marker_id": 14, "marker_length_mm": 40.0, "source_station": "produce"},
+    "basil": {"label": "basil proxy", "marker_id": 15, "marker_length_mm": 40.0, "source_station": "produce"},
+    "cheese": {"label": "cheese proxy", "marker_id": 20, "marker_length_mm": 40.0, "source_station": "chilled"},
+    "yoghurt": {"label": "yoghurt proxy", "marker_id": 21, "marker_length_mm": 40.0, "source_station": "chilled"},
+    "dressing": {"label": "dressing proxy", "marker_id": 30, "marker_length_mm": 40.0, "source_station": "pantry"},
+    "honey": {"label": "honey proxy", "marker_id": 31, "marker_length_mm": 40.0, "source_station": "pantry"},
+    "oil": {"label": "oil proxy", "marker_id": 32, "marker_length_mm": 40.0, "source_station": "pantry"},
+    "cereal": {"label": "cereal proxy", "marker_id": 33, "marker_length_mm": 40.0, "source_station": "pantry"}
+  },
+  "actions": {
+    "STAGE_BOWL": {"label": "stage bowl", "role": "equipment", "object_id": "bowl", "destination_station": "workspace"},
+    "STAGE_PLATE": {"label": "stage plate", "role": "equipment", "object_id": "plate", "destination_station": "workspace"},
+    "FETCH_LETTUCE": {"label": "fetch lettuce", "role": "produce", "object_id": "lettuce", "destination_station": "workspace"},
+    "FETCH_TOMATO": {"label": "fetch tomato", "role": "produce", "object_id": "tomato", "destination_station": "workspace"},
+    "FETCH_CUCUMBER": {"label": "fetch cucumber", "role": "produce", "object_id": "cucumber", "destination_station": "workspace"},
+    "FETCH_BANANA": {"label": "fetch banana", "role": "produce", "object_id": "banana", "destination_station": "workspace"},
+    "FETCH_STRAWBERRIES": {"label": "fetch strawberries", "role": "produce", "object_id": "strawberries", "destination_station": "workspace"},
+    "FETCH_BASIL": {"label": "fetch basil", "role": "produce", "object_id": "basil", "destination_station": "workspace"},
+    "FETCH_CHEESE": {"label": "fetch cheese", "role": "chilled", "object_id": "cheese", "destination_station": "workspace"},
+    "FETCH_YOGHURT": {"label": "fetch yoghurt", "role": "chilled", "object_id": "yoghurt", "destination_station": "workspace"},
+    "FETCH_DRESSING": {"label": "fetch dressing", "role": "pantry", "object_id": "dressing", "destination_station": "workspace"},
+    "FETCH_HONEY": {"label": "fetch honey", "role": "pantry", "object_id": "honey", "destination_station": "workspace"},
+    "FETCH_OIL": {"label": "fetch oil", "role": "pantry", "object_id": "oil", "destination_station": "workspace"},
+    "FETCH_CEREAL": {"label": "fetch cereal", "role": "pantry", "object_id": "cereal", "destination_station": "workspace"}
+  },
+  "recipes": {
+    "garden_salad": {"label": "Garden salad", "actions": ["STAGE_BOWL", "FETCH_LETTUCE", "FETCH_TOMATO", "FETCH_CUCUMBER", "FETCH_CHEESE", "FETCH_DRESSING"]},
+    "fruit_bowl": {"label": "Fruit bowl", "actions": ["STAGE_BOWL", "FETCH_BANANA", "FETCH_STRAWBERRIES", "FETCH_YOGHURT", "FETCH_HONEY", "FETCH_BASIL"]},
+    "caprese_plate": {"label": "Caprese plate", "actions": ["STAGE_PLATE", "FETCH_TOMATO", "FETCH_CHEESE", "FETCH_BASIL", "FETCH_CUCUMBER", "FETCH_OIL"]},
+    "breakfast_bowl": {"label": "Breakfast bowl", "actions": ["STAGE_BOWL", "FETCH_CEREAL", "FETCH_BANANA", "FETCH_YOGHURT", "FETCH_STRAWBERRIES", "FETCH_HONEY"]}
+  },
+  "motion": {
+    "calibrated": false,
+    "calibration_id": "",
+    "calibration_record": "",
+    "calibration_record_sha256": "",
+    "action_timeout_s": 120.0,
+    "command_timeout_s": 15.0,
+    "grasp_timeout_s": 45.0,
+    "rotation_tolerance_deg": 8.0,
+    "min_station_separation_deg": 15.0,
+    "placement_settle_s": 0.75,
+    "velocity_scale": 0.35
+  },
+  "perception": {
+    "fingertip_marker_length_mm": 14.0,
+    "min_marker_pixels": 18.0,
+    "max_reprojection_error_px": 3.0,
+    "min_marker_depth_m": 0.05,
+    "max_marker_depth_m": 0.80,
+    "stable_frames": 3,
+    "max_position_jump_m": 0.035,
+    "max_frame_age_s": 0.30,
+    "camera_startup_timeout_s": 12.0,
+    "camera_frame_timeout_ms": 1000,
+    "postcondition_timeout_s": 8.0,
+    "require_both_fingertips": true
+  },
+  "agent_settings": {
+    "seed": 1337,
+    "irl_horizon": 12,
+    "irl_cold_steps": 50,
+    "irl_warm_steps": 20,
+    "verbose": false
+  }
+}

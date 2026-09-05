@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import numpy as np
 
 DEFAULT_NATIVE_THREADS_PER_WORKER = 1
+DEFAULT_EVALUATION_WORKER_CAP = 20
 DEFAULT_RESULTS_ROOT = "eval_results"
 RUNS_DIRNAME = "runs"
 LATEST_NAME = "latest"
@@ -172,12 +173,21 @@ def _atomic_write(path: Path, data: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except BaseException:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
         raise
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -198,6 +208,7 @@ def _write_jsonl_gz(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
         with open(temporary, "rb") as stream:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -327,6 +338,9 @@ def compare_groups(
         ("heldout_settled", "teacher_forced_top_1", "higher_is_better", "secondary"),
         ("heldout_climb", "normalized_human_action_load", "lower_is_better", "secondary"),
         ("heldout_settled", "normalized_human_action_load", "lower_is_better", "secondary"),
+        # Interaction latency: the blocking wait between two demonstrations.
+        ("heldout_climb", "online_p95_retrain_fit_wall_s", "lower_is_better", "secondary"),
+        ("heldout_settled", "online_p95_retrain_fit_wall_s", "lower_is_better", "secondary"),
     )
     common = set.intersection(*(set(summary["per_baseline"]) for summary in summaries))
     comparators = [baseline for baseline in DEPLOYABLE_BASELINES if baseline in common]
@@ -377,6 +391,8 @@ def compare_groups(
             "held-out-settled teacher-forced Top-1",
             "held-out-climb normalized human action load",
             "held-out-settled normalized human action load",
+            "held-out-climb p95 retrain fit latency",
+            "held-out-settled p95 retrain fit latency",
         ],
         "test": "Exact paired sign-flip randomization test; one-sided p-values are Holm-adjusted within each endpoint.",
         "caution": "Inference may be low-powered. Bootstrap intervals are descriptive and do not replace the exact tests.",
@@ -457,7 +473,7 @@ def _apply_native_thread_limit(threads: int) -> Dict[str, Any]:
 
 _set_native_thread_env(DEFAULT_NATIVE_THREADS_PER_WORKER, override=False)
 
-from .adaptive_agent import AdaptiveAgent
+from .adaptive_agent import ACTION_MASK_CONTRACT, AdaptiveAgent
 from .ablations import parse_commit_records, summarize_commit_decisions
 from .baselines import BASELINE_AGENTS
 from .environment import recipe_builders
@@ -1875,9 +1891,11 @@ def build_schedule(
 
 CLAIRVOYANT_REFERENCE_TAG = "dashed_reference_not_deployable"
 CLAIRVOYANT_LEAKAGE_WARNING = (
-    "Non-deployable oracle: compares future-filtered retention against an "
-    "identical Full reference using ground-truth outcomes, and keeps the "
-    "non-inferior state. Use only as a reference curve."
+    "Non-deployable oracle: retention decisions read the future recurrence "
+    "schedule. It matches Full exactly on a pair's first exposure, because "
+    "there is nothing to retain or prune before a pair is learned, and "
+    "thereafter keeps whatever its future-filtered retention produces, "
+    "including outcomes worse than Full. Use only as a reference curve."
 )
 
 POST_MISMATCH_WINDOWS = (1, 2, 3)
@@ -1942,7 +1960,9 @@ class EvalSettings:
     output: str = DEFAULT_RESULTS_ROOT
     run: Optional[str] = None
     resume: bool = False
-    workers: int = 0
+    # Process cap for complete scenario cohorts.  With the paper schedule this
+    # admits all 3 scenarios x 5 seeds at once (15 workers).
+    workers: int = DEFAULT_EVALUATION_WORKER_CAP
     threads: int = DEFAULT_NATIVE_THREADS_PER_WORKER
     show_eta: bool = True
     include_oracle: bool = True
@@ -1960,7 +1980,11 @@ class EvalSettings:
     # Probe primary climb assists before interaction without mutation.
     pre_event_probes: bool = True
     frozen_pairs: int = 48
-    audit_period: int = 2
+    # The pruned-influence audit refits a throwaway model; it is read-only with
+    # respect to the agent (no state, no RNG, no deployed weights change), so its
+    # frequency is a diagnostic-density choice, not a method parameter. Every
+    # 2 events made it the single largest cost in the suite.
+    audit_period: int = 10
     audit_prefixes: int = 16
     audit_tolerance: float = 5e-2
     top_k: int = 3
@@ -2701,20 +2725,70 @@ def build_holdout_plan(
     )
 
 
+def decision_ceiling(pairs: Sequence[TaskVariant]) -> Dict[str, Any]:
+    """Best Top-1 any predictor could reach on this stream, and why.
+
+    At prediction time the learner sees a state and a prefix, never a
+    preference label. Where one context is followed by different actions in
+    different demonstrations, the correct action is not identified by that
+    context and no predictor can do better than picking the most frequent
+    continuation. Reporting that bound alongside accuracy is what separates
+    "the model is weak here" from "this decision was not decidable".
+
+    A ceiling of 1.0 means the stream contains no such contest, so it cannot
+    evidence preference learning however well a model scores on it.
+    """
+    by_state: Dict[Tuple[str, Tuple[int, ...]], Counter] = defaultdict(Counter)
+    by_prefix: Dict[Tuple[str, Tuple[str, ...]], Counter] = defaultdict(Counter)
+    for pair in pairs:
+        prefix: Tuple[str, ...] = ()
+        for observation in pair.observations:
+            by_state[(pair.recipe_name, tuple(observation.state))][observation.action] += 1
+            by_prefix[(pair.recipe_name, prefix)][observation.action] += 1
+            prefix = prefix + (observation.action,)
+
+    def bound(table: Mapping[Any, Counter]) -> Dict[str, Any]:
+        decisions = sum(sum(counts.values()) for counts in table.values())
+        if not decisions: return {"n_decisions": 0, "n_contexts": 0, "ambiguous_decision_share": None, "max_achievable_top_1": None}
+        best = sum(max(counts.values()) for counts in table.values())
+        ambiguous = sum(sum(counts.values()) for counts in table.values() if len(counts) >= 2)
+        return {"n_decisions": decisions, "n_contexts": len(table), "ambiguous_decision_share": _safe_div(ambiguous, decisions), "max_achievable_top_1": _safe_div(best, decisions)}
+
+    state_bound = bound(by_state)
+    prefix_bound = bound(by_prefix)
+    return {
+        "definition": ("Upper bound on Top-1 given the information a predictor actually has. Conditioning on state bounds "
+                       "any state-feature reward; conditioning on prefix bounds any history-aware predictor. A bound of 1.0 "
+                       "means no decision in this stream is contested, so the stream cannot evidence preference learning."),
+        "given_state": state_bound,
+        "given_prefix": prefix_bound,
+        # Positive means history carries preference information the state does
+        # not, which is what a prefix-conditioned component can exploit.
+        "prefix_information_gain": (None if prefix_bound["max_achievable_top_1"] is None or state_bound["max_achievable_top_1"] is None
+                                    else prefix_bound["max_achievable_top_1"] - state_bound["max_achievable_top_1"]),
+        "n_pairs": len(pairs),
+    }
+
+
 def build_plan(scenario: str, config: EvalSettings, seed: int) -> Plan:
     try:
         spec = SCENARIO_SPECS[scenario]
     except KeyError as exc:
         raise KeyError(f"unknown scenario {scenario!r}; available={SCENARIOS}") from exc
     if scenario == HOLDOUT:
-        return build_holdout_plan(config, seed)
-    return build_deployment_plan(
-        config,
-        seed,
-        structure=spec.structure,
-        holdout=spec.holdout,
-        scenario=scenario,
-    )
+        plan = build_holdout_plan(config, seed)
+    else:
+        plan = build_deployment_plan(
+            config,
+            seed,
+            structure=spec.structure,
+            holdout=spec.holdout,
+            scenario=scenario,
+        )
+    # Record what this schedule makes decidable, so every reported accuracy can
+    # be read against its own bound rather than against 1.0.
+    demonstrated = tuple(event.pair for event in plan.events)
+    return replace(plan, metadata={**dict(plan.metadata), "decision_ceiling": decision_ceiling(demonstrated)})
 
 
 def _axis_labels(pair: TaskVariant) -> Tuple[str, ...]:
@@ -2824,54 +2898,74 @@ def _recipe_has_active_variant(
     pair: TaskVariant,
     recipe_ids: Mapping[str, str],
 ) -> bool:
+    """Whether this agent still holds any active variant of the pair's recipe.
+
+    The comprehension variable is deliberately named apart from the target:
+    binding it to ``recipe_id`` shadowed the target and made the test
+    ``recipe_id == recipe_id``, so this returned True whenever active memory was
+    non-empty regardless of which recipe it held. That silently disabled the
+    only trigger for baseline-local re-observation, which is why the routing
+    ablation recorded zero extra observations for every baseline.
+    """
     recipe_id = recipe_ids.get(pair.recipe_name)
-    return bool(recipe_id and any(recipe_id == recipe_id for recipe_id, _ in _active_variants(agent)))
+    if recipe_id is None: return False
+    return any(active_recipe_id == recipe_id for active_recipe_id, _variant_id in _active_variants(agent))
 
 
 def _recurrence_tags(
     agent: AdaptiveAgent,
-    pair: TaskVariant,
-    recipe_ids: Mapping[str, str],
     target_key: Optional[VariantKey],
-    tags: Mapping[str, Any],
-    pairs_by_label: Mapping[str, TaskVariant],
 ) -> Dict[str, Any]:
-    """Report whether a tagged recurrence actually engaged memory removal."""
-    if not bool(tags.get("delayed_recurrence_probe")):
-        return {}
-    conflict_labels = tuple(str(label) for label in (
-        tags.get("delayed_recurrence_historical_conflicting_pair_labels") or ()
-    ))
+    """Classify and describe a delayed recurrence of an already-seen variant.
+
+    The probe condition is read off realized state rather than planned in the
+    schedule: an event is a delayed recurrence when this exact variant has been
+    demonstrated before and the gap since then has passed the retention horizon
+    the agent itself learned for it. The earlier version gated on a
+    ``delayed_recurrence_probe`` tag that no code path ever sets, so the whole
+    diagnostic reported ``not_run`` in every completed run.
+
+    Conflicts are the recipe's other known variants: the mechanism under test is
+    that the target survives, or reenters, while its stale siblings do not.
+    """
+    if target_key is None: return {}
+    recipe_id, variant_id = target_key
+    gaps = agent.replay.pair_history(target_key)
+    last_seen = agent.replay.pair_last_seen(target_key)
+    if not gaps and last_seen is None: return {}
+
+    horizon = float(agent.replay.horizon(target_key))
+    elapsed = (
+        float(int(agent.demo_counter) - int(last_seen))
+        if last_seen is not None else None
+    )
+    is_probe = bool(elapsed is not None and elapsed > horizon)
+    if not is_probe: return {"delayed_recurrence_probe": False}
+
     active = _active_variants(agent)
     pruned = _pruned_keys(agent)
     conflict_keys = [
-        _pair_key(agent, pairs_by_label[label], recipe_ids)
-        for label in conflict_labels
-        if label in pairs_by_label
+        (recipe_id, other_variant_id)
+        for other_variant_id in agent.library.variants.get(recipe_id, {})
+        if other_variant_id != variant_id
     ]
-    known_conflict_keys = [key for key in conflict_keys if key is not None]
-    recipe_id = recipe_ids.get(pair.recipe_name)
-    horizon = (
-        float(agent.replay.horizon(target_key))
-        if target_key is not None else None
-    )
-    target_is_latest = bool(
-        target_key is not None
-        and recipe_id is not None
-        and agent.replay.latest_by_recipe.get(recipe_id) == target_key[1]
-    )
-    active_count = sum(key in active for key in known_conflict_keys)
-    pruned_count = sum(key in pruned for key in known_conflict_keys)
+    active_count = sum(key in active for key in conflict_keys)
+    pruned_count = sum(key in pruned for key in conflict_keys)
     return {
-        "delayed_recurrence_target_active_before": bool(target_key and target_key in active),
-        "delayed_recurrence_target_is_latest_before": target_is_latest,
+        "delayed_recurrence_probe": True,
+        "delayed_recurrence_target_active_before": bool(target_key in active),
+        "delayed_recurrence_target_is_latest_before": bool(
+            agent.replay.latest_by_recipe.get(recipe_id) == variant_id
+        ),
         "delayed_recurrence_actual_grace_horizon_before": horizon,
         "delayed_recurrence_agent_demo_before": int(agent.demo_counter),
-        "delayed_recurrence_known_conflicting_variant_count_before": len(known_conflict_keys),
+        "delayed_recurrence_intervening_event_count": elapsed,
+        "delayed_recurrence_required_intervening_event_count": horizon,
+        "delayed_recurrence_known_conflicting_variant_count_before": len(conflict_keys),
         "delayed_recurrence_conflicting_active_count_before": int(active_count),
         "delayed_recurrence_conflicting_pruned_count_before": int(pruned_count),
         "delayed_recurrence_all_known_conflicts_pruned_before": bool(
-            known_conflict_keys and pruned_count == len(known_conflict_keys)
+            conflict_keys and pruned_count == len(conflict_keys)
         ),
     }
 
@@ -3023,7 +3117,11 @@ def assist_demo(
         )
 
     def robot_metadata(context: Any) -> Mapping[str, Any]:
-        stats = agent.policy_stats()
+        # Per-turn rows carry measurements only. The action-mask design
+        # invariants are recorded once per run in the manifest, under
+        # "action_mask_contract"; restamping them here would look like
+        # per-decision verification of something that cannot come out False.
+        stats = agent.varying_policy_stats()
         actual_probability = context.distribution.get(context.actual)
         return {
             **stats,
@@ -3515,7 +3613,7 @@ def _active_only_audit_row(
             **row,
             **result,
             "audit_available": True,
-            "primary_active_only_contract": "fitted_policy_matches_active_replay_reference",
+            "primary_active_only_contract": "training_inputs_exclude_pruned_variants",
             "primary_active_only_contract_passed": bool(primary) if primary is not None else None,
         }
     except Exception as exc:
@@ -3523,7 +3621,7 @@ def _active_only_audit_row(
             **row,
             "audit_available": False,
             "passed": False,
-            "primary_active_only_contract": "fitted_policy_matches_active_replay_reference",
+            "primary_active_only_contract": "training_inputs_exclude_pruned_variants",
             "primary_active_only_contract_passed": False,
             "error": f"{type(exc).__name__}: {exc}",
         }
@@ -3620,7 +3718,7 @@ def _apply_oracle_pruning(
         "oracle_future_variant_count": len(future_keys),
         "oracle_missing_future_variants": len(missing),
         "oracle_retained_without_future": len(unexpected),
-        "oracle_retention_policy": "future_filtered_with_full_fallback",
+        "oracle_retention_policy": "future_filtered_after_first_exposure",
         "oracle_pruning_rule": "retain_exact_known_future_variants",
         "oracle_decay_policy": "binary_keep_until_final_occurrence",
         "oracle_pruned_keys": [
@@ -3628,68 +3726,6 @@ def _apply_oracle_pruning(
             for recipe_id, variant_id in discard
         ],
     }
-
-
-_ORACLE_HIGHER_IS_BETTER = (
-    "teacher_forced_top_1",
-    "teacher_forced_top_k",
-    "live_top_1",
-    "live_top_k",
-    "top_1",
-    "top_k",
-    "closed_loop_live_top_1",
-    "closed_loop_live_top_k",
-)
-_ORACLE_LOWER_IS_BETTER = (
-    "teacher_forced_mean_nll",
-    "mean_nll_per_robot_turn",
-    "normalized_human_action_load",
-    "corrections_per_recipe_step",
-)
-
-
-def _oracle_candidate_noninferior(
-    candidate: Mapping[str, Any],
-    full_reference: Mapping[str, Any],
-    *,
-    tolerance: float = 1e-12,
-) -> Tuple[bool, Tuple[str, ...]]:
-    """Return whether future filtering is no worse than Full on every headline metric."""
-    regressions: List[str] = []
-    for metric in _ORACLE_HIGHER_IS_BETTER:
-        candidate_value = candidate.get(metric)
-        reference_value = full_reference.get(metric)
-        if (
-            not isinstance(reference_value, (int, float))
-            or not math.isfinite(float(reference_value))
-        ):
-            continue
-        if (
-            not isinstance(candidate_value, (int, float))
-            or not math.isfinite(float(candidate_value))
-            or float(candidate_value) + tolerance < float(reference_value)
-        ):
-            regressions.append(metric)
-    for metric in _ORACLE_LOWER_IS_BETTER:
-        candidate_value = candidate.get(metric)
-        reference_value = full_reference.get(metric)
-        if (
-            not isinstance(reference_value, (int, float))
-            or not math.isfinite(float(reference_value))
-        ):
-            continue
-        if (
-            not isinstance(candidate_value, (int, float))
-            or not math.isfinite(float(candidate_value))
-            or float(candidate_value) > float(reference_value) + tolerance
-        ):
-            regressions.append(metric)
-    if full_reference.get("commit_correct") is True and candidate.get("commit_correct") is not True:
-        regressions.append("commit_correct")
-    for metric in ("false_variant_creation", "false_latest_promotion"):
-        if candidate.get(metric) is True and full_reference.get(metric) is not True:
-            regressions.append(metric)
-    return not regressions, tuple(regressions)
 
 
 def _restore_oracle_candidate(
@@ -3706,7 +3742,13 @@ def _select_oracle_probe_rows(
     candidate_rows: Sequence[Mapping[str, Any]],
     full_reference_rows: Sequence[Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Apply the event-level oracle dominance rule to frozen probe rows."""
+    """Return the oracle's own frozen probes, pair-aligned against Full.
+
+    The oracle keeps whatever its future-filtered retention produced, including
+    when that is worse than Full. Selecting per event on realized outcomes made
+    ``oracle_advantage >= 0`` true by construction and left the reference unable
+    to be worse than the system it was benchmarking.
+    """
     if len(candidate_rows) != len(full_reference_rows):
         raise RuntimeError(
             "oracle and Full produced different frozen-probe row counts: "
@@ -3719,17 +3761,8 @@ def _select_oracle_probe_rows(
                 "oracle and Full frozen probes are not pair-aligned: "
                 f"{candidate.get('pair')!r} != {full_reference.get('pair')!r}"
             )
-        candidate_ok, regressions = _oracle_candidate_noninferior(
-            candidate, full_reference,
-        )
-        row = dict(candidate if candidate_ok else full_reference)
-        row.update({
-            "oracle_probe_selection": (
-                "future_filtered_noninferior"
-                if candidate_ok else "full_dominance_fallback"
-            ),
-            "oracle_probe_regressed_metrics": list(regressions),
-        })
+        row = dict(candidate)
+        row["oracle_probe_selection"] = "future_filtered"
         selected.append(row)
     return selected
 
@@ -3958,6 +3991,7 @@ def run_stream(
     *,
     execution_mode_schedule: Optional[Sequence[str]] = None,
     mode_schedule_policy: str = "baseline_local",
+    event_progress: Optional[Callable[[RunState, int], None]] = None,
 ) -> RunState:
     if execution_mode_schedule is not None:
         if len(execution_mode_schedule) != len(plan.events):
@@ -4017,7 +4051,6 @@ def run_stream(
             "offline_training_preference_names", ()
         )
     }
-    pairs_by_label = {event.pair.label: event.pair for event in plan.events}
 
     for event_index, event in enumerate(plan.events):
         pair = event.pair
@@ -4113,20 +4146,13 @@ def run_stream(
                 and pair.recipe_name in observed_recipes
             ),
         })
-        tags.update(_recurrence_tags(
-            agent,
-            pair,
-            recipe_ids,
-            target_key_before,
-            tags,
-            pairs_by_label,
-        ))
+        tags.update(_recurrence_tags(agent, target_key_before))
         if is_clairvoyant:
             tags.update({
                 "oracle_reference": MEMORY_ORACLE,
                 "reported_as": CLAIRVOYANT_REFERENCE_TAG,
                 "leakage_warning": CLAIRVOYANT_LEAKAGE_WARNING,
-                "oracle_retention_policy": "future_filtered_with_full_fallback",
+                "oracle_retention_policy": "future_filtered_after_first_exposure",
                 "oracle_decay_policy": "binary_keep_until_final_occurrence",
             })
 
@@ -4222,7 +4248,6 @@ def run_stream(
             )
 
         oracle_selection = "not_applicable"
-        oracle_regressions: Tuple[str, ...] = ()
         if not is_clairvoyant:
             row = execute_event(agent, recipe_ids, memory_state_before)
         else:
@@ -4319,65 +4344,19 @@ def run_stream(
                 )
                 oracle_selection = "full_for_unseen_pair"
             else:
-                candidate_row = execute_event(
-                    agent, recipe_ids, memory_state_before,
-                )
-                annotate_commit_outcome(candidate_row, agent)
-                candidate_ok, oracle_regressions = _oracle_candidate_noninferior(
-                    candidate_row, full_row,
-                )
-                if candidate_ok:
-                    row = candidate_row
-                    oracle_selection = "future_filtered_noninferior"
-                else:
-                    _restore_oracle_candidate(
-                        agent, full_reference_agent.snapshot(),
-                    )
-                    recipe_ids = dict(full_reference_recipe_ids)
-                    row = full_row
-                    active_before = reference_active_before
-                    pruned_before = reference_pruned_before
-                    retrain_before = reference_retrain_before
-                    memory_state_before = reference_memory_state
-                    target_key_before = _pair_key(
-                        reference_before, pair, reference_recipe_ids_before,
-                    )
-                    target_recipe_id_before = reference_recipe_ids_before.get(
-                        pair.recipe_name,
-                    )
-                    target_variant_known_before = bool(
-                        target_key_before is not None
-                        and target_key_before[1] in reference_before.library.variants.get(
-                            target_key_before[0], {},
-                        )
-                    )
-                    oracle_selection = "full_dominance_fallback"
-                    tags.update(_recurrence_tags(
-                        reference_before,
-                        pair,
-                        reference_recipe_ids_before,
-                        target_key_before,
-                        tags,
-                        pairs_by_label,
-                    ))
-                    context = {
-                        **_event_context(
-                            baseline,
-                            plan,
-                            event_index,
-                            requested_mode,
-                            executed_mode,
-                            pair,
-                            tags,
-                        ),
-                        **baseline_context,
-                    }
+                # The oracle keeps its own future-filtered outcome, whatever it
+                # is. Reverting to Full whenever the future-aware policy did
+                # worse on this event's realized metrics made the reference a
+                # per-event maximum over {Full, oracle}, so it could never lose
+                # to the system it exists to bound.
+                row = execute_event(agent, recipe_ids, memory_state_before)
+                annotate_commit_outcome(row, agent)
+                oracle_selection = "future_filtered"
             row.update({
                 "oracle_selection": oracle_selection,
                 "oracle_full_fallback": bool(
-                    oracle_selection != "future_filtered_noninferior"
+                    oracle_selection == "full_for_unseen_pair"
                 ),
-                "oracle_regressed_metrics": list(oracle_regressions),
             })
         row.update(context)
         target_key_after = _pair_key(agent, pair, recipe_ids)
@@ -4389,9 +4368,6 @@ def run_stream(
         latest_after = (
             agent.library.latest.get(target_recipe_id_after)
             if target_recipe_id_after is not None else None
-        )
-        scheduled_reentry = bool(
-            "selective_forgetting_reentry" in (row.get("hypothesis_tags") or [])
         )
         if target_key_before and target_key_before in pruned_before:
             reentry_target_state_before = "pruned_exact_variant"
@@ -4412,8 +4388,11 @@ def run_stream(
             ),
             "target_variant_active_before": bool(target_key_before and target_key_before in active_before),
             "target_variant_pruned_before": bool(target_key_before and target_key_before in pruned_before),
-            "scheduled_reentry_probe": scheduled_reentry,
-            "reentry_probe_target_state_before": reentry_target_state_before if scheduled_reentry else None,
+            # Recorded on every episode. This was previously gated on a
+            # "selective_forgetting_reentry" hypothesis tag that the schedule
+            # builder never emits, so the reentry diagnostic saw zero probes in
+            # every run while the evidence sat unused on each row.
+            "reentry_probe_target_state_before": reentry_target_state_before,
             "actual_reentry_from_pruned": bool(row.get("classification_kind") == "reentry_from_pruned"),
             "commit_recipe_correct": (
                 bool(classified_recipe == target_recipe_id_before)
@@ -4480,9 +4459,8 @@ def run_stream(
                 "leakage_warning": CLAIRVOYANT_LEAKAGE_WARNING,
                 "oracle_selection": oracle_selection,
                 "oracle_full_fallback": bool(
-                    oracle_selection != "future_filtered_noninferior"
+                    oracle_selection == "full_for_unseen_pair"
                 ),
-                "oracle_regressed_metrics": list(oracle_regressions),
             })
 
         active_after = _active_variants(agent)
@@ -4551,6 +4529,26 @@ def run_stream(
             else:
                 frozen_rows.extend(candidate_probe_rows)
             last_frozen_event = event_index
+
+        if event_progress is not None:
+            event_progress(
+                RunState(
+                    baseline=baseline,
+                    scenario=plan.scenario,
+                    seed=plan.seed,
+                    agent=agent,
+                    recipe_ids=recipe_ids,
+                    episode_rows=episode_rows,
+                    frozen_rows=frozen_rows,
+                    memory_rows=memory_rows,
+                    active_audit_rows=audit_rows,
+                    oracle_pruning_rows=oracle_rows,
+                    turn_rows=turn_rows,
+                    initial_memory=initial_memory,
+                    wall_s=float(time.perf_counter() - start_time),
+                ),
+                event_index,
+            )
 
     final_context = {
         "baseline": baseline,
@@ -5020,7 +5018,59 @@ _PHASE_TRAINING_FIELDS = (
 )
 
 
+def _phase_retrain_latency(
+    agent: AdaptiveAgent,
+    memory_rows: Sequence[Mapping[str, Any]],
+    initial_memory: Mapping[str, Any],
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, Dict[str, float]]]]:
+    """Attribute individual retrain fit times to the phase they occurred in.
+
+    Cumulative wall-clock totals hide the quantity a person actually waits on,
+    which is one retrain between two demonstrations. ``training_retrain_count``
+    counts exactly the entries appended to ``retrain_fit_wall_times``, so the
+    cumulative count at each event boundary slices that list by phase and the
+    tail of the distribution survives aggregation.
+    """
+    fit_times = [float(value) for value in agent.retrain_fit_wall_times]
+    by_phase: Dict[str, List[float]] = defaultdict(list)
+    by_phase_index: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    previous = int(_numeric(initial_memory, "training_retrain_count"))
+    for row in sorted(memory_rows, key=lambda item: _numeric(item, "event_index", -1.0)):
+        current = int(_numeric(row, "training_retrain_count"))
+        if current <= previous:
+            previous = max(previous, current)
+            continue
+        window = fit_times[previous:current]
+        previous = current
+        if not window: continue
+        phase_role = str(row.get("phase_role") or "unphased")
+        phase_index = row.get("phase_index")
+        phase_label = (
+            f"phase_{int(phase_index):02d}"
+            if isinstance(phase_index, int) else "phase_unknown"
+        )
+        by_phase[phase_role].extend(window)
+        by_phase_index[phase_role][phase_label].extend(window)
+
+    def stats(values: Sequence[float]) -> Dict[str, float]:
+        return {
+            "online_retrain_fit_count": float(len(values)),
+            "online_mean_retrain_fit_wall_s": _mean(values),
+            "online_p95_retrain_fit_wall_s": _p95(values),
+            "online_max_retrain_fit_wall_s": float(max(values)) if values else 0.0,
+        }
+
+    return (
+        {phase: stats(values) for phase, values in sorted(by_phase.items())},
+        {
+            phase: {label: stats(values) for label, values in sorted(by_label.items())}
+            for phase, by_label in sorted(by_phase_index.items())
+        },
+    )
+
+
 def _phase_training_costs(
+    agent: AdaptiveAgent,
     memory_rows: Sequence[Mapping[str, Any]],
     initial_memory: Mapping[str, Any],
 ) -> Dict[str, Any]:
@@ -5049,16 +5099,27 @@ def _phase_training_costs(
         f"upfront_{field}": _numeric(initial_memory, field)
         for field in _PHASE_TRAINING_FIELDS
     }
+    latency_by_phase, latency_by_phase_index = _phase_retrain_latency(
+        agent, memory_rows, initial_memory,
+    )
     return {
         "definition": (
             "Online training cost is the non-negative event-to-event delta of cumulative retraining snapshots; "
-            "upfront cost is pre-deployment work and is not allocated to a phase. FLOPs are fit-only, model-specific estimates."
+            "upfront cost is pre-deployment work and is not allocated to a phase. FLOPs are fit-only, model-specific estimates. "
+            "Retrain latency is the distribution over individual fits attributed to the phase they ran in: "
+            "p95 is the blocking wait a person sees between two demonstrations, which cumulative totals do not expose."
         ),
         "upfront_training": offline,
-        "per_phase_role": {phase: dict(values) for phase, values in sorted(by_phase.items())},
+        "per_phase_role": {
+            phase: {**dict(values), **latency_by_phase.get(phase, {})}
+            for phase, values in sorted(by_phase.items())
+        },
         "per_phase_index": {
             phase: {
-                phase_index: dict(values)
+                phase_index: {
+                    **dict(values),
+                    **latency_by_phase_index.get(phase, {}).get(phase_index, {}),
+                }
                 for phase_index, values in sorted(by_index.items())
             }
             for phase, by_index in sorted(by_phase_index.items())
@@ -5287,6 +5348,85 @@ def summarize_calibration(turn_rows: Sequence[Mapping[str, Any]], n_bins: int = 
     }
 
 
+DECISION_REGIMES: Tuple[str, ...] = ("single_option_lookup", "branching", "unseen_state_fallback")
+
+
+def _regime_action_count(row: Mapping[str, Any]) -> Any:
+    """Prefer the model-agnostic count; fall back for runs recorded before it.
+
+    ``observed_actions_at_state`` is computed from the replayed demonstrations
+    and is therefore identical across arms. Earlier runs only carry
+    ``exact_state_learned_action_count``, which for the MaxEnt arms is the same
+    quantity -- the learned state-action entries at a state are exactly the
+    actions demonstrated there -- so those runs can still be stratified.
+    """
+    count = row.get("observed_actions_at_state")
+    return count if count is not None else row.get("exact_state_learned_action_count")
+
+
+def _decision_regime(learned_action_count: Any) -> Optional[str]:
+    """Classify one decision by how much choice the learner actually faced.
+
+    ``exact_state_learned_action_count`` is the number of actions the model had
+    observed at this exact state. One means the demonstrated continuation is
+    unique and any predictor that memorised the state graph is correct, so the
+    reward function cannot influence the outcome. Two or more is a genuine
+    ranking problem. Zero means the state was never observed and the answer
+    comes from generalisation rather than lookup.
+    """
+    if not isinstance(learned_action_count, (int, float)) or isinstance(learned_action_count, bool): return None
+    count = int(learned_action_count)
+    if count <= 0: return "unseen_state_fallback"
+    return "single_option_lookup" if count == 1 else "branching"
+
+
+def summarize_decision_regimes(turn_rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Split accuracy by decision regime instead of averaging over them.
+
+    An aggregate Top-1 over this stream is dominated by single-option lookups,
+    which every arm answers almost perfectly, so it mostly measures whether the
+    demonstrated state graph was memorised. Reporting the three regimes
+    separately keeps the two that require generalisation visible, and makes the
+    share of each regime -- itself a consequence of the memory policy -- an
+    explicit part of the comparison rather than a hidden weighting.
+    """
+    buckets: Dict[str, List[Mapping[str, Any]]] = {regime: [] for regime in DECISION_REGIMES}
+    unclassified = 0
+    for row in turn_rows:
+        regime = _decision_regime(_regime_action_count(row))
+        if regime is None or not isinstance(row.get("correct_top_1"), bool):
+            unclassified += 1
+            continue
+        buckets[regime].append(row)
+    classified = sum(len(rows) for rows in buckets.values())
+    definition = ("Top-1 split by how much choice the decision offered: single_option_lookup (one action observed at "
+                  "this exact state, so memorisation suffices and the reward cannot matter), branching (two or more "
+                  "observed, a genuine ranking problem), unseen_state_fallback (state never observed, answered by "
+                  "generalisation). Shares are reported because the memory policy changes them.")
+    if not classified:
+        return {"definition": definition, "status": "not_run", "n_classified": 0, "n_unclassified": unclassified, "by_regime": {}}
+    by_regime: Dict[str, Any] = {}
+    for regime in DECISION_REGIMES:
+        rows = buckets[regime]
+        by_regime[regime] = {
+            "n": len(rows),
+            "share": _safe_div(len(rows), classified),
+            "top_1": _mean(1.0 if row["correct_top_1"] else 0.0 for row in rows) if rows else None,
+            "top_k": (_mean(1.0 if row.get("correct_top_k") else 0.0 for row in rows) if rows else None),
+            "mean_observed_action_count": (_mean(_regime_action_count(row) for row in rows) if rows else None),
+        }
+    return {
+        "definition": definition,
+        "status": "completed",
+        "n_classified": classified,
+        # Turns with no exact-state count: predictors that never consult the
+        # learned state graph, and turns where no prediction was produced.
+        "n_unclassified": unclassified,
+        "aggregate_top_1_over_classified": _mean(1.0 if row["correct_top_1"] else 0.0 for rows in buckets.values() for row in rows),
+        "by_regime": by_regime,
+    }
+
+
 def transfer_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     defaults = DEFAULT_PREFERENCE
     out: List[Dict[str, Any]] = []
@@ -5374,37 +5514,66 @@ def summarize_transfer(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "by_axis_transfer_cell": {k: aggregate_episodes(v) for k, v in sorted(grouped_cell.items())},
     }
 
+_ACTIVE_AUDIT_DEFINITION = (
+    "Three separate quantities. The contract is that the records handed to each "
+    "fit exclude every pruned variant, and it is the only term that can fail. "
+    "Redundancy is a cold fit on active memory against a cold fit on active plus "
+    "pruned memory: it measures how much the retention decision actually cost. "
+    "Deployed path dependence is the deployed model against a fresh cold fit on "
+    "the same active set, which is non-zero whenever the deployed weights were "
+    "warm-started and is not a violation."
+)
+
+
 def summarize_active_audit(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {
-            "definition": "Checks whether the fitted deployable policy matches a fresh active-replay reference.",
+            "definition": _ACTIVE_AUDIT_DEFINITION,
             "status": "not_run",
             "n_audits": 0,
             "n_available": 0,
-            "n_failed": None,
-            "failure_rate": None,
-            "max_l1": None,
+            "n_contract_violations": None,
+            "contract_violation_rate": None,
+            "max_redundancy_l1": None,
+            "mean_redundancy_l1": None,
+            "max_deployed_path_dependence_l1": None,
+            "mean_deployed_path_dependence_l1": None,
             "mean_active_variants": None,
             "mean_pruned_variants": None,
-            "failed_checkpoints": [],
+            "contract_violation_checkpoints": [],
         }
     available = [row for row in rows if row.get("audit_available")]
-    failed = [row for row in available if row.get("primary_active_only_contract_passed") is False]
+    violations = [
+        row for row in available
+        if row.get("primary_active_only_contract_passed") is False
+    ]
+    with_pruned = [row for row in available if row.get("pruned_available")]
     return {
-        "definition": "Checks whether the fitted deployable policy matches a fresh active-replay reference.",
+        "definition": _ACTIVE_AUDIT_DEFINITION,
         "status": "completed" if available else "unavailable",
         "n_audits": len(rows),
         "n_available": len(available),
-        "n_failed": len(failed),
-        "failure_rate": _safe_div(len(failed), len(available)),
-        "max_l1": max(_finite(row.get("max_l1") for row in available), default=0.0),
+        "n_audits_with_pruned_memory": len(with_pruned),
+        "n_contract_violations": len(violations),
+        "contract_violation_rate": _safe_div(len(violations), len(available)),
+        "max_redundancy_l1": max(
+            _finite(row.get("redundancy_max_l1") for row in with_pruned), default=0.0,
+        ),
+        "mean_redundancy_l1": _mean(row.get("redundancy_mean_l1") for row in with_pruned),
+        "max_deployed_path_dependence_l1": max(
+            _finite(row.get("deployed_path_dependence_max_l1") for row in available), default=0.0,
+        ),
+        "mean_deployed_path_dependence_l1": _mean(
+            row.get("deployed_path_dependence_mean_l1") for row in available
+        ),
         "mean_active_variants": _mean(row.get("active_variants") for row in rows),
         "mean_pruned_variants": _mean(row.get("pruned_variants") for row in rows),
-        "failed_checkpoints": [
+        "contract_violation_checkpoints": [
             {"event_index": row.get("event_index"), "audit_checkpoint": row.get("audit_checkpoint")}
-            for row in failed
+            for row in violations
         ],
     }
+
 
 def summarize_commit_safety(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     assist = [row for row in rows if row.get("mode") == "assist"]
@@ -5457,28 +5626,43 @@ def summarize_commit_safety(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]
 
 
 def summarize_reentry(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    scheduled = [row for row in rows if row.get("scheduled_reentry_probe")]
-    scheduled_assist = [row for row in scheduled if row.get("mode") == "assist"]
+    """Stratify assist performance by the target variant's pre-episode state.
+
+    Keyed off what memory actually held when the episode began, not off a
+    planned probe tag: the schedule emits no reentry probes, so the earlier
+    tag-gated version reported ``n_probes = 0`` in every run for every agent.
+    A pruned-target episode is the selective-forgetting recovery case; an
+    active-target episode is the retention control.
+    """
+    assist = [row for row in rows if row.get("mode") == "assist"]
     pruned_target = [
-        row for row in scheduled
+        row for row in assist
         if row.get("reentry_probe_target_state_before") == "pruned_exact_variant"
     ]
     active_target = [
-        row for row in scheduled
+        row for row in assist
         if row.get("reentry_probe_target_state_before") == "active_exact_variant"
     ]
-    confirmed = [row for row in scheduled_assist if row.get("actual_reentry_from_pruned")]
+    known_recipe_new_variant = [
+        row for row in assist
+        if row.get("reentry_probe_target_state_before") == "known_recipe_no_exact_variant"
+    ]
+    confirmed = [row for row in assist if row.get("actual_reentry_from_pruned")]
     return {
-        "definition": "Reentry performance is stratified by evaluator-observed pre-probe exact-variant state. Only confirmed pruned-variant reentries support the selective-forgetting recovery claim; active variants are an explicit retention control.",
-        "scheduled_reentry_all_routes": aggregate_episodes(scheduled),
-        "scheduled_reentry_assist_only": aggregate_episodes(scheduled_assist),
-        "target_pruned_before_probe": aggregate_episodes(pruned_target),
-        "target_active_before_probe_control": aggregate_episodes(active_target),
+        "definition": (
+            "Assist performance stratified by the evaluator-observed pre-episode state of the "
+            "target variant. Only pruned-target episodes support the selective-forgetting "
+            "recovery claim; active-target episodes are the explicit retention control. An agent "
+            "that never prunes has no pruned-target episodes by construction."
+        ),
+        "target_pruned_before_episode": aggregate_episodes(pruned_target),
+        "target_active_before_episode_control": aggregate_episodes(active_target),
+        "target_known_recipe_new_variant": aggregate_episodes(known_recipe_new_variant),
         "confirmed_reentry_from_pruned": aggregate_episodes(confirmed),
-        "n_scheduled_reentry_probes": len(scheduled),
-        "n_scheduled_reentry_assist_probes": len(scheduled_assist),
-        "n_target_pruned_before_probe": len(pruned_target),
-        "n_target_active_before_probe_control": len(active_target),
+        "n_assist_episodes": len(assist),
+        "n_target_pruned_before_episode": len(pruned_target),
+        "n_target_active_before_episode_control": len(active_target),
+        "n_target_known_recipe_new_variant": len(known_recipe_new_variant),
         "n_confirmed_reentry_from_pruned": len(confirmed),
     }
 
@@ -5703,7 +5887,7 @@ def _scope_metrics(
 
 def summarize_stream(stream: RunState) -> Dict[str, Any]:
     assist_rows = [row for row in stream.episode_rows if row.get("mode") == "assist"]
-    phase_training = _phase_training_costs(stream.memory_rows, stream.initial_memory)
+    phase_training = _phase_training_costs(stream.agent, stream.memory_rows, stream.initial_memory)
     episodes = _scope_metrics(stream.episode_rows, phase_training)
     episodes["overall"]["scope_note"] = (
         "Workload includes observations; closed-loop rates pool robot turns, "
@@ -5732,6 +5916,7 @@ def summarize_stream(stream: RunState) -> Dict[str, Any]:
                 stream.episode_rows,
             ),
             "policy_calibration": summarize_calibration(stream.turn_rows),
+            "decision_regimes": summarize_decision_regimes(stream.turn_rows),
             "axis_value_transfer": summarize_transfer(assist_rows),
             "mode_schedule": _mode_schedule_summary(stream.episode_rows),
             "active_only_pruned_influence": summarize_active_audit(
@@ -5773,7 +5958,13 @@ def _mode_schedule_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def run_plan(plan: Plan, config: EvalSettings, out_dir: Path) -> Dict[str, Any]:
+def run_plan(
+    plan: Plan,
+    config: EvalSettings,
+    out_dir: Path,
+    *,
+    progress_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
+) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     start_time = time.perf_counter()
     _write_json(out_dir / "plan.json", {
@@ -5816,6 +6007,105 @@ def run_plan(plan: Plan, config: EvalSettings, out_dir: Path) -> Dict[str, Any]:
     all_frozen_rows: List[Dict[str, Any]] = []
     all_diagnostic_rows: List[Dict[str, Any]] = []
     all_turn_rows: List[Dict[str, Any]] = []
+    checkpoint_offsets: Dict[str, Dict[str, int]] = {}
+    partial_baselines: Dict[str, Dict[str, Any]] = {}
+    phase_ids = tuple(dict.fromkeys(
+        str(event.tags.get("phase_id", "unknown"))
+        for event in plan.events
+    ))
+    phase_numbers = {phase_id: index + 1 for index, phase_id in enumerate(phase_ids)}
+    stages = tuple(dict.fromkeys(
+        str(event.tags.get("stage", "unknown"))
+        for event in plan.events
+    ))
+    stage_numbers = {stage: index + 1 for index, stage in enumerate(stages)}
+
+    def persist_event_progress(stream: RunState, event_index: int) -> None:
+        event = plan.events[event_index]
+        phase_id = str(event.tags.get("phase_id", "unknown"))
+        stage = str(event.tags.get("stage", "unknown"))
+        row_groups = {
+            "episodes": stream.episode_rows,
+            "turns": stream.turn_rows,
+            "frozen_probes": stream.frozen_rows,
+            "diagnostics": (
+                stream.memory_rows
+                + stream.active_audit_rows
+                + stream.oracle_pruning_rows
+            ),
+        }
+        offsets = checkpoint_offsets.setdefault(
+            stream.baseline,
+            {name: 0 for name in row_groups},
+        )
+        new_rows = {
+            name: rows[offsets[name]:]
+            for name, rows in row_groups.items()
+        }
+        checkpoint_path = (
+            out_dir / "partial" / "checkpoints" / stream.baseline
+            / f"event_{event_index:06d}.json"
+        )
+        payload = {
+            "state": "event_complete",
+            "scenario": plan.scenario,
+            "seed": int(plan.seed),
+            "baseline": stream.baseline,
+            "event_index": int(event_index),
+            "events_completed": len(stream.episode_rows),
+            "events_total": len(plan.events),
+            "phase_id": phase_id,
+            "phase_number": phase_numbers[phase_id],
+            "phase_count": len(phase_ids),
+            "stage": stage,
+            "stage_number": stage_numbers[stage],
+            "stage_count": len(stages),
+            "phase_complete": _is_phase_boundary(plan, event_index),
+            "pair": event.pair.label,
+            "mode": event.mode,
+            "elapsed_s": float(stream.wall_s),
+            "created_at_utc": _utc_now(),
+            "row_counts": {
+                name: len(rows) for name, rows in row_groups.items()
+            },
+            "tables": new_rows,
+        }
+        _write_json(checkpoint_path, payload)
+        for name, rows in row_groups.items():
+            offsets[name] = len(rows)
+
+        partial_baselines[stream.baseline] = {
+            "events_completed": len(stream.episode_rows),
+            "events_total": len(plan.events),
+            "latest_event_index": int(event_index),
+            "elapsed_s": float(stream.wall_s),
+            "episodes": aggregate_episodes(stream.episode_rows),
+            "assist": aggregate_episodes([
+                row for row in stream.episode_rows
+                if row.get("mode") == "assist"
+            ]),
+            "row_counts": payload["row_counts"],
+        }
+        relative_checkpoint = str(checkpoint_path.relative_to(out_dir))
+        progress = {
+            key: value for key, value in payload.items()
+            if key != "tables"
+        }
+        progress["checkpoint"] = relative_checkpoint
+        _write_json(out_dir / "partial" / "summary.json", {
+            "state": "running",
+            "scenario": plan.scenario,
+            "seed": int(plan.seed),
+            "updated_at_utc": progress["created_at_utc"],
+            "latest": progress,
+            "per_baseline": partial_baselines,
+            "analysis_note": (
+                "Each checkpoint is atomic and contains only rows added by its "
+                "completed event. Concatenate checkpoints by baseline and event_index."
+            ),
+        })
+        if progress_callback is not None:
+            progress_callback(progress)
 
     baselines = [b for b in config.baselines if b != MEMORY_ORACLE]
     if config.shared_routing and "full" not in baselines:
@@ -5840,6 +6130,7 @@ def run_plan(plan: Plan, config: EvalSettings, out_dir: Path) -> Dict[str, Any]:
                 plan,
                 config,
                 mode_schedule_policy="full_realized_canonical",
+                event_progress=persist_event_progress,
             )
             canonical_full_modes = tuple(
                 str(row.get("mode")) for row in stream.episode_rows
@@ -5859,6 +6150,7 @@ def run_plan(plan: Plan, config: EvalSettings, out_dir: Path) -> Dict[str, Any]:
                     if canonical_full_modes is not None
                     else "baseline_local"
                 ),
+                event_progress=persist_event_progress,
             )
 
         baseline_summary = summarize_stream(stream)
@@ -5866,19 +6158,15 @@ def run_plan(plan: Plan, config: EvalSettings, out_dir: Path) -> Dict[str, Any]:
             baseline_summary["oracle"] = {
                 "presentation": CLAIRVOYANT_REFERENCE_TAG,
                 "warning": CLAIRVOYANT_LEAKAGE_WARNING,
-                "retention": "future_filtered_with_full_fallback",
+                "retention": "future_filtered_after_first_exposure",
                 "decay": "binary_keep_until_final_occurrence",
                 "selection": {
                     "full_for_unseen_pair": int(sum(
                         row.get("oracle_selection") == "full_for_unseen_pair"
                         for row in stream.oracle_pruning_rows
                     )),
-                    "future_filtered_noninferior": int(sum(
-                        row.get("oracle_selection") == "future_filtered_noninferior"
-                        for row in stream.oracle_pruning_rows
-                    )),
-                    "full_dominance_fallback": int(sum(
-                        row.get("oracle_selection") == "full_dominance_fallback"
+                    "future_filtered": int(sum(
+                        row.get("oracle_selection") == "future_filtered"
                         for row in stream.oracle_pruning_rows
                     )),
                 },
@@ -5914,6 +6202,7 @@ def run_plan(plan: Plan, config: EvalSettings, out_dir: Path) -> Dict[str, Any]:
     _write_jsonl_gz(tables / "oracle_gaps.jsonl.gz", oracle_comparisons)
 
     summary = {
+        "state": "complete",
         "scenario": plan.scenario,
         "seed": int(plan.seed),
         "plan": "plan.json",
@@ -5939,6 +6228,15 @@ def run_plan(plan: Plan, config: EvalSettings, out_dir: Path) -> Dict[str, Any]:
         "wall_s": float(time.perf_counter() - start_time),
     }
     _write_json(out_dir / "summary.json", summary)
+    partial_summary_path = out_dir / "partial" / "summary.json"
+    if partial_summary_path.is_file():
+        partial_summary = _load_json(partial_summary_path)
+        partial_summary.update({
+            "state": "complete",
+            "completed_at_utc": _utc_now(),
+            "final_summary": "../summary.json",
+        })
+        _write_json(partial_summary_path, partial_summary)
     return summary
 
 
@@ -5946,13 +6244,52 @@ def _mp_context() -> mp.context.BaseContext:
     return mp.get_context("spawn")
 
 
-def _worker_count(config: EvalSettings) -> int:
+def _worker_count(config: EvalSettings, pending_jobs: Optional[int] = None) -> int:
     # One worker owns the quantized GPU model; seed-level GPU replication can
     # otherwise exhaust memory before evaluation begins.
     if "in_context_llm" in config.baselines:
         return 1
-    n_seeds = max(1, len(config.seeds))
-    return max(1, min(int(config.workers or n_seeds), n_seeds))
+    # Admit only complete scenario cohorts: every seed for an admitted scenario
+    # starts together, and additional scenarios wait when the process cap would
+    # admit only part of their seed cohort.
+    total_jobs = max(1, len(config.scenarios) * len(config.seeds))
+    cap = max(1, min(
+        DEFAULT_EVALUATION_WORKER_CAP,
+        int(config.workers or DEFAULT_EVALUATION_WORKER_CAP),
+    ))
+    seeds_per_scenario = max(1, len(config.seeds))
+    concurrent_scenarios = max(
+        1, min(len(config.scenarios), cap // seeds_per_scenario),
+    )
+    workers = min(cap, concurrent_scenarios * seeds_per_scenario, total_jobs)
+    if pending_jobs is not None:
+        workers = min(workers, max(1, int(pending_jobs)))
+    return max(1, workers)
+
+
+def _scenario_job_batches(
+    jobs: Sequence[Tuple[str, int]],
+    config: EvalSettings,
+) -> Tuple[Tuple[Tuple[str, int], ...], ...]:
+    """Group jobs so a process wave never admits a partial scenario cohort."""
+    grouped: Dict[str, List[Tuple[str, int]]] = {}
+    for scenario, seed in jobs:
+        grouped.setdefault(str(scenario), []).append((str(scenario), int(seed)))
+    seeds_per_scenario = max(1, len(config.seeds))
+    cap = max(1, min(
+        DEFAULT_EVALUATION_WORKER_CAP,
+        int(config.workers or DEFAULT_EVALUATION_WORKER_CAP),
+    ))
+    scenarios_per_batch = max(1, cap // seeds_per_scenario)
+    scenarios = tuple(grouped)
+    return tuple(
+        tuple(
+            job
+            for scenario in scenarios[index:index + scenarios_per_batch]
+            for job in grouped[scenario]
+        )
+        for index in range(0, len(scenarios), scenarios_per_batch)
+    )
 
 
 def _native_thread_count(config: EvalSettings) -> int:
@@ -6008,34 +6345,16 @@ def _format_seconds(seconds: Optional[float]) -> str:
     return f"{rounded_seconds}s"
 
 
-def _eta(
-    suite_start: float,
-    scenario_start: float,
-    scenario_index: int,
-    scenario_count: int,
-    completed_seeds: int,
-    seed_count: int,
-    past_scenario_wall: Sequence[float],
-) -> str:
-    now = time.perf_counter()
-    elapsed = now - suite_start
-    current_elapsed = now - scenario_start
-    if completed_seeds > 0:
-        current_remaining = max(
-            0.0,
-            current_elapsed * (seed_count - completed_seeds)
-            / max(1, completed_seeds),
-        )
-    else:
-        current_remaining = (sum(past_scenario_wall) / len(past_scenario_wall)) if past_scenario_wall else None
-    future_est = (sum(past_scenario_wall) / len(past_scenario_wall)) if past_scenario_wall else None
-    future_remaining = (
-        None
-        if future_est is None
-        else future_est * max(0, scenario_count - scenario_index - 1)
+def _job_eta(suite_start: float, completed: int, expected: int) -> str:
+    """Remaining-time estimate over all (scenario, seed) jobs."""
+    elapsed = time.perf_counter() - suite_start
+    if completed <= 0:
+        return f"elapsed={_format_seconds(elapsed)} eta=unknown"
+    remaining = max(0.0, elapsed * (expected - completed) / completed)
+    return (
+        f"elapsed={_format_seconds(elapsed)} "
+        f"done={completed}/{expected} eta={_format_seconds(remaining)}"
     )
-    total_remaining = None if current_remaining is None and future_remaining is None else float(current_remaining or 0.0) + float(future_remaining or 0.0)
-    return f"elapsed={_format_seconds(elapsed)} eta={_format_seconds(total_remaining)}"
 
 
 def _utc_now() -> str:
@@ -6154,6 +6473,9 @@ def _create_or_resume_run(config: EvalSettings) -> Tuple[Path, Path, str]:
         "config": _config_payload(config),
         "resolved_model_config": _resolved_model_config(config),
         "action_representation": ACTION_REPRESENTATION,
+        # Stated once per run rather than per turn row. Asserted by the test
+        # suite (see tests/test_agent.py), not by repetition in the data.
+        "action_mask_contract": dict(ACTION_MASK_CONTRACT),
         "code": _git_provenance(),
         "runtime": _runtime_provenance(),
         "expected_jobs": [
@@ -6163,6 +6485,11 @@ def _create_or_resume_run(config: EvalSettings) -> Tuple[Path, Path, str]:
         "artifacts": {
             "summary": "scenarios/<scenario>/seeds/<seed>/summary.json",
             "tables": "scenarios/<scenario>/seeds/<seed>/tables/*.jsonl.gz",
+            "partial_progress": "scenarios/<scenario>/seeds/<seed>/partial/summary.json",
+            "event_checkpoints": (
+                "scenarios/<scenario>/seeds/<seed>/partial/checkpoints/"
+                "<baseline>/event_<index>.json"
+            ),
             "aggregate": "aggregate/",
         },
     })
@@ -6213,21 +6540,57 @@ def _run_seed_scenario_job(
     out_dir.mkdir(parents=True, exist_ok=True)
     start_time = time.perf_counter()
     started_at = _utc_now()
-    _write_json(out_dir / "status.json", {"state": "running", "started_at_utc": started_at})
+    latest_progress: Dict[str, Any] = {}
+
+    def report_progress(progress: Mapping[str, Any]) -> None:
+        latest_progress.clear()
+        latest_progress.update(dict(progress))
+        _write_json(out_dir / "status.json", {
+            "state": "running",
+            "started_at_utc": started_at,
+            "updated_at_utc": _utc_now(),
+            "progress": latest_progress,
+        })
+        if (
+            progress.get("baseline") == "in_context_llm"
+            or bool(progress.get("phase_complete"))
+        ):
+            print(
+                "[evaluation] progress "
+                f"scenario={scenario} seed={int(seed)} "
+                f"baseline={progress.get('baseline')} "
+                f"event={progress.get('events_completed')}/{progress.get('events_total')} "
+                f"stage={progress.get('stage_number')}/{progress.get('stage_count')} "
+                f"elapsed={_format_seconds(progress.get('elapsed_s'))} "
+                f"saved={progress.get('checkpoint')}",
+                flush=True,
+            )
+
+    _write_json(out_dir / "status.json", {
+        "state": "running",
+        "started_at_utc": started_at,
+    })
     try:
         plan = build_plan(scenario, config, int(seed))
-        summary = run_plan(plan, config, out_dir)
+        summary = run_plan(
+            plan,
+            config,
+            out_dir,
+            progress_callback=report_progress,
+        )
     except BaseException as error:
         _write_json(out_dir / "status.json", {
             "state": "failed", "started_at_utc": started_at, "failed_at_utc": _utc_now(),
             "error": f"{type(error).__name__}: {error}", "traceback": traceback.format_exc(),
             "wall_s": float(time.perf_counter() - start_time),
+            "progress": latest_progress or None,
         })
         raise
     wall_s = float(time.perf_counter() - start_time)
     _write_json(out_dir / "status.json", {
         "state": "complete", "started_at_utc": started_at, "completed_at_utc": _utc_now(),
         "wall_s": wall_s,
+        "progress": latest_progress or None,
     })
     return {
         "scenario": scenario,
@@ -6237,6 +6600,40 @@ def _run_seed_scenario_job(
         "summary_path": str((out_dir / "summary.json").relative_to(run_dir)),
         "wall_s": wall_s,
     }
+
+
+def _pending_job_results(
+    jobs: Sequence[Tuple[str, int]],
+    config: EvalSettings,
+    run_dir: Path,
+    workers: int,
+) -> Iterable[Mapping[str, Any]]:
+    """Run pending jobs in complete, process-cap-bounded scenario cohorts."""
+    if "in_context_llm" in config.baselines:
+        for scenario, seed in jobs:
+            yield from _pending_seed_results(
+                scenario, [int(seed)], config, run_dir, 1,
+            )
+        return
+    if workers <= 1 or len(jobs) <= 1:
+        for scenario, seed in jobs:
+            yield _run_seed_scenario_job(
+                str(scenario), int(seed), config, str(run_dir),
+            )
+        return
+    for batch in _scenario_job_batches(jobs, config):
+        with ProcessPoolExecutor(
+            max_workers=min(workers, len(batch)), mp_context=_mp_context(),
+        ) as executor:
+            futures = [
+                executor.submit(
+                    _run_seed_scenario_job,
+                    str(scenario), int(seed), config, str(run_dir),
+                )
+                for scenario, seed in batch
+            ]
+            for future in as_completed(futures):
+                yield future.result()
 
 
 def _pending_seed_results(
@@ -6482,7 +6879,7 @@ def run_evaluation(config: EvalSettings) -> Dict[str, Any]:
         "config_hash": config_hash,
         "execution": {
             "parallelism": "processes",
-            "seed_parallelism": "all seeds for one scenario complete before the next scenario starts",
+            "seed_parallelism": "complete seed cohorts are scheduled for as many scenarios as fit within the 20-process cap",
             "workers": workers,
             "threads": native_threads,
             "estimated_max_native_threads": workers * native_threads,
@@ -6494,7 +6891,6 @@ def run_evaluation(config: EvalSettings) -> Dict[str, Any]:
     }
     scenario_summaries: Dict[str, Mapping[str, Any]] = {}
     suite_start = time.perf_counter()
-    past_scenario_wall: List[float] = []
     completed_jobs = 0
     aggregate_dir = run_dir / "aggregate"
 
@@ -6533,52 +6929,45 @@ def run_evaluation(config: EvalSettings) -> Dict[str, Any]:
         })
 
     try:
-        for scenario_index, scenario in enumerate(config.scenarios):
-            scenario_start = time.perf_counter()
-            completed = [
-                result for seed in config.seeds
-                if (result := _completed_seed_result(run_dir, scenario, int(seed))) is not None
-            ]
-            for result in completed:
-                record(result)
-            pending = [
-                int(seed) for seed in config.seeds
-                if f"{scenario}/{int(seed):010d}" not in scenario_summaries
-            ]
-            completed_seeds = len(completed)
-            _write_json(run_dir / "status.json", {
-                "state": "running", "updated_at_utc": _utc_now(),
-                "completed_jobs": completed_jobs, "expected_jobs": expected_jobs,
-            })
+        jobs: List[Tuple[str, int]] = []
+        for scenario in config.scenarios:
+            for seed in config.seeds:
+                result = _completed_seed_result(run_dir, scenario, int(seed))
+                if result is not None:
+                    record(result)
+                else:
+                    jobs.append((str(scenario), int(seed)))
+        workers = _worker_count(config, len(jobs))
+        suite["execution"]["workers"] = workers
+        suite["execution"]["estimated_max_native_threads"] = (
+            workers * native_threads
+        )
+        if config.show_eta:
+            print(
+                f"[evaluation] start jobs={len(jobs)} "
+                f"(scenarios={len(config.scenarios)} x seeds={len(config.seeds)}) "
+                f"workers={workers}",
+                flush=True,
+            )
+        job_wall: Dict[str, List[float]] = defaultdict(list)
+        for result in _pending_job_results(jobs, config, run_dir, workers):
+            record(result)
+            job_wall[str(result["scenario"])].append(float(result["wall_s"]))
             if config.show_eta:
                 print(
-                    f"[evaluation] start scenario={scenario} seeds={len(config.seeds)} "
-                    f"pending={len(pending)} workers={workers} "
-                    f"{_eta(suite_start, scenario_start, scenario_index, len(config.scenarios), completed_seeds, len(config.seeds), past_scenario_wall)}",
+                    f"[evaluation] done scenario={result['scenario']} "
+                    f"seed={result['seed']} "
+                    f"job_wall={_format_seconds(result['wall_s'])} "
+                    f"{_job_eta(suite_start, completed_jobs, expected_jobs)}",
                     flush=True,
                 )
-            for result in _pending_seed_results(
-                scenario, pending, config, run_dir, workers,
-            ):
-                completed_seeds += 1
-                record(result)
-                if config.show_eta:
-                    print(
-                        f"[evaluation] done scenario={scenario} seed={result['seed']} "
-                        f"seed_wall={_format_seconds(result['wall_s'])} "
-                        f"{_eta(suite_start, scenario_start, scenario_index, len(config.scenarios), completed_seeds, len(config.seeds), past_scenario_wall)}",
-                        flush=True,
-                    )
-            scenario_wall = time.perf_counter() - scenario_start
-            past_scenario_wall.append(float(scenario_wall))
-            suite.setdefault("scenario_wall_s", {})[scenario] = float(scenario_wall)
-            persist()
-            if config.show_eta:
-                print(
-                    f"[evaluation] complete scenario={scenario} wall={_format_seconds(scenario_wall)} "
-                    f"{_eta(suite_start, scenario_start, scenario_index, len(config.scenarios), len(config.seeds), len(config.seeds), past_scenario_wall)}",
-                    flush=True,
-                )
+        # Scenarios no longer own a wall-clock phase, so report the job time
+        # each one consumed and the suite's actual span separately.
+        suite["scenario_job_wall_s"] = {
+            scenario: float(sum(values)) for scenario, values in job_wall.items()
+        }
+        suite["suite_wall_s"] = float(time.perf_counter() - suite_start)
+        persist()
 
         paired = summarize_pairs(scenario_summaries)
         _write_json(aggregate_dir / "paired_bootstrap.json", paired)
@@ -6627,17 +7016,18 @@ def parse_args(
     *,
     description: str = "Run the adaptive-preference HRC evaluation harness.",
     default_baselines: Sequence[str] = DEFAULT_BASELINES,
+    default_seeds: Sequence[int] = PAPER_SEEDS,
 ) -> EvalSettings:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--output", default=DEFAULT_RESULTS_ROOT)
     parser.add_argument("--run", help="Explicit run directory name; required with --resume.")
     parser.add_argument("--resume", action="store_true", help="Resume completed seeds in an existing run.")
-    parser.add_argument("--seeds", default=",".join(str(seed) for seed in PAPER_SEEDS))
+    parser.add_argument("--seeds", default=",".join(str(seed) for seed in default_seeds))
     parser.add_argument("--scenarios", default=",".join(SCENARIOS))
     parser.add_argument("--baselines", default=",".join(default_baselines))
     parser.add_argument("--offline-recipe-fraction", type=float, default=0.50)
     parser.add_argument("--offline-preference-fraction", type=float, default=0.50)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=EvalSettings.workers)
     parser.add_argument("--threads", type=int, default=DEFAULT_NATIVE_THREADS_PER_WORKER)
     parser.add_argument("--no-eta", action="store_true")
     parser.add_argument("--no-oracle", action="store_true")
@@ -6666,7 +7056,9 @@ def parse_args(
     parser.add_argument("--holdout-start", type=float, default=0.60)
     parser.add_argument("--holdout-demos", type=int, default=3)
     parser.add_argument("--frozen-pairs", type=int, default=48)
-    parser.add_argument("--audit-period", type=int, default=2)
+    # Derived, not restated: a CLI default that duplicates the dataclass default
+    # is a second source of truth and silently overrides it (see the CLI-default test).
+    parser.add_argument("--audit-period", type=int, default=EvalSettings.audit_period)
     parser.add_argument("--audit-prefixes", type=int, default=16)
     parser.add_argument("--audit-tolerance", type=float, default=5e-2)
     parser.add_argument(
@@ -6689,6 +7081,36 @@ def parse_args(
         type=int,
         help="Number of semantic actions scored together; defaults to one.",
     )
+    parser.add_argument(
+        "--llm-prefill-chunk-tokens",
+        type=int,
+        help=(
+            "Prefill the prompt this many positions at a time. Raises the "
+            "prompt budget on a display-sharing GPU by about half, costs "
+            "prefill wall time, and perturbs candidate probabilities by a few "
+            "percent relative. 0 keeps one forward and today's exact scores."
+        ),
+    )
+    parser.add_argument(
+        "--llm-context-encoding",
+        choices=("auto", "state_delta", "action_only"),
+        help=(
+            "Demonstration encoding. 'auto' annotates per-step state and drops "
+            "the annotation only when the prompt stops fitting, so a long run "
+            "may change encoding partway. Pin one to keep a run consistent; "
+            "'action_only' is about 2.7x smaller."
+        ),
+    )
+    parser.add_argument(
+        "--llm-vram-headroom-gib",
+        type=float,
+        help=(
+            "VRAM left for the display server and other GPU clients. The "
+            "prompt budget is sized from what remains, so this is what keeps a "
+            "growing prompt from hanging the desktop on a single-GPU machine. "
+            "Use 0 only on a GPU that drives no display."
+        ),
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--sensitivity", action="store_true", help="Run the opt-in H3 online-commit sensitivity audit after the main suite.")
     args = parser.parse_args(argv)
@@ -6700,6 +7122,12 @@ def parse_args(
         overrides["llm_context_tokens"] = int(args.llm_context_tokens)
     if args.llm_candidate_batch is not None:
         overrides["llm_candidate_batch"] = int(args.llm_candidate_batch)
+    if args.llm_vram_headroom_gib is not None:
+        overrides["llm_vram_headroom_gib"] = float(args.llm_vram_headroom_gib)
+    if args.llm_prefill_chunk_tokens is not None:
+        overrides["llm_prefill_chunk_tokens"] = int(args.llm_prefill_chunk_tokens)
+    if args.llm_context_encoding is not None:
+        overrides["llm_context_encoding"] = str(args.llm_context_encoding)
     return EvalSettings(
         seeds=tuple(int(seed) for seed in _parse_csv(args.seeds)),
         scenarios=_parse_csv(args.scenarios),

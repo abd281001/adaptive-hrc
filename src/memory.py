@@ -153,21 +153,25 @@ class RecipeMatcher:
         return MatchResult("preference_shift", best_recipe_id, best_variant.variant_id, best_score, best_distance)
 
     def score(self, sequence: Sequence[str], library: Sequence[KnownVariant]) -> Dict[str, Tuple[KnownVariant, float, float]]:
-        """Score a library in one pass and retain its best variant per recipe."""
+        """Score a library in one pass and retain its best variant per recipe.
+        Selection depends only on the multiset overlap, so the order distance is
+        computed for each recipe's winner rather than for every variant. The
+        returned winner, score and distance are identical either way; the
+        discarded distances were never read.
+        """
         with self._profile("score"):
             self.variants_scored += len(library)
             actions = tuple(sequence)
             variant_id = make_variant_id(actions)
             action_counts = Counter(actions)
-            best: Dict[str, Tuple[KnownVariant, float, float]] = {}
+            winners: Dict[str, Tuple[KnownVariant, float, bool]] = {}
             for variant in library:
-                if (variant.variant_id == variant_id and variant.ordering == actions): score, distance = 1.0, 0.0
-                else:
-                    score = _jaccard_counters(action_counts, variant.counts())
-                    distance = kendall_tau_distance(actions, variant.ordering, unmatched_penalty=self.settings.unmatched_penalty)
-                previous = best.get(variant.recipe_id)
-                if previous is None or score > previous[1]: best[variant.recipe_id] = (variant, float(score), float(distance))
-            return best
+                exact = variant.variant_id == variant_id and variant.ordering == actions
+                score = 1.0 if exact else _jaccard_counters(action_counts, variant.counts())
+                previous = winners.get(variant.recipe_id)
+                if previous is None or score > previous[1]: winners[variant.recipe_id] = (variant, float(score), exact)
+            return {recipe_id: (variant, score, 0.0 if exact else float(kendall_tau_distance(actions, variant.ordering, unmatched_penalty=self.settings.unmatched_penalty)))
+                    for recipe_id, (variant, score, exact) in winners.items()}
 
     def score_prefix(self, prefix: Sequence[str], variants: List[KnownVariant]) -> List[Tuple[KnownVariant, float]]:
         """Rank variants by prefix overlap and shared-action order."""
@@ -280,17 +284,19 @@ class ReplayMemory:
             raise ValueError(f"unknown decay policy {policy!r}")
         self.settings = settings
         self.policy = policy
-        self.default_grace_horizon: int = max(0, int(getattr(settings, "initial_grace", 50)))
-        self.min_grace: int = max(0, int(getattr(settings, "min_grace", 6)))
-        self.prune_delay: int = max(1, int(getattr(settings, "prune_delay", 3)))
-        self.reuse_window: int = max(1, int(getattr(settings, "pair_gap_window", 12)))
-        self.reuse_min_samples: int = min(self.reuse_window, max(1, int(getattr(settings, "parent_weight_samples", 5))))
-        self.pair_downward_half_life: float = float(getattr(settings, "pair_prior_half_life", 3.0))
+        # Every horizon parameter is read straight off Settings so the values
+        # reported in a paper table are the values that ran.
+        self.default_grace_horizon: int = max(0, int(settings.initial_grace))
+        self.min_grace: int = max(0, int(settings.min_grace))
+        self.prune_delay: int = max(1, int(settings.prune_delay))
+        self.reuse_window: int = max(1, int(settings.pair_gap_window))
+        self.reuse_min_samples: int = min(self.reuse_window, max(1, int(settings.parent_weight_samples)))
+        self.pair_downward_half_life: float = float(settings.pair_prior_half_life)
         if not math.isfinite(self.pair_downward_half_life) or self.pair_downward_half_life <= 0.0: raise ValueError("pair_prior_half_life must be finite and positive")
-        self.reuse_quantile: float = min(1.0, max(0.0, float(getattr(settings, "gap_quantile", 0.90))))
-        self.reuse_iqr_multiplier: float = max(0.0, float(getattr(settings, "gap_iqr_scale", 1.50)))
-        self.recipe_reuse_window: int = max(self.reuse_window, int(getattr(settings, "recipe_gap_window", 24)))
-        self.global_reuse_window: int = max(self.recipe_reuse_window, int(getattr(settings, "global_gap_window", 60)))
+        self.reuse_quantile: float = min(1.0, max(0.0, float(settings.gap_quantile)))
+        self.reuse_iqr_multiplier: float = max(0.0, float(settings.gap_iqr_scale))
+        self.recipe_reuse_window: int = max(self.reuse_window, int(settings.recipe_gap_window))
+        self.global_reuse_window: int = max(self.recipe_reuse_window, int(settings.global_gap_window))
         self.post_grace_decay_rate = (0.0 if policy == "none" else float(settings.fixed_decay) if policy == "fixed"else 1.0 / float(self.prune_delay))
         self.active: Dict[VariantKey, MemoryItem] = {}
         self.pruned: Dict[VariantKey, RemovedItem] = {}
@@ -458,6 +464,10 @@ class ReplayMemory:
     def pair_history(self, key: VariantKey) -> List[int]:
         """Return the recurrence samples currently controlling one variant."""
         return list(self._pair_gap_window.get(key, ()))
+
+    def pair_last_seen(self, key: VariantKey) -> Optional[int]:
+        """Return the demonstration index at which one variant was last seen."""
+        return self._pair_last_seen_step.get(key)
 
     def _record_pair_reuse(self, key: VariantKey, now: int, step: Optional[int] = None) -> Optional[int]:
         last_seen = self._pair_last_seen_step.get(key)

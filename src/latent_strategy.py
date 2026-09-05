@@ -111,11 +111,11 @@ class LatentStrategyResidual:
         self.mean_demo_length   = 1.0
         self.last_score         = StrategyScore({}, 0.0, 0.0, 0, 0, 0)
         self.last_score_stats: Dict[str, Any] = {}
-        self.last_fit_stats: Dict[str, Any] = {"latent_strategy_enabled": bool(getattr(self.settings, "latent_strategy_enabled", True)),  "latent_strategy_prototypes": 0, "latent_strategy_fit_flops": 0.0}
+        self.last_fit_stats: Dict[str, Any] = {"latent_strategy_enabled": bool(self.settings.latent_strategy_enabled),  "latent_strategy_prototypes": 0, "latent_strategy_fit_flops": 0.0}
 
     def fit(self, demonstrations: Sequence[Sequence[Tuple[Tuple[int, ...], str]]], demo_weights: Sequence[float] | None = None) -> None:
         self.reset()
-        if not bool(getattr(self.settings, "latent_strategy_enabled", True)): return
+        if not bool(self.settings.latent_strategy_enabled): return
         indexed_rows    = [(index, tuple(action for _state, action in demo if action != "stop")) for index, demo in enumerate(demonstrations)]
         indexed_rows    = [(index, row) for index, row in indexed_rows if row]
         action_rows     = [row for _index, row in indexed_rows]
@@ -129,7 +129,7 @@ class LatentStrategyResidual:
         variance        = np.average((matrix - self.mean) ** 2, axis=0, weights=normalized)
         self.scale      = np.sqrt(np.maximum(variance, 1e-6)).astype(np.float32)
         standardized    = (matrix - self.mean) / self.scale
-        rank = min(max(1, int(getattr(self.settings, "latent_strategy_rank", 8))), len(action_rows), self.fingerprint_dim)
+        rank = min(max(1, int(self.settings.latent_strategy_rank)), len(action_rows), self.fingerprint_dim)
         _u, _singular, right = np.linalg.svd(np.sqrt(normalized)[:, None] * standardized, full_matrices=False)
         self.components = right[:rank].astype(np.float32)
         self.codes      = (standardized @ self.components.T).astype(np.float32)
@@ -137,7 +137,7 @@ class LatentStrategyResidual:
         self.code_scale = np.sqrt(np.maximum(code_variance, 1e-6)).astype(np.float32)
         self.fingerprints   = matrix.astype(np.float32)
         self.role_counts    = np.asarray([[sum(self.domain.action_role(action) == role for action in row) for role in self.roles ] for row in action_rows], dtype=np.int16)
-        self.role_sequences = tuple(tuple(self.role_index[self.domain.action_role(action)] for action in row) for row in action_rows) if float(getattr(self.settings, "latent_strategy_sequence_weight", 0.0)) > 0.0 else ()
+        self.role_sequences = tuple(tuple(self.role_index[self.domain.action_role(action)] for action in row) for row in action_rows) if float(self.settings.latent_strategy_sequence_weight) > 0.0 else ()
         self.weights        = weights.astype(np.float32)
         self.mean_demo_length = float(np.average([len(row) for row in action_rows], weights=normalized))
         flop_estimate       = float(6 * matrix.size + 4 * len(action_rows) * self.fingerprint_dim * rank)
@@ -183,7 +183,7 @@ class LatentStrategyResidual:
         if not len(finite):
             self.last_score = empty
             return empty
-        count = min(max(1, int(getattr(self.settings, "latent_strategy_knn", 3))), len(finite))
+        count = min(max(1, int(self.settings.latent_strategy_knn)), len(finite))
         kth_distance = float(np.partition(distances[finite], count - 1)[count - 1])
         indices = finite[distances[finite] <= kth_distance + 1e-8]
         count = int(len(indices))
@@ -220,7 +220,7 @@ class LatentStrategyResidual:
             values = np.asarray(per_neighbor, dtype=np.float64)
             utilities[action] = float(np.dot(neighbor_weights, values))
             agreements.append(1.0 - min(1.0, float(np.dot(neighbor_weights, (values - utilities[action]) ** 2))))
-        sequence_weight = float(getattr(self.settings, "latent_strategy_sequence_weight", 0.0))
+        sequence_weight = float(self.settings.latent_strategy_sequence_weight)
         alignment_confidence = 1.0
         alignment_flops = 0.0
         if sequence_weight > 0.0 and prefix_roles:

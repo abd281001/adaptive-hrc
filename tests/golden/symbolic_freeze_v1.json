@@ -1,7 +1,5 @@
 {
-  "schema_version": 1,
-  "source_commit": "eee03781276f4cefd7e419b663f2ba629234c192",
-  "description": "Frozen pre-Burrito symbolic MaxEnt smoke policy",
+  "_note": "settings pins every field that affects the frozen output, so a deliberate change to a Settings default cannot silently invalidate this drift detector. Regenerated when the MaxEnt fit was reformulated over a padded (state, action) grid: same estimand, array arithmetic, so the float accumulation order and therefore these bytes changed.",
   "actions": [
     "transfer (pot, from=storage, to=cooking_station)",
     "transfer (tomato, from=storage, to=prep_station)",
@@ -9,18 +7,7 @@
     "load (tomato, pot, cooking_station)",
     "turn_on (stove, cooking_station)"
   ],
-  "settings": {
-    "seed": 1337,
-    "irl_cold_steps": 3,
-    "irl_warm_steps": 2,
-    "irl_horizon": 8,
-    "latent_strategy_enabled": false
-  },
-  "reward_weights": {
-    "dtype": "float32",
-    "shape": [199],
-    "sha256": "8bb2d0ae3f7f828d2ce4c2f9b6422364cc5d1deba9498e526a584bc08c6b3284"
-  },
+  "description": "Frozen pre-Burrito symbolic MaxEnt smoke policy",
   "predictions": [
     {
       "transfer (pot, from=storage, to=cooking_station)": 0.999998000004,
@@ -35,7 +22,28 @@
       "cut (tomato, prep_station)": 0.9999990000010001,
       "turn_on (stove, cooking_station)": 9.99999000001e-07
     },
-    {"turn_on (stove, cooking_station)": 1.0},
-    {"turn_on (stove, cooking_station)": 1.0}
-  ]
+    {
+      "turn_on (stove, cooking_station)": 1.0
+    },
+    {
+      "turn_on (stove, cooking_station)": 1.0
+    }
+  ],
+  "reward_weights": {
+    "dtype": "float32",
+    "sha256": "f7aa74728a2429d9ac2714c7617f0ff241fbf6af7d742d1a4e6a5a1d0797ef03",
+    "shape": [
+      199
+    ]
+  },
+  "schema_version": 2,
+  "settings": {
+    "irl_cold_steps": 3,
+    "irl_horizon": 8,
+    "irl_learning_rate": 0.01,
+    "irl_warm_steps": 2,
+    "latent_strategy_enabled": false,
+    "seed": 1337
+  },
+  "source_commit": "47923d1d1ae767519b518baea333b657fa32d62f"
 }

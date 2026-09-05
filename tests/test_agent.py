@@ -7,6 +7,14 @@ from src.environment import recipe_builders
 from src.models import Settings
 from src.preferences import PREFERENCES, apply_preference, apply_preset_actions
 
+def _trace(*actions):
+    """Observed transitions for `actions`, as the live protocol records them."""
+    return tuple(
+        (observation.state, observation.action, observation.next_state)
+        for observation in observe_actions(actions)
+    )
+
+
 RECIPE_TOMATO_ONION_SOUP = recipe_builders()["tomato_onion_soup"]()
 RECIPE_TOMATO_SOUP = recipe_builders()["tomato_soup"]()
 RECIPE_MUSHROOM_SOUP = recipe_builders()["mushroom_soup"]()
@@ -230,12 +238,12 @@ class AdaptiveAgentTests(unittest.TestCase):
         b = "turn_on (stove, cooking_station)"
         c = "transfer (pan, from=storage, to=cooking_station)"
 
-        ag.replay.register("R1", "pref_a", (a, b), now=1, cycle=0)
+        ag.replay.register("R1", "pref_a", (a, b), now=1, cycle=0, transitions=_trace(a, b))
         ag._retrain()
         self.assertEqual(ag.maxent.normalizer.count, len(ag.maxent.state_vectors))
 
         ag.replay.active.clear()
-        ag.replay.register("R2", "pref_b", (c,), now=2, cycle=1)
+        ag.replay.register("R2", "pref_b", (c,), now=2, cycle=1, transitions=_trace(c))
         ag._retrain()
 
         self.assertEqual(ag.maxent.normalizer.count, len(ag.maxent.state_vectors))
@@ -484,7 +492,7 @@ class AdaptiveAgentTests(unittest.TestCase):
         self.assertEqual(len(ag.retrain_fit_wall_times), fit_count_before_prune_refresh + 1)
         self.assertEqual({entry.key for entry in ag.replay.active_items()}, {(recipe_id, new_h)})
 
-    def test_full_agent_uses_cumulative_membership_threshold_three(self):
+    def test_full_agent_counts_only_additions_toward_the_cold_threshold(self):
         ag = AdaptiveAgent(
             Settings(
                 verbose=False,
@@ -500,6 +508,7 @@ class AdaptiveAgentTests(unittest.TestCase):
 
         ag.replay.register(
             "R0", "h0", (actions[0],), now=1, cycle=0, pin_latest=False,
+            transitions=_trace(actions[0]),
         )
         ag._retrain()
         self.assertEqual(
@@ -510,26 +519,48 @@ class AdaptiveAgentTests(unittest.TestCase):
 
         ag.replay.register(
             "R1", "h1", (actions[1],), now=2, cycle=1, pin_latest=False,
+            transitions=_trace(actions[1]),
         )
         ag._retrain()
         self.assertEqual(ag.retrain_events[-1]["retrain_effective_start"], "warm")
         self.assertEqual(ag.cold_change_count, 1)
         self.assertTrue(ag._fit_stats()["warm_start"])
 
+        # A removal strictly shrinks the training set, so the incumbent weights
+        # stay valid: warm start, and the cold-start counter does not advance.
         ag.replay.active.pop(("R1", "h1"))
+        ag._retrain()
+        self.assertEqual(
+            ag.retrain_events[-1]["retrain_trigger"],
+            "removal_only_membership_change",
+        )
+        self.assertEqual(ag.retrain_events[-1]["retrain_effective_start"], "warm")
+        self.assertEqual(ag.retrain_events[-1]["active_removed_count"], 1)
+        self.assertEqual(ag.retrain_events[-1]["active_added_count"], 0)
+        self.assertEqual(ag.cold_change_count, 1)
+        self.assertTrue(ag._fit_stats()["warm_start"])
+
+        # Two further additions reach the threshold of three; the intervening
+        # removal contributed nothing to it.
+        ag.replay.register(
+            "R2", "h2", (actions[2],), now=3, cycle=3, pin_latest=False,
+            transitions=_trace(actions[2]),
+        )
         ag._retrain()
         self.assertEqual(ag.retrain_events[-1]["retrain_effective_start"], "warm")
         self.assertEqual(ag.cold_change_count, 2)
 
         ag.replay.register(
-            "R2", "h2", (actions[2],), now=3, cycle=3, pin_latest=False,
+            "R3", "h3", (actions[1],), now=4, cycle=4, pin_latest=False,
+            transitions=_trace(actions[1]),
         )
         ag._retrain()
         self.assertEqual(
             ag.retrain_events[-1]["retrain_trigger"],
-            "cumulative_membership_threshold_reached",
+            "cumulative_addition_threshold_reached",
         )
         self.assertEqual(ag.retrain_events[-1]["retrain_effective_start"], "cold")
+        self.assertEqual(ag.retrain_events[-1]["cold_threshold_basis"], "additions_only")
         self.assertEqual(ag.cold_change_count, 0)
         self.assertFalse(ag._fit_stats()["warm_start"])
 

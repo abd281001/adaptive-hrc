@@ -11,13 +11,78 @@ class EvaluationParallelismTests(unittest.TestCase):
     def test_workers_use_clean_processes(self):
         self.assertEqual(evaluation._mp_context().get_start_method(), "spawn")
 
-    def test_worker_count_is_capped_by_seed_count(self):
-        settings = evaluation.EvalSettings(seeds=(1, 2, 3, 4, 5), workers=20)
-        self.assertEqual(evaluation._worker_count(settings), 5)
+    def test_worker_count_admits_only_complete_scenario_seed_cohorts(self):
+        self.assertEqual(evaluation.EvalSettings().workers, 20)
+        self.assertEqual(evaluation.parse_args([]).workers, 20)
+        settings = evaluation.EvalSettings(
+            scenarios=("homogeneous", "heterogeneous", "holdout"),
+            seeds=(1, 2, 3, 4, 5),
+            workers=20,
+        )
+        self.assertEqual(evaluation._worker_count(settings), 15)
+        eight_seeds = evaluation.EvalSettings(
+            scenarios=("homogeneous", "heterogeneous", "holdout"),
+            seeds=tuple(range(8)), workers=20,
+        )
+        self.assertEqual(evaluation._worker_count(eight_seeds), 16)
+        twelve_seeds = evaluation.EvalSettings(
+            scenarios=("homogeneous", "heterogeneous", "holdout"),
+            seeds=tuple(range(12)), workers=20,
+        )
+        self.assertEqual(evaluation._worker_count(twelve_seeds), 12)
+        hard_cap = evaluation.EvalSettings(
+            scenarios=("homogeneous",), seeds=tuple(range(30)), workers=99,
+        )
+        self.assertEqual(evaluation._worker_count(hard_cap), 20)
 
-    def test_worker_count_defaults_to_one_worker_per_seed(self):
-        settings = evaluation.EvalSettings(seeds=(1, 2, 3, 4, 5), workers=0)
-        self.assertEqual(evaluation._worker_count(settings), 5)
+    def test_scenario_batches_never_admit_a_partial_seed_cohort(self):
+        settings = evaluation.EvalSettings(
+            scenarios=("homogeneous", "heterogeneous", "holdout"),
+            seeds=tuple(range(8)), workers=20,
+        )
+        jobs = [
+            (scenario, seed)
+            for scenario in settings.scenarios for seed in settings.seeds
+        ]
+        batches = evaluation._scenario_job_batches(jobs, settings)
+        self.assertEqual(tuple(map(len, batches)), (16, 8))
+        self.assertEqual(
+            tuple({scenario for scenario, _seed in batch} for batch in batches),
+            (
+                {"homogeneous", "heterogeneous"},
+                {"holdout"},
+            ),
+        )
+
+    def test_worker_count_never_exceeds_the_pending_work(self):
+        settings = evaluation.EvalSettings(
+            scenarios=("homogeneous", "heterogeneous", "holdout"),
+            seeds=(1, 2, 3, 4, 5),
+            workers=0,
+        )
+        self.assertEqual(evaluation._worker_count(settings, 3), 3)
+        self.assertGreaterEqual(evaluation._worker_count(settings), 1)
+
+    def test_pending_jobs_span_scenarios(self):
+        """Jobs from different scenarios must be able to run concurrently."""
+        settings = evaluation.EvalSettings(
+            scenarios=("homogeneous", "holdout"), seeds=(1, 2), workers=4,
+        )
+        seen = []
+
+        def fake_job(scenario, seed, _config, _run_dir):
+            seen.append((scenario, int(seed)))
+            return {"scenario": scenario, "seed": int(seed), "wall_s": 0.0}
+
+        with patch.object(evaluation, "_run_seed_scenario_job", fake_job):
+            results = list(evaluation._pending_job_results(
+                [("homogeneous", 1), ("holdout", 2)],
+                settings, Path("/tmp/jobs-test"), workers=1,
+            ))
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            {row["scenario"] for row in results}, {"homogeneous", "holdout"}
+        )
 
     def test_in_context_llm_uses_one_gpu_worker(self):
         settings = evaluation.EvalSettings(
