@@ -1261,7 +1261,7 @@ class InContextLlmTests(unittest.TestCase):
         self.assertLess(len(candidates), len(llm.llm_actions))
 
     def test_predict_actions_accepts_the_shared_predictor_interface(self):
-        """Every predictor arm accepts explicit state and feasible actions."""
+        """Every other arm takes state=/action_universe=; real_robot passes them."""
         builders = recipe_builders()
         name = next(iter(builders))
         pair = build_task(name, "default", builders[name])
