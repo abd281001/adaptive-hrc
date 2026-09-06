@@ -7,7 +7,7 @@ Robot installation (Python 3.10 with the existing NumPy and OpenCV):
 
 Run from the project root, with the dry-run camera bridge already running:
   /usr/bin/python3 -E tools/mixed_marker_probe.py --seconds 300 \
-      --report real_robot_runs/five_boxes_marker_probe.json
+      --report eval_results/real_robot_runs/five_boxes_marker_probe.json
 
 This is an ID diagnostic. It does not estimate metric poses, control the robot,
 open a RealSense pipeline, or change the production detector/configuration.

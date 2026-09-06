@@ -123,8 +123,8 @@ The Stretch/D405/ArUco motion runtime is self-contained under
 `src/real_robot/stretch_runtime`; deployment does not require the prior lab
 demo directory.
 The sample station geometry is intentionally uncalibrated and cannot enable
-motion. See [`docs/real_robot.md`](docs/real_robot.md) for the architecture,
-calibration checklist, remote-GUI options, safety gates, and robot commands.
+motion. See [`src/real_robot/README.md`](src/real_robot/README.md) for robot
+directory locations, migration of existing local data, and dry-run commands.
 Use `./hrc robot-doctor` for a read-only deployment preflight and
 `./hrc robot-report RUN_DIRECTORY` for an integrity/outcome summary. Live UI
 startup requires the explicit `--require-motion` handshake, a matching full
@@ -380,7 +380,7 @@ terminal prints one concise line per LLM event and at Full phase boundaries.
 - `src/plotting.py`: figures and paired holdout inference.
 - `src/hrc_simulation.py`: alternating human–robot interaction simulator.
 - `src/real_robot/`: physical task domain, live protocol, operator UI, and local Stretch bridge.
-- `robot_configs/stretch3_lab.json`: uncalibrated five-station pilot catalog and marker map.
+- `src/real_robot/robot_configs/stretch3_lab.json`: uncalibrated five-station pilot catalog and marker map.
 - `src/llm_baseline.py`: optional frozen in-context action predictor.
 - `burrito/wrapper/adaptive_hrc_burrito/`: physical-domain adapter,
   completion-checked task options, and the two-player HRC protocol.
@@ -392,3 +392,8 @@ Every completed evaluation is immutable under `eval_results/runs/<run>/`.
 stores a compact summary plus compressed episode, turn, frozen-probe,
 diagnostic, transfer, and oracle-gap tables. Generated results and external
 model weights are not part of the source repository.
+
+Real-robot sessions are written under `eval_results/real_robot_runs/`. Bridge
+execution state stays under `src/real_robot/real_robot_bridge_state/`; it is
+local runtime data, separate from evaluation results. Both locations are ignored
+by Git.

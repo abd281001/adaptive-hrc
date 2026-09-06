@@ -46,7 +46,38 @@ from src.real_robot.session import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = PROJECT_ROOT / "robot_configs" / "stretch3_lab.json"
+CONFIG_PATH = PROJECT_ROOT / "src/real_robot/robot_configs" / "stretch3_lab.json"
+
+
+@pytest.mark.parametrize("subdirectory", ["", "dry-run"])
+def test_relocated_bridge_does_not_bypass_existing_ledger(tmp_path, monkeypatch, subdirectory):
+    from src.real_robot import bridge
+
+    monkeypatch.chdir(tmp_path)
+    legacy_root = tmp_path / "real_robot_bridge_state"
+    legacy_state = legacy_root / subdirectory
+    legacy_state.mkdir(parents=True)
+    record = '{"execution_id":"unfinished-001","status":"running"}\n'
+    (legacy_state / "executions.jsonl").write_text(record, encoding="utf-8")
+    (legacy_state / "bridge.lock").write_text("previous-process\n", encoding="utf-8")
+    relocated_root = tmp_path / "src/real_robot/real_robot_bridge_state"
+
+    def unexpected_start(*args, **kwargs):
+        pytest.fail("Bridge acquired a new lock before migrating the old ledger")
+
+    monkeypatch.setattr(bridge, "ProcessLock", unexpected_start)
+    arguments = ["--config", str(CONFIG_PATH), "--camera-preview"]
+    if subdirectory:
+        arguments.extend(["--state-dir", str(relocated_root / subdirectory)])
+    with pytest.raises(SystemExit, match="existing bridge state"):
+        bridge.main(arguments)
+
+    assert not relocated_root.exists()
+    assert (legacy_state / "executions.jsonl").read_text(encoding="utf-8") == record
+    relocated_root.parent.mkdir(parents=True)
+    legacy_root.rename(relocated_root)
+    ledger = ExecutionLedger(relocated_root / subdirectory / "executions.jsonl")
+    assert ledger.unresolved_ids == ("unfinished-001",)
 
 
 class FakeAgent:
@@ -938,7 +969,7 @@ def test_trial_metadata_is_required_nonempty_and_unique(config, domain):
 
 def test_frozen_schedule_enforces_observation_block_and_next_trial(config, domain):
     schedule = load_study_schedule(
-        PROJECT_ROOT / "robot_configs" / "study_schedule.template.json", config,
+        PROJECT_ROOT / "src/real_robot/robot_configs" / "study_schedule.template.json", config,
     )
     assert len(schedule.episodes) == 16
     session = LiveHrcSession(

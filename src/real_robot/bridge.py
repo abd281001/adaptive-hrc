@@ -295,10 +295,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local Stretch 3 hardware bridge")
-    parser.add_argument("--config", default="robot_configs/stretch3_lab.json")
+    parser.add_argument("--config", default="src/real_robot/robot_configs/stretch3_lab.json")
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9100)
-    parser.add_argument("--state-dir", default="real_robot_bridge_state")
+    parser.add_argument("--state-dir", default="src/real_robot/real_robot_bridge_state")
     parser.add_argument("--enable-motion", action="store_true")
     parser.add_argument("--camera-preview", action="store_true", help="Open the D405 in dry-run mode; robot actions remain simulated")
     parser.add_argument("--calibration-mode", action="store_true", help="Permit supervised single-action probes with an uncalibrated config")
@@ -318,6 +318,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.calibration_mode and not args.enable_motion:
         raise SystemExit("--calibration-mode requires --enable-motion")
     state_dir = Path(args.state_dir)
+    # A path cleanup must not hide an existing execution ledger or its lock.
+    relocated_root = Path("src/real_robot/real_robot_bridge_state").resolve()
+    if state_dir.resolve().is_relative_to(relocated_root):
+        legacy_root = Path("real_robot_bridge_state")
+        if legacy_root.exists():
+            raise SystemExit(
+                f"existing bridge state at {legacy_root}; stop the bridge and move "
+                "that directory to src/real_robot/real_robot_bridge_state before restarting. "
+                "See src/real_robot/README.md"
+            )
     process_lock = ProcessLock(state_dir / "bridge.lock")
     ledger = ExecutionLedger(state_dir / "executions.jsonl")
     try:

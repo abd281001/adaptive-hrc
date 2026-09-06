@@ -403,7 +403,7 @@ def _run_directory(root: Path, requested: str | None) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Adaptive-HRC real-robot operator UI")
-    parser.add_argument("--config", default="robot_configs/stretch3_lab.json")
+    parser.add_argument("--config", default="src/real_robot/robot_configs/stretch3_lab.json")
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--hardware-url", default="", help="Local Stretch bridge URL; empty uses dry-run")
@@ -411,7 +411,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-motion", action="store_true", help="Refuse startup unless the bridge is live, ready, and digest-matched")
     parser.add_argument("--dry-run-delay", type=float, default=0.25)
     parser.add_argument("--operator-token", default="")
-    parser.add_argument("--output", default="real_robot_runs")
+    parser.add_argument("--output", default="eval_results/real_robot_runs")
     parser.add_argument("--run", default="")
     parser.add_argument("--resume-checkpoint", default="", help="Trusted local action-level checkpoint.pkl")
     parser.add_argument("--schedule", default="", help="Frozen participant-specific study schedule JSON")

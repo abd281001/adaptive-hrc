@@ -16,7 +16,7 @@ from src.real_robot.hardware import HttpStretchExecutor
 from src.real_robot.stretch_hardware import BridgeDryRunController
 
 
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "robot_configs/stretch3_lab.json"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "src/real_robot/robot_configs/stretch3_lab.json"
 
 
 class CameraPreviewTests(unittest.TestCase):

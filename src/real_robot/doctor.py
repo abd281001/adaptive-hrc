@@ -21,7 +21,7 @@ ROBOT_MODULES = ("stretch_body.robot", *RUNTIME_MODULES)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read-only real-robot deployment checks")
-    parser.add_argument("--config", default="robot_configs/stretch3_lab.json")
+    parser.add_argument("--config", default="src/real_robot/robot_configs/stretch3_lab.json")
     parser.add_argument("--hardware-url", default="")
     parser.add_argument("--expect-motion", action="store_true")
     parser.add_argument("--check-robot-runtime", action="store_true")

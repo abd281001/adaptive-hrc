@@ -12,7 +12,7 @@ ArucoDetector exactly as the production grasp loop does.
 Usage (Stretch SDK python, D405 mounted, robot facing the target station):
 
     python -m src.real_robot.marker_quality_probe \
-        --config robot_configs/lab_site.json \
+        --config src/real_robot/robot_configs/lab_site.json \
         --marker-id 12 --station-id produce
 
 Streams a live readout every ~0.3 s. Press Enter to freeze the current

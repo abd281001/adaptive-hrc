@@ -3,8 +3,10 @@
 prompts/
 /talents-zsc/
 eval_results/
-real_robot_runs/
-real_robot_bridge_state/
+/src/real_robot/real_robot_bridge_state/
+# Previous local output locations, retained until each checkout is migrated.
+/real_robot_runs/
+/real_robot_bridge_state/
 
 # Python environments and caches
 .venv-llm/

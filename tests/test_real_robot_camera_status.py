@@ -91,7 +91,7 @@ class CameraStatusTests(unittest.TestCase):
         self.assertIsNone(status["depth_camera_info"])
 
     def test_ui_preflight_round_trip_accepts_actual_camera_status(self):
-        config = load_lab_config(ROOT / "robot_configs/stretch3_lab.json")
+        config = load_lab_config(ROOT / "src/real_robot/robot_configs/stretch3_lab.json")
         controller = BridgeDryRunController(config)
         controller.camera_service = self.camera
         with tempfile.TemporaryDirectory() as temp_dir:
