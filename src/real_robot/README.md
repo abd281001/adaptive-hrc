@@ -2,6 +2,10 @@
 
 Run commands from the repository root. The default layout is:
 
+For the first supervised base/lift/arm/gripper movement check, before station
+calibration, follow [MOTION_CHECK.md](MOTION_CHECK.md). That console connects
+directly to Stretch Body and records measured movements without starting a task.
+
 | Contents | Location | Tracked by Git |
 | --- | --- | --- |
 | Robot configuration and templates | `src/real_robot/robot_configs/` | Yes |
