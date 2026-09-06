@@ -485,42 +485,16 @@ class CookingHrcRunner:
         retrain_executed = any(
             not bool(event.get("skipped", False)) for event in new_retrain_events
         )
-        # A retrain can be correctly skipped: if the shifted variant was
-        # already resident in active replay (active_rehearsal=True) from an
-        # earlier occurrence, TrainPolicy.decide() sees no addition/removal/
-        # weight change *this step* and returns "skip", "replay_unchanged".
-        # That's a legitimate no-op, not a missed retrain -- only treat the
-        # skip as a failure if the active set actually changed underneath it.
-        retrain_correctly_skipped = bool(new_retrain_events) and all(
-            bool(event.get("skipped", False))
-            and int(event.get("active_added_count", 0) or 0) == 0
-            and int(event.get("active_removed_count", 0) or 0) == 0
-            and int(event.get("active_weight_changed_count", 0) or 0) == 0
-            for event in new_retrain_events
-        )
         if (
             mode == ASSIST
             and task.preference_changed
             and task.exposure_after_change == 1
             and self.require_shift_update
             and self.memory_updates_enabled
-            and not (
-                commit_applied
-                and active_rehearsal
-                and (retrain_executed or retrain_correctly_skipped)
-            )
+            and not (commit_applied and active_rehearsal and retrain_executed)
         ):
-            # Name the term that failed. All three are recomputed above from
-            # separate agent state, and a bare assertion left the next run as
-            # the only way to learn which one was False.
             raise RuntimeError(
-                "first natural post-shift exposure did not commit, rehearse, "
-                f"and retrain (commit_applied={commit_applied}, "
-                f"active_rehearsal={active_rehearsal}, "
-                f"retrain_executed={retrain_executed}, "
-                f"retrain_correctly_skipped={retrain_correctly_skipped}, "
-                f"match_key={match_key!r}, "
-                f"retrain_events={new_retrain_events!r})"
+                "first natural post-shift exposure did not commit, rehearse, and retrain"
             )
 
         deliveries = executor._delivery_count() - deliveries_before

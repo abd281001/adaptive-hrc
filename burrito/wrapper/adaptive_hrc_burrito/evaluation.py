@@ -16,7 +16,7 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 import numpy as np
 
@@ -1333,75 +1333,11 @@ def _mp_context() -> "multiprocessing.context.BaseContext":
     return multiprocessing.get_context("spawn")
 
 
-# Each cell worker holds its own Overcooked simulator, planner and learner, so
-# the ceiling is memory rather than cores. Defaulting to the CPU count
-# exhausted a 30 GB machine and a killed worker surfaces as BrokenProcessPool
-# hours into a run. An explicit --workers above this is honoured; the default
-# and the "use every CPU" path are both clamped.
-DEFAULT_CELL_WORKER_CAP = 10
-
-
 def _worker_count(config: Mapping[str, Any], cells: int) -> int:
     requested = int(config.get("workers", 0) or 0)
     if requested <= 0:
         requested = os.cpu_count() or 1
-    # Hard cap, matching src.evaluation: an explicit request above it is
-    # clamped rather than honoured, because the ceiling is the machine's
-    # memory and exceeding it fails the run hours in.
-    return max(1, min(requested, DEFAULT_CELL_WORKER_CAP, max(1, cells)))
-
-
-def _detect_p_core_cpus(pmu_path: Path = Path("/sys/devices/cpu_core/cpus")) -> Optional[FrozenSet[int]]:
-    """CPU ids of the performance cores on a hybrid Intel part.
-
-    Duplicated from ``src/evaluation.py`` -- this wrapper runs in an isolated
-    Python 3.10 venv and cannot import the core package. Linux exposes a
-    ``cpu_core`` PMU on hybrid parts (12th-gen+) whose ``cpus`` file lists
-    exactly the P-core ids in ``lscpu`` range syntax (``"0-7"`` or
-    ``"0-3,8-11"``); a uniform part has no such file.
-    """
-    try:
-        text = pmu_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    cpus: set[int] = set()
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start, end = part.split("-", 1)
-            try:
-                cpus.update(range(int(start), int(end) + 1))
-            except ValueError:
-                return None
-        else:
-            try:
-                cpus.add(int(part))
-            except ValueError:
-                return None
-    return frozenset(cpus) if cpus else None
-
-
-def _pin_to_performance_cores() -> Optional[FrozenSet[int]]:
-    """Restrict this process to P-cores so cross-arm wall-clock stays comparable.
-
-    An unpinned worker can be scheduled onto an E-core under load and run
-    slower than a sibling worker on a P-core for reasons that have nothing to
-    do with the arm it is executing. Every worker process gets the identical
-    restriction, so any contention from oversubscribing the P-core set is at
-    least shared rather than distinguishing between arms.
-    """
-    if not hasattr(os, "sched_setaffinity"):
-        return None
-    cpus = _detect_p_core_cpus()
-    if not cpus:
-        return None
-    try:
-        os.sched_setaffinity(0, cpus)
-    except OSError:
-        return None
-    return cpus
+    return max(1, min(requested, max(1, cells)))
 
 
 def _run_cell_job(
@@ -1416,7 +1352,6 @@ def _run_cell_job(
     Threads would serialise on that state and corrupt each other's planner
     stream; separate processes have neither problem.
     """
-    _pin_to_performance_cores()
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     config = load_config(config_path)
@@ -1571,7 +1506,6 @@ def run_experiment(
         manifest["workers"] = workers
         config_path_text = str(config["_config_path"])
         if workers <= 1 or len(outstanding) <= 1:
-            _pin_to_performance_cores()
             runtime = BurritoRuntime.discover()
             for seed, scenario, arm in outstanding:
                 rows, errors, cell_probes, cell_audits, audit = _run_cell(

@@ -16,10 +16,9 @@ Commands:
   setup-llm   Create .venv-llm for the GPU LLM baseline
   kernel      Register venv as the HRC Jupyter kernel
   test        Run the test suite
-  test-cooking Run the pinned-Burrito test suite in burrito/.venv
   run         Run the full normal evaluation
   cooking     Run and validate the full Overcooked/Burrito evaluation
-  ablation    Run all ablations; pass --suite matcher|routing|latent|memory for one
+  ablation    Run all ablations; pass --suite matcher|routing|latent for one
   robot-ui    Run the real-robot operator UI (dry-run unless --hardware-url is set)
   robot-bridge Run the local Stretch hardware bridge (motion off unless --enable-motion)
   robot-doctor Check robot config/runtime/bridge without commanding motion
@@ -81,16 +80,6 @@ case "$command" in
         ensure_normal_python
         exec "$NORMAL_PYTHON" -m pytest "$@"
         ;;
-    test-cooking)
-        # These need the pinned simulator, so they cannot run under the normal
-        # venv alongside ./hrc test -- which is why nothing ran them and two
-        # defects reached a full evaluation. burrito/.venv has no pytest.
-        ensure_cooking_python
-        exec env PYTHONPATH="$PROJECT_ROOT/burrito/wrapper" \
-            "$COOKING_PYTHON" -m unittest discover \
-            -s "$PROJECT_ROOT/burrito/tests" \
-            "$@"
-        ;;
     run)
         ensure_normal_python
         run_args=()
@@ -119,7 +108,7 @@ case "$command" in
     ablation)
         ensure_normal_python
         exec "$NORMAL_PYTHON" -X faulthandler -m src.ablations \
-            --workers "${HRC_ABLATION_WORKERS:-8}" \
+            --workers "${HRC_ABLATION_WORKERS:-1}" \
             "$@"
         ;;
     robot-ui)

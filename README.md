@@ -42,7 +42,7 @@ Open `HRC.ipynb` in a Jupyter-compatible frontend, select the
 `Python (adaptive-hrc)` kernel, and run the cells from the repository root.
 Running all cells performs these three stages in order:
 
-1. the standard evaluation: three scenarios times eight paired seeds, written
+1. the standard evaluation: three scenarios times five paired seeds, written
    as one new directory under `eval_results/runs/`;
 2. the validated Overcooked/Burrito evaluation, executed through its isolated
    Python 3.10 runtime and written under `eval_results/cooking/`; and
@@ -55,25 +55,12 @@ immutable run directories rather than overwriting an earlier execution. An
 explicit cooking resume reuses only verified completed cell checkpoints.
 
 Generated artifacts are written beneath `eval_results/`. The full workflow is
-computationally expensive. The standard evaluation has a 10-process cap (set by memory, not core count;
-see `DEFAULT_EVALUATION_WORKER_CAP`) and admits only complete seed cohorts:
-with the default eight seeds, one scenario runs at a time using 8 workers, so
-the three scenarios run in sequence rather than in parallel. Every evaluation
-worker is pinned to the host's performance cores only (P-cores on a hybrid
-Intel part, detected from `/sys/devices/cpu_core/cpus`; a no-op on a uniform
-part), so cross-baseline wall-clock comparisons are not confounded by a
-worker landing on a slower efficiency core. With five seeds, all three
-scenarios instead run in parallel using 15 workers. Set `HRC_WORKERS` before
-starting Jupyter to request a lower cap. The four ablation suites run one at a
-time rather than concurrently, and each suite spreads its own scenario-seed
-grid across 8 worker processes by default; `HRC_ABLATION_WORKERS` may raise
-that to at most one worker per scenario-seed job. Running the suites in turn
-keeps unrelated suites out of contention for the same performance cores, which
-the per-arm wall-clock metrics depend on. The three longitudinal suites
-(routing, latent, memory) use the same eight paired seeds as the standard
-evaluation; the matcher suite generates one stress dataset from a single
-generation seed and has no paired-seed grid. The cooking config uses all
-available CPUs by
+computationally expensive. The standard evaluation has a 20-process cap and
+admits only complete seed cohorts: with five seeds, all three scenarios run in
+parallel using 15 workers; with eight seeds, two scenarios run at a time using
+16. Set `HRC_WORKERS` before starting Jupyter to request a lower cap. Each
+longitudinal ablation suite defaults to one worker; `HRC_ABLATION_WORKERS` may
+raise that to at most three. The cooking config uses all available CPUs by
 default; `HRC_COOKING_WORKERS` caps that count. Set
 `HRC_COOKING_RESUME` to an interrupted cooking run directory to reuse its
 completed seed/scenario/arm checkpoints.
@@ -170,8 +157,7 @@ the experiment UI.
   incumbent weights stay valid for the surviving subset. Only additions
   advance that threshold.
 
-The fixed paired seeds are `1337`, `2024`, `7`, `9001`, `31415`, `42`,
-`271828`, and `8675309`.
+The fixed paired seeds are `1337`, `2024`, `7`, `9001`, and `31415`.
 Experiment manifests record the configuration, Git commit, dirty-tree state,
 runtime package versions, and completion status. A resumed run must match its
 recorded configuration and experiment label.
@@ -231,7 +217,7 @@ automatically resolves the cached Qwen snapshot. The baseline remains separate
 from the normal notebook experiment. The default LLM runner pairs Full and the
 LLM on the same full shared realized schedule used by the main experiment. Its
 only sampling difference is that the expensive LLM evaluation uses seed `1337`
-rather than all eight seeds.
+rather than five seeds.
 
 On the RTX 5070/SM120 host, the checkpoint's original NF4 codes and scales are
 decoded with PyTorch tensor operations. The unstable bitsandbytes native 4-bit

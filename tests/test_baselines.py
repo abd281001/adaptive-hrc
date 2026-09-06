@@ -5,10 +5,8 @@ import unittest
 
 from src.baselines import (
     UnpinnedAgent,
-    BehaviorCloner,
     BASELINE_AGENTS,
     BehaviorCloningAgent,
-    MemoryMatchedBcAgent,
     EwcAgent,
     ReplayBcAgent,
     FixedDecayAgent,
@@ -57,14 +55,11 @@ class RunnableBaselineTests(unittest.TestCase):
                 "fixed",
                 "no_decay",
                 "bc",
-                "bc_adaptive",
                 "ewc",
                 "replay_bc",
                 "in_context_llm",
             },
         )
-        self.assertIs(BASELINE_AGENTS["bc"], BehaviorCloningAgent)
-        self.assertIs(BASELINE_AGENTS["bc_adaptive"], MemoryMatchedBcAgent)
         self.assertIs(BASELINE_AGENTS["unpinned"], UnpinnedAgent)
         self.assertIs(BASELINE_AGENTS["frozen"], FrozenAgent)
         self.assertIs(BASELINE_AGENTS["offline_default"], FrozenAgent)
@@ -198,9 +193,6 @@ class RunnableBaselineTests(unittest.TestCase):
         self.assertEqual(BehaviorCloningAgent(_fast_config()).replay.policy, "none")
         self.assertEqual(EwcAgent(_fast_config()).replay.policy, "none")
         self.assertEqual(ReplayBcAgent(_fast_config()).replay.policy, "none")
-        self.assertEqual(
-            MemoryMatchedBcAgent(_fast_config()).replay.policy, "adaptive",
-        )
 
     def test_irl_memory_controls_disable_both_semantic_components(self):
         for agent_type in (
@@ -216,9 +208,6 @@ class RunnableBaselineTests(unittest.TestCase):
             BehaviorCloningAgent: ("behavior_cloning", "not_applicable"),
             ReplayBcAgent: (
                 "experience_replay_behavior_cloning", "not_applicable",
-            ),
-            MemoryMatchedBcAgent: (
-                "behavior_cloning_adaptive_memory", "not_applicable",
             ),
             EwcAgent: ("ewc_maxent", "engineered"),
             FrozenAgent: ("maxent", "engineered"),
@@ -243,70 +232,6 @@ class RunnableBaselineTests(unittest.TestCase):
 
         self.assertFalse(FixedDecayAgent(_fast_config()).settings.pin_latest)
         self.assertFalse(BehaviorCloningAgent(_fast_config()).settings.pin_latest)
-
-    def test_memory_matched_bc_isolates_the_predictor_from_the_memory_policy(self):
-        """``bc`` and ``bc_adaptive`` may differ only in how storage behaves.
-
-        The pair is only interpretable as a predictor-vs-memory decomposition
-        if the retention policy is the sole difference between this arm and
-        Full, and the model family is the sole difference between this arm and
-        ``bc``.  Both halves are asserted here so a later settings change
-        cannot quietly reintroduce a second confound.
-        """
-        matched = MemoryMatchedBcAgent(_fast_config())
-        plain = BehaviorCloningAgent(_fast_config())
-
-        # Full's memory policy, restored.
-        self.assertEqual(matched.replay.policy, "adaptive")
-        self.assertTrue(matched.settings.pin_latest)
-
-        # Still the cloner, not MaxEnt: the semantic components are reached
-        # only through the MaxEnt predictor, so they stay off in both arms.
-        self.assertIsInstance(matched.cloner, BehaviorCloner)
-        self.assertEqual(matched.predictor_name(), plain.predictor_name() + "_adaptive_memory")
-        self.assertEqual(matched.irl_feature_name(), "not_applicable")
-        for agent in (matched, plain):
-            self.assertFalse(agent.settings.semantic_fallback_enabled)
-            self.assertFalse(agent.settings.latent_strategy_enabled)
-
-        # Everything the cloner is fitted with is unchanged.
-        self.assertEqual(
-            {
-                field: getattr(matched.settings, field)
-                for field in vars(matched.settings)
-                if field.startswith("bc_")
-            },
-            {
-                field: getattr(plain.settings, field)
-                for field in vars(plain.settings)
-                if field.startswith("bc_")
-            },
-        )
-        self.assertEqual(
-            matched.retrain_policy.cold_after, plain.retrain_policy.cold_after,
-        )
-
-    def test_memory_matched_bc_decays_and_pins_the_way_full_does(self):
-        first = "transfer (pot, from=storage, to=cooking_station)"
-        second = "turn_on (stove, cooking_station)"
-        matched = MemoryMatchedBcAgent(_fast_config())
-        matched._register_if_live("recipe", [first, second], step=1)
-
-        # Pinned, so the latest variant is protected from the decay above.
-        self.assertEqual(len(matched.replay.latest_keys), 1)
-        key = next(iter(matched.replay.latest_keys))
-        self.assertIn(key, matched.replay.active)
-        self.assertEqual(matched.replay.step(now=10_000, cycle=1), [])
-        self.assertIn(key, matched.replay.active)
-
-        # Unpinned entries still decay, unlike ``bc``'s nondecaying storage.
-        matched.replay.register(
-            "other", "stale", (first,), now=0, cycle=0, pin_latest=False,
-        )
-        for step in range(1, 200):
-            matched.replay.step(now=10_000 + step, cycle=1 + step)
-        self.assertIn(("other", "stale"), matched.replay.pruned)
-        self.assertIn(key, matched.replay.active)
 
     def test_er_bc_default_reservoir_is_bounded_conservatively(self):
         agent = ReplayBcAgent(_fast_config())

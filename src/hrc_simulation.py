@@ -108,7 +108,6 @@ def _predict(recipe_step: int, prefix: Tuple[str, ...], actual: str, predict_dis
 
 def simulate_episode(*, observations: Sequence[Any], actual_actions: Sequence[str], current_prefix: Callable[[], Sequence[str]], predict_distribution: Callable[[Sequence[str]], Mapping[str, float]],
     observe_ground_truth: Callable[[Any, Optional[Mapping[str, float]], Optional[str]], None], top_k: int, min_probability: float, tie_rng: Optional[np.random.Generator] = None, timing: Timing = DEFAULT_TIMING,
-    capture_prediction_metadata: Optional[Callable[[Prediction], Mapping[str, Any]]] = None,
     capture_robot_metadata: Optional[Callable[[RobotDecision], Mapping[str, Any]]] = None, on_robot_feedback: Optional[Callable[[RobotDecision], None]] = None) -> EpisodeTrace:
     """Run the HRC protocol: human first, then alternating robot/correction turns."""
     robot_turn_next = False
@@ -134,8 +133,7 @@ def simulate_episode(*, observations: Sequence[Any], actual_actions: Sequence[st
             # Shadow predictions never control execution. Together with the robot-turn predictions they score every ground-truth prefix.
             prediction = _predict(index, prefix, actual, predict_distribution, top_k, decision_rng)
             teacher_forced_top_1_tie_count += int(prediction.top_1_tie_size > 1)
-            metadata = (dict(capture_prediction_metadata(prediction) or {}) if capture_prediction_metadata is not None else {})
-            human_turns.append(HumanTurn(**vars(prediction), human_turn_index=human_turn_count - 1, metadata=metadata))
+            human_turns.append(HumanTurn(**vars(prediction), human_turn_index=human_turn_count - 1))
             human_action_time += timing.human_action_time
             total_time += timing.human_action_time
             observe_ground_truth(observation, prediction.distribution, prediction.predicted)
@@ -175,9 +173,7 @@ def simulate_episode(*, observations: Sequence[Any], actual_actions: Sequence[st
             executed_by = "human_correction"
             robot_turn_next = True
 
-        metadata = (dict(capture_prediction_metadata(decision) or {}) if capture_prediction_metadata is not None else {})
-        if capture_robot_metadata is not None:
-            metadata.update(dict(capture_robot_metadata(decision) or {}))
+        metadata = (dict(capture_robot_metadata(decision) or {}) if capture_robot_metadata is not None else {})
         if on_robot_feedback is not None: on_robot_feedback(decision)
         total_time += step_time
         human_actions = human_turn_count + human_correction_count
