@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 import numpy as np
 from .environment import CONTAINERS, INGREDIENTS, parse_action_label
@@ -25,6 +26,7 @@ def _role_schema(roles: Sequence[str]) -> Tuple[Dict[str, int], int, Dict[Tuple[
     return role_index, pair_offset, pair_index, pair_offset + len(pair_index)
 
 
+@lru_cache(maxsize=8192)
 def action_role(label: str) -> str:
     """Map a grounded action to a recipe/ingredient-invariant workflow role."""
     action = parse_action_label(str(label))
@@ -169,20 +171,34 @@ class LatentStrategyResidual:
         target = query[mask].astype(np.float32)
         return target, tuple(mask), len(observed), relations
 
-    def score(self, prefix: Sequence[str], candidates: Sequence[str], *, decision_prefix: Sequence[str] | None = None) -> StrategyScore:
-        empty = StrategyScore({}, 0.0, 0.0, 0, 0, 0)
+    def _score_result(
+        self,
+        prefix: Sequence[str],
+        candidates: Sequence[str],
+        *,
+        decision_prefix: Sequence[str] | None = None,
+        min_observed_roles: int = 3,
+    ) -> Tuple[StrategyScore, Dict[str, Any]]:
+        """Compute a residual without mutating decision-time telemetry."""
         target, mask, observed_roles, relations = self._partial_observation(prefix)
-        # Three distinct roles expose three pairwise relations.  The residual still cannot act until a human correction confirms its hypothesis. partial prefix admits too many incompatible strategies and the residual must remain neutral.
-        if target is None or observed_roles < 3 or not len(self.codes):
-            self.last_score_stats = {"latent_strategy_attempted": False, "latent_strategy_observed_roles": observed_roles, "latent_strategy_observed_relations": relations}
-            self.last_score = empty
-            return empty
+        empty = StrategyScore({}, 0.0, 0.0, observed_roles, relations, 0)
+        base_stats: Dict[str, Any] = {
+            "latent_strategy_attempted": False,
+            "latent_strategy_observed_roles": observed_roles,
+            "latent_strategy_observed_relations": relations,
+        }
+        if not len(self.codes) or not len(self.components):
+            return empty, {**base_stats, "latent_strategy_score_outcome": "unavailable"}
+        # Three distinct roles expose three pairwise relations in the deployed
+        # policy. Counterfactual diagnostics may lower this to two without
+        # changing the distribution returned to the agent.
+        if target is None or observed_roles < max(1, int(min_observed_roles)):
+            return empty, {**base_stats, "latent_strategy_score_outcome": "insufficient_observed_roles"}
         # Strategy identity is inferred only from precedence relations already exposed by the prefix.  The 8-D code remains the compact stored representation; raw relation bits avoid inventing unobserved future coordinates when the prefix is sparse.
         distances = np.sqrt(np.mean((self.fingerprints[:, mask] - target[None, :]) ** 2, axis=1))
         finite = np.flatnonzero(np.isfinite(distances))
         if not len(finite):
-            self.last_score = empty
-            return empty
+            return empty, {**base_stats, "latent_strategy_score_outcome": "no_finite_neighbors"}
         count = min(max(1, int(self.settings.latent_strategy_knn)), len(finite))
         kth_distance = float(np.partition(distances[finite], count - 1)[count - 1])
         indices = finite[distances[finite] <= kth_distance + 1e-8]
@@ -240,22 +256,41 @@ class LatentStrategyResidual:
                     utilities[action] = ((1.0 - sequence_weight) * utilities[action] + sequence_weight * sequence_utility)
                 alignment_confidence = min(1.0, confidence_mass)
         if not utilities:
-            self.last_score = empty
-            return empty
+            return empty, {**base_stats, "latent_strategy_score_outcome": "no_candidate_utilities"}
         center = float(np.mean(list(utilities.values())))
         scale = max(abs(value - center) for value in utilities.values())
         if scale <= 1e-8:
-            self.last_score = empty
-            return empty
+            return empty, {**base_stats, "latent_strategy_score_outcome": "uniform_residual"}
         utilities = {action: (value - center) / scale for action, value in utilities.items()}
         coverage = min(1.0, covered / max(1, possible))
         evidence = min(1.0, (observed_roles - 1) / 3.0)
         confidence = (evidence * latent_agreement * float(np.mean(agreements)) * ((1.0 - sequence_weight) + sequence_weight * alignment_confidence))
         result = StrategyScore(utilities, confidence, coverage, observed_roles, relations, count)
+        stats = {"latent_strategy_attempted": True, "latent_strategy_observed_roles": observed_roles, "latent_strategy_observed_relations": relations, "latent_strategy_neighbor_count": count,
+            "latent_strategy_confidence": confidence, "latent_strategy_coverage": coverage, "latent_strategy_code_dispersion": code_dispersion, "latent_strategy_sequence_weight": sequence_weight, "latent_strategy_alignment_flops": alignment_flops,
+            "latent_strategy_score_outcome": "scored"}
+        return result, stats
+
+    def score(self, prefix: Sequence[str], candidates: Sequence[str], *, decision_prefix: Sequence[str] | None = None) -> StrategyScore:
+        result, stats = self._score_result(
+            prefix, candidates, decision_prefix=decision_prefix,
+            min_observed_roles=3,
+        )
         self.last_score = result
-        self.last_score_stats = {"latent_strategy_attempted": True, "latent_strategy_observed_roles": observed_roles, "latent_strategy_observed_relations": relations, "latent_strategy_neighbor_count": count,
-            "latent_strategy_confidence": confidence, "latent_strategy_coverage": coverage, "latent_strategy_code_dispersion": code_dispersion, "latent_strategy_sequence_weight": sequence_weight, "latent_strategy_alignment_flops": alignment_flops}
+        self.last_score_stats = stats
         return result
+
+    def score_snapshot(
+        self,
+        prefix: Sequence[str],
+        candidates: Sequence[str],
+        *,
+        min_observed_roles: int = 3,
+    ) -> Tuple[StrategyScore, Dict[str, Any]]:
+        """Pure counterfactual score; never overwrites correction-time state."""
+        return self._score_result(
+            prefix, candidates, min_observed_roles=min_observed_roles,
+        )
 
     @staticmethod
     def _aligned_next_role(observed: Tuple[int, ...], prototype: Tuple[int, ...],) -> Tuple[int | None, float, float]:

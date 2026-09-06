@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import faulthandler
 import gzip
 import hashlib
 import importlib.metadata
@@ -25,19 +26,23 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 DEFAULT_NATIVE_THREADS_PER_WORKER = 1
-DEFAULT_EVALUATION_WORKER_CAP = 20
+# Each worker holds its own agent, replay and fitted model. Sizing this to
+# the CPU count exhausted memory on a 30 GB machine and a killed worker
+# surfaces as BrokenProcessPool hours into a run, so the cap is set by
+# memory rather than cores. Raise it only with headroom to spare.
+DEFAULT_EVALUATION_WORKER_CAP = 10
 DEFAULT_RESULTS_ROOT = "eval_results"
 RUNS_DIRNAME = "runs"
 LATEST_NAME = "latest"
 LLM_CUDA_ALLOCATOR_CONFIG = "expandable_segments:True"
 # Literal paired seeds keep defaults independent of PRNG implementation details.
 PAPER_SEEDS = (
-    1337, 2024, 7, 9001, 31415,
+    1337, 2024, 7, 9001, 31415, 42, 271828, 8675309,
 )
 PAIRED_BOOTSTRAP_SAMPLES = 10_000
 DEMOS_PER_GAP = 3
@@ -472,6 +477,63 @@ def _apply_native_thread_limit(threads: int) -> Dict[str, Any]:
 
 
 _set_native_thread_env(DEFAULT_NATIVE_THREADS_PER_WORKER, override=False)
+
+
+def _detect_p_core_cpus(pmu_path: Path = Path("/sys/devices/cpu_core/cpus")) -> Optional[FrozenSet[int]]:
+    """CPU ids of the performance cores on a hybrid Intel part.
+
+    Linux exposes a ``cpu_core`` PMU on hybrid parts (12th-gen+) whose
+    ``cpus`` file lists exactly the P-core ids in ``lscpu`` range syntax
+    (``"0-7"`` or ``"0-3,8-11"``); a uniform part has no such file. Absent
+    that signal there is nothing to distinguish, so callers should treat
+    ``None`` as "don't pin" rather than guess a core set.
+    """
+    try:
+        text = pmu_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    cpus: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            try:
+                cpus.update(range(int(start), int(end) + 1))
+            except ValueError:
+                return None
+        else:
+            try:
+                cpus.add(int(part))
+            except ValueError:
+                return None
+    return frozenset(cpus) if cpus else None
+
+
+def _pin_to_performance_cores() -> Optional[FrozenSet[int]]:
+    """Restrict this process to P-cores so cross-baseline wall-clock stays comparable.
+
+    An unpinned worker can be scheduled onto an E-core under load and run
+    slower than a sibling worker on a P-core for reasons that have nothing to
+    do with the baseline it is fitting -- the retrain/predict wall-clock
+    metrics this evaluation reports and compares across baselines would then
+    partly reflect scheduling luck. Every worker process gets the identical
+    restriction, so if the pool oversubscribes the P-core set the resulting
+    contention is at least shared rather than distinguishing between arms.
+    Returns the CPU set actually applied, or ``None`` if pinning did not
+    happen (no ``sched_setaffinity`` -- not Linux, or no hybrid P-core PMU).
+    """
+    if not hasattr(os, "sched_setaffinity"):
+        return None
+    cpus = _detect_p_core_cpus()
+    if not cpus:
+        return None
+    try:
+        os.sched_setaffinity(0, cpus)
+    except OSError:
+        return None
+    return cpus
 
 from .adaptive_agent import ACTION_MASK_CONTRACT, AdaptiveAgent
 from .ablations import parse_commit_records, summarize_commit_decisions
@@ -1990,6 +2052,9 @@ class EvalSettings:
     top_k: int = 3
     profile: bool = False
     sensitivity: bool = False
+    # Permanent opt-in one-step component counterfactuals. These are logged
+    # after the deployed prediction and never fed to execution or learning.
+    component_counterfactuals: bool = False
     model_settings: Mapping[str, Any] = field(default_factory=dict)
     # Reporting label with no behavioral effect.
     experiment: str = "standard_evaluation"
@@ -3069,6 +3134,88 @@ def observe_demo(
     }
 
 
+def _counterfactual_policy_record(
+    distribution: Mapping[str, float], actual: str, floor: float,
+) -> Dict[str, Any]:
+    """Compact, RNG-free paired outcomes for one shadow policy."""
+    if not distribution:
+        return {
+            "argmax_action": None,
+            "argmax_probability": None,
+            "actual_action_probability": None,
+            "actual_action_nll": -math.log(max(float(floor), 1e-12)),
+            "actual_in_top_tie": False,
+            "expected_top_1": 0.0,
+            "top_tie_size": 0,
+        }
+    peak = max(float(value) for value in distribution.values())
+    tied = sorted(
+        str(action) for action, probability in distribution.items()
+        if math.isclose(float(probability), peak, rel_tol=0.0, abs_tol=1e-12)
+    )
+    actual_probability = distribution.get(str(actual))
+    actual_in_top_tie = str(actual) in tied
+    return {
+        "argmax_action": tied[0],
+        "argmax_probability": peak,
+        "actual_action_probability": (
+            float(actual_probability) if actual_probability is not None else None
+        ),
+        "actual_action_nll": -math.log(max(
+            float(actual_probability) if actual_probability is not None else 0.0,
+            max(float(floor), 1e-12),
+        )),
+        "actual_in_top_tie": actual_in_top_tie,
+        "expected_top_1": (
+            1.0 / len(tied) if actual_in_top_tie and tied else 0.0
+        ),
+        "top_tie_size": len(tied),
+    }
+
+
+_COUNTERFACTUAL_POLICY_NAMES = {
+    "maxent_only",
+    "semantic_current",
+    "deployed_current",
+    "semantic_completion",
+    "semantic_completion_current_gate",
+    "latent_relaxed",
+    "latent_two_role",
+}
+
+
+def _validate_component_counterfactual_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    """Fail before a partial or final artifact can contain silent gaps."""
+    required_policy_fields = {
+        "argmax_action", "argmax_probability", "actual_action_probability",
+        "actual_action_nll", "actual_in_top_tie", "expected_top_1",
+        "top_tie_size",
+    }
+    for index, row in enumerate(rows):
+        for field in ("semantic_gate_outcome", "latent_gate_outcome"):
+            if row.get(field) is None:
+                raise RuntimeError(
+                    f"component diagnostic turn {index} is missing {field}"
+                )
+        policies = row.get("counterfactual_policies")
+        if not isinstance(policies, Mapping):
+            raise RuntimeError(
+                f"component diagnostic turn {index} has no counterfactual policies"
+            )
+        if set(policies) != _COUNTERFACTUAL_POLICY_NAMES:
+            raise RuntimeError(
+                f"component diagnostic turn {index} has unexpected branches: "
+                f"{sorted(policies)}"
+            )
+        for name, policy in policies.items():
+            if not isinstance(policy, Mapping) or not required_policy_fields.issubset(policy):
+                raise RuntimeError(
+                    f"component diagnostic turn {index} has incomplete branch {name!r}"
+                )
+
+
 def assist_demo(
     agent: AdaptiveAgent,
     pair: TaskVariant,
@@ -3101,8 +3248,42 @@ def assist_demo(
     observations = pair.observations
     actual_actions = tuple(observation.action for observation in observations)
 
+    pending_prediction: Dict[str, Any] = {}
+
     def predict(prefix: Sequence[str]) -> Mapping[str, float]:
-        return agent.predict_actions(list(prefix))
+        deployed_t0 = time.perf_counter()
+        distribution = agent.predict_actions(list(prefix))
+        deployed_wall_s = time.perf_counter() - deployed_t0
+        # Capture decision-time telemetry before any shadow branch can touch
+        # diagnostic state. This is also what makes human-shadow rows complete.
+        decision_stats = dict(agent.varying_policy_stats())
+        counterfactual: Optional[Dict[str, Any]] = None
+        candidates: Tuple[str, ...] = ()
+        shadow_wall_s = 0.0
+        if config.component_counterfactuals:
+            state = agent.domain.state_from_actions(prefix)
+            candidates = tuple(agent.domain.legal_actions(
+                state, agent._known_action_universe(),
+            ))
+            shadow_t0 = time.perf_counter()
+            counterfactual = agent.maxent.counterfactual_policies(
+                state,
+                candidates,
+                prefix=prefix,
+                allow_latent_strategy=agent._latent_strategy_confirmed,
+                deployed_distribution=distribution,
+            )
+            shadow_wall_s = time.perf_counter() - shadow_t0
+        pending_prediction.clear()
+        pending_prediction.update({
+            "prefix": tuple(prefix),
+            "decision_stats": decision_stats,
+            "deployed_prediction_wall_s": float(deployed_wall_s),
+            "counterfactual_prediction_wall_s": float(shadow_wall_s),
+            "counterfactual": counterfactual,
+            "candidates": candidates,
+        })
+        return distribution
 
     def observe(
         obs: Any,
@@ -3116,17 +3297,48 @@ def assist_demo(
             precomputed_prediction=predicted,
         )
 
-    def robot_metadata(context: Any) -> Mapping[str, Any]:
-        # Per-turn rows carry measurements only. The action-mask design
-        # invariants are recorded once per run in the manifest, under
-        # "action_mask_contract"; restamping them here would look like
-        # per-decision verification of something that cannot come out False.
-        stats = agent.varying_policy_stats()
+    def prediction_metadata(context: Any) -> Mapping[str, Any]:
+        if tuple(context.prefix) != pending_prediction.get("prefix"):
+            raise RuntimeError(
+                "prediction metadata did not match the immediately preceding prefix"
+            )
+        stats = dict(pending_prediction.get("decision_stats") or {})
         actual_probability = context.distribution.get(context.actual)
-        return {
+        metadata: Dict[str, Any] = {
             **stats,
             "actual_action_probability": float(actual_probability) if actual_probability is not None else None,
+            "deployed_prediction_wall_s": pending_prediction.get("deployed_prediction_wall_s"),
+            "counterfactual_prediction_wall_s": pending_prediction.get("counterfactual_prediction_wall_s"),
         }
+        counterfactual = pending_prediction.get("counterfactual")
+        if counterfactual is not None:
+            candidates = tuple(pending_prediction.get("candidates") or ())
+            role_counts = Counter(
+                agent.domain.action_role(action) for action in candidates
+            )
+            actual_role = agent.domain.action_role(str(context.actual))
+            metadata.update({
+                **dict(counterfactual.get("stats") or {}),
+                "counterfactual_policies": {
+                    name: _counterfactual_policy_record(
+                        distribution, context.actual,
+                        agent.settings.min_probability,
+                    )
+                    for name, distribution in counterfactual["policies"].items()
+                },
+                "candidate_role_count": len(role_counts),
+                "same_role_candidate_group_count": sum(
+                    int(count > 1) for count in role_counts.values()
+                ),
+                "max_same_role_candidate_multiplicity": max(
+                    role_counts.values(), default=0,
+                ),
+                "actual_role_candidate_multiplicity": int(
+                    role_counts.get(actual_role, 0)
+                ),
+            })
+        pending_prediction.clear()
+        return metadata
 
     start_time = time.perf_counter()
     trace = simulate_episode(
@@ -3139,7 +3351,7 @@ def assist_demo(
         min_probability=float(agent.settings.min_probability),
         tie_rng=agent._tie_break_rng,
         timing=DEFAULT_TIMING,
-        capture_robot_metadata=robot_metadata,
+        capture_prediction_metadata=prediction_metadata,
     )
     match = agent.end_demo() if commit else None
     commit_diagnostics = dict(
@@ -6042,6 +6254,8 @@ def run_plan(
             name: rows[offsets[name]:]
             for name, rows in row_groups.items()
         }
+        if config.component_counterfactuals:
+            _validate_component_counterfactual_rows(new_rows["turns"])
         checkpoint_path = (
             out_dir / "partial" / "checkpoints" / stream.baseline
             / f"event_{event_index:06d}.json"
@@ -6194,6 +6408,8 @@ def run_plan(
     axis_rows = transfer_rows(all_episode_rows)
     oracle_comparisons = build_oracle_rows(per_baseline)
     tables = out_dir / "tables"
+    if config.component_counterfactuals:
+        _validate_component_counterfactual_rows(all_turn_rows)
     _write_jsonl_gz(tables / "episodes.jsonl.gz", all_episode_rows)
     _write_jsonl_gz(tables / "turns.jsonl.gz", all_turn_rows)
     _write_jsonl_gz(tables / "frozen_probes.jsonl.gz", all_frozen_rows)
@@ -6532,15 +6748,58 @@ def _completed_seed_result(run_dir: Path, scenario: str, seed: int) -> Optional[
     }
 
 
+def _clear_stale_checkpoints(out_dir: Path) -> int:
+    """Drop checkpoints from an earlier attempt at this seed.
+
+    A seed that did not finish is re-run from its first event, because resume
+    is seed-level. Its old checkpoints are not overwritten past the point the
+    new attempt reaches, so a directory can end up holding a low range from one
+    attempt and a high range from another. Concatenating those by event index --
+    which is what the partial summary tells readers to do -- would splice two
+    different runs of the same seed into one series.
+    """
+    checkpoint_root = out_dir / "partial" / "checkpoints"
+    if not checkpoint_root.is_dir():
+        return 0
+    removed = 0
+    for path in checkpoint_root.glob("*/event_*.json"):
+        path.unlink()
+        removed += 1
+    return removed
+
+
+def _open_worker_fault_log(out_dir: Path) -> Optional[Any]:
+    """Point faulthandler at a file so a native crash leaves a stack behind.
+
+    A worker that dies on a fatal signal prints its traceback to stderr, which
+    for a pooled worker is the launching terminal and is kept nowhere. The
+    parent then reports only ``BrokenProcessPool``, which says the process died
+    and nothing about where. On this GPU stack that has happened twice, hours
+    into a run, so the evidence has to survive in the run directory.
+
+    The handle is deliberately never closed: it has to stay valid through a
+    signal that terminates the process.
+    """
+    try:
+        handle = open(out_dir / "worker_fault.log", "a", buffering=1)
+        faulthandler.enable(file=handle, all_threads=True)
+        return handle
+    except (OSError, RuntimeError, ValueError):
+        # Diagnostics must never be the reason a run cannot start.
+        return None
+
+
 def _run_seed_scenario_job(
     scenario: str, seed: int, config: EvalSettings, run_dir: str,
 ) -> Dict[str, Any]:
+    _pin_to_performance_cores()
     _apply_native_thread_limit(_native_thread_count(config))
     out_dir = _seed_dir(Path(run_dir), scenario, seed)
     out_dir.mkdir(parents=True, exist_ok=True)
     start_time = time.perf_counter()
     started_at = _utc_now()
     latest_progress: Dict[str, Any] = {}
+    fault_log = _open_worker_fault_log(out_dir)
 
     def report_progress(progress: Mapping[str, Any]) -> None:
         latest_progress.clear()
@@ -6566,6 +6825,7 @@ def _run_seed_scenario_job(
                 flush=True,
             )
 
+    _clear_stale_checkpoints(out_dir)
     _write_json(out_dir / "status.json", {
         "state": "running",
         "started_at_utc": started_at,
@@ -6662,10 +6922,23 @@ def _pending_seed_results(
                     )
                     result = dict(future.result())
             except BrokenProcessPool as exc:
+                # BrokenProcessPool says only that the child died. What it died
+                # in is in the worker's own fault log, if it took a signal
+                # faulthandler could catch; name the file either way so the
+                # first thing anyone reads is the one that has the answer.
+                fault_log = _seed_dir(Path(run_dir), scenario, int(seed)) / "worker_fault.log"
+                detail = (
+                    f"see {fault_log} for the native stack"
+                    if fault_log.is_file() and fault_log.stat().st_size
+                    else f"no stack was written to {fault_log}, so the worker "
+                    "was killed by an uncatchable signal (SIGKILL) rather than "
+                    "faulting"
+                )
                 raise RuntimeError(
                     "LLM GPU worker terminated natively for "
                     f"scenario={scenario}, seed={int(seed)}; automatic retry "
-                    "is disabled because this runtime is not reproducible"
+                    "is disabled because this runtime is not reproducible. "
+                    f"{detail}"
                 ) from exc
             result.update({
                 "native_worker_attempts": 1,
@@ -6866,6 +7139,15 @@ def run_sensitivity(config: EvalSettings) -> Dict[str, Any]:
 
 
 def run_evaluation(config: EvalSettings) -> Dict[str, Any]:
+    if config.component_counterfactuals:
+        if tuple(config.baselines) != ("full",):
+            raise ValueError(
+                "component counterfactual diagnostics require --baselines full"
+            )
+        if config.include_oracle:
+            raise ValueError(
+                "component counterfactual diagnostics require --no-oracle"
+            )
     llm_runtime = _configure_llm_runtime(config)
     workers = _worker_count(config)
     native_threads = _native_thread_count(config)
@@ -7113,6 +7395,14 @@ def parse_args(
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--sensitivity", action="store_true", help="Run the opt-in H3 online-commit sensitivity audit after the main suite.")
+    parser.add_argument(
+        "--component-counterfactuals", action="store_true",
+        help=(
+            "Log pure MaxEnt, semantic-completion, and relaxed-latent "
+            "counterfactuals without changing the deployed policy. "
+            "Diagnostic prediction times are not benchmark-comparable."
+        ),
+    )
     args = parser.parse_args(argv)
 
     overrides: Dict[str, Any] = {}
@@ -7178,7 +7468,12 @@ def parse_args(
         top_k=int(args.top_k),
         profile=bool(args.profile),
         sensitivity=bool(args.sensitivity),
+        component_counterfactuals=bool(args.component_counterfactuals),
         model_settings=overrides,
+        experiment=(
+            "component_counterfactual_diagnostic"
+            if args.component_counterfactuals else "standard_evaluation"
+        ),
     )
 
 

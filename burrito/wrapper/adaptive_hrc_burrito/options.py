@@ -217,7 +217,19 @@ def macro_is_legal(
     if label == fetch_and_stage_action(protein):
         return not _has_object(state, chopped) and not _has_object(state, cooked)
     if label == prepare_and_stage_action(protein):
-        return bool(_objects(state, chopped)) and not _has_ready(state, chopped)
+        # Staged, whether or not it is already chopped through.  The upstream
+        # chop primitive selects its board by ``_not_is_ready`` over *both*
+        # proteins (see GO_TO_CHOP_BOARD_AND_CHOP_INGREDIENT, and its own note
+        # that it "cannot deal with the situation to chop ingredients others
+        # put down"), so preparing one protein finishes any other unready
+        # board.  ``burrito_combo`` is the only recipe that stages two at
+        # once, and requiring ``not _has_ready`` there made the second
+        # protein's prepare permanently illegal: an unreachable task-graph
+        # node that deadlocked the episode.  An already-chopped item satisfies
+        # this option's postcondition, so ``_prepare_and_stage`` runs no
+        # primitives and the chop ticks stay booked to the option that did the
+        # work.
+        return bool(_objects(state, chopped))
     if label == start_cooking_action(protein):
         return _has_ready(state, chopped) and not _has_object(state, cooked)
     if label == plate_protein_action(protein):

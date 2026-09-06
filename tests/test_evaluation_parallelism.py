@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
@@ -7,51 +8,132 @@ from unittest.mock import patch
 from src import evaluation
 
 
+class PerformanceCoreAffinityTests(unittest.TestCase):
+    """Cross-baseline wall-clock comparisons assume every worker runs on the
+    same class of core; an E-core scheduling accident would silently favor
+    whichever baseline happened to land on a P-core."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp_path = Path(self._tmp.name)
+
+    def _write_range(self, text: str) -> Path:
+        pmu_path = self.tmp_path / "cpus"
+        pmu_path.write_text(text, encoding="utf-8")
+        return pmu_path
+
+    def test_parses_a_contiguous_range(self):
+        pmu_path = self._write_range("0-7\n")
+        self.assertEqual(
+            evaluation._detect_p_core_cpus(pmu_path), frozenset(range(8)),
+        )
+
+    def test_parses_a_disjoint_range(self):
+        pmu_path = self._write_range("0-3,8-11\n")
+        self.assertEqual(
+            evaluation._detect_p_core_cpus(pmu_path),
+            frozenset([0, 1, 2, 3, 8, 9, 10, 11]),
+        )
+
+    def test_returns_none_when_the_pmu_file_is_absent(self):
+        self.assertIsNone(
+            evaluation._detect_p_core_cpus(self.tmp_path / "missing"),
+        )
+
+    def test_returns_none_on_unparseable_content(self):
+        pmu_path = self._write_range("not-a-range\n")
+        self.assertIsNone(evaluation._detect_p_core_cpus(pmu_path))
+
+    def test_pin_is_a_noop_without_sched_setaffinity(self):
+        # Stand-in for a platform (e.g. macOS) with no sched_setaffinity.
+        class _NoAffinityOs:
+            def __getattr__(self, name):
+                if name == "sched_setaffinity":
+                    raise AttributeError(name)
+                return getattr(os, name)
+
+        with patch.object(evaluation, "os", _NoAffinityOs()):
+            self.assertIsNone(evaluation._pin_to_performance_cores())
+
+    def test_pin_is_a_noop_on_a_uniform_part(self):
+        with patch.object(
+            evaluation, "_detect_p_core_cpus", return_value=None,
+        ):
+            self.assertIsNone(evaluation._pin_to_performance_cores())
+
+    def test_pin_restricts_this_process_to_the_detected_cpu_set(self):
+        if not hasattr(os, "sched_setaffinity"):
+            self.skipTest("sched_setaffinity is Linux-only")
+        original = os.sched_getaffinity(0)
+        fake_cpus = frozenset(sorted(original)[:1])
+        try:
+            with patch.object(
+                evaluation, "_detect_p_core_cpus", return_value=fake_cpus,
+            ):
+                applied = evaluation._pin_to_performance_cores()
+            self.assertEqual(applied, fake_cpus)
+            self.assertEqual(os.sched_getaffinity(0), set(fake_cpus))
+        finally:
+            os.sched_setaffinity(0, original)
+
+
 class EvaluationParallelismTests(unittest.TestCase):
     def test_workers_use_clean_processes(self):
         self.assertEqual(evaluation._mp_context().get_start_method(), "spawn")
 
     def test_worker_count_admits_only_complete_scenario_seed_cohorts(self):
-        self.assertEqual(evaluation.EvalSettings().workers, 20)
-        self.assertEqual(evaluation.parse_args([]).workers, 20)
+        self.assertEqual(
+            evaluation.EvalSettings().workers,
+            evaluation.DEFAULT_EVALUATION_WORKER_CAP,
+        )
+        cap = evaluation.DEFAULT_EVALUATION_WORKER_CAP
+        self.assertEqual(evaluation.parse_args([]).workers, cap)
+        # Five seeds: two whole cohorts fit inside the cap, a third does not.
         settings = evaluation.EvalSettings(
             scenarios=("homogeneous", "heterogeneous", "holdout"),
             seeds=(1, 2, 3, 4, 5),
-            workers=20,
+            workers=cap,
         )
-        self.assertEqual(evaluation._worker_count(settings), 15)
+        self.assertEqual(evaluation._worker_count(settings), 10)
+        # Eight seeds: one cohort fits, so the pool shrinks to the cohort size
+        # rather than admitting part of a second scenario.
         eight_seeds = evaluation.EvalSettings(
             scenarios=("homogeneous", "heterogeneous", "holdout"),
-            seeds=tuple(range(8)), workers=20,
+            seeds=tuple(range(8)), workers=cap,
         )
-        self.assertEqual(evaluation._worker_count(eight_seeds), 16)
+        self.assertEqual(evaluation._worker_count(eight_seeds), 8)
+        # Twelve seeds: no cohort fits, so the cap alone bounds the pool and a
+        # single scenario is drained across successive batches.
         twelve_seeds = evaluation.EvalSettings(
             scenarios=("homogeneous", "heterogeneous", "holdout"),
-            seeds=tuple(range(12)), workers=20,
+            seeds=tuple(range(12)), workers=cap,
         )
-        self.assertEqual(evaluation._worker_count(twelve_seeds), 12)
+        self.assertEqual(evaluation._worker_count(twelve_seeds), cap)
         hard_cap = evaluation.EvalSettings(
             scenarios=("homogeneous",), seeds=tuple(range(30)), workers=99,
         )
-        self.assertEqual(evaluation._worker_count(hard_cap), 20)
+        # An explicit request above the cap is clamped: the ceiling is the
+        # machine's memory, and exceeding it kills a worker hours into a run.
+        self.assertEqual(evaluation._worker_count(hard_cap), cap)
 
     def test_scenario_batches_never_admit_a_partial_seed_cohort(self):
+        # Eight seeds per scenario against the worker cap: a second scenario
+        # would need sixteen slots, so each batch is one complete cohort.
         settings = evaluation.EvalSettings(
             scenarios=("homogeneous", "heterogeneous", "holdout"),
-            seeds=tuple(range(8)), workers=20,
+            seeds=tuple(range(8)),
+            workers=evaluation.DEFAULT_EVALUATION_WORKER_CAP,
         )
         jobs = [
             (scenario, seed)
             for scenario in settings.scenarios for seed in settings.seeds
         ]
         batches = evaluation._scenario_job_batches(jobs, settings)
-        self.assertEqual(tuple(map(len, batches)), (16, 8))
+        self.assertEqual(tuple(map(len, batches)), (8, 8, 8))
         self.assertEqual(
             tuple({scenario for scenario, _seed in batch} for batch in batches),
-            (
-                {"homogeneous", "heterogeneous"},
-                {"holdout"},
-            ),
+            ({"homogeneous"}, {"heterogeneous"}, {"holdout"}),
         )
 
     def test_worker_count_never_exceeds_the_pending_work(self):
