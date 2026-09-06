@@ -3,8 +3,13 @@
 This check establishes joint movement before defining stations or running
 observation/assistance. It uses the robot's installed Stretch Body SDK directly.
 It does not load the task configuration, change calibration, start a camera,
-translate the base, command the wrist/head, or automatically home/recenter.
+translate the base, or automatically home/recenter. Wrist pitch moves only on
+an explicit `pitch` command; head, wrist yaw and roll are not commanded.
 The initial empty-space test requires no markers or reference station.
+
+For the apparatus with lid tags and a downward wrist near the tabletop, proceed
+to [POSE_CALIBRATION.md](POSE_CALIBRATION.md) after the basic movement checks.
+There is no required 10 cm lowering test: table clearance is posture-dependent.
 
 The interfaces were checked against Stretch Body **0.7.31**. Software tests use
 fake hardware; the actual robot must still perform the checks below.
@@ -19,7 +24,7 @@ fake hardware; the actual robot must still perform the checks below.
 3. Start with an empty gripper. Move boxes and people outside the test sweep.
    The robot must already be homed using its standard supervised procedure.
    Use a retracted arm and an initial lift/wrist posture whose full rotation
-   sweep clears the table and robot. The console preserves wrist orientation.
+   sweep clears the table and robot. The console initially preserves wrist orientation.
    Check cable slack through both +/-48 degree turns. Stay at the physical
    runstop. The browser's stop button does not control this standalone console.
 4. Mark the base's initial footprint and orientation on the floor. Its starting
@@ -49,10 +54,13 @@ fake hardware; the actual robot must still perform the checks below.
 
 ## Check base rotation first
 
-Keep the arm at <=0.020 m extension and the lift at its starting height. If
+Keep the arm at <=0.020 m extension and the lift at an inspected clear height. If
 retraction is needed, use `arm -1` for a 1 cm step while watching clearance;
 stop once the measured extension is <=0.020 m. The console will refuse a step
 past the joint limit. It will not reposition the wrist to make a path clear.
+After inspecting the full base/wrist sweep, enter `clearance` to record this
+posture. Turning requires its lift height and wrist angles. Startup alone does
+not establish table clearance.
 
 First enter `heading 5`. Expect approximately +5 degrees from startup at about
 5.7 degrees/second, then a stop. Positive is counterclockwise viewed from above.
@@ -78,18 +86,16 @@ zero or the intermediate headings.
 
 These are candidate viewing/reaching directions, not calibrated stations.
 
-## Check lowering by 10 cm
+## Check small lift movements with clearance
 
 Choose a clear test heading, for example `heading 16`. Keep the base stationary.
 Enter `lift -1` for a first 1 cm downward step, then `lift 1` to return.
 
-If there is clearance for the full drop, enter `lift -2` **five times**, separately.
-The total requested change is -10 cm from the current height. For example, an
-initial lift reading of 0.900 m becomes approximately 0.800 m. This is **not** a
-command to set the lift to 0.100 m. If "10 cm" describes the current gap above
-the table, do not consume that entire gap; stop with clearance for the wrist,
-fingers and box. Lift readings are joint coordinates, not fingertip height above
-the table. Use `status` to compare with the recorded starting lift height.
+If already near the table, start by raising instead. Do not lower through the
+current tabletop gap or attempt a fixed 10 cm drop. At the present apparatus the
+downward wrist and horizontal wrist have different clearances; teach those
+postures separately. Lift readings are joint coordinates, not fingertip height
+above the tabletop. Stop before contact and retain a visible clearance margin.
 
 Lift/arm speed is 1 cm/s, and each command is at most 2 cm. The tool limits lift
 exploration to +/-15 cm of startup and checks the SDK's current joint limits.
@@ -105,18 +111,21 @@ At the same heading, with clearance at the chosen height:
    location. There is no assumed reach distance. Watch the complete wrist/finger
    assembly, not just the camera image. Stop before an obstacle or table edge.
 3. Enter `note test_station_reach` to record the current measured pose. The
-   report captures heading, lift, extension and gripper position.
+   report captures heading, lift, extension, gripper position and all wrist angles.
 4. With the gripper empty, enter `close`. This commands **0 units**, where the
    fingertips just touch, instead of the SDK's -100 close/squeeze preset.
+   The deadline is computed from angular travel; the reported gripper needs
+   about 45 seconds for full closure at the deliberately slow speed. Lack of
+   progress for two seconds still stops the session; inspect any failure.
 5. Enter `open` again. Visually confirm both fingers move, and no joint other
    than the gripper moves.
 6. Retract along the clear path using `arm -1` or `arm -2` as appropriate until
    extension <=0.020 m. Raise the lift in small positive steps to the recorded
-   startup height. Only then use `heading 0` or the next station heading.
+   clearance height and wrist angles. Only then use `heading 0` or the next station heading.
 
 Do not rotate an extended arm through the table. The console refuses rotation
-while extended or below the initial lift height; that initial height still has
-to be chosen by the operator for actual clearance. The first-check arm ceiling
+while extended, below the recorded clearance height, or at a different wrist
+orientation. That clearance pose must be inspected by the operator. The first-check arm ceiling
 is 0.350 m, in addition to the robot's own limits. A target farther away requires
 a reviewed layout; do not move the base forward to compensate during this check.
 
@@ -163,7 +172,7 @@ runtime, initial positions, requested targets, completed targets, notes, and
 faults. They are ignored by Git and do not modify any calibration record.
 
 Share the console's initial positions, the measured results for the four
-headings, the 10 cm lift change, the chosen reach extension, and any first error.
+headings, the lift changes actually tested, the chosen reach extension, and any first error.
 After these movements are established, define station reach/lift poses, qualify
 box grasping and placement, and then resume the observation-to-assistance demo.
 

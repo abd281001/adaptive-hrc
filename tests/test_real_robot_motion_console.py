@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.real_robot.motion_console import MotionConsole, MotionFault, main, request_stop
+from src.real_robot.motion_console import MotionConsole, MotionFault, main, request_stop, gripper_timing
 from src.real_robot import motion_console
 
 
@@ -22,10 +22,23 @@ class Joint:
         self.robot.pending = lambda: self.status.update(pos=target)
 
 
+class Wrist:
+    def __init__(self, robot, name, position):
+        self.robot, self.name = robot, name
+        self.status = {"pos": position, "vel": 0.0, "timestamp_pc": 1.0}
+        self.soft_motion_limits = {"current": [-1.5, 1.0]}
+
+    def move_to(self, target, **kwargs):
+        self.robot.calls.append((self.name, target, kwargs))
+        if not self.robot.blocked:
+            self.status["pos"] = target
+
+
 class Robot:
     def __init__(self):
         self.calls, self.pending = [], None
         self.homed, self.stale, self.blocked = True, False, False
+        self.gripper_rate, self.gripper_target = None, None
         self.arm = Joint(self, "arm", 0.0, [0.0, 0.52])
         self.lift = Joint(self, "lift", 0.9, [0.0, 1.1])
         self.base = SimpleNamespace(
@@ -35,10 +48,16 @@ class Robot:
             rotate_by=self.rotate_by,
         )
         self.gripper = SimpleNamespace(
-            status={"pos_pct": 70.0, "vel": 0.0, "timestamp_pc": 1.0},
+            status={"pos_pct": 70.0, "vel": 0.0, "timestamp_pc": 1.0, "effort": 0.0},
             poses={"open": 70.0, "close": -100}, move_to=self.gripper_move,
+            pct_to_world_rad=lambda value: value * 3279 / 100 * 2 * math.pi / 4096,
+            params={"motion": {"max": {"vel": 20.0, "accel": 20.0}}},
+            soft_motion_limits={"current": [-5.03, 8.933]},
         )
-        self.end_of_arm = SimpleNamespace(get_joint=lambda name: self.gripper)
+        self.wrist = {name: Wrist(self, name, -math.pi/4 if name == "wrist_pitch" else 0.0)
+                      for name in motion_console.WRIST_JOINTS}
+        self.end_of_arm = SimpleNamespace(get_joint=lambda name:
+                                         self.gripper if name == "stretch_gripper" else self.wrist.get(name))
         self.pimu = SimpleNamespace(
             status={"runstop_event": False, "timestamp": 1.0},
             runstop_event_trigger=lambda: self.calls.append(("runstop",)),
@@ -56,7 +75,10 @@ class Robot:
     def gripper_move(self, target, **kwargs):
         self.calls.append(("gripper", target, kwargs))
         if not self.blocked:
-            self.gripper.status["pos_pct"] = target
+            if self.gripper_rate is None:
+                self.gripper.status["pos_pct"] = target
+            else:
+                self.gripper_target = target
 
     def push_command(self):
         self.calls.append(("push",))
@@ -69,6 +91,13 @@ class Robot:
             for motor in (self.arm.motor, self.lift.motor, self.base.left_wheel, self.base.right_wheel, self.pimu):
                 motor.status["timestamp"] += 0.05
             self.gripper.status["timestamp_pc"] += 0.05
+            for joint in self.wrist.values():
+                joint.status["timestamp_pc"] += 0.05
+        if self.gripper_target is not None:
+            remaining = self.gripper_target - self.gripper.status["pos_pct"]
+            step = math.copysign(min(abs(remaining), self.gripper_rate * 0.05), remaining)
+            self.gripper.status["pos_pct"] += step
+            self.gripper.status["vel"] = 0.2 if abs(remaining) > abs(step) else 0.0
 
 
 @pytest.fixture
@@ -94,6 +123,7 @@ def test_station_headings_are_absolute_from_start_even_across_wrap(rig):
     robot, console, events = rig
     robot.base.status["theta"] = math.radians(175)
     console.start["theta_rad"] = math.radians(175)
+    console.execute("clearance")
     for heading in (-48, -16, 16, 48, 0):
         console.execute(f"heading {heading}")
     turns = [call[1] for call in robot.calls if call[0] == "base"]
@@ -103,6 +133,7 @@ def test_station_headings_are_absolute_from_start_even_across_wrap(rig):
 
 def test_rotation_requires_retracted_arm_and_starting_height(rig):
     robot, console, _ = rig
+    console.execute("clearance")
     robot.arm.status["pos"] = 0.1
     with pytest.raises(ValueError, match="Retract"):
         console.execute("heading 16")
@@ -211,8 +242,9 @@ def test_session_shutdown_and_reports(rig, tmp_path, monkeypatch, ending):
     monkeypatch.setattr(motion_console.signal, "signal", lambda *args: None)
     monkeypatch.setattr(motion_console.time, "sleep", lambda dt: None)
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    def create(r, record):
+    def create(r, record, **kwargs):
         console.record = record
+        console.read_only = kwargs["read_only"]
         return console
     monkeypatch.setattr(motion_console, "MotionConsole", create)
     answers = iter(["READY", "arm 1", "quit"])
@@ -238,3 +270,104 @@ def test_session_shutdown_and_reports(rig, tmp_path, monkeypatch, ending):
         assert ("runstop",) not in robot.calls
     if ending == "status_only":
         assert robot.calls == [("sdk_stop",)]
+
+
+def test_full_close_on_reported_robot_needs_more_than_thirty_seconds(rig):
+    robot, console, events = rig
+    robot.gripper.status["pos_pct"] = 177.5846294602013
+    speed, accel, travel, timeout = gripper_timing(robot.gripper, robot.gripper.status["pos_pct"], 0)
+    assert speed == 0.2 and accel == 0.4
+    assert travel == pytest.approx(45.16, abs=0.02)
+    assert 58 < timeout < 60
+    robot.gripper_rate = 3.75  # Slightly slower than nominal, like the observed log.
+    started = console.clock()
+    console.execute("close")
+    assert 45 < console.clock() - started < timeout
+    assert robot.gripper.status["pos_pct"] == pytest.approx(0.0)
+    assert events[-1][0] == "target_reached"
+
+
+def test_long_deadline_does_not_allow_stalled_gripper_to_push_for_a_minute(rig):
+    robot, console, events = rig
+    robot.blocked = True
+    started = console.clock()
+    with pytest.raises(MotionFault, match="no progress"):
+        console.execute("close")
+    assert console.clock() - started < 3.0
+    assert events[-1][0] == "motion_failed"
+    assert not any(e == "target_reached" for e, _ in events)
+
+
+def test_gripper_sdk_soft_limit_is_checked_before_dispatch(rig):
+    robot, console, _ = rig
+    robot.gripper.soft_motion_limits["current"] = [0.5, 8.933]
+    with pytest.raises(ValueError, match="SDK current limits"):
+        console.execute("close")
+    assert robot.calls == []
+
+
+def test_clearance_is_explicit_and_not_inferred_from_starting_pose(rig):
+    robot, console, _ = rig
+    for command in ("heading 5", "pitch 2"):
+        with pytest.raises(ValueError, match="record|clearance"):
+            console.execute(command)
+    assert robot.calls == []
+
+
+def test_pitch_is_relative_bounded_and_immediate(rig):
+    robot, console, events = rig
+    console.execute("clearance")
+    console.execute("pitch 5")
+    assert robot.wrist["wrist_pitch"].status["pos"] == pytest.approx(math.radians(-40))
+    assert len(robot.calls) == 1  # No queued prismatic/base command is pushed.
+    assert robot.calls[0][0] == "wrist_pitch"
+    assert robot.calls[0][2] == {"v_des": 0.08, "a_des": 0.16}
+    with pytest.raises(ValueError, match="wrist angles"):
+        console.execute("heading 5")
+    console.execute("note S0_horizontal_candidate")
+    assert events[-1][1]["pose"]["wrist_pitch_rad"] == pytest.approx(math.radians(-40))
+    assert events[-1][1]["pose"]["heading_deg"] == pytest.approx(0)
+
+
+@pytest.mark.parametrize("problem", ["lowered", "extended", "too_big", "joint_limit"])
+def test_pitch_guards_prevent_dispatch(rig, problem):
+    robot, console, _ = rig
+    console.execute("clearance")
+    command = "pitch 5"
+    if problem == "lowered":
+        robot.lift.status["pos"] -= 0.02
+    elif problem == "extended":
+        robot.arm.status["pos"] = 0.1
+    elif problem == "too_big":
+        command = "pitch 45"
+    else:
+        robot.wrist["wrist_pitch"].soft_motion_limits["current"] = [-math.pi/4, -math.pi/4]
+    with pytest.raises(ValueError):
+        console.execute(command)
+    assert robot.calls == []
+
+
+def test_wrist_stale_feedback_is_fatal(rig):
+    robot, console, _ = rig
+    console.execute("clearance")
+    original = robot.tick
+    def frozen_pitch():
+        stamp = robot.wrist["wrist_pitch"].status["timestamp_pc"]
+        original()
+        robot.wrist["wrist_pitch"].status["timestamp_pc"] = stamp
+    robot.tick = frozen_pitch
+    with pytest.raises(MotionFault, match="wrist_pitch"):
+        console.execute("pitch 2")
+    assert robot.calls == []
+
+
+def test_read_only_status_can_inspect_active_runstop_without_clearing_it(rig):
+    robot, console, _ = rig
+    console.read_only = True
+    robot.pimu.status["runstop_event"] = True
+    robot.arm.motor.status["runstop_on"] = True
+    console.ready()
+    assert console.status()["wrist_pitch_rad"] == pytest.approx(-math.pi/4)
+    with pytest.raises(ValueError, match="read-only"):
+        console.execute("pitch 2")
+    assert robot.calls == []

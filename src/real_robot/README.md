@@ -5,6 +5,9 @@ Run commands from the repository root. The default layout is:
 For the first supervised base/lift/arm/gripper movement check, before station
 calibration, follow [MOTION_CHECK.md](MOTION_CHECK.md). That console connects
 directly to Stretch Body and records measured movements without starting a task.
+After that, use [POSE_CALIBRATION.md](POSE_CALIBRATION.md) to teach a higher
+downward viewing pose and a horizontal box approach. The console records all
+three wrist angles and now budgets gripper time from its actual angular travel.
 
 | Contents | Location | Tracked by Git |
 | --- | --- | --- |
