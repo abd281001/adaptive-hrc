@@ -70,6 +70,8 @@ class Settings:
     # 100 truncated the fit before its own stale-progress criterion fired.
     irl_cold_steps: int = 200
     irl_warm_steps: int = 80
+    # Gradient steps tolerated after the last log-loss improvement.
+    irl_patience: int = 60
     expand_actions: bool = False
 
     # Semantic value interpolation is a separate out-of-support fallback; it does not change the MaxEnt reward representation above.
@@ -83,8 +85,10 @@ class Settings:
     latent_strategy_rank: int = 8
     latent_strategy_knn: int = 3
     latent_strategy_strength: float = 1.0
-    # Optional heavier masked-role trajectory alignment (zero = timing only).
-    latent_strategy_sequence_weight: float = 0.0
+    # Masked-role trajectory alignment. The lightweight rank-8/k-3 setting at
+    # 0.5 improved held-out transfer on 15 paired seeds without a material
+    # homogeneous/heterogeneous regression; zero retains timing-only ablations.
+    latent_strategy_sequence_weight: float = 0.5
 
     # Frozen in-context LLM baseline.
     llm_model: str = ""
@@ -553,34 +557,50 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
     horizon = int(settings.irl_horizon)
     demo_mass = np.maximum(weights.astype(np.float64), 0.0) / max(float(len(demonstrations)), 1.0)
     start_rows = np.asarray(start_states, dtype=np.intp)
+    patience = max(1, int(settings.irl_patience))
 
-    def soft_backup(rewards: np.ndarray, values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """One soft-Bellman backup over the whole grid."""
-        base = rewards[row_states].astype(np.float64)
-        q_grid = base[:, None] + discount * values[grid_next].astype(np.float64)
-        peak = np.where(grid_valid, q_grid, -np.inf).max(axis=1)
-        mass = np.where(grid_valid, np.exp((q_grid - peak[:, None]) / temperature), 0.0).sum(axis=1)
-        updated = rewards.copy()
-        updated[row_states] = peak + temperature * np.log(np.maximum(mass, 1e-12))
-        return updated, q_grid
+    # Action-major: the sweep reduces over the ~5-wide action axis, and a
+    # (row, action) layout makes that a strided per-row reduction.
+    next_by_action  = np.ascontiguousarray(grid_next.T)
+    valid_by_action = np.ascontiguousarray(grid_valid.T)
+    action_penalty  = np.where(valid_by_action, 0.0, -np.inf)
+    features64 = np.ascontiguousarray(features[:n_states], dtype=np.float64)
+    live_by_action = valid_by_action & (np.ascontiguousarray(grid_actions.T) != deviation_action_id)
+    next_flat = next_by_action.reshape(-1)
+    start_mass = np.bincount(start_rows, weights=demo_mass, minlength=n_states + 1)
+
+    def soft_backup(base: np.ndarray, values: np.ndarray, out: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """One soft-Bellman backup; also returns the policy so callers don't rebuild it."""
+        weight_grid = values[next_by_action]
+        weight_grid *= discount
+        weight_grid += base
+        weight_grid += action_penalty
+        peak = weight_grid.max(axis=0)
+        weight_grid -= peak
+        weight_grid /= temperature
+        np.exp(weight_grid, out=weight_grid)
+        mass = weight_grid.sum(axis=0)
+        # Every row carries the deviation action, so mass >= 1 always.
+        out[row_states] = peak + temperature * np.log(mass)
+        return out, weight_grid, mass
 
     def converge_values(rewards: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
+        """Iterate the soft backup to its fixed point; return values and policy."""
+        nonlocal convergence_calls
+        convergence_calls += 1
+        base = rewards[row_states]
         values = rewards.copy()
-        q_grid = np.zeros((n_rows, grid_width), dtype=np.float64)
+        spare = rewards.copy()
+        weight_grid = np.zeros((grid_width, n_rows), dtype=np.float64)
+        mass = np.ones(n_rows, dtype=np.float64)
         sweeps = 0
         for _sweep in range(50):
             sweeps += 1
-            updated, q_grid = soft_backup(rewards, values)
-            gap = float(np.max(np.abs(updated - values)))
-            values = updated
+            updated, weight_grid, mass = soft_backup(base, values, spare)
+            gap = float(np.abs(updated - values).max())
+            values, spare = updated, values
             if gap < 1e-6: break
-        return values, q_grid, sweeps
-
-    def grid_policy(q_grid: np.ndarray) -> np.ndarray:
-        peak = np.where(grid_valid, q_grid, -np.inf).max(axis=1)
-        weight_grid = np.where(grid_valid, np.exp((q_grid - peak[:, None]) / temperature), 0.0)
-        total = weight_grid.sum(axis=1, keepdims=True)
-        return weight_grid / np.where(total > 0.0, total, 1.0)
+        return values, weight_grid / mass, sweeps
 
     best_weights = reward_weights.copy()
     best_loss = float("inf")
@@ -588,17 +608,17 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
     stale_steps = 0
     momentum = np.zeros(n_features, dtype=np.float32)
     iterations_run = value_sweeps = occupancy_updates = 0
+    occupancy_steps = occupancy_feature_rows = convergence_calls = 0
     ewc_active = ewc_anchor is not None and ewc_fisher is not None
 
     for iteration in range(iterations):
         iterations_run = iteration + 1
         learning_rate = float(settings.irl_learning_rate) * (0.97 ** (stale_steps // 20))
-        rewards = features @ reward_weights
-        values, q_grid, sweeps = converge_values(rewards)
+        rewards = (features @ reward_weights).astype(np.float64)
+        values, policy, sweeps = converge_values(rewards)
         value_sweeps += sweeps
-        policy = grid_policy(q_grid)
 
-        probabilities = policy[expert_row_index, expert_column_index]
+        probabilities = policy[expert_column_index, expert_row_index]
         current_loss = float(-(expert_weight * np.log(np.maximum(probabilities, 1e-12))).sum() / max(expert_mass, 1e-9))
         if current_loss < best_loss:
             best_loss = current_loss
@@ -607,25 +627,22 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
         else:
             stale_steps += 1
 
-        # Discounted occupancy. Occupancy is linear in the start distribution
-        # and the dynamics are shared, so the per-demonstration walks pool into
-        # one weighted vector: sum_d w_d (occ_d @ T) == (sum_d w_d occ_d) @ T.
-        # The deviation action absorbs into the zero-reward sink and therefore
-        # leaks its mass, exactly as the per-state walk did.
-        transition_mass = np.where(grid_valid & (grid_actions != deviation_action_id), policy, 0.0)
-        pooled = np.zeros(n_states + 1, dtype=np.float64)
-        np.add.at(pooled, start_rows, demo_mass)
-        expected_features_vector = np.zeros(n_features, dtype=np.float32)
+        transition_mass = np.where(live_by_action, policy, 0.0)
+        pooled = start_mass.copy()
+        discounted_occupancy = np.zeros(n_states + 1, dtype=np.float64)
         step_discount = 1.0
         for _step in range(horizon):
             occupancy_updates += int(np.count_nonzero(pooled))
-            expected_features_vector += (step_discount * pooled[:n_states] @ features[:n_states]).astype(np.float32)
-            contribution = pooled[row_states][:, None] * transition_mass
-            next_pooled = np.zeros_like(pooled)
-            np.add.at(next_pooled, grid_next.reshape(-1), contribution.reshape(-1))
+            occupancy_steps += 1
+            discounted_occupancy += step_discount * pooled
+            contribution = pooled[row_states] * transition_mass
+            next_pooled = np.bincount(next_flat, weights=contribution.reshape(-1), minlength=n_states + 1)
             if not next_pooled.any(): break
             pooled = next_pooled
             step_discount *= discount
+        # sum_t g^t (mu_t @ F) == (sum_t g^t mu_t) @ F: one matvec, not one per step.
+        occupancy_feature_rows += n_states
+        expected_features_vector = (discounted_occupancy[:n_states] @ features64).astype(np.float32)
 
         gradient = empirical_features - expected_features_vector - float(settings.irl_l2) * reward_weights
         if ewc_active:
@@ -634,16 +651,17 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
         best_gradient_norm = min(best_gradient_norm, float(np.linalg.norm(gradient)))
         momentum = 0.9 * momentum + 0.1 * gradient
         reward_weights = reward_weights + learning_rate * momentum
-        if stale_steps > 60: break
+        if stale_steps > patience: break
 
-    best_rewards = features @ best_weights
-    best_values, best_q_grid, final_value_sweeps = converge_values(best_rewards)
+    best_rewards = (features @ best_weights).astype(np.float64)
+    best_values, _best_policy, final_value_sweeps = converge_values(best_rewards)
+    best_q_by_action = best_values[next_by_action] * discount + best_rewards[row_states]
 
     policy_actions = {state_id: [action for action in actions if action != deviation_action_id] for state_id, actions in action_ids_by_state.items()}
     policy_q_values: Dict[Tuple[int, int], float] = {}
     for (state_id, action_id), (row, column) in grid_column_of.items():
         if action_id == deviation_action_id: continue
-        policy_q_values[(state_id, action_id)] = float(best_q_grid[row, column])
+        policy_q_values[(state_id, action_id)] = float(best_q_by_action[column, row])
     deviation_column = {row: column for (state_id, action_id), (row, column) in grid_column_of.items() if action_id == deviation_action_id}
     deviation_margins: List[float] = []
     for demo in demonstrations:
@@ -652,7 +670,7 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
             row, column = grid_column_of[(state_ids[state], action_ids[action])]
             deviation = deviation_column.get(row)
             if deviation is None: continue
-            deviation_margins.append(float(best_q_grid[row, column]) - float(best_q_grid[row, deviation]))
+            deviation_margins.append(float(best_q_by_action[column, row]) - float(best_q_by_action[deviation, row]))
     if deviation_margins:
         deviation_margin_min = float(min(deviation_margins))
         deviation_margin_mean = float(sum(deviation_margins) / len(deviation_margins))
@@ -661,11 +679,11 @@ def fit_maxent_irl(demonstrations: Sequence[Demonstration], features: np.ndarray
         deviation_margin_min = 0.0
         deviation_margin_mean = 0.0
         deviation_margin_negative_frac = 0.0
-    stats = {"model_family": "maxent_irl", "flop_accounting_scope": "maxent_fit_partial_arithmetic_only", "flop_cross_model_comparable": False, "n_demonstrations": float(len(demonstrations)),
+    stats = {"model_family": "maxent_irl", "flop_accounting_scope": "maxent_fit_estimated_algorithmic_flops", "flop_cross_model_comparable": False, "n_demonstrations": float(len(demonstrations)),
             "n_demo_state_visits": float(sum(len(demo) for demo in demonstrations)), "n_states": float(n_states), "n_states_augmented": float(n_states + 1), "n_features": float(n_features),
             "parameter_count": float(n_features), "n_actions": float(n_actions), "n_state_action_pairs": float(len(state_action_pairs)), "n_policy_states": float(len(action_ids_by_state)),
             "n_policy_state_actions": float(sum(len(row) for row in action_ids_by_state.values())), "n_transition_edges": float(len(transitions)), "n_extra_transition_edges": float(len(extra_transitions or {})),
-            "iterations_requested": float(iterations), "iterations_run": float(iterations_run), "value_sweeps": float(value_sweeps), "final_value_sweeps": float(final_value_sweeps), "occupancy_updates": float(occupancy_updates),
+            "iterations_requested": float(iterations), "iterations_run": float(iterations_run), "irl_patience": float(patience), "value_sweeps": float(value_sweeps), "final_value_sweeps": float(final_value_sweeps), "occupancy_updates": float(occupancy_updates), "occupancy_steps": float(occupancy_steps), "value_convergence_calls": float(convergence_calls), "n_policy_rows": float(n_rows), "occupancy_feature_rows": float(occupancy_feature_rows), "grid_cells": float(n_rows * grid_width),
             "occupancy_method": "finite_horizon_dp", "best_demo_log_loss": float(best_loss), "best_gradient_norm": float(best_gradient_norm), "deviation_margin_n": float(len(deviation_margins)),
             "deviation_margin_min": deviation_margin_min, "deviation_margin_mean": deviation_margin_mean, "deviation_margin_negative_frac": deviation_margin_negative_frac, "warm_start": 1.0 if warm_start else 0.0,
             "ewc_enabled": 1.0 if ewc_active else 0.0}
@@ -700,22 +718,36 @@ def _apply_action(state: StateVector, action: str) -> Optional[StateVector]:
 
 
 def _estimate_maxent_flops(stats: Mapping[str, Any]) -> float:
+    """Estimated algorithmic FLOPs for one fit; not a hardware measurement.
+
+    One FLOP per elementwise add/sub/mul/div/exp/log; 2*m*n per matvec; one per
+    reduced element. Keyed on the padded grid the fit actually walks, not on
+    valid edges or nonzero counts.
+    """
     features = float(stats.get("n_features", 0.0))
     states = float(stats.get("n_states_augmented", 0.0))
-    state_action_pairs = float(stats.get("n_state_action_pairs", 0.0))
-    policy_edges = float(stats.get("n_policy_state_actions", 0.0))
+    rows = float(stats.get("n_policy_rows", 0.0))
     visits = float(stats.get("n_demo_state_visits", 0.0))
     iterations = float(stats.get("iterations_run", 0.0))
     sweeps = float(stats.get("value_sweeps", 0.0)) + float(stats.get("final_value_sweeps", 0.0))
-    occupancy = float(stats.get("occupancy_updates", 0.0))
-    empirical_work = 2.0 * visits * features
+    convergence_calls = float(stats.get("value_convergence_calls", 0.0))
+    occupancy_steps = float(stats.get("occupancy_steps", 0.0))
+    occupancy_feature_rows = float(stats.get("occupancy_feature_rows", 0.0))
+    grid_cells = float(stats.get("grid_cells", 0.0))
+
+    empirical_work = 2.0 * visits * features + features
     reward_work = 2.0 * states * features * max(1.0, iterations + 1.0)
-    bellman_work = sweeps * (4.0 * state_action_pairs + 8.0 * policy_edges)
-    policy_work = iterations * 8.0 * policy_edges
-    occupancy_work = 2.0 * occupancy * features
-    gradient_work = iterations * 8.0 * features
+    bellman_work = sweeps * (8.0 * grid_cells + 3.0 * rows + 3.0 * states)
+    policy_work = convergence_calls * grid_cells
+    loss_work = iterations * 4.0 * visits
+    occupancy_work = (occupancy_steps * (2.0 * states + 2.0 * grid_cells)
+                      + iterations * grid_cells
+                      + 2.0 * occupancy_feature_rows * features)
+    gradient_work = iterations * 10.0 * features
     if bool(stats.get("ewc_enabled", 0.0)): gradient_work += iterations * 4.0 * features
-    return float(empirical_work + reward_work + bellman_work + policy_work + occupancy_work + gradient_work)
+    final_work = 2.0 * grid_cells + visits
+    return float(empirical_work + reward_work + bellman_work + policy_work
+                 + loss_work + occupancy_work + gradient_work + final_work)
 
 
 class MaxEntIrl:
@@ -747,9 +779,10 @@ class MaxEntIrl:
         self.last_fisher_stats: Dict[str, Any] = {}
         self._fallback_counts = (0, 0, 0)  # attempted, accepted, rejected
         self._last_exact_learned_action_count = 0
+        self._last_semantic_gate_outcome = "unavailable"
         self.latent_strategy =  LatentStrategyResidual(self.settings, domain=self.domain)
         self._last_expansion_stats: Dict[str, float] = {}
-        self.last_fit_stats:    Dict[str, Any] = {"model_family": "maxent_irl", "estimated_flops": 0.0, "flop_accounting_scope": "maxent_fit_partial_arithmetic_only", "flop_cross_model_comparable": False}
+        self.last_fit_stats:    Dict[str, Any] = {"model_family": "maxent_irl", "estimated_flops": 0.0, "flop_accounting_scope": "maxent_fit_estimated_algorithmic_flops", "flop_cross_model_comparable": False}
 
     def _expand_actions(self, demonstrations: Sequence[Demonstration]) -> Dict[Tuple[StateVector, str], StateVector]:
         if not bool(self.settings.expand_actions):
@@ -844,49 +877,210 @@ class MaxEntIrl:
         weights = 1.0 / np.maximum(neighbor_distances, 1e-8)
         return float(np.average(self.values[neighbors], weights=weights))
 
-    def _feasible_distribution(self, state: StateVector, candidates: Sequence[str]) -> Dict[str, float]:
-        if self.reward_weights is None: return {}
+    def _feasible_policy(
+        self,
+        state: StateVector,
+        candidates: Sequence[str],
+        *,
+        semantic_mode: str = "current",
+    ) -> Tuple[Dict[str, float], Tuple[int, int, int], int, str]:
+        """Build one feasible policy without mutating prediction telemetry."""
+        if semantic_mode not in {"current", "disabled", "completion"}:
+            raise ValueError(f"unknown semantic policy mode {semantic_mode!r}")
+        if self.reward_weights is None:
+            return {}, (0, 0, 0), 0, "unavailable"
         state_id = self.state_ids.get(tuple(state))
         candidate_actions = list(self.domain.legal_actions(tuple(state), tuple(str(value) for value in candidates)))
         learned = [(action, float(self.q_values[(state_id, action_id)])) for action in candidate_actions for action_id in (self.action_ids.get(action),) if state_id is not None and action_id is not None and (state_id, action_id) in self.q_values]
-        self._last_exact_learned_action_count = len(learned)
-        if learned:
-            self._fallback_counts = (0, 0, 0)
+        learned_count = len(learned)
+        if learned and semantic_mode != "completion":
             probabilities = _softmax_probs([value for _action, value in learned], self.settings.irl_temperature)
             distribution = {action: probability for (action, _value), probability in zip(learned, probabilities)}
             # Preserve the complete state-valid distribution requested by the evaluation contract. Unlearned semantic estimates do not compete with an exact-state MaxEnt policy; they retain floor support for calibration and NLL.
             for action in candidate_actions:
                 if action not in distribution: distribution[action] = 0.0
-            return _normalize_probs(distribution, self.settings.min_probability)
+            return (_normalize_probs(distribution, self.settings.min_probability),
+                    (0, 0, 0), learned_count, "exact_policy")
 
         current_features = self._state_features(tuple(state))
-        if current_features is None: return {}
+        if current_features is None:
+            return {}, (0, 0, 0), learned_count, "unavailable"
         current_reward = float(current_features @ self.reward_weights)
-        actions: List[str] = []
-        q_values: List[float] = []
-        semantic_fallback_enabled = bool(self.settings.semantic_fallback_enabled)
+        scored: List[Tuple[str, float]] = list(learned)
+        learned_actions = {action for action, _value in learned}
+        semantic_enabled = bool(
+            semantic_mode != "disabled"
+            and self.settings.semantic_fallback_enabled
+        )
         fallback_counts = [0, 0, 0]
         for action in candidate_actions:
+            if action in learned_actions:
+                continue
             successor = self.domain.successor(tuple(state), action)
-            if successor is None: continue
-            actions.append(action)
-            if not semantic_fallback_enabled:
-                # Pure MaxEnt controls retain the common feasible-action interface without receiving a semantic transfer signal.
-                q_values.append(current_reward)
+            if successor is None:
+                continue
+            if not semantic_enabled:
+                if not learned:
+                    # MaxEnt has no learned Q-value here, so the no-semantic
+                    # counterfactual retains uniform state-valid support.
+                    scored.append((action, current_reward))
                 continue
             fallback_counts[0] += 1
             neighbor_value = self._semantic_neighbor_value(successor)
             if neighbor_value is None:
-                # Rejected transfer retains neutral probability support.
                 fallback_counts[2] += 1
-                q_values.append(current_reward)
+                # The deployed fallback is neutral when no exact action is
+                # learned. Completion leaves rejected candidates at the floor.
+                if not learned:
+                    scored.append((action, current_reward))
                 continue
             fallback_counts[1] += 1
-            q_values.append(current_reward + float(self.settings.irl_discount) * neighbor_value)
-        self._fallback_counts = tuple(fallback_counts)
-        if not actions: return {}
-        probabilities = _softmax_probs(q_values, self.settings.irl_temperature)
-        return _normalize_probs(dict(zip(actions, probabilities)), self.settings.min_probability)
+            scored.append((action, current_reward + float(self.settings.irl_discount) * neighbor_value))
+        counts = tuple(fallback_counts)
+        if not scored:
+            return {}, counts, learned_count, "unavailable"
+        probabilities = _softmax_probs([value for _action, value in scored], self.settings.irl_temperature)
+        distribution = {action: probability for (action, _value), probability in zip(scored, probabilities)}
+        if learned:
+            for action in candidate_actions:
+                if action not in distribution:
+                    distribution[action] = 0.0
+        if semantic_mode == "disabled":
+            outcome = "disabled"
+        elif learned:
+            outcome = "completion_used" if fallback_counts[1] else "completion_rejected" if fallback_counts[0] else "exact_policy"
+        else:
+            outcome = "fallback_used" if fallback_counts[1] else "fallback_rejected" if fallback_counts[0] else "unavailable"
+        return (_normalize_probs(distribution, self.settings.min_probability),
+                counts, learned_count, outcome)
+
+    def _feasible_distribution(self, state: StateVector, candidates: Sequence[str]) -> Dict[str, float]:
+        distribution, counts, learned_count, outcome = self._feasible_policy(
+            state, candidates, semantic_mode="current",
+        )
+        self._fallback_counts = counts
+        self._last_exact_learned_action_count = learned_count
+        self._last_semantic_gate_outcome = outcome
+        return distribution
+
+    @staticmethod
+    def _latent_gate_outcome(
+        score_stats: Mapping[str, Any], *, enabled: bool,
+        confirmed: bool, policy_support: bool, alpha: float,
+    ) -> str:
+        if not enabled:
+            return "disabled"
+        score_outcome = str(score_stats.get("latent_strategy_score_outcome", "unavailable"))
+        if score_outcome != "scored":
+            return score_outcome
+        if not confirmed:
+            return "blocked_confirmation"
+        if not policy_support:
+            return "blocked_policy_support"
+        return "applied" if float(alpha) > 0.0 else "zero_alpha"
+
+    def counterfactual_policies(
+        self,
+        state: StateVector,
+        candidates: Sequence[str],
+        *,
+        prefix: Sequence[str],
+        allow_latent_strategy: bool,
+        deployed_distribution: Mapping[str, float],
+    ) -> Dict[str, Any]:
+        """Pure one-step component and intervention branches."""
+        state_before = (
+            self._fallback_counts,
+            self._last_exact_learned_action_count,
+            self._last_semantic_gate_outcome,
+            dict(self.last_prediction_stats),
+            self.latent_strategy.last_score,
+            dict(self.latent_strategy.last_score_stats),
+        )
+        maxent_only, _base_counts, _base_learned, base_semantic = self._feasible_policy(
+            state, candidates, semantic_mode="disabled",
+        )
+        semantic_current, current_counts, learned_count, current_semantic = self._feasible_policy(
+            state, candidates, semantic_mode="current",
+        )
+        semantic_completion, completion_counts, _completion_learned, completion_semantic = self._feasible_policy(
+            state, candidates, semantic_mode="completion",
+        )
+        score_three, score_three_stats = self.latent_strategy.score_snapshot(
+            prefix, candidates, min_observed_roles=3,
+        )
+        score_two, score_two_stats = self.latent_strategy.score_snapshot(
+            prefix, candidates, min_observed_roles=2,
+        )
+        latent_enabled = bool(self.settings.latent_strategy_enabled)
+        policy_support = bool(current_counts[0]) or learned_count >= 2
+        current_gate = bool(latent_enabled and allow_latent_strategy and policy_support)
+        completion_current_gate, completion_alpha = (
+            fuse_strategy_residual(semantic_completion, score_three, float(self.settings.latent_strategy_strength))
+            if current_gate else (dict(semantic_completion), 0.0)
+        )
+        latent_relaxed, relaxed_alpha = (
+            fuse_strategy_residual(semantic_current, score_three, float(self.settings.latent_strategy_strength))
+            if latent_enabled else (dict(semantic_current), 0.0)
+        )
+        latent_two_role, two_role_alpha = (
+            fuse_strategy_residual(semantic_current, score_two, float(self.settings.latent_strategy_strength))
+            if latent_enabled else (dict(semantic_current), 0.0)
+        )
+        result = {
+            "policies": {
+                "maxent_only": maxent_only,
+                "semantic_current": semantic_current,
+                "deployed_current": dict(deployed_distribution),
+                "semantic_completion": semantic_completion,
+                "semantic_completion_current_gate": completion_current_gate,
+                "latent_relaxed": latent_relaxed,
+                "latent_two_role": latent_two_role,
+            },
+            "stats": {
+                "semantic_maxent_only_outcome": base_semantic,
+                "semantic_current_outcome": current_semantic,
+                "semantic_completion_outcome": completion_semantic,
+                "semantic_completion_attempted_actions": int(completion_counts[0]),
+                "semantic_completion_accepted_actions": int(completion_counts[1]),
+                "semantic_completion_rejected_actions": int(completion_counts[2]),
+                "latent_relaxed_alpha": float(relaxed_alpha),
+                "latent_two_role_alpha": float(two_role_alpha),
+                "semantic_completion_current_gate_alpha": float(completion_alpha),
+                "latent_relaxed_score_outcome": score_three_stats.get("latent_strategy_score_outcome"),
+                "latent_two_role_score_outcome": score_two_stats.get("latent_strategy_score_outcome"),
+                "latent_two_role_observed_roles": int(score_two.observed_roles),
+                "latent_two_role_observed_relations": int(score_two.observed_relations),
+            },
+        }
+        expected_support = set(map(str, deployed_distribution))
+        for name, distribution in result["policies"].items():
+            if set(distribution) != expected_support:
+                raise RuntimeError(
+                    f"counterfactual policy {name!r} changed feasible support"
+                )
+            total = sum(float(value) for value in distribution.values())
+            if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-9):
+                raise RuntimeError(
+                    f"counterfactual policy {name!r} is not normalized: {total}"
+                )
+            if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in distribution.values()):
+                raise RuntimeError(
+                    f"counterfactual policy {name!r} contains an invalid probability"
+                )
+        state_after = (
+            self._fallback_counts,
+            self._last_exact_learned_action_count,
+            self._last_semantic_gate_outcome,
+            dict(self.last_prediction_stats),
+            self.latent_strategy.last_score,
+            dict(self.latent_strategy.last_score_stats),
+        )
+        if state_after != state_before:
+            raise RuntimeError(
+                "counterfactual policy computation mutated deployed prediction state"
+            )
+        return result
 
     def _record_prediction_stats(self, candidate_count: int) -> None:
         attempted, accepted, rejected = self._fallback_counts
@@ -898,7 +1092,8 @@ class MaxEntIrl:
             "semantic_fallback_attempted": bool(attempted),
             "semantic_fallback_used": bool(accepted),
             "semantic_fallback_accepted_actions": int(accepted),
-            "semantic_fallback_rejected_actions": int(rejected)
+            "semantic_fallback_rejected_actions": int(rejected),
+            "semantic_gate_outcome": self._last_semantic_gate_outcome,
         }
 
     def predict(self, state: StateVector, candidate_actions: Optional[Sequence[str]] = None, prefix: Optional[Sequence[str]] = None, allow_latent_strategy: bool = True) -> Dict[str, float]:
@@ -910,10 +1105,12 @@ class MaxEntIrl:
         latent_score = self.latent_strategy.score(tuple(prefix or ()), candidates)
         alpha = 0.0
         latent_enabled = bool(self.settings.latent_strategy_enabled)
-        if latent_enabled and allow_latent_strategy and (attempted or conflict): distribution, alpha = fuse_strategy_residual(distribution, latent_score, float(self.settings.latent_strategy_strength))
+        policy_support = bool(attempted or conflict)
+        if latent_enabled and allow_latent_strategy and policy_support: distribution, alpha = fuse_strategy_residual(distribution, latent_score, float(self.settings.latent_strategy_strength))
         self._record_prediction_stats(len(distribution))
         self.last_prediction_stats.update(dict(self.latent_strategy.last_score_stats))
-        self.last_prediction_stats.update({"latent_strategy_eligible": bool(latent_enabled and allow_latent_strategy and (attempted or conflict)), "latent_strategy_used": bool(alpha > 0.0), "latent_strategy_alpha": float(alpha)})
+        self.last_prediction_stats.update({"latent_strategy_eligible": bool(latent_enabled and allow_latent_strategy and policy_support), "latent_strategy_used": bool(alpha > 0.0), "latent_strategy_alpha": float(alpha),
+            "latent_gate_outcome": self._latent_gate_outcome(self.latent_strategy.last_score_stats, enabled=latent_enabled, confirmed=bool(allow_latent_strategy), policy_support=policy_support, alpha=alpha)})
         return distribution
 
     def latent_supports_correction(self, corrected_prefix: Sequence[str], candidates: Sequence[str], actual: str, predicted: str) -> bool:

@@ -15,6 +15,8 @@ from src.ablations import (
     MatcherSettings,
     GraphMatcher,
     LATENT_STRATEGY_ABLATION_ARMS,
+    MEMORY_PREDICTOR_ABLATION_CELLS,
+    MEMORY_PREDICTOR_ABLATION_METRICS,
     LOCAL_ROUTE,
     SHARED_ROUTE,
     build_partial_order_graph,
@@ -29,34 +31,65 @@ from src.ablations import (
     latent_strategy_ablation_design,
     summarize_commit_decisions,
     summarize_latent_strategy_ablation,
+    summarize_memory_predictor_ablation,
     summarize_routing_ablation,
     teaching_metrics,
     _trend,
 )
 
 
+ABLATION_SCENARIOS = ("homogeneous", "heterogeneous", "holdout")
+
+
+def _ablation_payload(name, seeds, scenarios=ABLATION_SCENARIOS):
+    """A minimal suite output that satisfies the collection validator."""
+    arms = {arm.name for arm in LATENT_STRATEGY_ABLATION_ARMS}
+    if name == "matcher":
+        return {"summary_by_matcher": {"graph": {}}}
+    if name == "routing":
+        return {
+            "rows": [
+                {"scenario": scenario, "seed": seed, "trend": [{}]}
+                for scenario in scenarios for seed in seeds
+            ]
+        }
+    if name == "memory":
+        return {
+            "rows": [
+                {
+                    "scenario": scenario, "seed": seed,
+                    "baseline": str(cell["baseline"]),
+                    "memory_level": str(cell["memory"]),
+                    "memory_policy": (
+                        "adaptive"
+                        if cell["memory"] == "adaptive_pinned" else "none"
+                    ),
+                    "latest_pin_enabled": (
+                        cell["memory"] == "adaptive_pinned"
+                    ),
+                }
+                for scenario in scenarios for seed in seeds
+                for cell in MEMORY_PREDICTOR_ABLATION_CELLS
+            ],
+            "summary": {"memory_levels_are_internally_consistent": True},
+        }
+    return {
+        "rows": [
+            {"scenario": scenario, "seed": seed, "arm": arm}
+            for scenario in scenarios for seed in seeds for arm in arms
+        ]
+    }
+
+
 class AllAblationRunnerTests(unittest.TestCase):
     def test_collection_runner_owns_outputs_manifest_and_validation(self):
-        scenarios = ("homogeneous", "heterogeneous", "holdout")
-        arms = {arm.name for arm in LATENT_STRATEGY_ABLATION_ARMS}
+        from src.evaluation import PAPER_SEEDS
+
+        scenarios = ABLATION_SCENARIOS
+        seeds = tuple(int(seed) for seed in PAPER_SEEDS)
 
         def complete(name, command, run_dir, _environment):
-            if name == "matcher":
-                payload = {"summary_by_matcher": {"graph": {}}}
-            elif name == "routing":
-                payload = {
-                    "rows": [
-                        {"scenario": scenario, "seed": 1337, "trend": [{}]}
-                        for scenario in scenarios
-                    ]
-                }
-            else:
-                payload = {
-                    "rows": [
-                        {"scenario": scenario, "seed": 1337, "arm": arm}
-                        for scenario in scenarios for arm in arms
-                    ]
-                }
+            payload = _ablation_payload(name, seeds, scenarios)
             output = Path(run_dir) / f"{name}.json"
             output.write_text(json.dumps(payload), encoding="utf-8")
             return {
@@ -78,10 +111,206 @@ class AllAblationRunnerTests(unittest.TestCase):
             manifest = json.loads(Path(result["manifest"]).read_text())
 
         self.assertEqual(result["state"], "complete")
-        self.assertEqual(set(result["outputs"]), {"matcher", "routing", "latent"})
+        self.assertEqual(
+            set(result["outputs"]),
+            {"matcher", "routing", "latent", "memory"},
+        )
         self.assertEqual(manifest["state"], "complete")
-        self.assertEqual(set(manifest["jobs"]), {"matcher", "routing", "latent"})
+        self.assertEqual(
+            set(manifest["jobs"]),
+            {"matcher", "routing", "latent", "memory"},
+        )
         self.assertEqual(manifest["longitudinal_scenarios"], list(scenarios))
+        self.assertEqual(manifest["longitudinal_seeds"], list(seeds))
+
+    def test_suites_run_one_at_a_time_over_the_full_paired_seed_grid(self):
+        """Each suite gets the machine to itself for its own seed grid.
+
+        Running all four suites at once would put unrelated suites in
+        contention for the same performance cores, and the per-arm wall-clock
+        numbers these suites report are meant to be comparable.
+        """
+        from src.evaluation import PAPER_SEEDS
+
+        seeds = tuple(int(seed) for seed in PAPER_SEEDS)
+        seed_csv = ",".join(str(seed) for seed in seeds)
+        order: list = []
+        live: list = []
+        overlaps: list = []
+
+        def record(name, command, run_dir, _environment):
+            live.append(name)
+            if len(live) > 1:
+                overlaps.append(tuple(live))
+            order.append((name, list(command)))
+            payload = _ablation_payload(name, seeds)
+            output = Path(run_dir) / f"{name}.json"
+            output.write_text(json.dumps(payload), encoding="utf-8")
+            live.remove(name)
+            return {
+                "name": name, "command": list(command),
+                "started_at_utc": "2026-01-01T00:00:00Z",
+                "completed_at_utc": "2026-01-01T00:00:01Z",
+                "return_code": 0, "wall_s": 1.0,
+                "output": str(output),
+                "stdout": str(Path(run_dir) / f"{name}.stdout.log"),
+                "stderr": str(Path(run_dir) / f"{name}.stderr.log"),
+            }
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "src.ablations._run_ablation_process", side_effect=record,
+        ):
+            result = run_all_ablations(directory, workers=8)
+            manifest = json.loads(Path(result["manifest"]).read_text())
+
+        self.assertEqual(overlaps, [], "suites overlapped instead of running in turn")
+        self.assertEqual(manifest["suite_execution"], "sequential")
+        self.assertEqual(manifest["suite_parallelism"], 1)
+        self.assertEqual(manifest["longitudinal_workers_per_suite"], 8)
+
+        commands = dict(order)
+        for suite, flag in (
+            ("routing", "--routing-seeds"),
+            ("latent", "--latent-seeds"),
+            ("memory", "--memory-seeds"),
+        ):
+            command = commands[suite]
+            self.assertEqual(command[command.index(flag) + 1], seed_csv)
+            self.assertEqual(command[command.index("--workers") + 1], "8")
+        # The matcher suite generates one stress dataset rather than a paired
+        # seed grid, so it keeps its single generation seed.
+        self.assertNotIn("--routing-seeds", commands["matcher"])
+        self.assertIn("--seed", commands["matcher"])
+
+    def test_worker_count_may_span_the_whole_scenario_seed_grid(self):
+        from src.evaluation import PAPER_SEEDS, SCENARIOS
+
+        maximum = len(SCENARIOS) * len(PAPER_SEEDS)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, f"between 1 and {maximum}"):
+                run_all_ablations(directory, workers=maximum + 1)
+
+
+class MemoryPredictorFactorialAblationTests(unittest.TestCase):
+    def test_cells_cross_both_factors_exactly_once(self):
+        cells = MEMORY_PREDICTOR_ABLATION_CELLS
+        self.assertEqual(len(cells), 4)
+        self.assertEqual(
+            {(cell["predictor"], cell["memory"]) for cell in cells},
+            {
+                ("maxent", "adaptive_pinned"),
+                ("maxent", "retain_all"),
+                ("behavior_cloning", "adaptive_pinned"),
+                ("behavior_cloning", "retain_all"),
+            },
+        )
+        # 'full' must lead: it defines the shared interaction route the other
+        # three cells replay, so the comparison stays paired.
+        self.assertEqual(cells[0]["baseline"], "full")
+        self.assertEqual(
+            {cell["baseline"] for cell in cells},
+            {"full", "bc_adaptive", "no_decay", "bc"},
+        )
+
+    def test_registered_cells_agree_with_the_agents_they_name(self):
+        """The design is only meaningful if the arms behave as labelled."""
+        from src.baselines import BASELINE_AGENTS
+        from src.models import Settings
+
+        config = Settings(
+            verbose=False, irl_cold_steps=2, irl_warm_steps=1,
+            bc_cold_epochs=2, bc_warm_epochs=1,
+        )
+        expected_policy = {"adaptive_pinned": "adaptive", "retain_all": "none"}
+        for cell in MEMORY_PREDICTOR_ABLATION_CELLS:
+            with self.subTest(baseline=cell["baseline"]):
+                if cell["baseline"] == "full":
+                    from src.adaptive_agent import AdaptiveAgent
+                    agent = AdaptiveAgent(settings=config)
+                else:
+                    agent = BASELINE_AGENTS[cell["baseline"]](config)
+                self.assertEqual(
+                    agent.replay.policy, expected_policy[cell["memory"]],
+                )
+                self.assertEqual(
+                    agent.settings.pin_latest,
+                    cell["memory"] == "adaptive_pinned",
+                )
+                self.assertEqual(
+                    agent.predictor_name().startswith("behavior_cloning"),
+                    cell["predictor"] == "behavior_cloning",
+                )
+
+    def test_summary_signs_every_effect_so_positive_favours_the_treatment(self):
+        def row(scenario, seed, baseline, memory, top_1, load):
+            return {
+                "scenario": scenario, "seed": seed, "baseline": baseline,
+                "memory_level": memory,
+                "memory_policy": (
+                    "adaptive" if memory == "adaptive_pinned" else "none"
+                ),
+                "latest_pin_enabled": memory == "adaptive_pinned",
+                "teacher_forced_top_1": top_1,
+                "normalized_human_action_load": load,
+            }
+
+        # Memory helps both predictors by the same amount, so the interaction
+        # is zero even though the cloner is the more accurate model here.
+        rows = [
+            row("homogeneous", 7, "full", "adaptive_pinned", 0.90, 0.50),
+            row("homogeneous", 7, "no_decay", "retain_all", 0.85, 0.55),
+            row("homogeneous", 7, "bc_adaptive", "adaptive_pinned", 0.95, 0.45),
+            row("homogeneous", 7, "bc", "retain_all", 0.90, 0.50),
+        ]
+        summary = summarize_memory_predictor_ablation(rows)
+        effects = {
+            entry["name"]: entry["metrics"]
+            for entry in summary["paired_seed_simple_effects"]
+        }
+
+        # Higher-is-better metric passes through unchanged.
+        self.assertAlmostEqual(
+            effects["memory_effect_within_maxent"]["teacher_forced_top_1"][
+                "mean_treatment_advantage"
+            ], 0.05,
+        )
+        # Lower-is-better metric is flipped, so a drop in human load is a gain.
+        self.assertAlmostEqual(
+            effects["memory_effect_within_behavior_cloning"][
+                "normalized_human_action_load"
+            ]["mean_treatment_advantage"], 0.05,
+        )
+        # BC is ahead under a matched memory policy, so Full's simple effect
+        # on the predictor factor is negative rather than silently clipped.
+        self.assertAlmostEqual(
+            effects["predictor_effect_under_adaptive_memory"][
+                "teacher_forced_top_1"
+            ]["mean_treatment_advantage"], -0.05,
+        )
+
+        interaction = summary["memory_by_predictor_interaction"][0]["metrics"]
+        for metric, _direction in MEMORY_PREDICTOR_ABLATION_METRICS[:1]:
+            self.assertAlmostEqual(
+                interaction[metric]["mean_interaction"], 0.0,
+            )
+        self.assertTrue(summary["memory_levels_are_internally_consistent"])
+
+    def test_summary_flags_a_cell_that_did_not_run_its_declared_policy(self):
+        rows = [
+            {
+                "scenario": "homogeneous", "seed": 7, "baseline": "full",
+                "memory_level": "adaptive_pinned",
+                "memory_policy": "adaptive", "latest_pin_enabled": True,
+            },
+            {
+                "scenario": "homogeneous", "seed": 7, "baseline": "bc_adaptive",
+                "memory_level": "adaptive_pinned",
+                # Regression guard: the arm silently kept BC's old storage.
+                "memory_policy": "none", "latest_pin_enabled": False,
+            },
+        ]
+        summary = summarize_memory_predictor_ablation(rows)
+        self.assertFalse(summary["memory_levels_are_internally_consistent"])
 
 
 class LatentStrategyComponentAblationTests(unittest.TestCase):

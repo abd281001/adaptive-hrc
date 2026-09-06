@@ -340,9 +340,16 @@ class LatestAgent(UnpinnedAgent):
 class BehaviorCloningAgent(BaselineAgent):
     """Supervised next-action imitation over unweighted, nondecaying storage."""
 
+    # Storage is a class attribute so a subclass can hold the predictor fixed
+    # and vary only the memory policy; see MemoryMatchedBcAgent.
+    MEMORY_POLICY = "none"
+    PIN_LATEST = False
+
     def __init__(self, settings: Settings = DEFAULT_SETTINGS, **kwargs):
-        super().__init__(settings=_without_proposed_components(settings), **kwargs)
-        self.replay = ReplayMemory(self.settings, policy="none")
+        super().__init__(settings=replace(
+            _without_proposed_components(settings), pin_latest=self.PIN_LATEST,
+        ), **kwargs)
+        self.replay = ReplayMemory(self.settings, policy=self.MEMORY_POLICY)
         self.cloner = BehaviorCloner(settings=self.settings, domain=self.domain)
 
     def predictor_name(self) -> str:
@@ -442,6 +449,28 @@ class BehaviorCloningAgent(BaselineAgent):
             self._set_policy_stats(confidence, entropy, "baseline_policy")
         else: self._set_policy_stats(None, None, "baseline_empty")
         return distribution
+
+
+class MemoryMatchedBcAgent(BehaviorCloningAgent):
+    """BC under Full's adaptive-decay and latest-pin memory policy.
+
+    ``bc`` differs from Full in two places at once: it swaps MaxEnt IRL for a
+    linear cloner and it retains every variant at unit weight.  Its margin
+    therefore cannot be attributed to either change.  This arm moves only the
+    predictor, so the ``full``/``bc_adaptive``/``bc``/``no_decay`` quartet
+    separates the model family from the retention policy.
+
+    Full's two semantic components stay disabled because both are reached
+    through the MaxEnt predictor, which this arm does not use.  ``pin_latest``
+    is memory-side, so it is restored here.
+    """
+
+    MEMORY_POLICY = "adaptive"
+    PIN_LATEST = True
+
+    def predictor_name(self) -> str:
+        return "behavior_cloning_adaptive_memory"
+
 
 class EwcAgent(BaselineAgent):
     """IRL plus diagonal-Fisher EWC over nondecaying storage."""
@@ -624,6 +653,7 @@ BASELINE_AGENTS = {
     "fixed": FixedDecayAgent,
     "no_decay": NoDecayAgent,
     "bc": BehaviorCloningAgent,
+    "bc_adaptive": MemoryMatchedBcAgent,
     "ewc": EwcAgent,
     "replay_bc": ReplayBcAgent,
     "in_context_llm": InContextLlmAgent
