@@ -230,6 +230,17 @@ class D405CameraService:
                 "color_camera_info": self.color_camera_info,
             }
 
+    @staticmethod
+    def _camera_info_for_status(camera_info):
+        """Copy intrinsics into JSON types without changing perception arrays."""
+        if camera_info is None:
+            return None
+        return {
+            "camera_matrix": np.asarray(camera_info["camera_matrix"]).tolist(),
+            "distortion_coefficients": np.asarray(camera_info["distortion_coefficients"]).tolist(),
+            "distortion_model": str(camera_info["distortion_model"]),
+        }
+
     def get_status(self):
         with self.lock:
             age_s = None if self.latest_monotonic is None else max(0.0, time.monotonic() - self.latest_monotonic)
@@ -255,8 +266,8 @@ class D405CameraService:
                 "exposure": self.exposure,
                 "last_error": self.last_error,
                 "device_identity": dict(self.device_identity),
-                "depth_camera_info": self.depth_camera_info,
-                "color_camera_info": self.color_camera_info,
+                "depth_camera_info": self._camera_info_for_status(self.depth_camera_info),
+                "color_camera_info": self._camera_info_for_status(self.color_camera_info),
             }
 
     def get_color_camera_info(self):

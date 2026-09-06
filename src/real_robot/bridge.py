@@ -300,6 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=9100)
     parser.add_argument("--state-dir", default="real_robot_bridge_state")
     parser.add_argument("--enable-motion", action="store_true")
+    parser.add_argument("--camera-preview", action="store_true", help="Open the D405 in dry-run mode; robot actions remain simulated")
     parser.add_argument("--calibration-mode", action="store_true", help="Permit supervised single-action probes with an uncalibrated config")
     parser.add_argument("--confirm-start-station", default="")
     parser.add_argument("--acknowledge-reconciled", action="append", default=[])
@@ -309,6 +310,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.camera_preview and args.enable_motion:
+        raise SystemExit("--camera-preview is for dry runs only; live mode already owns the camera")
     if args.bind not in {"127.0.0.1", "localhost", "::1"} and not args.allow_remote_hardware_api:
         raise SystemExit("refusing a non-loopback hardware API without --allow-remote-hardware-api")
     config = load_lab_config(args.config)
@@ -330,11 +333,16 @@ def main(argv: list[str] | None = None) -> int:
                 config, confirmed_start_station=args.confirm_start_station,
                 calibration_mode=args.calibration_mode,
             )
-            if args.enable_motion else BridgeDryRunController(config)
+            if args.enable_motion else BridgeDryRunController(config, camera_preview=args.camera_preview)
         )
-        server = BridgeServer((args.bind, args.port), controller, config, ledger)
+        try:
+            server = BridgeServer((args.bind, args.port), controller, config, ledger)
+        except BaseException:
+            controller.close()
+            raise
         print(f"Stretch bridge: http://{args.bind}:{args.port}")
         print(f"Motion enabled: {bool(args.enable_motion)}")
+        print(f"Dry-run camera preview: {bool(args.camera_preview)}")
         print(f"Calibration mode: {bool(args.calibration_mode)}")
         print(f"Config digest: {config.digest}")
         print(f"State directory: {state_dir}")

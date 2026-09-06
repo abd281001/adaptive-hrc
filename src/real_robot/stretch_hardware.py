@@ -478,14 +478,31 @@ class StretchHardwareController:
 
 
 class BridgeDryRunController:
-    """Hardware-bridge dry run that validates requests and slot allocation."""
+    """Simulated actions with an optional D405 preview; never starts the SDK."""
 
-    def __init__(self, config: LabConfig):
+    def __init__(self, config: LabConfig, *, camera_preview: bool = False):
         self.config = config
         self.current_station = config.home_station
         self._stopped = False
         self._executed: list[str] = []
         self._phase = "ready"
+        self.camera_service: Any = None
+        if camera_preview:
+            camera_type = importlib.import_module(
+                "src.real_robot.stretch_runtime.camera_service"
+            ).D405CameraService
+            p = config.perception
+            self.camera_service = camera_type(
+                exposure="medium", capture_fps=15, stream_fps=10,
+                startup_timeout_s=p.camera_startup_timeout_s,
+                frame_timeout_ms=p.camera_frame_timeout_ms,
+                stale_after_s=p.max_frame_age_s,
+            )
+            try:
+                self.camera_service.start()
+            except BaseException:
+                self.close()
+                raise
 
     def execute(self, action: ActionSpec, *, execution_id: str, placement_slot_id: str) -> Mapping[str, Any]:
         if self._stopped:
@@ -516,6 +533,7 @@ class BridgeDryRunController:
             "current_station": self.current_station, "pose_confident": True,
             "current_phase": self._phase, "executed_actions": list(self._executed),
             "config_digest": self.config.digest,
+            "camera": self.camera_service.get_status() if self.camera_service is not None else None,
         }
 
     def emergency_stop(self) -> Mapping[str, Any]:
@@ -524,7 +542,19 @@ class BridgeDryRunController:
         return {"ok": True, "status": "stopped", "restart_required": True}
 
     def camera_jpeg(self) -> bytes | None:
-        return None
+        if self.camera_service is None:
+            return None
+        bundle = self.camera_service.get_latest_bundle()
+        age_s = bundle["age_s"]
+        frame = bundle["color"]
+        if frame is None or age_s is None or age_s > self.config.perception.max_frame_age_s:
+            return None
+        cv2 = importlib.import_module("cv2")
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        return encoded.tobytes() if ok else None
 
     def close(self) -> None:
         self._stopped = True
+        camera, self.camera_service = self.camera_service, None
+        if camera is not None:
+            camera.stop()
