@@ -338,8 +338,8 @@ class ScheduleTests(unittest.TestCase):
         assert abs(fraction - metadata["transition_fraction"]) < 1e-12
         assert sum(phase["gap"] for phase in metadata["phases"]) == expected_demos // 3
 
-    def test_default_protocol_has_five_paired_seeds_and_three_scenarios(self):
-        self.assertEqual(len(PAPER_SEEDS), 5)
+    def test_default_protocol_has_eight_paired_seeds_and_three_scenarios(self):
+        self.assertEqual(len(PAPER_SEEDS), 8)
         self.assertEqual(parse_args([]).seeds, PAPER_SEEDS)
         self.assertEqual(
             SCENARIOS,
@@ -1282,3 +1282,53 @@ class PhaseFigureSeparationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerCrashDiagnosticsTests(unittest.TestCase):
+    """A worker that dies natively has to leave evidence and clean state."""
+
+    def test_stale_checkpoints_from_an_earlier_attempt_are_cleared(self):
+        from src.evaluation import _clear_stale_checkpoints
+
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            checkpoints = out_dir / "partial" / "checkpoints" / "in_context_llm"
+            checkpoints.mkdir(parents=True)
+            for index in (0, 71, 131):
+                (checkpoints / f"event_{index:06d}.json").write_text("{}")
+            keep = out_dir / "partial" / "summary.json"
+            keep.write_text("{}")
+
+            removed = _clear_stale_checkpoints(out_dir)
+
+            self.assertEqual(removed, 3)
+            self.assertEqual(list(checkpoints.glob("event_*.json")), [])
+            # Only per-event checkpoints are stale; the summary is not.
+            self.assertTrue(keep.is_file())
+
+    def test_clearing_checkpoints_is_safe_before_any_exist(self):
+        from src.evaluation import _clear_stale_checkpoints
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(_clear_stale_checkpoints(Path(directory)), 0)
+
+    def test_worker_fault_log_captures_a_native_stack(self):
+        import faulthandler
+        from src.evaluation import _open_worker_fault_log
+
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            previously_enabled = faulthandler.is_enabled()
+            handle = _open_worker_fault_log(out_dir)
+            try:
+                self.assertIsNotNone(handle)
+                self.assertTrue(faulthandler.is_enabled())
+                faulthandler.dump_traceback(file=handle, all_threads=False)
+            finally:
+                if previously_enabled:
+                    faulthandler.enable()
+                else:
+                    faulthandler.disable()
+
+            written = (out_dir / "worker_fault.log").read_text()
+            self.assertIn("test_worker_fault_log_captures_a_native_stack", written)

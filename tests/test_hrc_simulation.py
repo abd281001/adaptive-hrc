@@ -8,6 +8,50 @@ from src.hrc_simulation import simulate_episode
 
 
 class LaterReferenceActionDiagnosticTests(unittest.TestCase):
+    def test_prediction_metadata_covers_human_and_robot_before_observation(self):
+        actions = ("a", "b", "c")
+        prefix: list[str] = []
+        order: list[tuple[str, int]] = []
+
+        def predict_distribution(_current_prefix):
+            return {"a": 1.0}
+
+        def capture(prediction):
+            order.append(("capture", prediction.recipe_step))
+            return {"decision_step": prediction.recipe_step}
+
+        def observe_ground_truth(observation, _distribution, _predicted):
+            order.append(("observe", len(prefix)))
+            prefix.append(observation)
+
+        trace = simulate_episode(
+            observations=actions,
+            actual_actions=actions,
+            current_prefix=lambda: tuple(prefix),
+            predict_distribution=predict_distribution,
+            observe_ground_truth=observe_ground_truth,
+            top_k=1,
+            min_probability=1e-12,
+            capture_prediction_metadata=capture,
+        )
+
+        turns = sorted(
+            [*trace.robot_turns, *trace.human_shadow_turns],
+            key=lambda turn: turn.recipe_step,
+        )
+        self.assertEqual(
+            [turn.metadata["decision_step"] for turn in turns],
+            [0, 1, 2],
+        )
+        self.assertEqual(
+            order,
+            [
+                ("capture", 0), ("observe", 0),
+                ("capture", 1), ("observe", 1),
+                ("capture", 2), ("observe", 2),
+            ],
+        )
+
     def test_wrong_prediction_records_only_a_later_reference_action_match(self):
         actions = ("a", "b", "c", "b")
         prefix: list[str] = []

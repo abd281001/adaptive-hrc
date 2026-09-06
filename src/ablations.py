@@ -17,7 +17,7 @@ Standalone runners construct isolated agents and never mutate a caller's agent.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import itertools
 import json
 import math
@@ -84,6 +84,36 @@ ROUTING_BASELINES: Tuple[str, ...] = (
     "replay_bc",
 )
 DEFAULT_ABLATION_RESULTS_ROOT = "eval_results/ablation_runs"
+# Suites run one at a time, so a suite may use the whole performance-core
+# budget for its own scenario-seed grid. Eight matches both the paired seed
+# count and the P-core count of the reference host.
+DEFAULT_ABLATION_WORKERS = 8
+
+# Memory-policy x predictor factorial.  ``bc`` differs from ``full`` in two
+# places at once -- linear cloner instead of MaxEnt, and retain-everything
+# instead of adaptive decay with a latest pin -- so neither arm's margin is
+# attributable.  ``bc_adaptive`` and ``no_decay`` fill the two off-diagonal
+# cells, which makes the memory policy separable from the model family.
+PREDICTOR_LEVELS: Tuple[str, str] = ("maxent", "behavior_cloning")
+MEMORY_LEVELS: Tuple[str, str] = ("adaptive_pinned", "retain_all")
+MEMORY_PREDICTOR_ABLATION_CELLS: Tuple[Dict[str, str], ...] = (
+    {"baseline": "full", "label": "MaxEnt + adaptive memory",
+     "predictor": "maxent", "memory": "adaptive_pinned"},
+    {"baseline": "bc_adaptive", "label": "BC + adaptive memory",
+     "predictor": "behavior_cloning", "memory": "adaptive_pinned"},
+    {"baseline": "no_decay", "label": "MaxEnt + retain-all",
+     "predictor": "maxent", "memory": "retain_all"},
+    {"baseline": "bc", "label": "BC + retain-all",
+     "predictor": "behavior_cloning", "memory": "retain_all"},
+)
+MEMORY_PREDICTOR_ABLATION_METRICS: Tuple[Tuple[str, str], ...] = (
+    ("teacher_forced_top_1", "higher_is_better"),
+    ("teacher_forced_top_k", "higher_is_better"),
+    ("teacher_forced_mean_nll", "lower_is_better"),
+    ("live_top_1", "higher_is_better"),
+    ("normalized_human_action_load", "lower_is_better"),
+    ("corrections_per_recipe_step", "lower_is_better"),
+)
 
 
 @dataclass(frozen=True)
@@ -2623,12 +2653,14 @@ def _latent_job(
     from .evaluation import (
         _apply_native_thread_limit,
         _native_thread_count,
+        _pin_to_performance_cores,
         build_plan,
         run_stream,
         summarize_stream,
     )
     from .memory import clear_caches
 
+    _pin_to_performance_cores()
     _apply_native_thread_limit(_native_thread_count(config))
     plan = build_plan(scenario, config, seed)
     rows: List[Dict[str, Any]] = []
@@ -2806,17 +2838,104 @@ def run_latent_strategy_ablation(
     }
 
 
+def _memory_predictor_row(
+    stream: Any,
+    cell: Mapping[str, str],
+    summary: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Flatten one factorial cell, plus the retention state that defines it."""
+    assist = summary.get("assist") or {}
+    overall = assist.get("overall") or {}
+    system = summary.get("system") or {}
+    fit_stats = system.get("fit_stats") or {}
+    row: Dict[str, Any] = {
+        "scenario": str(stream.scenario),
+        "seed": int(stream.seed),
+        "baseline": str(cell["baseline"]),
+        "label": str(cell["label"]),
+        "predictor_level": str(cell["predictor"]),
+        "memory_level": str(cell["memory"]),
+        # Retention state is what the memory factor is supposed to move. It is
+        # recorded per cell so the summary can verify the two arms of a level
+        # really shared a policy rather than merely being labelled alike.
+        "memory_policy": system.get("memory_policy"),
+        "latest_pin_enabled": system.get("latest_pin_enabled"),
+        "active_variants": system.get("active_variants"),
+        "pruned_variants": system.get("pruned_variants"),
+        "mean_active_weight": system.get("mean_active_weight"),
+        "predictor": system.get("predictor"),
+        "model_family": fit_stats.get("model_family"),
+        "stream_wall_s": float(stream.wall_s),
+        "training_fit_wall_s": system.get("training_fit_wall_s"),
+        "training_estimated_fit_flops": system.get(
+            "training_estimated_fit_flops"
+        ),
+        "trend": _trend(stream),
+        "detailed_metrics": dict(summary),
+    }
+    row.update({
+        metric: overall.get(metric)
+        for metric, _direction in MEMORY_PREDICTOR_ABLATION_METRICS
+    })
+    return row
+
+
+def _memory_predictor_job(
+    job: Tuple[str, int, Any, Tuple[Mapping[str, str], ...]],
+) -> List[Dict[str, Any]]:
+    """Run all four factorial cells on one paired scenario/seed plan."""
+    scenario, seed, config, cells = job
+    from .evaluation import (
+        _apply_native_thread_limit,
+        _native_thread_count,
+        _pin_to_performance_cores,
+        build_plan,
+        run_stream,
+        summarize_stream,
+    )
+    from .memory import clear_caches
+
+    _pin_to_performance_cores()
+    _apply_native_thread_limit(_native_thread_count(config))
+    plan = build_plan(scenario, config, seed)
+    rows: List[Dict[str, Any]] = []
+    reference_schedule: Optional[Tuple[str, ...]] = None
+    for cell in cells:
+        clear_caches()
+        stream = run_stream(
+            str(cell["baseline"]),
+            plan,
+            config,
+            execution_mode_schedule=reference_schedule,
+            mode_schedule_policy=(
+                "memory_predictor_ablation_full_reference_route"
+                if reference_schedule is None
+                else "memory_predictor_ablation_matched_full_route"
+            ),
+        )
+        if reference_schedule is None:
+            reference_schedule = tuple(
+                str(row.get("mode")) for row in stream.episode_rows
+            )
+        rows.append(_memory_predictor_row(
+            stream, cell, summarize_stream(stream),
+        ))
+    return rows
+
+
 def _route_job(job: Tuple[str, int, Any, Tuple[str, ...]]) -> List[Dict[str, Any]]:
     """Run one scenario's routing comparisons in an isolated process."""
     scenario, seed, config, baselines = job
     from .evaluation import (
         _apply_native_thread_limit,
         _native_thread_count,
+        _pin_to_performance_cores,
         build_plan,
         run_stream,
     )
     from .memory import clear_caches
 
+    _pin_to_performance_cores()
     _apply_native_thread_limit(_native_thread_count(config))
     strict_config = replace(config, allow_repeat_observation=False)
     local_config = replace(config, allow_repeat_observation=True)
@@ -2851,6 +2970,262 @@ def _route_job(job: Tuple[str, int, Any, Tuple[str, ...]]) -> List[Dict[str, Any
         )
         rows.append(_teaching_row(local, LOCAL_ROUTE))
     return rows
+
+
+MEMORY_PREDICTOR_CONTRASTS: Tuple[Dict[str, str], ...] = (
+    {"name": "memory_effect_within_maxent",
+     "treatment": "full", "reference": "no_decay",
+     "question": "does the memory policy help the proposed predictor"},
+    {"name": "memory_effect_within_behavior_cloning",
+     "treatment": "bc_adaptive", "reference": "bc",
+     "question": "does the same memory policy help a linear cloner"},
+    {"name": "predictor_effect_under_adaptive_memory",
+     "treatment": "full", "reference": "bc_adaptive",
+     "question": "predictor gap once both arms share Full's memory policy"},
+    {"name": "predictor_effect_under_retain_all",
+     "treatment": "no_decay", "reference": "bc",
+     "question": "predictor gap when neither arm forgets"},
+)
+
+
+def _paired_cell_deltas(
+    indexed: Mapping[Tuple[str, int, str], Mapping[str, Any]],
+    scenario: str,
+    treatment: str,
+    reference: str,
+) -> Tuple[Dict[str, Any], Dict[str, List[float]]]:
+    """Seed-matched treatment-minus-reference deltas for one scenario."""
+    seeds = sorted({
+        seed for row_scenario, seed, baseline in indexed
+        if row_scenario == scenario and baseline == treatment
+        and (scenario, seed, reference) in indexed
+    })
+    metric_deltas: Dict[str, Any] = {}
+    raw: Dict[str, List[float]] = {}
+    for metric, direction in MEMORY_PREDICTOR_ABLATION_METRICS:
+        deltas: List[float] = []
+        for seed in seeds:
+            treatment_value = indexed[(scenario, seed, treatment)].get(metric)
+            reference_value = indexed[(scenario, seed, reference)].get(metric)
+            if not isinstance(treatment_value, (int, float)) or not (
+                isinstance(reference_value, (int, float))
+            ):
+                continue
+            delta = float(treatment_value) - float(reference_value)
+            # Sign every contrast so positive favours the treatment, whichever
+            # way the underlying metric reads.
+            if direction == "lower_is_better":
+                delta = -delta
+            if math.isfinite(delta):
+                deltas.append(delta)
+        raw[metric] = deltas
+        metric_deltas[metric] = {
+            "direction": direction,
+            "n_paired_seeds": len(deltas),
+            "mean_treatment_advantage": _finite_mean(deltas),
+        }
+    return {"scenario": scenario, "n_paired_seeds": len(seeds),
+            "metrics": metric_deltas}, raw
+
+
+def summarize_memory_predictor_ablation(
+    rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Cell means, the four simple effects, and the memory x predictor term."""
+    grouped: Dict[Tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
+    indexed: Dict[Tuple[str, int, str], Mapping[str, Any]] = {}
+    for row in rows:
+        scenario = str(row.get("scenario"))
+        baseline = str(row.get("baseline"))
+        grouped[(scenario, baseline)].append(row)
+        seed = row.get("seed")
+        if isinstance(seed, int):
+            indexed[(scenario, int(seed), baseline)] = row
+
+    cell_means = []
+    for (scenario, baseline), group in sorted(grouped.items()):
+        first = group[0]
+        cell_means.append({
+            "scenario": scenario,
+            "baseline": baseline,
+            "label": first.get("label"),
+            "predictor_level": first.get("predictor_level"),
+            "memory_level": first.get("memory_level"),
+            "n_seeds": len(group),
+            "memory_policy": first.get("memory_policy"),
+            "latest_pin_enabled": first.get("latest_pin_enabled"),
+            "mean_active_variants": _finite_mean(
+                row.get("active_variants") for row in group
+            ),
+            "mean_pruned_variants": _finite_mean(
+                row.get("pruned_variants") for row in group
+            ),
+            **{
+                f"mean_{metric}": _finite_mean(row.get(metric) for row in group)
+                for metric, _direction in MEMORY_PREDICTOR_ABLATION_METRICS
+            },
+        })
+
+    scenarios = sorted({scenario for scenario, _seed, _baseline in indexed})
+    simple_effects: List[Dict[str, Any]] = []
+    raw_by_contrast: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
+    for contrast in MEMORY_PREDICTOR_CONTRASTS:
+        for scenario in scenarios:
+            entry, raw = _paired_cell_deltas(
+                indexed, scenario,
+                str(contrast["treatment"]), str(contrast["reference"]),
+            )
+            simple_effects.append({**dict(contrast), **entry})
+            raw_by_contrast[(str(contrast["name"]), scenario)] = raw
+
+    # The interaction is the question the arm was added to answer: if the
+    # memory policy is worth as much to a linear cloner as to MaxEnt, the gain
+    # is the memory, not the model family.
+    interactions = []
+    for scenario in scenarios:
+        maxent = raw_by_contrast.get(
+            ("memory_effect_within_maxent", scenario), {},
+        )
+        cloner = raw_by_contrast.get(
+            ("memory_effect_within_behavior_cloning", scenario), {},
+        )
+        metrics: Dict[str, Any] = {}
+        for metric, direction in MEMORY_PREDICTOR_ABLATION_METRICS:
+            left = maxent.get(metric) or []
+            right = cloner.get(metric) or []
+            paired = min(len(left), len(right))
+            metrics[metric] = {
+                "direction": direction,
+                "n_paired_seeds": paired,
+                "mean_memory_effect_within_maxent": _finite_mean(left),
+                "mean_memory_effect_within_behavior_cloning": _finite_mean(
+                    right,
+                ),
+                "mean_interaction": _finite_mean(
+                    a - b for a, b in zip(left[:paired], right[:paired])
+                ),
+            }
+        interactions.append({
+            "scenario": scenario,
+            "definition": (
+                "memory effect within MaxEnt minus memory effect within "
+                "behaviour cloning; near zero means the retention policy pays "
+                "off independently of the model family"
+            ),
+            "metrics": metrics,
+        })
+
+    # A mislabelled cell would silently invalidate every contrast above.
+    policy_check = {
+        level: sorted({
+            (str(row.get("memory_policy")), bool(row.get("latest_pin_enabled")))
+            for row in rows if str(row.get("memory_level")) == level
+        })
+        for level in MEMORY_LEVELS
+    }
+    return {
+        "mean_by_scenario_cell": cell_means,
+        "paired_seed_simple_effects": simple_effects,
+        "memory_by_predictor_interaction": interactions,
+        "realized_memory_policy_by_level": {
+            level: [list(item) for item in value]
+            for level, value in policy_check.items()
+        },
+        "memory_levels_are_internally_consistent": all(
+            len(value) == 1 for value in policy_check.values()
+        ),
+    }
+
+
+def run_memory_predictor_ablation(
+    evaluation_config: Optional[Any] = None,
+    cells: Sequence[Mapping[str, str]] = MEMORY_PREDICTOR_ABLATION_CELLS,
+) -> Dict[str, Any]:
+    """Run the paired 2x2 memory-policy by predictor longitudinal ablation."""
+    from .evaluation import EvalSettings
+
+    selected = tuple(dict(cell) for cell in cells)
+    baselines = tuple(str(cell["baseline"]) for cell in selected)
+    if len(set(baselines)) != len(baselines):
+        raise ValueError("memory ablation cells must name distinct baselines")
+    if baselines[0] != "full":
+        raise ValueError(
+            "memory ablation requires 'full' first; it sets the shared route"
+        )
+    observed = {
+        (str(cell["predictor"]), str(cell["memory"])) for cell in selected
+    }
+    expected = {
+        (predictor, memory)
+        for predictor in PREDICTOR_LEVELS for memory in MEMORY_LEVELS
+    }
+    if observed != expected:
+        raise ValueError(
+            "memory ablation requires every predictor x memory cell exactly "
+            f"once; missing={sorted(expected - observed)} "
+            f"unexpected={sorted(observed - expected)}"
+        )
+
+    config = evaluation_config or EvalSettings(
+        seeds=(1337,),
+        baselines=baselines,
+        include_oracle=False,
+        experiment="memory_predictor_ablation",
+    )
+    config = replace(
+        config,
+        baselines=baselines,
+        include_oracle=False,
+        shared_routing=True,
+        observe_missing_recipes=False,
+        allow_repeat_observation=False,
+        audit_period=0,
+        sensitivity=False,
+        experiment="memory_predictor_ablation",
+    )
+
+    jobs = [
+        (str(scenario), int(seed), config, selected)
+        for scenario in config.scenarios for seed in config.seeds
+    ]
+    workers = max(1, min(int(config.workers or 1), len(jobs)))
+    if workers == 1:
+        groups = [_memory_predictor_job(job) for job in jobs]
+    else:
+        context = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
+            groups = [future.result() for future in as_completed(
+                pool.submit(_memory_predictor_job, job) for job in jobs
+            )]
+    rows = [row for group in groups for row in group]
+    order = {name: index for index, name in enumerate(baselines)}
+    rows.sort(key=lambda row: (
+        str(row["scenario"]), int(row["seed"]), order[str(row["baseline"])],
+    ))
+    return {
+        "definition": (
+            "Paired 2x2 longitudinal ablation crossing the predictor (MaxEnt "
+            "against a linear behaviour cloner) with the retention policy "
+            "(Full's adaptive decay and latest pin against retaining every "
+            "variant at unit weight). All four cells follow Full's realized "
+            "interaction schedule on a shared plan."
+        ),
+        "design_type": "paired_memory_policy_by_predictor_factorial_ablation",
+        "rationale": (
+            "The publication 'bc' arm moves the predictor and the retention "
+            "policy at the same time, so its margin over Full cannot be "
+            "attributed to either. Holding the cloner fixed and giving it "
+            "Full's memory policy isolates the retention contribution, and "
+            "the interaction term reports whether that contribution depends "
+            "on the model family."
+        ),
+        "primary_contrast": "memory_effect_within_behavior_cloning",
+        "predictor_levels": list(PREDICTOR_LEVELS),
+        "memory_levels": list(MEMORY_LEVELS),
+        "cells": [dict(cell) for cell in selected],
+        "rows": rows,
+        "summary": summarize_memory_predictor_ablation(rows),
+    }
 
 
 def summarize_routing_ablation(
@@ -3078,9 +3453,12 @@ def run_routing_ablation(
 
 
 def _parse_args() -> argparse.Namespace:
+    from .evaluation import PAPER_SEEDS
+
+    paired_seed_csv = ",".join(str(seed) for seed in PAPER_SEEDS)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--suite", choices=("all", "matcher", "routing", "latent"),
+        "--suite", choices=("all", "matcher", "routing", "latent", "memory"),
         default="all",
     )
     parser.add_argument("--seed", type=int, default=MatcherSettings.seed)
@@ -3088,7 +3466,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--case-limit", type=int, default=MatcherSettings.case_limit)
     parser.add_argument("--no-prefixes", action="store_true")
     parser.add_argument("--no-calibration", action="store_true")
-    parser.add_argument("--routing-seeds", default="1337")
+    parser.add_argument("--routing-seeds", default=paired_seed_csv)
     parser.add_argument(
         "--routing-scenarios",
         default="homogeneous,heterogeneous,holdout",
@@ -3097,13 +3475,19 @@ def _parse_args() -> argparse.Namespace:
         "--routing-baselines", default=",".join(ROUTING_BASELINES),
     )
     parser.add_argument("--routing-recipes", type=int, default=20)
-    parser.add_argument("--latent-seeds", default="1337")
+    parser.add_argument("--memory-seeds", default=paired_seed_csv)
+    parser.add_argument(
+        "--memory-scenarios",
+        default="homogeneous,heterogeneous,holdout",
+    )
+    parser.add_argument("--memory-recipes", type=int, default=20)
+    parser.add_argument("--latent-seeds", default=paired_seed_csv)
     parser.add_argument(
         "--latent-scenarios",
         default="homogeneous,heterogeneous,holdout",
     )
     parser.add_argument("--latent-recipes", type=int, default=20)
-    parser.add_argument("--workers", type=int, default=3)
+    parser.add_argument("--workers", type=int, default=DEFAULT_ABLATION_WORKERS)
     parser.add_argument(
         "--output",
         help=(
@@ -3176,9 +3560,10 @@ def _run_ablation_process(
 def _validate_all_ablation_results(
     results: Mapping[str, Mapping[str, Any]],
     *,
-    seed: int,
+    seeds: Sequence[int],
     scenarios: Sequence[str],
 ) -> None:
+    expected_seeds = {int(value) for value in seeds}
     matcher = results.get("matcher", {})
     if not isinstance(matcher.get("summary_by_matcher"), dict):
         raise RuntimeError("matcher ablation output is incomplete")
@@ -3188,7 +3573,7 @@ def _validate_all_ablation_results(
         raise RuntimeError("routing ablation has no result rows")
     if {
         row.get("scenario") for row in routing_rows
-    } != set(scenarios) or {row.get("seed") for row in routing_rows} != {seed}:
+    } != set(scenarios) or {row.get("seed") for row in routing_rows} != expected_seeds:
         raise RuntimeError("routing ablation did not cover its scenario-seed grid")
     if any(
         not isinstance(row.get("trend"), list) or not row["trend"]
@@ -3204,26 +3589,64 @@ def _validate_all_ablation_results(
         raise RuntimeError("latent-strategy ablation did not execute all arms")
     if {
         row.get("scenario") for row in latent_rows
-    } != set(scenarios) or {row.get("seed") for row in latent_rows} != {seed}:
+    } != set(scenarios) or {row.get("seed") for row in latent_rows} != expected_seeds:
         raise RuntimeError(
             "latent-strategy ablation did not cover its scenario-seed grid"
+        )
+
+    memory = results.get("memory", {})
+    memory_rows = memory.get("rows")
+    if not isinstance(memory_rows, list) or not memory_rows:
+        raise RuntimeError("memory-policy ablation has no result rows")
+    expected_cells = {
+        str(cell["baseline"]) for cell in MEMORY_PREDICTOR_ABLATION_CELLS
+    }
+    if {row.get("baseline") for row in memory_rows} != expected_cells:
+        raise RuntimeError(
+            "memory-policy ablation did not execute every factorial cell"
+        )
+    if {
+        row.get("scenario") for row in memory_rows
+    } != set(scenarios) or {row.get("seed") for row in memory_rows} != expected_seeds:
+        raise RuntimeError(
+            "memory-policy ablation did not cover its scenario-seed grid"
+        )
+    # Every contrast in the summary assumes the two arms of a memory level
+    # really ran the same retention policy; a mislabelled cell would leave the
+    # deltas looking valid while measuring nothing.
+    if not (memory.get("summary") or {}).get(
+        "memory_levels_are_internally_consistent"
+    ):
+        raise RuntimeError(
+            "memory-policy ablation cells disagree with their declared "
+            "retention level"
         )
 
 
 def run_all_ablations(
     output_root: str | Path = DEFAULT_ABLATION_RESULTS_ROOT,
     *,
-    workers: int = 1,
+    workers: int = DEFAULT_ABLATION_WORKERS,
 ) -> Dict[str, Any]:
-    """Run and validate the fixed reviewer-facing ablation collection."""
-    from .evaluation import NATIVE_THREAD_ENV_VARS, SCENARIOS
+    """Run and validate the fixed reviewer-facing ablation collection.
 
+    Suites run one at a time, and each suite spreads its own scenario-seed
+    grid across ``workers`` processes. The alternative -- all four suites at
+    once, each internally near-sequential -- puts unrelated suites in
+    contention for the same performance cores, which is exactly what the
+    per-arm wall-clock metrics are supposed to be able to compare.
+    """
+    from .evaluation import NATIVE_THREAD_ENV_VARS, PAPER_SEEDS, SCENARIOS
+
+    seeds = tuple(int(seed) for seed in PAPER_SEEDS)
     longitudinal_workers = int(workers)
-    if not 1 <= longitudinal_workers <= len(SCENARIOS):
+    maximum_workers = len(SCENARIOS) * len(seeds)
+    if not 1 <= longitudinal_workers <= maximum_workers:
         raise ValueError(
-            f"workers must be between 1 and {len(SCENARIOS)}"
+            f"workers must be between 1 and {maximum_workers}"
         )
     seed = int(MatcherSettings.seed)
+    seed_csv = ",".join(str(value) for value in seeds)
     scenario_csv = ",".join(SCENARIOS)
     root = Path(output_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -3241,17 +3664,24 @@ def run_all_ablations(
         ],
         "routing": [
             sys.executable, "-X", "faulthandler", "-m", "src.ablations",
-            "--suite", "routing", "--routing-seeds", str(seed),
+            "--suite", "routing", "--routing-seeds", seed_csv,
             "--routing-scenarios", scenario_csv,
             "--workers", str(longitudinal_workers),
             "--output", str(run_dir / "routing.json"), "--quiet",
         ],
         "latent": [
             sys.executable, "-X", "faulthandler", "-m", "src.ablations",
-            "--suite", "latent", "--latent-seeds", str(seed),
+            "--suite", "latent", "--latent-seeds", seed_csv,
             "--latent-scenarios", scenario_csv,
             "--workers", str(longitudinal_workers),
             "--output", str(run_dir / "latent.json"), "--quiet",
+        ],
+        "memory": [
+            sys.executable, "-X", "faulthandler", "-m", "src.ablations",
+            "--suite", "memory", "--memory-seeds", seed_csv,
+            "--memory-scenarios", scenario_csv,
+            "--workers", str(longitudinal_workers),
+            "--output", str(run_dir / "memory.json"), "--quiet",
         ],
     }
     environment = os.environ.copy()
@@ -3265,9 +3695,11 @@ def run_all_ablations(
         "started_at_utc": datetime.now(timezone.utc).isoformat().replace(
             "+00:00", "Z"
         ),
-        "seed": seed,
+        "matcher_seed": seed,
+        "longitudinal_seeds": list(seeds),
         "longitudinal_scenarios": list(SCENARIOS),
-        "suite_parallelism": len(commands),
+        "suite_execution": "sequential",
+        "suite_parallelism": 1,
         "longitudinal_workers_per_suite": longitudinal_workers,
         "commands": commands,
         "jobs": {},
@@ -3275,27 +3707,18 @@ def run_all_ablations(
     _atomic_json(manifest_path, manifest)
 
     try:
-        with ThreadPoolExecutor(max_workers=len(commands)) as executor:
-            futures = {
-                executor.submit(
-                    _run_ablation_process,
-                    name,
-                    command,
-                    run_dir,
-                    environment,
-                ): name
-                for name, command in commands.items()
-            }
-            for future in as_completed(futures):
-                record = future.result()
-                manifest["jobs"][record["name"]] = record
-                _atomic_json(manifest_path, manifest)
-                print(
-                    f"[ablation] {record['name']} "
-                    f"return_code={record['return_code']} "
-                    f"wall_s={record['wall_s']:.1f}",
-                    flush=True,
-                )
+        for name, command in commands.items():
+            record = _run_ablation_process(
+                name, command, run_dir, environment,
+            )
+            manifest["jobs"][record["name"]] = record
+            _atomic_json(manifest_path, manifest)
+            print(
+                f"[ablation] {record['name']} "
+                f"return_code={record['return_code']} "
+                f"wall_s={record['wall_s']:.1f}",
+                flush=True,
+            )
 
         failed = sorted(
             name for name, record in manifest["jobs"].items()
@@ -3311,7 +3734,7 @@ def run_all_ablations(
             for name, record in manifest["jobs"].items()
         }
         _validate_all_ablation_results(
-            results, seed=seed, scenarios=SCENARIOS,
+            results, seeds=seeds, scenarios=SCENARIOS,
         )
     except BaseException as error:
         manifest["state"] = "failed"
@@ -3349,6 +3772,36 @@ def main() -> None:
         )
         if not args.quiet:
             print(json.dumps(result, indent=args.indent, sort_keys=True))
+        return
+    if args.suite == "memory":
+        from .evaluation import EvalSettings, ScheduleSettings
+
+        seeds = tuple(
+            int(value) for value in str(args.memory_seeds).split(",")
+            if value.strip()
+        )
+        scenarios = tuple(
+            value.strip() for value in str(args.memory_scenarios).split(",")
+            if value.strip()
+        )
+        baselines = tuple(
+            str(cell["baseline"]) for cell in MEMORY_PREDICTOR_ABLATION_CELLS
+        )
+        evaluation_config = EvalSettings(
+            seeds=seeds,
+            scenarios=scenarios,
+            baselines=baselines,
+            include_oracle=False,
+            show_eta=False,
+            recipe_count=int(args.memory_recipes),
+            schedule=ScheduleSettings(),
+            frozen_pairs=EvalSettings.frozen_pairs,
+            audit_period=0,
+            model_settings={},
+            experiment="memory_predictor_ablation",
+            workers=max(0, int(args.workers)),
+        )
+        _emit(run_memory_predictor_ablation(evaluation_config), args)
         return
     if args.suite == "latent":
         from .evaluation import EvalSettings, ScheduleSettings

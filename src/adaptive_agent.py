@@ -592,6 +592,34 @@ class AdaptiveAgent:
         with self._profile("state_from_prefix"):
             return self.domain.state_from_actions(prefix)
 
+    @contextlib.contextmanager
+    def _domain_scoped_to(self, recipe_id: Optional[str]):
+        """Point a multi-task domain at the recipe a recording was made under.
+
+        ``state_from_actions`` replays from ``domain.initial_state()``, which
+        on a multi-recipe domain is the recipe the domain currently holds --
+        the one most recently played, not the one the memory entry came from.
+        Replaying a recorded ordering under the wrong recipe raises on its
+        very first action, which silenced the pruning audit for every
+        multi-recipe ladder. Single-task domains have no ``begin_task`` and
+        are left untouched.
+        """
+        begin_task = getattr(self.domain, "begin_task", None)
+        restore_to = getattr(self.domain, "recipe_id", None)
+        if (
+            begin_task is None
+            or restore_to is None
+            or not recipe_id
+            or str(recipe_id) == str(restore_to)
+        ):
+            yield
+            return
+        begin_task(str(recipe_id))
+        try:
+            yield
+        finally:
+            begin_task(str(restore_to))
+
     def _known_action_universe(self) -> Tuple[str, ...]:
         """Union of grounded actions in active replay, without task routing."""
         actions = {self.domain.canonical_action(action) for entry in self.replay.active_items() for action in entry.ordering if action != "stop"}
@@ -952,22 +980,29 @@ class AdaptiveAgent:
         caller's decision, because a warm-start gap and a pruned-data gap mean
         opposite things.
         """
-        prefixes: List[Tuple[str, ...]] = []
-        seen: Set[Tuple[str, ...]] = set()
+        # Keyed by (recipe, prefix), not by prefix alone: the same token
+        # sequence -- the empty prefix above all -- denotes a different state
+        # under a different recipe, so deduplicating on the prefix would drop
+        # every recipe after the first.
+        prefixes: List[Tuple[str, Tuple[str, ...]]] = []
+        seen: Set[Tuple[str, Tuple[str, ...]]] = set()
         for entry in entries:
             sequence = tuple(entry.ordering)
+            recipe_id = str(getattr(entry, "recipe_id", "") or "")
             for length in (0, min(len(sequence), 1), len(sequence) // 2, max(0, len(sequence) - 1)):
-                prefix = sequence[:length]
-                if prefix not in seen:
-                    prefixes.append(prefix)
-                    seen.add(prefix)
+                key = (recipe_id, sequence[:length])
+                if key not in seen:
+                    prefixes.append(key)
+                    seen.add(key)
                 if len(prefixes) >= max(1, int(max_prefixes)): break
             if len(prefixes) >= max(1, int(max_prefixes)): break
         differences = []
-        for prefix in prefixes:
-            state = self._replay_prefix(prefix)
-            deployed = current(state, prefix)
-            refit = reference(state, prefix)
+        for recipe_id, prefix in prefixes:
+            # The predictors stay inside the scope: they read the domain too.
+            with self._domain_scoped_to(recipe_id):
+                state = self._replay_prefix(prefix)
+                deployed = current(state, prefix)
+                refit = reference(state, prefix)
             tokens = sorted(set(deployed) | set(refit))
             differences.append(sum(abs(float(deployed.get(token, 0.0)) - float(refit.get(token, 0.0))) for token in tokens))
         maximum = max(differences, default=0.0)
