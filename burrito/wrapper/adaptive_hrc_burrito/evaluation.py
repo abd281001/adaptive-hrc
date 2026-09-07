@@ -652,6 +652,7 @@ def _episode_record(
         "commit_applied": result.commit_applied,
         "active_rehearsal": result.active_rehearsal,
         "retrain_executed": result.retrain_executed,
+        "retrain_correctly_skipped": result.retrain_correctly_skipped,
         "retrain_event_count": len(result.retrain_events),
         "lead_actor_policy": result.lead_actor_policy,
         "semantic_fallback_decisions": sum(
@@ -906,6 +907,27 @@ def _run_cell(
     return episodes, failures, probes, audits, audit
 
 
+def _retrain_settled(row: Mapping[str, Any]) -> bool:
+    """Did the acquisition leave the deployed model fit on the committed set?
+
+    ``BurritoHrcRunner`` already accepts a retrain that ``TrainPolicy``
+    correctly skipped: when the shifted variant was still resident in active
+    replay from an earlier occurrence, the policy sees no membership or weight
+    change on this step and returns ``"replay_unchanged"``.  That is a
+    legitimate no-op rather than a missed update, and the runtime records it as
+    ``retrain_correctly_skipped``.
+
+    This validator runs behind that runtime, so it has to apply the same rule.
+    Testing ``retrain_executed`` alone rejected episodes the protocol had
+    already accepted, which is why a completed run with zero execution
+    failures still reported a validation failure.  Records written before the
+    flag existed carry no value and fall back to the strict test.
+    """
+    if bool(row.get("retrain_executed")):
+        return True
+    return bool(row.get("retrain_correctly_skipped", False))
+
+
 def _adaptation_records(episodes: Sequence[Mapping[str, Any]]) -> list[Dict[str, Any]]:
     grouped: Dict[Tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
     for row in episodes:
@@ -939,7 +961,7 @@ def _adaptation_records(episodes: Sequence[Mapping[str, Any]]) -> list[Dict[str,
             "update_verified": bool(
                 first["commit_applied"]
                 and first["active_rehearsal"]
-                and first["retrain_executed"]
+                and _retrain_settled(first)
             ),
             "acquisition_corrections": first["human_corrections"],
             # Corrections only ever occur on robot turns, so a preference whose
@@ -1671,7 +1693,7 @@ def validate_result(
     recurrences = [row for row in full if row["exposure_after_change"] >= 2]
     if "verified_shift_update" in requirements and (
         not acquisitions or not all(
-            row["commit_applied"] and row["active_rehearsal"] and row["retrain_executed"]
+            row["commit_applied"] and row["active_rehearsal"] and _retrain_settled(row)
             for row in acquisitions
         )
     ):

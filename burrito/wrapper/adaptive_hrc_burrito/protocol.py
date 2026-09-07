@@ -154,6 +154,7 @@ class CookingEpisodeResult:
     commit_applied: bool
     active_rehearsal: bool
     retrain_executed: bool
+    retrain_correctly_skipped: bool
     retrain_events: Tuple[Mapping[str, Any], ...]
     compatibility_dynamics: bool
     compatibility_calls: Tuple[str, ...]
@@ -557,6 +558,7 @@ class CookingHrcRunner:
             commit_applied=commit_applied,
             active_rehearsal=active_rehearsal,
             retrain_executed=retrain_executed,
+            retrain_correctly_skipped=retrain_correctly_skipped,
             retrain_events=new_retrain_events,
             compatibility_dynamics=bool(executor.compatibility_dynamics),
             compatibility_calls=tuple(getattr(executor, "compatibility_calls", ())),

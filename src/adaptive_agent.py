@@ -592,6 +592,24 @@ class AdaptiveAgent:
         with self._profile("state_from_prefix"):
             return self.domain.state_from_actions(prefix)
 
+    def _entry_domain_task(self, entry: Any) -> str:
+        """Name a replay entry's task the way the *domain* names it.
+
+        ``entry.recipe_id`` is the label this agent allocated when the recipe
+        was first observed (``R0``, ``R1``, ...). A multi-task domain has its
+        own task identifiers and need not recognize ours, so scoping by our
+        label raised on the domain's very first lookup and silenced the
+        pruning audit for every entry. A domain that can recover the task from
+        a state is asked to do so from the entry's own recorded transition;
+        otherwise the agent's label is all there is, which is correct for the
+        single-task and shared-namespace cases.
+        """
+        recover = getattr(self.domain, "recipe_of_state", None)
+        transitions = getattr(entry, "transitions", ())
+        if recover is not None and transitions:
+            return str(recover(transitions[0][0]))
+        return str(getattr(entry, "recipe_id", "") or "")
+
     @contextlib.contextmanager
     def _domain_scoped_to(self, recipe_id: Optional[str]):
         """Point a multi-task domain at the recipe a recording was made under.
@@ -988,7 +1006,7 @@ class AdaptiveAgent:
         seen: Set[Tuple[str, Tuple[str, ...]]] = set()
         for entry in entries:
             sequence = tuple(entry.ordering)
-            recipe_id = str(getattr(entry, "recipe_id", "") or "")
+            recipe_id = self._entry_domain_task(entry)
             for length in (0, min(len(sequence), 1), len(sequence) // 2, max(0, len(sequence) - 1)):
                 key = (recipe_id, sequence[:length])
                 if key not in seen:

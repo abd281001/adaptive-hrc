@@ -98,6 +98,18 @@ class CookingDomainAdapter:
             "simulator geometry belongs to the physical executor"
         )
 
+    def recipe_of_state(self, state: Any) -> str:
+        """Recover the catalog recipe a state belongs to.
+
+        The encoded state carries its recipe in slot zero, so a stored replay
+        transition identifies its own task.  ``AdaptiveAgent`` labels recipes
+        with the identifiers it allocates during observation (``R0``, ``R1``,
+        ...), which this catalog does not know; scoping the domain by that
+        label raised on every audit.  Reading the recipe back out of the state
+        keeps the learner's naming private to the learner.
+        """
+        return TaskState.decode(self.state_key(state)).recipe_id
+
     def state_from_completed(
         self, recipe_id: str, completed: Sequence[str],
     ) -> StateVector:
