@@ -191,8 +191,16 @@ def load_config(path: str | Path) -> Dict[str, Any]:
             "the full cooking evaluation must use the Adaptive-HRC baseline "
             f"roster in order: {ARM_NAMES}"
         )
-    if tuple(map(int, config["seeds"])) != (1337, 2024, 7, 9001, 31415):
-        raise ValueError("the full evaluation uses the five Adaptive-HRC paper seeds")
+    # Taken from Adaptive-HRC rather than restated, so the replication cannot
+    # silently fall behind the paired grid the symbolic evaluation runs. It
+    # already had: this stayed at five seeds after that grid grew to eight.
+    from src.evaluation import PAPER_SEEDS
+
+    if tuple(map(int, config["seeds"])) != tuple(int(s) for s in PAPER_SEEDS):
+        raise ValueError(
+            "the full evaluation uses the Adaptive-HRC paper seeds "
+            f"{tuple(int(s) for s in PAPER_SEEDS)}"
+        )
     if tuple(map(str, config["scenarios"])) != SCENARIOS:
         raise ValueError("the full evaluation must contain all three scenarios")
     if set(map(str, config["recipe_ids"])) != set(RECIPES):

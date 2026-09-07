@@ -32,6 +32,7 @@ from adaptive_hrc_burrito.evaluation import (
     load_config,
 )
 from adaptive_hrc_burrito.ladder import ladder_audit
+from src.evaluation import PAPER_SEEDS
 from adaptive_hrc_burrito.task_graph import is_preference_discriminating
 
 
@@ -185,7 +186,7 @@ class ConfigRegressions(unittest.TestCase):
 class HoldoutRegressions(unittest.TestCase):
     def test_holdout_labels_isomorphic_transfers(self):
         """A source and target with one DAG relabel the axis, never generalise."""
-        for seed in (1337, 2024, 7, 9001, 31415):
+        for seed in PAPER_SEEDS:
             tasks, audit = generate_ladder(
                 seed=seed, scenario="holdout", recipe_ids=tuple(RECIPES),
                 settings=LadderSettings(), return_audit=True,
@@ -336,7 +337,7 @@ class RealizedBehaviourRegressions(unittest.TestCase):
                 )
 
     def test_holdout_generalises_within_every_stratum(self):
-        for seed in (1337, 2024, 7, 9001, 31415):
+        for seed in PAPER_SEEDS:
             _tasks, audit = generate_ladder(
                 seed=seed, scenario="holdout", recipe_ids=tuple(RECIPES),
                 settings=LadderSettings(), return_audit=True,

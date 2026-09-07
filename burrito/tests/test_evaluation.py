@@ -17,6 +17,7 @@ from adaptive_hrc_burrito.evaluation import (
     _build_agent,
     load_config,
 )
+from src.evaluation import PAPER_SEEDS
 from src.models import Settings
 
 
@@ -30,7 +31,10 @@ class EvaluationTests(unittest.TestCase):
         config = load_config(BURRITO_ROOT / "configs" / "full.json")
         self.assertNotIn("require_clean_git", config)
         self.assertEqual(tuple(config["arms"]), ARM_NAMES)
-        self.assertEqual(config["seeds"], [1337, 2024, 7, 9001, 31415])
+        # Derived, not restated: the config is required to run the same
+        # paired grid as the symbolic evaluation, and restating it here is
+        # how the two fell out of step at five seeds against eight.
+        self.assertEqual(config["seeds"], [int(seed) for seed in PAPER_SEEDS])
         self.assertEqual(
             config["scenarios"], ["homogeneous", "heterogeneous", "holdout"],
         )
@@ -61,8 +65,8 @@ class EvaluationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "schema must be 4"):
                 load_config(path)
 
-    def test_five_seed_schedule_lengths_and_longitudinal_invariants(self):
-        for seed in (1337, 2024, 7, 9001, 31415):
+    def test_paper_seed_schedule_lengths_and_longitudinal_invariants(self):
+        for seed in PAPER_SEEDS:
             homogeneous = generate_ladder(seed=seed, scenario="homogeneous")
             heterogeneous = generate_ladder(seed=seed, scenario="heterogeneous")
             holdout = generate_ladder(seed=seed, scenario="holdout")
