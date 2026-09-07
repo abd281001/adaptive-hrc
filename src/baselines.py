@@ -44,7 +44,7 @@ class BehaviorCloner:
         self.action_ids: Dict[str, int] = {}
         self.action_labels: Dict[int, str] = {}
         self.history_action_ids: Dict[str, int] = {}
-        self.history_size: int = max(1, int(self.settings.bc_history))
+        self.history_size: int = max(0, int(self.settings.bc_history))
         self.last_fit_stats: Dict[str, object] = {}
 
     def reset(self) -> None:
@@ -53,17 +53,30 @@ class BehaviorCloner:
         self.action_ids = {}
         self.action_labels = {}
         self.history_action_ids = {}
-        self.history_size = max(1, int(self.settings.bc_history))
+        self.history_size = self._history_lags()
         self.last_fit_stats = {"model_family": "behavior_cloning", "estimated_flops": 0.0, "flop_accounting_scope": "behavior_cloning_fit_dense_numeric_only", "flop_cross_model_comparable": False}
 
+    def _history_lags(self) -> int:
+        """Action lags the cloner conditions on; zero is state-only.
+
+        This used to clamp to one, so a configuration asking for no history
+        still received a lag of it, and the step counter below was
+        unconditional. Both are now honoured, because "no within-episode
+        history" is the condition that separates this model family from a
+        state-indexed policy rather than a setting nobody sets.
+        """
+        return max(0, int(self.settings.bc_history))
+
     def _history_dim(self) -> int:
-        return max(1, int(self.settings.bc_history)) * len(self.history_action_ids) + 1
+        counter = 1 if bool(self.settings.bc_prefix_length_feature) else 0
+        return self._history_lags() * len(self.history_action_ids) + counter
 
     def _prefix_features(self, prefix: Sequence[str]) -> np.ndarray:
-        history = max(1, int(self.settings.bc_history))
+        history = self._history_lags()
         vocab_size = len(self.history_action_ids)
-        out = np.zeros(history * vocab_size + 1, dtype=np.float32)
-        out[-1] = float(len(prefix))
+        counter = 1 if bool(self.settings.bc_prefix_length_feature) else 0
+        out = np.zeros(history * vocab_size + counter, dtype=np.float32)
+        if counter: out[-1] = float(len(prefix))
         for lag in range(1, history + 1):
             if len(prefix) < lag: continue
             action = prefix[-lag]
@@ -104,14 +117,14 @@ class BehaviorCloner:
         weights = np.zeros((feature_dim, len(action_ids)), dtype=np.float32)
         bias = np.zeros(len(action_ids), dtype=np.float32)
         if previous_weights is None or previous_bias is None: return weights, bias
-        current_history_size = max(1, int(self.settings.bc_history))
+        current_history_size = self._history_lags()
         state_rows = min(previous_state_dim, self.state_dim, previous_weights.shape[0], weights.shape[0])
         previous_history_offset = max(0, previous_state_dim)
         history_offset = max(0, self.state_dim)
         previous_history_vocab_size = len(previous_history_ids)
         history_vocab_size = len(self.history_action_ids)
-        shared_history_size = min(max(1, int(previous_history_size)), current_history_size)
-        previous_length_row = previous_history_offset + max(1, int(previous_history_size)) * previous_history_vocab_size
+        shared_history_size = min(max(0, int(previous_history_size)), current_history_size)
+        previous_length_row = previous_history_offset + max(0, int(previous_history_size)) * previous_history_vocab_size
         length_row = history_offset + current_history_size * history_vocab_size
         for action, current_index in action_ids.items():
             previous_index = previous_action_ids.get(action)
@@ -127,7 +140,9 @@ class BehaviorCloner:
                     previous_row = previous_base + previous_action_index
                     current_row = current_base + current_action_index
                     if previous_row < previous_weights.shape[0] and current_row < weights.shape[0]: weights[current_row, current_index] = previous_weights[previous_row, previous_index]
-            if previous_length_row < previous_weights.shape[0] and length_row < weights.shape[0]: weights[length_row, current_index] = previous_weights[previous_length_row, previous_index]
+            # Absent when the step counter is disabled, so the row exists in
+            # neither layout and there is nothing to carry across.
+            if bool(self.settings.bc_prefix_length_feature) and previous_length_row < previous_weights.shape[0] and length_row < weights.shape[0]: weights[length_row, current_index] = previous_weights[previous_length_row, previous_index]
             bias[current_index] = previous_bias[previous_index]
         return weights, bias
 
@@ -186,7 +201,7 @@ class BehaviorCloner:
         self.bias = model_bias.astype(np.float32)
         self.action_ids = dict(action_ids)
         self.action_labels = dict(action_labels)
-        self.history_size = max(1, int(self.settings.bc_history))
+        self.history_size = self._history_lags()
         n_examples = int(feature_rows.shape[0])
         n_actions = int(len(action_ids))
         param_count = int(feature_dim * n_actions + n_actions)

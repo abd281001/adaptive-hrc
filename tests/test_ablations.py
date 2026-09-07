@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.ablations import (
+    REPRESENTATION_ABLATION_ARMS,
     COMMIT_FULL,
     COMMIT_PROMOTION,
     COMMIT_TENTATIVE,
@@ -44,6 +45,15 @@ ABLATION_SCENARIOS = ("homogeneous", "heterogeneous", "holdout")
 def _ablation_payload(name, seeds, scenarios=ABLATION_SCENARIOS):
     """A minimal suite output that satisfies the collection validator."""
     arms = {arm.name for arm in LATENT_STRATEGY_ABLATION_ARMS}
+    if name == "representation":
+        return {
+            "rows": [
+                {"scenario": scenario, "seed": seed, "arm": arm.name}
+                for scenario in scenarios for seed in seeds
+                for arm in REPRESENTATION_ABLATION_ARMS
+            ],
+            "summary": {"memory_policy_held_fixed": True},
+        }
     if name == "matcher":
         return {"summary_by_matcher": {"graph": {}}}
     if name == "routing":
@@ -113,12 +123,12 @@ class AllAblationRunnerTests(unittest.TestCase):
         self.assertEqual(result["state"], "complete")
         self.assertEqual(
             set(result["outputs"]),
-            {"matcher", "routing", "latent", "memory"},
+            {"matcher", "routing", "latent", "memory", "representation"},
         )
         self.assertEqual(manifest["state"], "complete")
         self.assertEqual(
             set(manifest["jobs"]),
-            {"matcher", "routing", "latent", "memory"},
+            {"matcher", "routing", "latent", "memory", "representation"},
         )
         self.assertEqual(manifest["longitudinal_scenarios"], list(scenarios))
         self.assertEqual(manifest["longitudinal_seeds"], list(seeds))

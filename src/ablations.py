@@ -256,6 +256,222 @@ def latent_strategy_ablation_design() -> Dict[str, Any]:
     }
 
 
+# --- predictor-representation ablation -------------------------------------
+# The memory policy is held at Full's adaptive decay with the latest pin in
+# every arm, so the only factor that moves is what the predictor is allowed to
+# see. Two families are varied on their own axis: the reward representation
+# the MaxEnt policy scores states with, and the within-episode history the
+# cloner conditions on. That separates "this model family is weaker" from
+# "this model family cannot see the thing that disambiguates the decision".
+REPRESENTATION_FAMILIES: Tuple[str, str] = ("maxent", "behavior_cloning")
+
+
+@dataclass(frozen=True)
+class RepresentationAblationArm:
+    """One predictor-representation condition under Full's memory policy.
+
+    ``within_episode_history`` states, in the arm itself, how much of the
+    current episode the predictor can condition on. A MaxEnt policy indexes
+    its value function by environment state, so it reads ``none`` whatever its
+    reward representation; the cloner reads whatever its prefix block encodes.
+    Preferences here are goal-preserving reorderings, so two variants of one
+    recipe pass through the same states and diverge on history alone -- which
+    makes this column, rather than the model family, the quantity the ablation
+    is about.
+    """
+
+    name: str
+    label: str
+    baseline: str
+    family: str
+    representation: str
+    within_episode_history: str
+    purpose: str
+    overrides: Mapping[str, Any] = field(default_factory=dict)
+
+    def model_overrides(self) -> Dict[str, Any]:
+        return dict(self.overrides)
+
+    def settings(self, base: Settings = DEFAULT_SETTINGS) -> Settings:
+        """Apply this arm without changing any other model setting."""
+        return replace(base, **self.model_overrides())
+
+
+REPRESENTATION_ABLATION_ARMS: Tuple[RepresentationAblationArm, ...] = (
+    RepresentationAblationArm(
+        name="maxent_engineered",
+        label="MaxEnt, engineered reward features",
+        baseline="full", family="maxent",
+        representation="engineered_reward_features",
+        within_episode_history="none",
+        purpose="Deployed reference condition.",
+        overrides={"irl_features": "engineered"},
+    ),
+    RepresentationAblationArm(
+        name="maxent_semantic",
+        label="MaxEnt, semantic reward features",
+        baseline="full", family="maxent",
+        representation="semantic_reward_features",
+        within_episode_history="none",
+        purpose=(
+            "Tests whether the reward representation, rather than the absence "
+            "of within-episode history, is what limits the MaxEnt head."
+        ),
+        overrides={"irl_features": "semantic"},
+    ),
+    RepresentationAblationArm(
+        name="maxent_raw_state",
+        label="MaxEnt, raw state features",
+        baseline="full", family="maxent",
+        representation="raw_state_features",
+        within_episode_history="none",
+        purpose=(
+            "Removes feature engineering entirely, bounding how much of the "
+            "MaxEnt gap the reward representation can account for."
+        ),
+        overrides={"irl_features": "raw_state"},
+    ),
+    RepresentationAblationArm(
+        name="cloner_history_3",
+        label="Cloner, three action lags and step count",
+        baseline="bc_adaptive", family="behavior_cloning",
+        representation="state_plus_action_history",
+        within_episode_history="three_action_lags_and_step_count",
+        purpose="Deployed cloner reference condition.",
+        overrides={"bc_history": 3, "bc_prefix_length_feature": True},
+    ),
+    RepresentationAblationArm(
+        name="cloner_history_1",
+        label="Cloner, one action lag and step count",
+        baseline="bc_adaptive", family="behavior_cloning",
+        representation="state_plus_action_history",
+        within_episode_history="one_action_lag_and_step_count",
+        purpose="Graded reduction of the cloner's history window.",
+        overrides={"bc_history": 1, "bc_prefix_length_feature": True},
+    ),
+    RepresentationAblationArm(
+        name="cloner_step_count_only",
+        label="Cloner, step count only",
+        baseline="bc_adaptive", family="behavior_cloning",
+        representation="state_plus_step_count",
+        within_episode_history="step_count_only",
+        purpose=(
+            "Keeps episode position but removes which actions produced it, "
+            "separating ordering evidence from bare progress."
+        ),
+        overrides={"bc_history": 0, "bc_prefix_length_feature": True},
+    ),
+    RepresentationAblationArm(
+        name="cloner_state_only",
+        label="Cloner, state only",
+        baseline="bc_adaptive", family="behavior_cloning",
+        representation="state_only",
+        within_episode_history="none",
+        purpose=(
+            "The primary contrast. Prefix features become prefix-invariant, "
+            "so this cloner sees exactly what the MaxEnt head sees. If its "
+            "advantage on unseen states and coexisting preferences "
+            "disappears here, that advantage was access to within-episode "
+            "history rather than the model family."
+        ),
+        overrides={"bc_history": 0, "bc_prefix_length_feature": False},
+    ),
+)
+
+REPRESENTATION_ABLATION_CONTRASTS: Tuple[Mapping[str, str], ...] = (
+    {
+        "name": "cloner_history_contribution",
+        "reference": "cloner_state_only",
+        "treatment": "cloner_history_3",
+        "interpretation": (
+            "Causal contribution of within-episode action history to the "
+            "cloner, with the memory policy, the stored demonstrations and "
+            "every other setting matched. The ablation's primary contrast."
+        ),
+    },
+    {
+        "name": "cloner_action_identity_contribution",
+        "reference": "cloner_step_count_only",
+        "treatment": "cloner_history_3",
+        "interpretation": (
+            "Separates knowing which actions were taken from knowing how far "
+            "the episode has progressed."
+        ),
+    },
+    {
+        "name": "maxent_reward_representation_sensitivity",
+        "reference": "maxent_engineered",
+        "treatment": "maxent_raw_state",
+        "interpretation": (
+            "Bounds how much of the MaxEnt gap the reward representation can "
+            "account for; all three MaxEnt arms stay history-free."
+        ),
+    },
+    {
+        "name": "history_free_family_contrast",
+        "reference": "maxent_engineered",
+        "treatment": "cloner_state_only",
+        "interpretation": (
+            "Model family compared at matched access to history. A small gap "
+            "here alongside a large history contribution locates the "
+            "difference in the representation rather than the learner. "
+            "Descriptive: the two families do not carry identical components."
+        ),
+    },
+)
+
+REPRESENTATION_ABLATION_METRICS: Tuple[Tuple[str, str], ...] = (
+    ("teacher_forced_top_1", "higher_is_better"),
+    ("teacher_forced_top_k", "higher_is_better"),
+    ("teacher_forced_mean_nll", "lower_is_better"),
+    ("live_top_1", "higher_is_better"),
+    ("normalized_human_action_load", "lower_is_better"),
+    ("corrections_per_recipe_step", "lower_is_better"),
+    ("unseen_state_fallback_top_1", "higher_is_better"),
+    ("branching_top_1", "higher_is_better"),
+    ("single_option_lookup_top_1", "higher_is_better"),
+    ("direct_retrieval_top_1", "higher_is_better"),
+    ("new_preference_top_1", "higher_is_better"),
+    ("preference_seen_elsewhere_top_1", "higher_is_better"),
+    ("coexistence_degradation", "lower_is_better"),
+)
+
+
+def representation_ablation_design() -> Dict[str, Any]:
+    """Return the auditable arm roster and contrasts used by the runner."""
+    return {
+        "families": list(REPRESENTATION_FAMILIES),
+        "memory_policy_held_fixed": "adaptive_decay_with_latest_pin",
+        "arms": [
+            {
+                "name": arm.name,
+                "label": arm.label,
+                "baseline": arm.baseline,
+                "family": arm.family,
+                "representation": arm.representation,
+                "within_episode_history": arm.within_episode_history,
+                "model_overrides": arm.model_overrides(),
+                "purpose": arm.purpose,
+            }
+            for arm in REPRESENTATION_ABLATION_ARMS
+        ],
+        "contrasts": [
+            dict(contrast) for contrast in REPRESENTATION_ABLATION_CONTRASTS
+        ],
+        "metrics": [
+            {"metric": metric, "direction": direction}
+            for metric, direction in REPRESENTATION_ABLATION_METRICS
+        ],
+        "component_parity_note": (
+            "Full's semantic value fallback and latent-strategy residual are "
+            "reached through the MaxEnt head, so they are present in the "
+            "MaxEnt arms and absent from the cloner arms. Every within-family "
+            "contrast above is component-matched; the cross-family contrast "
+            "is not, and is reported as descriptive."
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class MatcherSettings:
     """Configuration for the standalone matcher stress suite."""
@@ -3228,6 +3444,383 @@ def run_memory_predictor_ablation(
     }
 
 
+def _regime_top_1(summary: Mapping[str, Any], regime: str) -> Optional[float]:
+    """Top-1 within one decision regime, or None when the regime is empty."""
+    regimes = ((summary.get("diagnostics") or {}).get("decision_regimes") or {})
+    row = (regimes.get("by_regime") or {}).get(regime) or {}
+    return _as_optional_float(row.get("top_1"))
+
+
+def _regime_share(summary: Mapping[str, Any], regime: str) -> Optional[float]:
+    regimes = ((summary.get("diagnostics") or {}).get("decision_regimes") or {})
+    row = (regimes.get("by_regime") or {}).get(regime) or {}
+    return _as_optional_float(row.get("share"))
+
+
+def _transfer_cell_top_1(summary: Mapping[str, Any], cell: str) -> Optional[float]:
+    """Teacher-forced top-1 in one transfer cell of the assist stream."""
+    cells = ((summary.get("assist") or {}).get("by_transfer_cell") or {})
+    row = cells.get(cell) or {}
+    if not _as_optional_float(row.get("n_teacher_forced_predictions")):
+        return None
+    return _as_optional_float(row.get("teacher_forced_top_1"))
+
+
+def _coexistence_profile(
+    summary: Mapping[str, Any],
+) -> Tuple[Dict[str, Optional[float]], Optional[float]]:
+    """Accuracy against the number of preferences active for one recipe.
+
+    The degradation term is the single-preference cell minus the most crowded
+    populated cell. It is the quantity a state-indexed predictor should lose
+    on: coexisting variants of one recipe share states and separate only on
+    what has already happened this episode.
+    """
+    counts = ((summary.get("assist") or {}).get("by_active_preference_count") or {})
+    profile: Dict[str, Optional[float]] = {}
+    populated: List[Tuple[int, float]] = []
+    for key, row in counts.items():
+        value = _as_optional_float((row or {}).get("teacher_forced_top_1"))
+        profile[str(key)] = value
+        try:
+            index = int(str(key))
+        except (TypeError, ValueError):
+            continue
+        if value is not None:
+            populated.append((index, float(value)))
+    if len(populated) < 2:
+        return profile, None
+    populated.sort()
+    return profile, float(populated[0][1] - populated[-1][1])
+
+
+def _representation_row(
+    stream: Any,
+    arm: RepresentationAblationArm,
+    summary: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Flatten one representation arm and the endpoints it is judged on."""
+    assist = summary.get("assist") or {}
+    overall = assist.get("overall") or {}
+    system = summary.get("system") or {}
+    fit_stats = system.get("fit_stats") or {}
+    coexistence, degradation = _coexistence_profile(summary)
+    row: Dict[str, Any] = {
+        "scenario": str(stream.scenario),
+        "seed": int(stream.seed),
+        "arm": arm.name,
+        "label": arm.label,
+        "baseline": arm.baseline,
+        "family": arm.family,
+        "representation": arm.representation,
+        "within_episode_history": arm.within_episode_history,
+        "model_overrides": arm.model_overrides(),
+        # Retention state is held fixed by design, so it is recorded to prove
+        # the arms really shared a memory policy rather than being labelled
+        # alike -- the same check the 2x2 memory suite makes.
+        "memory_policy": system.get("memory_policy"),
+        "latest_pin_enabled": system.get("latest_pin_enabled"),
+        "active_variants": system.get("active_variants"),
+        "pruned_variants": system.get("pruned_variants"),
+        "predictor": system.get("predictor"),
+        "model_family": fit_stats.get("model_family"),
+        "irl_features": system.get("irl_features"),
+        "bc_history": arm.model_overrides().get("bc_history"),
+        "bc_prefix_length_feature": arm.model_overrides().get(
+            "bc_prefix_length_feature"
+        ),
+        "parameter_count": fit_stats.get("parameter_count"),
+        "history_feature_dim": fit_stats.get("history_feature_dim"),
+        "stream_wall_s": float(stream.wall_s),
+        "training_fit_wall_s": system.get("training_fit_wall_s"),
+        "single_option_lookup_share": _regime_share(
+            summary, "single_option_lookup"
+        ),
+        "branching_share": _regime_share(summary, "branching"),
+        "unseen_state_fallback_share": _regime_share(
+            summary, "unseen_state_fallback"
+        ),
+        "coexistence_profile": coexistence,
+        "trend": _trend(stream),
+        "detailed_metrics": dict(summary),
+    }
+    row.update({
+        metric: overall.get(metric)
+        for metric, _direction in REPRESENTATION_ABLATION_METRICS
+        if metric in overall
+    })
+    row.update({
+        "single_option_lookup_top_1": _regime_top_1(
+            summary, "single_option_lookup"
+        ),
+        "branching_top_1": _regime_top_1(summary, "branching"),
+        "unseen_state_fallback_top_1": _regime_top_1(
+            summary, "unseen_state_fallback"
+        ),
+        "direct_retrieval_top_1": _transfer_cell_top_1(
+            summary, "direct_retrieval"
+        ),
+        "new_preference_top_1": _transfer_cell_top_1(
+            summary, "seen_recipe_new_preference"
+        ),
+        "preference_seen_elsewhere_top_1": _transfer_cell_top_1(
+            summary, "seen_recipe_preference_seen_elsewhere"
+        ),
+        "coexistence_degradation": degradation,
+    })
+    return row
+
+
+def _representation_job(
+    job: Tuple[str, int, Any, Tuple[RepresentationAblationArm, ...]],
+) -> List[Dict[str, Any]]:
+    """Run every representation arm on one paired scenario/seed plan."""
+    scenario, seed, config, arms = job
+    from .evaluation import (
+        _apply_native_thread_limit,
+        _native_thread_count,
+        _pin_to_performance_cores,
+        build_plan,
+        run_stream,
+        summarize_stream,
+    )
+    from .memory import clear_caches
+
+    _pin_to_performance_cores()
+    _apply_native_thread_limit(_native_thread_count(config))
+    plan = build_plan(scenario, config, seed)
+    rows: List[Dict[str, Any]] = []
+    reference_schedule: Optional[Tuple[str, ...]] = None
+    shared_settings = dict(config.model_settings)
+    for arm in arms:
+        arm_config = replace(
+            config,
+            baselines=(arm.baseline,),
+            model_settings={**shared_settings, **arm.model_overrides()},
+        )
+        clear_caches()
+        stream = run_stream(
+            arm.baseline,
+            plan,
+            arm_config,
+            execution_mode_schedule=reference_schedule,
+            mode_schedule_policy=(
+                "representation_ablation_reference_route"
+                if reference_schedule is None
+                else "representation_ablation_matched_route"
+            ),
+        )
+        if reference_schedule is None:
+            reference_schedule = tuple(
+                str(row.get("mode")) for row in stream.episode_rows
+            )
+        rows.append(_representation_row(stream, arm, summarize_stream(stream)))
+    return rows
+
+
+def summarize_representation_ablation(
+    rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Aggregate per-arm means and paired within-family contrasts.
+
+    Contrasts carry the exact paired randomization p-value the evaluation
+    module already uses for holdout inference, so a component claim from this
+    suite is tested the same way as a scenario claim.
+    """
+    from .evaluation import _sign_flip_test
+
+    by_scenario_arm: Dict[Tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
+    by_key: Dict[Tuple[str, int, str], Mapping[str, Any]] = {}
+    for row in rows:
+        scenario = str(row["scenario"])
+        arm = str(row["arm"])
+        by_scenario_arm[(scenario, arm)].append(row)
+        by_key[(scenario, int(row["seed"]), arm)] = row
+
+    means: List[Dict[str, Any]] = []
+    for (scenario, arm), group in sorted(by_scenario_arm.items()):
+        entry: Dict[str, Any] = {
+            "scenario": scenario,
+            "arm": arm,
+            "label": str(group[0]["label"]),
+            "family": str(group[0]["family"]),
+            "representation": str(group[0]["representation"]),
+            "within_episode_history": str(group[0]["within_episode_history"]),
+            "memory_policy": group[0].get("memory_policy"),
+            "latest_pin_enabled": group[0].get("latest_pin_enabled"),
+            "n_seeds": len(group),
+        }
+        for metric, _direction in REPRESENTATION_ABLATION_METRICS:
+            entry[f"mean_{metric}"] = _finite_mean(
+                row.get(metric) for row in group
+            )
+        for metric in (
+            "active_variants", "pruned_variants", "parameter_count",
+            "history_feature_dim", "training_fit_wall_s",
+            "single_option_lookup_share", "branching_share",
+            "unseen_state_fallback_share",
+        ):
+            entry[f"mean_{metric}"] = _finite_mean(
+                row.get(metric) for row in group
+            )
+        means.append(entry)
+
+    scenarios = sorted({str(row["scenario"]) for row in rows})
+    contrasts: List[Dict[str, Any]] = []
+    for scenario in scenarios:
+        for spec in REPRESENTATION_ABLATION_CONTRASTS:
+            reference = str(spec["reference"])
+            treatment = str(spec["treatment"])
+            seeds = sorted({
+                int(row["seed"]) for row in rows
+                if str(row["scenario"]) == scenario
+            })
+            metrics: Dict[str, Any] = {}
+            for metric, direction in REPRESENTATION_ABLATION_METRICS:
+                deltas: List[float] = []
+                for seed in seeds:
+                    treated = by_key.get((scenario, seed, treatment))
+                    control = by_key.get((scenario, seed, reference))
+                    if treated is None or control is None:
+                        continue
+                    high = _as_optional_float(treated.get(metric))
+                    low = _as_optional_float(control.get(metric))
+                    if high is None or low is None:
+                        continue
+                    advantage = high - low
+                    deltas.append(
+                        advantage if direction == "higher_is_better"
+                        else -advantage
+                    )
+                if not deltas:
+                    continue
+                one_sided, two_sided = _sign_flip_test(deltas)
+                metrics[metric] = {
+                    "direction": direction,
+                    "mean_treatment_advantage": _finite_mean(deltas),
+                    "n_paired_seeds": len(deltas),
+                    "seeds_favouring_treatment": sum(
+                        1 for value in deltas if value > 0.0
+                    ),
+                    "sign_flip_p_one_sided": one_sided,
+                    "sign_flip_p_two_sided": two_sided,
+                }
+            contrasts.append({
+                "scenario": scenario,
+                "name": str(spec["name"]),
+                "reference": reference,
+                "treatment": treatment,
+                "interpretation": str(spec["interpretation"]),
+                "metrics": metrics,
+            })
+
+    held_fixed = sorted({
+        (str(row.get("memory_policy")), bool(row.get("latest_pin_enabled")))
+        for row in rows
+    })
+    return {
+        "mean_by_scenario_arm": means,
+        "paired_within_family_contrasts": contrasts,
+        "memory_policy_levels_observed": [
+            {"memory_policy": policy, "latest_pin_enabled": pinned}
+            for policy, pinned in held_fixed
+        ],
+        "memory_policy_held_fixed": len(held_fixed) == 1,
+    }
+
+
+def run_representation_ablation(
+    evaluation_config: Optional[Any] = None,
+    arms: Sequence[RepresentationAblationArm] = REPRESENTATION_ABLATION_ARMS,
+) -> Dict[str, Any]:
+    """Run the paired predictor-representation longitudinal ablation."""
+    from .evaluation import EvalSettings
+
+    selected = tuple(arms)
+    names = tuple(arm.name for arm in selected)
+    if len(set(names)) != len(names):
+        raise ValueError("representation ablation arms must be uniquely named")
+    families = {arm.family for arm in selected}
+    unknown = families - set(REPRESENTATION_FAMILIES)
+    if unknown:
+        raise ValueError(f"unknown representation families: {sorted(unknown)}")
+    for family in REPRESENTATION_FAMILIES:
+        if sum(1 for arm in selected if arm.family == family) < 2:
+            raise ValueError(
+                f"family {family!r} needs at least two arms for a "
+                "within-family contrast"
+            )
+    from .baselines import BASELINE_AGENTS
+
+    baselines = {arm.baseline for arm in selected}
+    unsupported = baselines - {"full", *BASELINE_AGENTS}
+    if unsupported:
+        raise ValueError(f"unknown ablation baselines: {sorted(unsupported)}")
+
+    config = evaluation_config or EvalSettings(
+        seeds=(1337,),
+        baselines=("full",),
+        include_oracle=False,
+        experiment="representation_ablation",
+    )
+    config = replace(
+        config,
+        include_oracle=False,
+        shared_routing=True,
+        observe_missing_recipes=False,
+        allow_repeat_observation=False,
+        audit_period=0,
+        sensitivity=False,
+        experiment="representation_ablation",
+    )
+
+    jobs = [
+        (str(scenario), int(seed), config, selected)
+        for scenario in config.scenarios for seed in config.seeds
+    ]
+    workers = max(1, min(int(config.workers or 1), len(jobs)))
+    if workers == 1:
+        groups = [_representation_job(job) for job in jobs]
+    else:
+        context = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
+            groups = [future.result() for future in as_completed(
+                pool.submit(_representation_job, job) for job in jobs
+            )]
+    rows = [row for group in groups for row in group]
+    rows.sort(key=lambda row: (
+        str(row["scenario"]), int(row["seed"]), names.index(str(row["arm"])),
+    ))
+    return {
+        "definition": (
+            "Paired longitudinal ablation of what the predictor is allowed to "
+            "see, with Full's adaptive-decay and latest-pin memory policy held "
+            "fixed in every arm. The MaxEnt arms vary the reward "
+            "representation; the cloner arms vary the within-episode action "
+            "history, down to a state-only condition that sees exactly what "
+            "the MaxEnt head sees."
+        ),
+        "design_type": "paired_predictor_representation_component_ablation",
+        "design": representation_ablation_design(),
+        "rationale": (
+            "Preferences in this domain are goal-preserving reorderings, so "
+            "coexisting variants of one recipe traverse the same environment "
+            "states and separate only on what has already happened in the "
+            "episode. A state-indexed policy cannot represent that "
+            "distinction and a history-conditioned one can, which predicts "
+            "the cloner's advantage on unseen states, on branching decisions "
+            "and under coexisting preferences. Removing the cloner's history "
+            "while holding storage and memory policy fixed tests that "
+            "explanation directly, and sweeping the MaxEnt reward "
+            "representation bounds the competing explanation."
+        ),
+        "primary_contrast": "cloner_history_contribution",
+        "primary_endpoint": "unseen_state_fallback_top_1",
+        "rows": rows,
+        "summary": summarize_representation_ablation(rows),
+    }
+
+
 def summarize_routing_ablation(
     rows: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
@@ -3458,7 +4051,8 @@ def _parse_args() -> argparse.Namespace:
     paired_seed_csv = ",".join(str(seed) for seed in PAPER_SEEDS)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--suite", choices=("all", "matcher", "routing", "latent", "memory"),
+        "--suite",
+        choices=("all", "matcher", "routing", "latent", "memory", "representation"),
         default="all",
     )
     parser.add_argument("--seed", type=int, default=MatcherSettings.seed)
@@ -3487,6 +4081,12 @@ def _parse_args() -> argparse.Namespace:
         default="homogeneous,heterogeneous,holdout",
     )
     parser.add_argument("--latent-recipes", type=int, default=20)
+    parser.add_argument("--representation-seeds", default=paired_seed_csv)
+    parser.add_argument(
+        "--representation-scenarios",
+        default="homogeneous,heterogeneous,holdout",
+    )
+    parser.add_argument("--representation-recipes", type=int, default=20)
     parser.add_argument("--workers", type=int, default=DEFAULT_ABLATION_WORKERS)
     parser.add_argument(
         "--output",
@@ -3622,6 +4222,35 @@ def _validate_all_ablation_results(
             "retention level"
         )
 
+    representation = results.get("representation", {})
+    representation_rows = representation.get("rows")
+    if not isinstance(representation_rows, list) or not representation_rows:
+        raise RuntimeError("representation ablation has no result rows")
+    expected_representation_arms = {
+        arm.name for arm in REPRESENTATION_ABLATION_ARMS
+    }
+    if {
+        row.get("arm") for row in representation_rows
+    } != expected_representation_arms:
+        raise RuntimeError("representation ablation did not execute all arms")
+    if {
+        row.get("scenario") for row in representation_rows
+    } != set(scenarios) or {
+        row.get("seed") for row in representation_rows
+    } != expected_seeds:
+        raise RuntimeError(
+            "representation ablation did not cover its scenario-seed grid"
+        )
+    # The suite only isolates the representation if every arm really shared
+    # Full's retention policy. A drifting memory level would leave the
+    # contrasts looking valid while measuring two factors at once.
+    if not (representation.get("summary") or {}).get(
+        "memory_policy_held_fixed"
+    ):
+        raise RuntimeError(
+            "representation ablation arms did not share one retention policy"
+        )
+
 
 def run_all_ablations(
     output_root: str | Path = DEFAULT_ABLATION_RESULTS_ROOT,
@@ -3682,6 +4311,14 @@ def run_all_ablations(
             "--memory-scenarios", scenario_csv,
             "--workers", str(longitudinal_workers),
             "--output", str(run_dir / "memory.json"), "--quiet",
+        ],
+        "representation": [
+            sys.executable, "-X", "faulthandler", "-m", "src.ablations",
+            "--suite", "representation",
+            "--representation-seeds", seed_csv,
+            "--representation-scenarios", scenario_csv,
+            "--workers", str(longitudinal_workers),
+            "--output", str(run_dir / "representation.json"), "--quiet",
         ],
     }
     environment = os.environ.copy()
@@ -3833,6 +4470,36 @@ def main() -> None:
             workers=max(0, int(args.workers)),
         )
         _emit(run_latent_strategy_ablation(evaluation_config), args)
+        return
+    if args.suite == "representation":
+        from .evaluation import EvalSettings, ScheduleSettings
+
+        seeds = tuple(
+            int(value) for value in str(args.representation_seeds).split(",")
+            if value.strip()
+        )
+        scenarios = tuple(
+            value.strip()
+            for value in str(args.representation_scenarios).split(",")
+            if value.strip()
+        )
+        # Every arm names its own baseline, so the roster here only has to be
+        # non-empty and valid; `_representation_job` overrides it per arm.
+        evaluation_config = EvalSettings(
+            seeds=seeds,
+            scenarios=scenarios,
+            baselines=("full",),
+            include_oracle=False,
+            show_eta=False,
+            recipe_count=int(args.representation_recipes),
+            schedule=ScheduleSettings(),
+            frozen_pairs=EvalSettings.frozen_pairs,
+            audit_period=0,
+            model_settings={},
+            experiment="representation_ablation",
+            workers=max(0, int(args.workers)),
+        )
+        _emit(run_representation_ablation(evaluation_config), args)
         return
     if args.suite == "routing":
         from .evaluation import EvalSettings, ScheduleSettings

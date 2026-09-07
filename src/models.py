@@ -128,6 +128,11 @@ class Settings:
     bc_learning_rate: float = 0.1
     bc_l2: float = 1e-4
     bc_history: int = 3
+    # Within-episode history the cloner may condition on: `bc_history` action
+    # lags plus, when enabled, a step counter. Zero lags with the counter off
+    # leaves the cloner state-only, which is what the MaxEnt head sees -- the
+    # comparison that separates the model family from its access to history.
+    bc_prefix_length_feature: bool = True
     bc_cold_epochs: int = 120
     bc_warm_epochs: int = 60
     bc_batch: int = 64
@@ -195,6 +200,7 @@ class Settings:
         if self.llm_context_encoding not in {"auto", "state_delta", "action_only"}: raise ValueError("llm_context_encoding must be 'auto', 'state_delta', or 'action_only'")
         for name in ("irl_cold_steps", "irl_warm_steps"):
             if int(getattr(self, name)) < 1:                                        raise ValueError(f"{name} must be positive")
+        if int(self.bc_history) < 0:                                                raise ValueError("bc_history cannot be negative")
         if int(self.semantic_knn) < 1:                                              raise ValueError("semantic_knn must be positive")
         if int(self.latent_strategy_rank) < 1:                                      raise ValueError("latent_strategy_rank must be positive")
         if int(self.latent_strategy_knn) < 1:                                       raise ValueError("latent_strategy_knn must be positive")
