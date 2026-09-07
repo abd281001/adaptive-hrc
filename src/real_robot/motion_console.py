@@ -42,6 +42,10 @@ class MotionFault(RuntimeError):
     """Stop the session; do not retry or recover automatically."""
 
 
+class PreflightFault(MotionFault, ValueError):
+    """Refuse a command before dispatch without shutting down the SDK."""
+
+
 def finite(value):
     result = float(value)
     if not math.isfinite(result):
@@ -170,6 +174,24 @@ class MotionConsole:
             if self.clock() >= deadline:
                 raise MotionFault("Feedback did not advance before command")
 
+    def preflight(self):
+        """Health-check before dispatch; tolerate only a brief transient PIMU timestamp gap."""
+        deadline = self.clock() + 0.75
+        while True:
+            try:
+                self.ready()
+                return
+            except MotionFault as exc:
+                # This fault has occurred transiently on the real Stretch PIMU.
+                # No actuator command has been dispatched yet, so briefly retry
+                # only this exact condition. Every other health fault refuses
+                # immediately.
+                if str(exc) != "pimu: no valid feedback timestamp" or self.clock() >= deadline:
+                    raise PreflightFault(
+                        f"Pre-command health check failed: {exc}"
+                    ) from exc
+                self.sleep(0.05)
+
     def status(self):
         p = self.pose()
         heading = math.degrees(angle_delta(p["theta_rad"], self.start["theta_rad"]))
@@ -229,6 +251,286 @@ class MotionConsole:
         raise MotionFault(f"{key}: target {target:.4f} not reached and settled; "
                           f"measured {self.pose()[key]:.4f}. Inspect before retrying")
 
+    def goto_calibrated(self, label):
+        """Restore known same-size-box geometry using bounded console moves."""
+        valid = {
+            "box_view",
+            "box_scan",
+            "box_pregrasp",
+            "box_carry",
+            "box_return",
+        }
+        if label not in valid:
+            raise ValueError(
+                "Use: goto box_view | box_scan | box_pregrasp | "
+                "box_carry | box_return"
+            )
+
+        ARM_RETRACTED = 0.003
+        ARM_PREGRASP = 0.223
+        LIFT_VIEW = 0.878
+        LIFT_PREGRASP = 0.758
+        LIFT_CLEAR = 0.858
+        PITCH_BOX_DEG = -16.61
+
+        def move_linear(command, key, target):
+            while True:
+                current = self.pose()[key]
+                error_cm = 100.0 * (target - current)
+                if abs(error_cm) <= 0.1:
+                    return
+                step = max(-2.0, min(2.0, error_cm))
+                self.execute(f"{command} {step:.3f}")
+
+        def move_pitch(target_deg):
+            while True:
+                current_deg = math.degrees(self.pose()["wrist_pitch_rad"])
+                error_deg = target_deg - current_deg
+                if abs(error_deg) <= 1.0:
+                    return
+                step = max(-5.0, min(5.0, error_deg))
+                self.execute(f"pitch {step:.3f}")
+
+        def require_box_pitch():
+            current_deg = math.degrees(self.pose()["wrist_pitch_rad"])
+            if abs(current_deg - PITCH_BOX_DEG) > 2.0:
+                raise ValueError(
+                    f"Expected box wrist pitch near {PITCH_BOX_DEG:.2f} deg; "
+                    f"measured {current_deg:.2f} deg"
+                )
+
+        if label in {"box_view", "box_scan", "box_pregrasp"}:
+            # Always establish the known high/retracted geometry first.
+            move_linear("arm", "arm_m", ARM_RETRACTED)
+            move_linear("lift", "lift_m", LIFT_VIEW)
+            move_pitch(PITCH_BOX_DEG)
+
+            if label == "box_view":
+                print("Reached calibrated box_view geometry.")
+                return
+
+            move_linear("arm", "arm_m", ARM_PREGRASP)
+
+            if label == "box_scan":
+                print("Reached calibrated box_scan geometry.")
+                return
+
+            move_linear("lift", "lift_m", LIFT_PREGRASP)
+            print("Reached calibrated box_pregrasp geometry.")
+            return
+
+        if label == "box_carry":
+            # Do not change wrist orientation while a box may be held.
+            require_box_pitch()
+            move_linear("lift", "lift_m", LIFT_CLEAR)
+            move_linear("arm", "arm_m", ARM_RETRACTED)
+            move_linear("lift", "lift_m", LIFT_VIEW)
+            print("Reached calibrated box_carry geometry.")
+            return
+
+        if label == "box_return":
+            # Assumes the base is still aimed at the same source slot.
+            require_box_pitch()
+            move_linear("lift", "lift_m", LIFT_VIEW)
+            move_linear("arm", "arm_m", ARM_PREGRASP)
+            move_linear("lift", "lift_m", LIFT_PREGRASP)
+
+            # Release at the previously calibrated source pose.
+            self.move_box_gripper(132.0)
+
+            move_linear("lift", "lift_m", LIFT_VIEW)
+            move_linear("arm", "arm_m", ARM_RETRACTED)
+            print("Returned box and restored box_view geometry.")
+            return
+
+
+    def move_box_gripper(self, target):
+        """Move gripper to a calibrated box aperture in bounded <=5-unit steps."""
+        target = float(target)
+
+        for _ in range(30):
+            current = self.pose()["gripper_units"]
+            error = target - current
+
+            if abs(error) <= 1.5:
+                print(
+                    f"Reached box gripper target {target:.1f}; "
+                    f"measured {current:.1f} units."
+                )
+                return
+
+            step = max(-5.0, min(5.0, error))
+            self.execute(f"grip {step:.3f}")
+
+        raise MotionFault(
+            f"Gripper did not converge to calibrated target {target:.1f}"
+        )
+
+    def cycle_box(self, box):
+        """Pick a same-size box from its fixed Station-1 slot and return it."""
+        headings = {
+            "b1": -12.0,
+            "b5": -24.0,
+            "b3": -36.0,
+        }
+        box = box.lower()
+        if box not in headings:
+            raise ValueError("Use: cycle b1 | cycle b5 | cycle b3")
+
+        heading = headings[box]
+
+        # Establish turn-safe high/retracted geometry.
+        self.goto_calibrated("box_view")
+        self.move_box_gripper(132.0)
+
+        print(f"Rotating to {box.upper()} at heading {heading:+.1f} deg.")
+        self.execute(f"heading {heading}")
+
+        # Same-size boxes share the calibrated radial grasp geometry.
+        self.goto_calibrated("box_pregrasp")
+
+        answer = input(
+            f"Inspect {box.upper()} alignment. "
+            "Press ENTER to grasp, or type NO to abort: "
+        ).strip().lower()
+        if answer:
+            print("Cycle aborted before grasp.")
+            return
+
+        self.move_box_gripper(103.0)
+
+        answer = input(
+            f"Confirm {box.upper()} is securely held. "
+            "Press ENTER to lift, or type NO to abort: "
+        ).strip().lower()
+        if answer:
+            print("Cycle stopped with robot at grasp pose; support/reconcile box manually.")
+            return
+
+        self.goto_calibrated("box_carry")
+
+        answer = input(
+            f"{box.upper()} lifted. Press ENTER to return it to its source mark, "
+            "or type NO to stop here: "
+        ).strip().lower()
+        if answer:
+            print("Cycle stopped in carry pose; support/reconcile box manually.")
+            return
+
+        self.goto_calibrated("box_return")
+        print(f"{box.upper()} pickup-and-return cycle complete.")
+
+
+    def mark_stations(self):
+        """Use B1 to establish and mark S2, S3, and S4."""
+
+        headings = {
+            "S1_B1": -12.0,
+            "S2": 12.0,
+            "S3": 24.0,
+            "S4": 36.0,
+        }
+
+        LIFT_VIEW = 0.878
+        ARM_RETRACTED = 0.003
+
+        def confirm(message):
+            answer = input(
+                message + " Press ENTER to continue, or type NO to abort: "
+            ).strip().lower()
+            if answer:
+                raise ValueError("Station-marking sequence aborted by operator")
+
+        def move_linear(command, key, target):
+            while True:
+                current = self.pose()[key]
+                error_cm = 100.0 * (target - current)
+
+                if abs(error_cm) <= 0.1:
+                    return
+
+                step = max(-2.0, min(2.0, error_cm))
+                self.execute(f"{command} {step:.3f}")
+
+        def pickup(label, heading):
+            # Always begin turn-safe.
+            self.goto_calibrated("box_view")
+            self.move_box_gripper(132.0)
+
+            self.execute(f"heading {heading}")
+
+            self.goto_calibrated("box_pregrasp")
+
+            confirm(
+                f"Inspect B1 alignment at {label}; fingers should straddle "
+                "the box without touching the table."
+            )
+
+            self.move_box_gripper(103.0)
+
+            confirm(f"Confirm B1 is securely gripped at {label}.")
+
+            self.goto_calibrated("box_carry")
+
+            print(f"B1 picked from {label} and is in carry pose.")
+
+        def place(station, heading):
+            # Carry pose is high/retracted before this base turn.
+            self.execute(f"heading {heading}")
+
+            confirm(
+                f"Check the table area for {station}. It must be flat, clear, "
+                "supported, and free of obstacles."
+            )
+
+            self.goto_calibrated("box_pregrasp")
+
+            # This pose becomes the repeatable placement/pickup location.
+            self.execute(f"note {station}_place")
+
+            # Release B1 without going to the huge full-open aperture.
+            self.move_box_gripper(132.0)
+
+            # IMPORTANT: raise away from the released box before retracting.
+            move_linear("lift", "lift_m", LIFT_VIEW)
+            move_linear("arm", "arm_m", ARM_RETRACTED)
+
+            self.execute(f"note {station}_view")
+
+            print(f"B1 placed at {station}.")
+            confirm(
+                f"MARK B1's footprint on the table now as {station}. "
+                "Do not move B1 after marking."
+            )
+
+        print("")
+        print("=== STATION MARKING WITH B1 ===")
+        print("S1/B1=-12 deg, S2=+12, S3=+24, S4=+36")
+        print("B1 will finish at S4.")
+        print("")
+
+        confirm(
+            "Verify the robot base is on the taped HOME position, "
+            "B1 is on its marked S1 spot, and S2/S3/S4 table areas are clear."
+        )
+
+        pickup("S1/B1", headings["S1_B1"])
+
+        place("S2", headings["S2"])
+        pickup("S2", headings["S2"])
+
+        place("S3", headings["S3"])
+        pickup("S3", headings["S3"])
+
+        place("S4", headings["S4"])
+
+        print("")
+        print("=== STATION MARKING COMPLETE ===")
+        print("S2 = +12 deg")
+        print("S3 = +24 deg")
+        print("S4 = +36 deg")
+        print("B1 remains at S4.")
+
     def execute(self, raw):
         parts = raw.split()
         if not parts:
@@ -238,17 +540,32 @@ class MotionConsole:
             print(HELP)
             return
         if name == "status" and len(parts) == 1:
-            self.ready()
+            self.preflight()
             self.status()
             return
         if name == "note" and len(parts) > 1:
-            self.ready()
+            self.preflight()
             self.record("note", label=" ".join(parts[1:]), pose=self.status())
             return
         if self.read_only:
             raise ValueError("This connection is read-only")
+        if name == "goto" and len(parts) == 2:
+            self.goto_calibrated(parts[1].lower())
+            return
+        if name == "markstations" and len(parts) == 1:
+            self.mark_stations()
+            return
+        if name == "cycle" and len(parts) == 2:
+            self.cycle_box(parts[1])
+            return
+        if name == "boxopen" and len(parts) == 1:
+            self.move_box_gripper(132.0)
+            return
+        if name == "boxgrip" and len(parts) == 1:
+            self.move_box_gripper(103.0)
+            return
         if name == "clearance" and len(parts) == 1:
-            self.ready()
+            self.preflight()
             p = self.pose()
             if p["arm_m"] > 0.02:
                 raise ValueError("Retract arm to <=0.020 m before recording clearance")
@@ -262,7 +579,7 @@ class MotionConsole:
                 or name not in ("heading", "lift", "arm", "grip", "open", "close", "pitch")):
             raise ValueError("Use help for commands")
         value = finite(parts[1]) if len(parts) == 2 else None
-        self.ready()
+        self.preflight()
         p = self.pose()
         if name == "heading":
             if abs(value) > 48:
@@ -302,7 +619,7 @@ class MotionConsole:
             low, high = [measured(x) for x in joint.soft_motion_limits["current"]]
             if not low <= target <= high:
                 raise ValueError("Pitch target exceeds the SDK's current joint limits")
-            tolerance, timeout = math.radians(0.5), 8
+            tolerance, timeout = math.radians(2.0), 8
             command = lambda: joint.move_to(target, v_des=0.08, a_des=0.16)
         else:
             maximum = self.limits()["gripper_open_units"]
