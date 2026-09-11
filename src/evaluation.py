@@ -4074,11 +4074,18 @@ def run_stream(
     plan: Plan,
     config: EvalSettings,
     *,
+    agent_name: Optional[str] = None,
     execution_mode_schedule: Optional[Sequence[str]] = None,
     mode_schedule_policy: str = "baseline_local",
     event_progress: Optional[Callable[[RunState, int], None]] = None,
     resume_dir: Optional[Path] = None,
 ) -> RunState:
+    """Run one arm over one plan.
+
+    ``baseline`` labels every row and names the result folder; ``agent_name``
+    says which agent to build. They differ only for an ablation arm, which is
+    a settings variant of an existing agent under its own name.
+    """
     if execution_mode_schedule is not None:
         if len(execution_mode_schedule) != len(plan.events):
             raise ValueError(
@@ -4093,7 +4100,7 @@ def run_stream(
     # Independent Settings instances keep the two deterministic RNG streams
     # identical without allowing one fit to advance the other's generator.
     agent = build_agent(
-        "full" if is_clairvoyant else baseline,
+        "full" if is_clairvoyant else (agent_name or baseline),
         replace(settings) if is_clairvoyant else settings,
     )
     full_reference_agent: Optional[AdaptiveAgent] = None
@@ -6277,6 +6284,7 @@ def execute_baseline_stream(
     plan: Plan,
     config: EvalSettings,
     *,
+    agent_name: Optional[str] = None,
     route: Optional[Sequence[str]] = None,
     event_progress: Optional[Callable[["RunState", int], None]] = None,
     resume_dir: Optional[Path] = None,
@@ -6294,6 +6302,7 @@ def execute_baseline_stream(
             baseline,
             plan,
             config,
+            agent_name=agent_name,
             mode_schedule_policy="full_realized_canonical",
             event_progress=event_progress,
             resume_dir=resume_dir,
@@ -6303,6 +6312,7 @@ def execute_baseline_stream(
             baseline,
             plan,
             config,
+            agent_name=agent_name,
             execution_mode_schedule=(
                 tuple(str(mode) for mode in route) if route is not None else None
             ),
@@ -6469,6 +6479,7 @@ def run_baseline_cell(
     config: EvalSettings,
     out_dir: Path,
     *,
+    agent_name: Optional[str] = None,
     route: Optional[Sequence[str]] = None,
     progress_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
@@ -6486,6 +6497,7 @@ def run_baseline_cell(
         baseline,
         plan,
         config,
+        agent_name=agent_name,
         route=route,
         event_progress=_EventProgressWriter(plan, out_dir, progress_callback),
         resume_dir=out_dir if config.event_resume else None,
@@ -6777,14 +6789,57 @@ def _resolved_model_config(config: EvalSettings) -> Dict[str, Any]:
     return payload
 
 
-def _config_hash(config: EvalSettings) -> str:
-    payload = _config_payload(config)
-    for key in ("output", "run", "resume", "workers", "show_eta", "experiment"):
-        payload.pop(key, None)
-    payload["resolved_model_config"] = _resolved_model_config(config)
-    payload["action_representation"] = ACTION_REPRESENTATION
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+# Settings that select work or diagnostics rather than defining the
+# experiment: which arms to run, whether to include the oracle, how often to
+# audit, where to write, how many processes. Two runs differing only in these
+# describe the same grid, so an ablation that adds arms resumes the same
+# directory and reuses every finished cell.
+_WORK_SELECTING_SETTINGS = (
+    "output", "run", "resume", "workers", "show_eta", "experiment",
+    "baselines", "include_oracle", "audit_period",
+)
+
+
+def _identity_digest(
+    config_payload: Mapping[str, Any],
+    resolved_model_config: Mapping[str, Any],
+    action_representation: Any,
+) -> str:
+    """Digest of everything that determines what a cell computes.
+
+    Taken over the stored fields rather than over an ``EvalSettings``, so a
+    run recorded before this function changed still resolves: its identity is
+    recomputed from its manifest instead of trusting the digest it saved.
+    """
+    payload = {
+        key: value for key, value in dict(config_payload).items()
+        if key not in _WORK_SELECTING_SETTINGS
+    }
+    payload["resolved_model_config"] = dict(resolved_model_config)
+    payload["action_representation"] = action_representation
+    encoded = json.dumps(
+        _jsonable(payload), sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _config_hash(config: EvalSettings) -> str:
+    return _identity_digest(
+        _config_payload(config),
+        _resolved_model_config(config),
+        ACTION_REPRESENTATION,
+    )
+
+
+def manifest_identity(manifest: Mapping[str, Any]) -> Optional[str]:
+    """The identity of a recorded run, recomputed from its manifest."""
+    config = manifest.get("config")
+    resolved = manifest.get("resolved_model_config")
+    if not isinstance(config, Mapping) or not isinstance(resolved, Mapping):
+        return None
+    return _identity_digest(
+        config, resolved, manifest.get("action_representation"),
+    )
 
 
 def _safe_component(value: str, label: str) -> str:
@@ -7077,6 +7132,7 @@ def _open_worker_fault_log(out_dir: Path) -> Optional[Any]:
 
 def _run_baseline_cell_job(
     baseline: str, scenario: str, seed: int, config: EvalSettings, run_dir: str,
+    agent_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Process entry point for one arm/scenario/seed cell."""
     _pin_to_performance_cores()
@@ -7146,6 +7202,7 @@ def _run_baseline_cell_job(
             plan,
             config,
             out_dir,
+            agent_name=agent_name,
             route=route,
             progress_callback=report_progress,
         )
@@ -7187,6 +7244,7 @@ def _pending_cell_results(
     config: EvalSettings,
     run_dir: Path,
     workers: int,
+    agent_name: Optional[str] = None,
 ) -> Iterable[Mapping[str, Any]]:
     """Run one arm's outstanding cells in process-cap-bounded cohorts.
 
@@ -7201,6 +7259,7 @@ def _pending_cell_results(
         for scenario, seed in cells:
             yield _run_baseline_cell_job(
                 str(baseline), str(scenario), int(seed), config, str(run_dir),
+                agent_name,
             )
         return
     for batch in _scenario_job_batches(cells, config):
@@ -7211,6 +7270,7 @@ def _pending_cell_results(
                 executor.submit(
                     _run_baseline_cell_job,
                     str(baseline), str(scenario), int(seed), config, str(run_dir),
+                    agent_name,
                 )
                 for scenario, seed in batch
             ]
@@ -7817,7 +7877,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(json.dumps(_jsonable({
         "run_dir": summary["run_dir"],
         "latest_dir": summary["latest_dir"],
-        "scenarios": sorted(summary.get("scenarios", {})),
+        "state": summary.get("state"),
+        "completed_cells": summary.get("completed_jobs"),
+        "expected_cells": summary.get("expected_jobs"),
+        "baselines": list(summary.get("execution", {}).get("baseline_order", ())),
     }), indent=2, sort_keys=True))
 
 

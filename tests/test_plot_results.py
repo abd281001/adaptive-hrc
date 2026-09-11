@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from plot_results import load_ablation, pareto_frontier, pareto_points
+from plot_results import load_arms, pareto_frontier, pareto_points
 
 
 def points(totals, counts):
@@ -52,45 +52,54 @@ def test_flop_frontier_uses_flops_instead_of_time():
 
 
 @pytest.fixture
-def ablation(tmp_path):
-    methods = {"full": None, "full_no_support": None}
-    rows, reference = [], {"systems": [], "pareto_accuracy": []}
-    for seed in (7, 42):
-        for arm in methods:
-            key = dict(scenario="homogeneous", seed=seed, baseline=arm)
-            system = dict(training_total_retrain_wall_s=8, training_retrain_count=4,
-                          training_estimated_fit_flops=80)
-            rows.append(dict(scenario="homogeneous", seed=seed, arm=arm, live_top_1=0.99,
-                             detailed_metrics={"system": system,
-                                               "assist": {"overall": {"live_top_1": 0.8, "teacher_forced_top_1": 0.99}}}))
-            if arm == "full":
-                reference["systems"].append(dict(system, **key, training_total_retrain_wall_s=12))
-                reference["pareto_accuracy"].append(dict(key, value=0.8))
-    path = tmp_path / "components.json"
-    path.write_text(json.dumps({"rows": rows}))
-    (tmp_path / "manifest.json").write_text(json.dumps({"state": "complete", "jobs": {"components": {"return_code": 0}}}))
-    return path, methods, reference
+def run(tmp_path):
+    """A run directory holding both a roster arm and an ablation arm."""
+    arms = ("full", "full_no_pin")
+    jobs = [dict(scenario="homogeneous", seed=seed) for seed in (7, 42)]
+    (tmp_path / "manifest.json").write_text(json.dumps({"expected_jobs": jobs}))
+    for job in jobs:
+        for arm in arms:
+            folder = (tmp_path / "baselines" / arm / "scenarios" / job["scenario"]
+                      / "seeds" / f"{job['seed']:010d}")
+            folder.mkdir(parents=True)
+            (folder / "summary.json").write_text(json.dumps({
+                "state": "complete",
+                "per_baseline": {arm: {
+                    "system": {"training_total_retrain_wall_s": 8,
+                               "training_retrain_count": 4,
+                               "training_estimated_fit_flops": 80},
+                    "assist": {"overall": {"live_top_1": 0.8}},
+                }},
+            }))
+    return tmp_path, arms
 
 
-def test_ablation_uses_own_timing_and_live_robot_accuracy(ablation):
-    data = load_ablation(*ablation)
-    for p in pareto_points(data["pareto_accuracy"], data["systems"]):
-        assert p["mean_retrain_time_s"] == 2  # Not the standard run's 3 s/retrain.
-        assert p["mean_fit_flops"] == 20
-        assert p["accuracy"] == 0.8
-        assert p["n_seeds"] == 2
+def test_arms_are_read_from_their_own_cells(run):
+    path, arms = run
+    data = load_arms(path, arms)
+    for point in pareto_points(data["pareto_accuracy"], data["systems"]):
+        assert point["mean_retrain_time_s"] == 2
+        assert point["mean_fit_flops"] == 20
+        assert point["accuracy"] == 0.8
+        assert point["n_seeds"] == 2
+    assert {row["baseline"] for row in data["systems"]} == set(arms)
 
 
-@pytest.mark.parametrize("damage", ["missing", "duplicate", "different_full"])
-def test_ablation_rejects_unmatched_data(ablation, damage):
-    path, methods, reference = ablation
-    data = json.loads(path.read_text())
-    if damage == "missing":
-        data["rows"].pop()
-    elif damage == "duplicate":
-        data["rows"].append(data["rows"][0])
-    else:
-        data["rows"][0]["detailed_metrics"]["system"]["training_retrain_count"] = 5
-    path.write_text(json.dumps(data))
-    with pytest.raises(ValueError, match="cohort|differ"):
-        load_ablation(path, methods, reference)
+def test_full_is_the_same_cell_for_baselines_and_ablation_arms(run):
+    """There is nothing to reconcile: one run, one Full."""
+    path, arms = run
+    baselines = load_arms(path, ("full",))
+    components = load_arms(path, arms)
+    mine = [r for r in components["systems"] if r["baseline"] == "full"]
+    assert mine == baselines["systems"]
+
+
+def test_an_incomplete_cell_is_rejected(run):
+    path, arms = run
+    cell = (path / "baselines" / "full_no_pin" / "scenarios" / "homogeneous"
+            / "seeds" / "0000000007" / "summary.json")
+    payload = json.loads(cell.read_text())
+    payload["state"] = "running"
+    cell.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="not complete"):
+        load_arms(path, arms)

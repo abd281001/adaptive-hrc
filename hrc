@@ -19,8 +19,9 @@ Commands:
   test-cooking Run the pinned-Burrito test suite in burrito/.venv
   run         Run the full normal evaluation
   cooking     Run and validate the full Overcooked/Burrito evaluation
-  ablation    Run all ablations; pass --suite matcher|routing|latent|memory|
-              representation|components|retention for one
+  ablation    Run ablations into the standard run; pass --groups all or a
+              comma list of matcher|components|retention|latent|memory|
+              representation|routing (default: all)
   robot-ui    Run the real-robot operator UI (dry-run unless --hardware-url is set)
   robot-bridge Run the local Stretch hardware bridge (motion off unless --enable-motion)
   robot-doctor Check robot config/runtime/bridge without commanding motion

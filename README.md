@@ -47,8 +47,8 @@ Running all cells performs these three stages in order:
 2. the validated Overcooked/Burrito evaluation, executed through its isolated
    Python 3.10 runtime and written under `eval_results/cooking/`; and
 3. the matcher, routing, latent-strategy, memory, representation, component,
-   and retention ablations, written as one new
-   directory under `eval_results/ablation_runs/`.
+   and retention ablations, contributed as extra arms to the
+   standard run directory.
 
 The three scenarios are stored inside one standard run directory; they are not
 three separate top-level runs. By default, every notebook execution creates new
@@ -65,16 +65,14 @@ Intel part, detected from `/sys/devices/cpu_core/cpus`; a no-op on a uniform
 part), so cross-baseline wall-clock comparisons are not confounded by a
 worker landing on a slower efficiency core. With five seeds, all three
 scenarios instead run in parallel using 15 workers. Set `HRC_WORKERS` before
-starting Jupyter to request a lower cap. The seven ablation suites run one at a
-time rather than concurrently, and each suite spreads its own scenario-seed
-grid across 8 worker processes by default; `HRC_ABLATION_WORKERS` may raise
-that to at most one worker per scenario-seed job. Running the suites in turn
-keeps unrelated suites out of contention for the same performance cores, which
-the per-arm wall-clock metrics depend on. The three longitudinal suites
-(routing, latent, memory, representation, components, retention) use the same
-eight paired seeds as the standard
-evaluation; the matcher suite generates one stress dataset from a single
-generation seed and has no paired-seed grid. The cooking config uses all
+starting Jupyter to request a lower cap. Ablation arms run one at a time,
+each spreading its own scenario-seed grid across 8 worker processes by default; `HRC_ABLATION_WORKERS` may raise
+that to at most one worker per scenario-seed job. Running the arms in turn
+keeps unrelated arms out of contention for the same performance cores, which
+the per-arm wall-clock metrics depend on. Every longitudinal group uses the
+same eight paired seeds as the standard evaluation; the matcher group
+generates one stress dataset from a single generation seed and has no
+paired-seed grid. The cooking config uses all
 available CPUs by
 default; `HRC_COOKING_WORKERS` caps that count. Set
 `HRC_COOKING_RESUME` to an interrupted cooking run directory to reuse its
@@ -87,13 +85,13 @@ The launcher routes each workflow to its owning environment:
 ./hrc run
 ./hrc cooking
 ./hrc ablation
-./hrc ablation --suite matcher
+./hrc ablation --groups matcher
 ```
 
 `./hrc run` runs only the standard three-scenario, five-seed evaluation;
-`./hrc cooking` runs the sole full cooking config; and `./hrc ablation` runs all
-seven ablation suites. Passing `--suite matcher`, `routing`, `latent`, `memory`,
-`representation`, `components`, or `retention` selects one ablation. Additional
+`./hrc cooking` runs the sole full cooking config; and `./hrc ablation` runs
+every ablation group. `--groups` takes a comma list of `matcher`, `components`,
+`retention`, `latent`, `memory`, `representation` or `routing`. Additional
 evaluator arguments can be appended to the runners.
 
 The Overcooked/Burrito replication uses a separate pinned Python 3.10
@@ -202,30 +200,44 @@ recorded configuration and experiment label.
 
 ## Ablations
 
-The application runner launches seven independent diagnostic suites, one at a
-time:
+An ablation is an arm plus a contrast. There is no separate ablation runner
+and no separate ablation output: arms are run by the evaluation's own per-cell
+runner into the same run directory, so `baselines/<arm>/` holds the component
+arms beside the deployable roster. An arm named by several groups -- or shared
+with the roster -- is therefore computed once and read by every contrast that
+names it. `src/ablations.py` declares three tables and nothing else executes
+that is not in them:
 
-- matcher stress tests for recipe/preference identification;
-- observation-routing comparisons under matched and local recovery schedules;
-- a four-arm comparison of MaxEnt-only and latent timing strategies;
-- a memory-policy by predictor factorial;
-- a predictor-representation comparison across MaxEnt reward features and
-  cloner history depth;
-- a component suite that removes one piece of Full's predictor support at a
-  time; and
-- a retention suite that moves one memory mechanism at a time.
+- `ARMS`: 24 diagnostic conditions, each an agent plus settings overrides plus
+  a route. The deployable roster is referenced by name, never redeclared; a
+  roster cell that is missing is an error telling you to finish `./hrc run`
+  rather than a silent re-run.
+- `CONTRASTS`: every planned comparison, with one primary per group. Deltas are
+  signed so positive always favours the treatment; comparisons whose arms do
+  not carry identical components are marked `descriptive` and are not evidence
+  for their name.
+- `INVARIANTS`: what each group's contrasts depend on -- which component an arm
+  moved, which arms must agree on a memory policy -- read back from the
+  recorded state of the run rather than from the declared configuration.
 
-Each suite writes its JSON results, command, timing, logs, and completion state
-under a unique run directory. Every longitudinal suite uses the eight paired
-seeds across all three scenarios by default; the matcher suite generates one
-stress dataset from a single generation seed.
+Import-time validation rejects a table that cannot mean what it says: a
+duplicate arm name, two arms that are the same condition, a contrast naming an
+arm that does not exist, a metric declaring two directions, or a group with no
+primary contrast.
 
-The longitudinal suites are scheduled arm-major, like the standard evaluation:
-an arm completes the whole scenario/seed grid before the next starts, and its
-rows are written to `<suite>/arms/<arm>.json` beside the combined
-`<suite>.json`. The first arm is the reference and publishes the route the
-rest replay, so the remaining arms are independently inspectable and
-re-runnable.
+Collapsing the six longitudinal suites this way removed 480 of 1,344 stream
+runs per full grid (36%). The duplicates were `full` (declared by four suites
+and the roster), the joint component removal (identical to the deployable
+`unpinned`), the MaxEnt-only latent arm (identical to the no-latent-residual
+component arm), the full-history cloner (identical to the 2x2's BC cell), and
+the routing suite's reference and shared arms, which reproduced the standard
+run exactly. Routing now declares only the three local arms that can differ:
+a method that never retires a variant cannot route differently, so its local
+run was provably its shared run.
+
+The matcher stress suite is the one group that runs no deployment stream. It
+generates synthetic identification cases and scores several matchers offline,
+and it is kept in its own section of the file.
 
 ### Attribution suites
 
@@ -233,17 +245,16 @@ The deployable baseline roster is a system-level comparison: every memory
 baseline is built through `_without_proposed_components`, so it drops the
 latest pin, the semantic fallback and the latent residual together and a
 Full-versus-baseline margin cannot be assigned to any single mechanism. The
-component and retention suites exist to make those assignments, and both hold
+component and retention groups exist to make those assignments, and both hold
 everything except one declared factor at Full's configuration.
 
-`--suite components` removes one predictor-support component at a time
+The `components` group removes one predictor-support component at a time
 (`full_no_pin`, `full_no_semantic_fallback`, `full_no_latent_residual`) and
-then all three together (`full_no_support`). The joint arm is settings-identical
-to the deployable `unpinned` baseline while keeping Full's adaptive retention,
-so comparing the joint drop against the sum of the single drops reports whether
-the components are additive.
+then all three together. The joint removal is settings-identical to the
+deployable `unpinned` baseline, so that roster arm *is* the joint condition
+and is read rather than re-run under a second name.
 
-`--suite retention` moves one memory mechanism at a time under Full's predictor
+The `retention` group moves one memory mechanism at a time under Full's predictor
 support. `constant_grace` is the control the roster's `fixed` arm is often
 mistaken for: `ReplayMemory.step` gates its grace check on the adaptive policy,
 so `fixed` has no grace period at all *and* uses a different post-grace

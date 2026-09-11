@@ -1,635 +1,335 @@
-"""Reviewer-facing contracts for matcher and self-training audits."""
+"""Contracts for the matcher stress suite and the longitudinal arm grid."""
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
-import re
 import tempfile
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 from src.ablations import (
-    COMPONENT_ABLATION_ARMS,
-    _arm_cell_job,
-    _arm_suite_specs,
-    run_arm_major_suite,
-    REPRESENTATION_ABLATION_ARMS,
-    RETENTION_ABLATION_ARMS,
+    ARMS,
+    CONTRASTS,
+    CORE_METRICS,
+    GROUP_METRICS,
+    INVARIANTS,
+    LOCAL,
+    PUBLISH,
+    REPLAY,
+    Arm,
     COMMIT_FULL,
     COMMIT_PROMOTION,
     COMMIT_TENTATIVE,
     MatcherSettings,
     GraphMatcher,
-    LATENT_STRATEGY_ABLATION_ARMS,
-    MEMORY_PREDICTOR_ABLATION_CELLS,
-    MEMORY_PREDICTOR_ABLATION_METRICS,
-    LOCAL_ROUTE,
-    SHARED_ROUTE,
+    arm_config,
+    arms_by_name,
     build_partial_order_graph,
-    parse_commit_records,
+    check_invariants,
+    declared_arms,
     default_matchers,
     generate_match_cases,
+    group_arms,
+    group_contrasts,
+    group_metrics,
+    groups,
     multiset_jaccard,
+    paired_deltas,
+    parse_commit_records,
     partial_order_similarity,
+    roster_arms,
     run_matcher_ablation,
-    run_all_ablations,
-    run_routing_ablation,
-    latent_strategy_ablation_design,
     summarize_commit_decisions,
-    summarize_latent_strategy_ablation,
-    summarize_memory_predictor_ablation,
-    summarize_routing_ablation,
+    summarize_group,
     teaching_metrics,
-    _trend,
+    _holm,
+    _validate_tables,
 )
 
 
 ABLATION_SCENARIOS = ("homogeneous", "heterogeneous", "holdout")
 
 
-def _ablation_payload(name, seeds, scenarios=ABLATION_SCENARIOS):
-    """A minimal suite output that satisfies the collection validator."""
-    arms = {arm.name for arm in LATENT_STRATEGY_ABLATION_ARMS}
-    if name == "representation":
-        return {
-            "rows": [
-                {"scenario": scenario, "seed": seed, "arm": arm.name}
-                for scenario in scenarios for seed in seeds
-                for arm in REPRESENTATION_ABLATION_ARMS
-            ],
-            "summary": {"memory_policy_held_fixed": True},
-        }
-    if name == "matcher":
-        return {"summary_by_matcher": {"graph": {}}}
-    if name == "routing":
-        return {
-            "rows": [
-                {"scenario": scenario, "seed": seed, "trend": [{}]}
-                for scenario in scenarios for seed in seeds
-            ]
-        }
-    if name == "memory":
-        return {
-            "rows": [
-                {
-                    "scenario": scenario, "seed": seed,
-                    "arm": str(cell["arm"]),
-                    "baseline": str(cell["baseline"]),
-                    "memory_level": str(cell["memory"]),
-                    "memory_policy": (
-                        "adaptive"
-                        if cell["memory"] == "adaptive_pinned" else "none"
-                    ),
-                    "latest_pin_enabled": (
-                        cell["memory"] == "adaptive_pinned"
-                    ),
-                }
-                for scenario in scenarios for seed in seeds
-                for cell in MEMORY_PREDICTOR_ABLATION_CELLS
-            ],
-            "summary": {
-                "memory_levels_are_internally_consistent": True,
-                "maxent_cells_share_predictor_support": True,
-            },
-        }
-    if name == "components":
-        return {
-            "rows": [
-                {"scenario": scenario, "seed": seed, "arm": arm.name}
-                for scenario in scenarios for seed in seeds
-                for arm in COMPONENT_ABLATION_ARMS
-            ],
-            "summary": {
-                "declared_factors_were_applied": True,
-                "retention_held_constant": True,
-            },
-        }
-    if name == "retention":
-        return {
-            "rows": [
-                {"scenario": scenario, "seed": seed, "arm": arm.name}
-                for scenario in scenarios for seed in seeds
-                for arm in RETENTION_ABLATION_ARMS
-            ],
-            "summary": {"predictor_support_held_constant": True},
-        }
-    return {
-        "rows": [
-            {"scenario": scenario, "seed": seed, "arm": arm}
-            for scenario in scenarios for seed in seeds for arm in arms
-        ]
-    }
+class ArmTableTests(unittest.TestCase):
+    """The tables are the design; they must not be able to lie about it."""
 
+    def test_tables_validate_at_import(self):
+        _validate_tables()
 
-class AllAblationRunnerTests(unittest.TestCase):
-    def test_collection_runner_owns_outputs_manifest_and_validation(self):
-        from src.evaluation import PAPER_SEEDS
+    def test_no_declared_arm_duplicates_the_deployable_roster(self):
+        from src.evaluation import DEFAULT_BASELINES, MEMORY_ORACLE
 
-        scenarios = ABLATION_SCENARIOS
-        seeds = tuple(int(seed) for seed in PAPER_SEEDS)
+        roster = set(DEFAULT_BASELINES) | {MEMORY_ORACLE}
+        self.assertEqual(set(arms_by_name()) & roster, set())
 
-        def complete(name, command, run_dir, _environment):
-            payload = _ablation_payload(name, seeds, scenarios)
-            output = Path(run_dir) / f"{name}.json"
-            output.write_text(json.dumps(payload), encoding="utf-8")
-            return {
-                "name": name,
-                "command": list(command),
-                "started_at_utc": "2026-01-01T00:00:00Z",
-                "completed_at_utc": "2026-01-01T00:00:01Z",
-                "return_code": 0,
-                "wall_s": 1.0,
-                "output": str(output),
-                "stdout": str(Path(run_dir) / f"{name}.stdout.log"),
-                "stderr": str(Path(run_dir) / f"{name}.stderr.log"),
-            }
+    def test_no_two_arms_are_the_same_condition(self):
+        conditions = {}
+        for arm in ARMS:
+            key = (arm.agent, arm.route, tuple(sorted(arm.overrides.items())))
+            self.assertNotIn(key, conditions, f"{arm.name} repeats {conditions.get(key)}")
+            conditions[key] = arm.name
 
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "src.ablations._run_ablation_process", side_effect=complete,
-        ):
-            result = run_all_ablations(directory, workers=1)
-            manifest = json.loads(Path(result["manifest"]).read_text())
+    def test_an_arm_shared_by_two_groups_is_declared_once(self):
+        """The cross-group duplicates the old suites each recomputed."""
+        shared = {arm.name: arm.groups for arm in ARMS if len(arm.groups) > 1}
+        self.assertEqual(shared["full_no_latent_residual"], ("components", "latent"))
+        self.assertEqual(shared["bc_adaptive"], ("memory", "representation"))
 
-        self.assertEqual(result["state"], "complete")
-        expected_suites = {
-            "matcher", "routing", "latent", "memory", "representation",
-            "components", "retention",
-        }
-        self.assertEqual(set(result["outputs"]), expected_suites)
-        self.assertEqual(manifest["state"], "complete")
-        self.assertEqual(set(manifest["jobs"]), expected_suites)
-        self.assertEqual(manifest["longitudinal_scenarios"], list(scenarios))
-        self.assertEqual(manifest["longitudinal_seeds"], list(seeds))
+    def test_every_group_declares_exactly_one_primary_contrast(self):
+        for group in groups():
+            primary = [c.name for c in group_contrasts(group) if c.primary]
+            self.assertEqual(len(primary), 1, f"{group}: {primary}")
 
-    def test_suites_run_one_at_a_time_over_the_full_paired_seed_grid(self):
-        """Each suite gets the machine to itself for its own seed grid.
+    def test_contrasts_only_name_arms_that_exist(self):
+        from src.evaluation import DEFAULT_BASELINES, MEMORY_ORACLE
 
-        Running all four suites at once would put unrelated suites in
-        contention for the same performance cores, and the per-arm wall-clock
-        numbers these suites report are meant to be comparable.
-        """
-        from src.evaluation import PAPER_SEEDS
+        known = set(arms_by_name()) | set(DEFAULT_BASELINES) | {MEMORY_ORACLE}
+        for contrast in CONTRASTS:
+            self.assertIn(contrast.treatment, known, contrast.name)
+            self.assertIn(contrast.reference, known, contrast.name)
 
-        seeds = tuple(int(seed) for seed in PAPER_SEEDS)
-        seed_csv = ",".join(str(seed) for seed in seeds)
-        order: list = []
-        live: list = []
-        overlaps: list = []
-
-        def record(name, command, run_dir, _environment):
-            live.append(name)
-            if len(live) > 1:
-                overlaps.append(tuple(live))
-            order.append((name, list(command)))
-            payload = _ablation_payload(name, seeds)
-            output = Path(run_dir) / f"{name}.json"
-            output.write_text(json.dumps(payload), encoding="utf-8")
-            live.remove(name)
-            return {
-                "name": name, "command": list(command),
-                "started_at_utc": "2026-01-01T00:00:00Z",
-                "completed_at_utc": "2026-01-01T00:00:01Z",
-                "return_code": 0, "wall_s": 1.0,
-                "output": str(output),
-                "stdout": str(Path(run_dir) / f"{name}.stdout.log"),
-                "stderr": str(Path(run_dir) / f"{name}.stderr.log"),
-            }
-
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "src.ablations._run_ablation_process", side_effect=record,
-        ):
-            result = run_all_ablations(directory, workers=8)
-            manifest = json.loads(Path(result["manifest"]).read_text())
-
-        self.assertEqual(overlaps, [], "suites overlapped instead of running in turn")
-        self.assertEqual(manifest["suite_execution"], "sequential")
-        self.assertEqual(manifest["suite_parallelism"], 1)
-        self.assertEqual(manifest["longitudinal_workers_per_suite"], 8)
-
-        commands = dict(order)
-        for suite, flag in (
-            ("routing", "--routing-seeds"),
-            ("latent", "--latent-seeds"),
-            ("memory", "--memory-seeds"),
-            ("components", "--components-seeds"),
-            ("retention", "--retention-seeds"),
-        ):
-            command = commands[suite]
-            self.assertEqual(command[command.index(flag) + 1], seed_csv)
-            self.assertEqual(command[command.index("--workers") + 1], "8")
-        # The matcher suite generates one stress dataset rather than a paired
-        # seed grid, so it keeps its single generation seed.
-        self.assertNotIn("--routing-seeds", commands["matcher"])
-        self.assertIn("--seed", commands["matcher"])
-
-    def test_worker_count_may_span_the_whole_scenario_seed_grid(self):
-        from src.evaluation import PAPER_SEEDS, SCENARIOS
-
-        maximum = len(SCENARIOS) * len(PAPER_SEEDS)
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, f"between 1 and {maximum}"):
-                run_all_ablations(directory, workers=maximum + 1)
-
-
-class MemoryPredictorFactorialAblationTests(unittest.TestCase):
-    def test_cells_cross_both_factors_exactly_once(self):
-        cells = MEMORY_PREDICTOR_ABLATION_CELLS
-        self.assertEqual(len(cells), 4)
-        self.assertEqual(
-            {(cell["predictor"], cell["memory"]) for cell in cells},
-            {
-                ("maxent", "adaptive_pinned"),
-                ("maxent", "retain_all"),
-                ("behavior_cloning", "adaptive_pinned"),
-                ("behavior_cloning", "retain_all"),
-            },
-        )
-        # 'full' must lead: it defines the shared interaction route the other
-        # three cells replay, so the comparison stays paired.
-        self.assertEqual(cells[0]["arm"], "full")
-        # Two cells share the 'full' baseline and differ only in their
-        # settings overrides, so the arm name is the cell identity.
-        self.assertEqual(
-            {cell["arm"] for cell in cells},
-            {"full", "bc_adaptive", "maxent_retain_all", "bc"},
-        )
-        self.assertEqual(
-            {cell["baseline"] for cell in cells},
-            {"full", "bc_adaptive", "bc"},
-        )
-
-    def test_both_maxent_cells_keep_fulls_predictor_support(self):
-        """The repair: the memory factor must not move the semantic components.
-
-        The MaxEnt retain-all cell used to be the `no_decay` baseline, which is
-        built through `_without_proposed_components` and therefore also dropped
-        the semantic fallback and the latent residual. That left the MaxEnt
-        simple effect and the interaction term confounded.
-        """
-        from dataclasses import replace as replace_settings
-        from src.models import DEFAULT_SETTINGS
-
-        maxent = [
-            cell for cell in MEMORY_PREDICTOR_ABLATION_CELLS
-            if cell["predictor"] == "maxent"
-        ]
-        self.assertEqual(len(maxent), 2)
-        for cell in maxent:
-            with self.subTest(arm=cell["arm"]):
-                settings = replace_settings(
-                    DEFAULT_SETTINGS, **dict(cell.get("overrides") or {}),
+    def test_a_metric_reads_one_direction_everywhere(self):
+        directions = dict(CORE_METRICS)
+        for extras in GROUP_METRICS.values():
+            for metric, direction in extras:
+                self.assertEqual(
+                    directions.setdefault(metric, direction), direction, metric,
                 )
-                self.assertTrue(settings.semantic_fallback_enabled)
-                self.assertTrue(settings.latent_strategy_enabled)
 
-    def test_registered_cells_agree_with_the_agents_they_name(self):
-        """The design is only meaningful if the arms behave as labelled."""
-        from dataclasses import replace
-        from src.baselines import BASELINE_AGENTS
-        from src.models import Settings
+    def test_the_latent_group_is_a_complete_two_by_two(self):
+        """The deployed residual is a corner of the design, not beside it.
 
-        config = Settings(
-            verbose=False, irl_cold_steps=2, irl_warm_steps=1,
-            bc_cold_epochs=2, bc_warm_epochs=1,
+        Capacity x sequence alignment has four cells. 'full' is the shipped
+        one -- low capacity with alignment on -- and it comes from the
+        roster, so completing the design costs no extra run.
+        """
+        from src.models import DEFAULT_SETTINGS as D
+
+        corners = {
+            (arm.facets["capacity"], arm.facets["sequence_alignment"])
+            for arm in ARMS if "latent" in arm.groups and "capacity" in arm.facets
+        }
+        self.assertEqual(corners, {("low", "off"), ("high", "off"), ("high", "on")})
+        # The fourth corner is Full as deployed.
+        self.assertTrue(D.latent_strategy_enabled)
+        self.assertEqual(
+            (D.latent_strategy_rank, D.latent_strategy_knn,
+             D.latent_strategy_sequence_weight), (8, 3, 0.5),
         )
-        expected_policy = {"adaptive_pinned": "adaptive", "retain_all": "none"}
-        for cell in MEMORY_PREDICTOR_ABLATION_CELLS:
-            with self.subTest(arm=cell["arm"]):
-                # A cell is its baseline *plus* its settings overrides; the
-                # MaxEnt row distinguishes its two cells that way.
-                cell_config = replace(config, **dict(cell.get("overrides") or {}))
-                if cell["baseline"] == "full":
-                    from src.adaptive_agent import AdaptiveAgent
-                    agent = AdaptiveAgent(settings=cell_config)
+        self.assertIn("full", group_arms("latent"))
+
+    def test_only_arms_that_can_retire_a_variant_get_a_local_route(self):
+        """A retain-all method cannot route differently, so it has no local arm."""
+        local = {arm.agent for arm in ARMS if arm.route == LOCAL}
+        self.assertEqual(local, {"unpinned", "latest", "fixed"})
+
+    def test_roster_arms_are_referenced_and_never_declared(self):
+        referenced = set(roster_arms(groups()))
+        self.assertEqual(referenced, {"full", "unpinned", "bc", "latest", "fixed"})
+        self.assertEqual(referenced & set(arms_by_name()), set())
+
+
+class ArmConfigTests(unittest.TestCase):
+    def _config(self):
+        from src.evaluation import EvalSettings
+
+        return EvalSettings(seeds=(1337,), scenarios=("homogeneous",),
+                            baselines=("full",), model_settings={"irl_l2": 0.5})
+
+    def test_overrides_are_layered_onto_the_shared_model_settings(self):
+        arm = arms_by_name()["full_no_pin"]
+        config = arm_config(arm, self._config())
+        self.assertEqual(config.model_settings["irl_l2"], 0.5)
+        self.assertIs(config.model_settings["pin_latest"], False)
+
+    def test_a_replaying_arm_keeps_shared_routing(self):
+        config = arm_config(arms_by_name()["full_no_pin"], self._config())
+        self.assertTrue(config.shared_routing)
+        self.assertFalse(config.allow_repeat_observation)
+
+    def test_a_local_arm_is_free_to_request_its_own_observations(self):
+        config = arm_config(arms_by_name()["unpinned_local"], self._config())
+        self.assertFalse(config.shared_routing)
+        self.assertTrue(config.observe_missing_recipes)
+        self.assertTrue(config.allow_repeat_observation)
+
+    def test_nothing_that_determines_the_plan_is_changed(self):
+        base = self._config()
+        for arm in ARMS:
+            with self.subTest(arm=arm.name):
+                config = arm_config(arm, base)
+                for field in ("seeds", "scenarios", "recipe_count", "schedule"):
+                    self.assertEqual(getattr(config, field), getattr(base, field))
+
+
+class ContrastSummaryTests(unittest.TestCase):
+    @staticmethod
+    def _rows(values):
+        return [
+            {"arm": arm, "scenario": "homogeneous", "seed": seed, **metrics}
+            for arm, per_seed in values.items()
+            for seed, metrics in per_seed.items()
+        ]
+
+    def test_deltas_are_signed_so_positive_always_favours_the_treatment(self):
+        contrast = next(c for c in CONTRASTS if c.name == "cost_of_removing_latest_pin")
+        rows = self._rows({
+            "full": {1: {"teacher_forced_top_1": 0.9, "normalized_human_action_load": 0.5},
+                     2: {"teacher_forced_top_1": 0.9, "normalized_human_action_load": 0.5}},
+            "full_no_pin": {1: {"teacher_forced_top_1": 0.8, "normalized_human_action_load": 0.6},
+                            2: {"teacher_forced_top_1": 0.8, "normalized_human_action_load": 0.6}},
+        })
+        entry = paired_deltas(rows, contrast, CORE_METRICS, "homogeneous")
+        # Higher-is-better passes through.
+        self.assertAlmostEqual(
+            entry["metrics"]["teacher_forced_top_1"]["mean_treatment_advantage"], 0.1)
+        # Lower-is-better is flipped: Full needing less human work is a gain.
+        self.assertAlmostEqual(
+            entry["metrics"]["normalized_human_action_load"]["mean_treatment_advantage"], 0.1)
+
+    def test_only_seeds_present_in_both_arms_are_paired(self):
+        contrast = next(c for c in CONTRASTS if c.name == "cost_of_removing_latest_pin")
+        rows = self._rows({
+            "full": {1: {"live_top_1": 0.9}, 2: {"live_top_1": 0.9}, 3: {"live_top_1": 0.9}},
+            "full_no_pin": {1: {"live_top_1": 0.8}, 2: {"live_top_1": 0.8}},
+        })
+        entry = paired_deltas(rows, contrast, CORE_METRICS, "homogeneous")
+        self.assertEqual(entry["n_paired_seeds"], 2)
+        self.assertEqual(entry["metrics"]["live_top_1"]["n_paired_seeds"], 2)
+
+    def test_secondary_contrasts_share_one_multiplicity_family(self):
+        rows = self._rows({
+            arm: {seed: {metric: 0.5 for metric, _d in group_metrics("components")}
+                  for seed in range(1, 9)}
+            for arm in group_arms("components")
+        })
+        summary = summarize_group("components", rows, ("homogeneous",))
+        self.assertEqual(summary["primary_contrast"], "cost_of_removing_latest_pin")
+        for entry in summary["contrasts"]:
+            for metric in entry["metrics"].values():
+                if entry["primary"]:
+                    self.assertNotIn("sign_flip_p_two_sided_holm", metric)
                 else:
-                    agent = BASELINE_AGENTS[cell["baseline"]](cell_config)
-                self.assertEqual(
-                    agent.replay.policy, expected_policy[cell["memory"]],
-                )
-                self.assertEqual(
-                    agent.settings.pin_latest,
-                    cell["memory"] == "adaptive_pinned",
-                )
-                self.assertEqual(
-                    agent.predictor_name().startswith("behavior_cloning"),
-                    cell["predictor"] == "behavior_cloning",
-                )
+                    self.assertIn("sign_flip_p_two_sided_holm", metric)
 
-    def test_summary_signs_every_effect_so_positive_favours_the_treatment(self):
-        def row(scenario, seed, arm, memory, top_1, load):
-            return {
-                "scenario": scenario, "seed": seed, "arm": arm,
-                "memory_level": memory,
-                "memory_policy": (
-                    "adaptive" if memory == "adaptive_pinned" else "none"
-                ),
-                "latest_pin_enabled": memory == "adaptive_pinned",
-                "teacher_forced_top_1": top_1,
-                "normalized_human_action_load": load,
-            }
+    def test_holm_is_monotone_and_never_reduces_a_p_value(self):
+        raw = [0.001, 0.02, 0.04, 0.5]
+        adjusted = _holm(raw)
+        self.assertEqual(adjusted, sorted(adjusted))
+        for before, after in zip(raw, adjusted):
+            self.assertGreaterEqual(after, before)
 
-        # Memory helps both predictors by the same amount, so the interaction
-        # is zero even though the cloner is the more accurate model here.
-        rows = [
-            row("homogeneous", 7, "full", "adaptive_pinned", 0.90, 0.50),
-            row("homogeneous", 7, "maxent_retain_all", "retain_all", 0.85, 0.55),
-            row("homogeneous", 7, "bc_adaptive", "adaptive_pinned", 0.95, 0.45),
-            row("homogeneous", 7, "bc", "retain_all", 0.90, 0.50),
-        ]
-        summary = summarize_memory_predictor_ablation(rows)
-        effects = {
-            entry["name"]: entry["metrics"]
-            for entry in summary["paired_seed_simple_effects"]
+
+class InvariantTests(unittest.TestCase):
+    @staticmethod
+    def _component_rows(**overrides):
+        state = {
+            "full": (True, True, True),
+            "full_no_pin": (False, True, True),
+            "full_no_semantic_fallback": (True, False, True),
+            "full_no_latent_residual": (True, True, False),
+            "unpinned": (False, False, False),
         }
+        state.update(overrides)
+        return [
+            {"arm": arm, "scenario": "homogeneous", "seed": seed,
+             "latest_pin_enabled": pin, "semantic_fallback_enabled": semantic,
+             "latent_strategy_enabled": latent, "memory_policy": "adaptive"}
+            for arm, (pin, semantic, latent) in state.items() for seed in (1, 2)
+        ]
 
-        # Higher-is-better metric passes through unchanged.
-        self.assertAlmostEqual(
-            effects["memory_effect_within_maxent"]["teacher_forced_top_1"][
-                "mean_treatment_advantage"
-            ], 0.05,
-        )
-        # Lower-is-better metric is flipped, so a drop in human load is a gain.
-        self.assertAlmostEqual(
-            effects["memory_effect_within_behavior_cloning"][
-                "normalized_human_action_load"
-            ]["mean_treatment_advantage"], 0.05,
-        )
-        # BC is ahead under a matched memory policy, so Full's simple effect
-        # on the predictor factor is negative rather than silently clipped.
-        self.assertAlmostEqual(
-            effects["predictor_effect_under_adaptive_memory"][
-                "teacher_forced_top_1"
-            ]["mean_treatment_advantage"], -0.05,
-        )
+    def test_an_arm_that_moved_its_declared_component_passes(self):
+        checks = check_invariants("components", self._component_rows())
+        self.assertTrue(all(check["holds"] for check in checks), checks)
 
-        interaction = summary["memory_by_predictor_interaction"][0]["metrics"]
-        for metric, _direction in MEMORY_PREDICTOR_ABLATION_METRICS[:1]:
-            self.assertAlmostEqual(
-                interaction[metric]["mean_interaction"], 0.0,
-            )
-        self.assertTrue(summary["memory_levels_are_internally_consistent"])
+    def test_an_arm_that_moved_the_wrong_component_is_caught(self):
+        rows = self._component_rows(full_no_pin=(True, True, True))
+        checks = {c["name"]: c for c in check_invariants("components", rows)}
+        failed = checks["each_component_arm_moved_exactly_its_own_component"]
+        self.assertFalse(failed["holds"])
+        self.assertTrue(any("full_no_pin" in p for p in failed["problems"]))
 
-    def test_summary_flags_a_cell_that_did_not_run_its_declared_policy(self):
+    def test_arms_that_must_agree_are_checked_against_each_other(self):
         rows = [
-            {
-                "scenario": "homogeneous", "seed": 7, "baseline": "full",
-                "memory_level": "adaptive_pinned",
-                "memory_policy": "adaptive", "latest_pin_enabled": True,
-            },
-            {
-                "scenario": "homogeneous", "seed": 7, "baseline": "bc_adaptive",
-                "memory_level": "adaptive_pinned",
-                # Regression guard: the arm silently kept BC's old storage.
-                "memory_policy": "none", "latest_pin_enabled": False,
-            },
+            {"arm": "full", "scenario": "homogeneous", "seed": 1,
+             "memory_policy": "adaptive", "latest_pin_enabled": True},
+            {"arm": "bc_adaptive", "scenario": "homogeneous", "seed": 1,
+             "memory_policy": "none", "latest_pin_enabled": True},
         ]
-        summary = summarize_memory_predictor_ablation(rows)
-        self.assertFalse(summary["memory_levels_are_internally_consistent"])
+        checks = {c["name"]: c for c in check_invariants("memory", rows)}
+        self.assertFalse(checks["adaptive_memory_level_is_internally_consistent"]["holds"])
 
 
-class LatentStrategyComponentAblationTests(unittest.TestCase):
-    def test_four_arms_encode_the_controlled_component_design(self):
-        arms = {arm.name: arm for arm in LATENT_STRATEGY_ABLATION_ARMS}
+class ArmReuseTests(unittest.TestCase):
+    """An arm is run once and read by every group that names it."""
 
-        self.assertEqual(
-            set(arms),
-            {
-                "maxent_only",
-                "latent_timing_lightweight",
-                "latent_timing_capacity_matched",
-                "latent_timing_trajectory_hybrid",
-            },
-        )
-        self.assertFalse(arms["maxent_only"].latent_strategy_enabled)
-        self.assertEqual(
-            arms["latent_timing_lightweight"].model_overrides(),
-            {
-                "latent_strategy_enabled": True,
-                "latent_strategy_rank": 8,
-                "latent_strategy_knn": 3,
-                "latent_strategy_strength": 1.0,
-                "latent_strategy_sequence_weight": 0.0,
-            },
-        )
-        timing = arms["latent_timing_capacity_matched"].model_overrides()
-        hybrid = arms["latent_timing_trajectory_hybrid"].model_overrides()
-        self.assertEqual(
-            {
-                key: value for key, value in timing.items()
-                if key != "latent_strategy_sequence_weight"
-            },
-            {
-                key: value for key, value in hybrid.items()
-                if key != "latent_strategy_sequence_weight"
-            },
-        )
-        self.assertEqual(timing["latent_strategy_sequence_weight"], 0.0)
-        self.assertEqual(hybrid["latent_strategy_sequence_weight"], 0.5)
+    @staticmethod
+    def _config(root, **overrides):
+        from src.evaluation import EvalSettings, ScheduleSettings
 
-    def test_design_marks_only_capacity_matched_trajectory_contrast(self):
-        design = latent_strategy_ablation_design()
-        contrast = next(
-            row for row in design["planned_contrasts"]
-            if row["name"] == "trajectory_alignment_contribution"
+        values = dict(
+            seeds=(1337,), scenarios=("homogeneous",),
+            baselines=("full", "unpinned"), include_oracle=False,
+            recipe_count=2,
+            schedule=ScheduleSettings(panel_size=2, phases=2, demos=24,
+                                      min_recipes=1, max_recipes=2),
+            audit_period=0, show_eta=False, workers=1, output=str(root),
+            model_settings={"irl_cold_steps": 1, "irl_warm_steps": 1},
         )
+        values.update(overrides)
+        return EvalSettings(**values)
 
-        self.assertEqual(
-            contrast["reference"], "latent_timing_capacity_matched",
-        )
-        self.assertEqual(
-            contrast["treatment"], "latent_timing_trajectory_hybrid",
-        )
-        self.assertIn("Do not attribute", design["invalid_causal_contrast"])
+    def test_ablation_arms_join_the_standard_run_and_reuse_the_roster(self):
+        from src.ablations import run_ablations
+        from src.evaluation import run_evaluation
 
-    def test_summary_uses_paired_treatment_minus_reference_deltas(self):
-        rows = []
-        for seed, timing, hybrid in ((1, 0.60, 0.65), (2, 0.70, 0.73)):
-            for arm, score in (
-                ("maxent_only", timing - 0.04),
-                ("latent_timing_lightweight", timing - 0.02),
-                ("latent_timing_capacity_matched", timing),
-                ("latent_timing_trajectory_hybrid", hybrid),
-            ):
-                rows.append({
-                    "scenario": "homogeneous",
-                    "seed": seed,
-                    "arm": arm,
-                    "teacher_forced_top_1": score,
-                })
-
-        summary = summarize_latent_strategy_ablation(rows)
-        trajectory = next(
-            row for row in summary["paired_seed_contrasts"]
-            if row["name"] == "trajectory_alignment_contribution"
-        )
-
-        self.assertEqual(trajectory["n_paired_seeds"], 2)
-        self.assertAlmostEqual(
-            trajectory["metrics"]["teacher_forced_top_1"]
-            ["mean_treatment_minus_reference"],
-            0.04,
-        )
-
-
-class AblationTrendTests(unittest.TestCase):
-    def test_trend_logs_each_ladder_phase(self):
-        stream = SimpleNamespace(
-            episode_rows=[
-                {
-                    "phase_index": 0, "event_index": 0, "mode": "observe",
-                    "recipe_steps": 4,
-                },
-                {
-                    "phase_index": 0, "event_index": 1, "mode": "assist",
-                    "teacher_forced_correct_count": 2,
-                    "teacher_forced_prediction_count": 4,
-                    "teacher_forced_total_nll": 3.0,
-                },
-                {
-                    "phase_index": 1, "event_index": 2, "mode": "assist",
-                    "teacher_forced_correct_count": 3,
-                    "teacher_forced_prediction_count": 4,
-                    "teacher_forced_total_nll": 2.0,
-                },
-            ],
-            frozen_rows=[
-                {"event_index": 1, "checkpoint": "event_1", "top_1": 0.5},
-                {"event_index": 2, "checkpoint": "event_2", "top_1": 0.75},
-            ],
-            memory_rows=[
-                {"event_index": 1, "active_variants": 1, "pruned_variants": 0},
-                {"event_index": 2, "active_variants": 2, "pruned_variants": 0},
-            ],
-        )
-        trend = _trend(stream)
-        self.assertEqual([row["phase"] for row in trend], [0, 1])
-        self.assertEqual(trend[0]["phase_top_1"], 0.5)
-        self.assertEqual(trend[1]["phase_top_1"], 0.75)
-        self.assertEqual(trend[1]["top_1_seen"], 0.625)
-        self.assertEqual(trend[1]["active_variants"], 2)
-
-class TeachingBurdenRoutingAblationTests(unittest.TestCase):
-    def test_burden_separates_planned_demos_extra_demos_and_corrections(self):
-        episodes = [
-            {
-                "mode": "observe",
-                "requested_mode": "observe",
-                "recipe_steps": 10,
-            },
-            {
-                "mode": "observe",
-                "requested_mode": "assist",
-                "recipe_steps": 5,
-            },
-            {
-                "mode": "assist",
-                "requested_mode": "assist",
-                "recipe_steps": 8,
-                "hrc_human_correction_count": 2,
-                "hrc_human_turn_count": 2,
-                "hrc_robot_turn_count": 6,
-                "hrc_robot_correct_count": 4,
-                "teacher_forced_prediction_count": 8,
-                "teacher_forced_correct_count": 6,
-            },
-        ]
-
-        metrics = teaching_metrics(
-            episodes,
-            [
-                {"checkpoint": "phase_1", "top_1": 0.4, "top_k": 0.7,
-                 "recipe_steps": 5, "hrc_human_turn_count": 1,
-                 "hrc_human_correction_count": 3},
-                {"checkpoint": "final", "top_1": 0.8, "top_k": 0.9,
-                 "recipe_steps": 5, "hrc_human_turn_count": 2,
-                 "hrc_human_correction_count": 1},
-                {"checkpoint": "pre_event_2", "probe_phase": "pre_event",
-                 "top_1": 0.0, "top_k": 0.0,
-                 "recipe_steps": 5, "hrc_human_turn_count": 0,
-                 "hrc_human_correction_count": 5},
-            ],
-        )
-
-        self.assertEqual(metrics["n_planned_demonstration_actions"], 10.0)
-        self.assertEqual(metrics["n_extra_demonstration_actions"], 5.0)
-        self.assertEqual(metrics["n_corrective_teaching_actions"], 2.0)
-        self.assertEqual(metrics["n_total_explicit_teaching_actions"], 17.0)
-        self.assertAlmostEqual(metrics["fixed_checkpoint_top_1"], 0.6)
-        self.assertAlmostEqual(
-            metrics["fixed_checkpoint_corrections_per_recipe_step"], 0.4,
-        )
-        self.assertAlmostEqual(
-            metrics["fixed_checkpoint_normalized_human_action_load"], 0.7,
-        )
-        self.assertAlmostEqual(
-            metrics["fixed_checkpoint_mean_corrections_per_task"], 2.0,
-        )
-        self.assertEqual(metrics["fixed_checkpoint_n_rows"], 2)
-        self.assertAlmostEqual(
-            metrics["assist_live_top_1_selection_affected"], 4.0 / 6.0,
-        )
-        self.assertAlmostEqual(metrics["assist_teacher_forced_top_1"], 0.75)
-        self.assertAlmostEqual(
-            metrics["assist_normalized_human_action_load"], 0.5,
-        )
-        self.assertAlmostEqual(
-            metrics["assist_mean_corrections_per_task"], 2.0,
-        )
-        self.assertAlmostEqual(
-            metrics["assist_corrections_per_recipe_step"], 0.25,
-        )
-
-    def test_summary_reports_matched_local_minus_shared_burden(self):
-        rows = []
-        for seed in (1, 2):
-            common = {
-                "scenario": "test",
-                "seed": seed,
-                "baseline": "bc",
-                "n_corrective_teaching_actions": 2.0,
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            suite = run_evaluation(self._config(root, experiment="standard"))
+            run_dir = Path(suite["run_dir"])
+            roster_cells = {
+                path.relative_to(run_dir).parts[1]
+                for path in run_dir.glob("baselines/*/scenarios/*/seeds/*/summary.json")
             }
-            rows.append({
-                **common,
-                "routing_condition": SHARED_ROUTE,
-                "n_total_explicit_teaching_actions": 20.0,
-                "n_extra_demonstration_actions": 0.0,
-                "fixed_checkpoint_top_1": 0.5,
-            })
-            rows.append({
-                **common,
-                "routing_condition": LOCAL_ROUTE,
-                "n_total_explicit_teaching_actions": 30.0,
-                "n_extra_demonstration_actions": 10.0,
-                "fixed_checkpoint_top_1": 0.6,
-            })
+            self.assertEqual(roster_cells, {"full", "unpinned"})
 
-        summary = summarize_routing_ablation(rows)
-        contrast = summary["paired_seed_local_minus_shared"][0]
-
-        self.assertEqual(contrast["n_paired_seeds"], 2)
-        self.assertEqual(
-            contrast["metrics"]["n_extra_demonstration_actions"]
-            ["mean_local_minus_shared"],
-            10.0,
-        )
-        self.assertAlmostEqual(
-            contrast["metrics"]["fixed_checkpoint_top_1"]
-            ["mean_local_minus_shared"],
-            0.1,
-        )
-        self.assertAlmostEqual(
-            contrast[
-                "mean_fixed_checkpoint_top_1_gain_per_additional_demonstration_action"
-            ],
-            0.01,
-        )
-
-    def test_frozen_deployment_references_are_not_valid_local_teaching_arms(self):
-        with self.assertRaisesRegex(ValueError, "frozen deployment references"):
-            run_routing_ablation(
-                baselines=("full", "frozen"),
+            report = run_ablations(
+                ("components",), self._config(root, experiment="ablation"),
+                workers=1, progress=False,
             )
+            # The same directory: the arm list is not part of the run identity.
+            self.assertEqual(report["execution"]["run"], run_dir.name)
+            # Full and unpinned are read, never re-run.
+            self.assertEqual(
+                set(report["execution"]["roster_arms_reused"]), {"full", "unpinned"},
+            )
+            self.assertNotIn("full", report["execution"]["cells_executed"])
+            self.assertNotIn("unpinned", report["execution"]["cells_executed"])
+            self.assertEqual(
+                set(report["execution"]["cells_executed"]),
+                {"full_no_pin", "full_no_semantic_fallback", "full_no_latent_residual"},
+            )
+            self.assertTrue(report["complete"])
+            self.assertTrue(report["invariants_hold"])
+
+            # Running again executes nothing at all.
+            again = run_ablations(
+                ("components",), self._config(root, experiment="ablation"),
+                workers=1, progress=False,
+            )
+            self.assertEqual(
+                set(again["execution"]["cells_executed"].values()), {0},
+            )
+
+    def test_ablating_without_the_standard_run_fails_loudly(self):
+        from src.ablations import run_ablations
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(SystemExit, "no evaluation run matches"):
+                run_ablations(
+                    ("components",), self._config(Path(directory)),
+                    workers=1, progress=False,
+                )
 
 
 class DiscriminationAblationTests(unittest.TestCase):
@@ -838,106 +538,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class ArmMajorAblationSchedulingTests(unittest.TestCase):
-    """Suites run arm by arm; that must not move a single ablation number."""
 
-    TIMING = re.compile(r"(wall_s|_at_utc|elapsed_s|latency|_per_s|_time|gflops_s)$")
 
-    @classmethod
-    def _without_timings(cls, value):
-        if isinstance(value, dict):
-            return {
-                key: cls._without_timings(item)
-                for key, item in value.items()
-                if not cls.TIMING.search(key)
-            }
-        if isinstance(value, list):
-            return [cls._without_timings(item) for item in value]
-        return value
-
-    @staticmethod
-    def _config(experiment):
-        from src.evaluation import EvalSettings, ScheduleSettings
-
-        return EvalSettings(
-            seeds=(1337,), scenarios=("homogeneous",), baselines=("full",),
-            include_oracle=False, show_eta=False, recipe_count=2,
-            schedule=ScheduleSettings(
-                panel_size=2, phases=2, demos=24, min_recipes=1, max_recipes=2,
-            ),
-            audit_period=0, workers=1, experiment=experiment,
-            model_settings={
-                "irl_cold_steps": 1, "irl_warm_steps": 1,
-                "bc_cold_epochs": 1, "bc_warm_epochs": 1,
-            },
-        )
-
-    @classmethod
-    def _cell_major(cls, suite, arms, config):
-        """The previous nesting: one cell at a time, every arm inside it."""
-        spec = _arm_suite_specs()[suite]
-        rows = []
-        for scenario in config.scenarios:
-            for seed in config.seeds:
-                route = None
-                for arm in arms:
-                    row, realized = _arm_cell_job(
-                        (suite, str(scenario), int(seed), config, arm, route)
-                    )
-                    if realized is not None:
-                        route = realized
-                    rows.append(row)
-        order = {spec.name(arm): index for index, arm in enumerate(arms)}
-        rows.sort(key=lambda row: (
-            str(row["scenario"]), int(row["seed"]), order[str(row["arm"])],
-        ))
-        return rows
-
-    def test_arm_major_scheduling_matches_cell_major_scheduling(self):
-        suites = (
-            ("component_ablation", tuple(COMPONENT_ABLATION_ARMS)),
-            ("latent_strategy_ablation", tuple(LATENT_STRATEGY_ABLATION_ARMS)),
-            ("memory_predictor_ablation",
-             tuple(dict(cell) for cell in MEMORY_PREDICTOR_ABLATION_CELLS)),
-            ("representation_ablation", tuple(REPRESENTATION_ABLATION_ARMS)),
-        )
-        for suite, arms in suites:
-            with self.subTest(suite=suite):
-                config = self._config(suite)
-                self.assertEqual(
-                    self._without_timings(self._cell_major(suite, arms, config)),
-                    self._without_timings(run_arm_major_suite(suite, arms, config)),
-                )
-
-    def test_each_arm_gets_its_own_result_file(self):
-        arms = tuple(COMPONENT_ABLATION_ARMS)
-        config = self._config("component_ablation")
-        with tempfile.TemporaryDirectory() as directory:
-            arms_dir = Path(directory) / "arms"
-            rows = run_arm_major_suite(
-                "component_ablation", arms, config, arms_dir=arms_dir,
-            )
-            written = {path.stem for path in arms_dir.iterdir()}
-            self.assertEqual(written, {arm.name for arm in arms})
-            split = [
-                row
-                for path in sorted(arms_dir.iterdir())
-                for row in json.loads(path.read_text())["rows"]
-            ]
-            self.assertCountEqual(split, rows)
-            # Exactly one arm defines the route the others replay.
-            reference = [
-                json.loads(path.read_text())["arm"]
-                for path in arms_dir.iterdir()
-                if json.loads(path.read_text())["reference_arm"]
-            ]
-            self.assertEqual(reference, ["full"])
-
-    def test_an_arm_name_that_is_not_a_safe_filename_is_rejected(self):
-        from src.ablations import _safe_arm_component
-
-        self.assertEqual(_safe_arm_component("full_no_pin"), "full_no_pin")
-        for bad in ("../escape", "with/slash", ""):
-            with self.subTest(name=bad):
-                with self.assertRaises(ValueError):
-                    _safe_arm_component(bad)
+if __name__ == "__main__":
+    unittest.main()

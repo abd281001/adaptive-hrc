@@ -152,7 +152,7 @@ class EvaluationParallelismTests(unittest.TestCase):
         )
         seen = []
 
-        def fake_job(baseline, scenario, seed, _config, _run_dir):
+        def fake_job(baseline, scenario, seed, _config, _run_dir, _agent=None):
             seen.append((baseline, scenario, int(seed)))
             return {
                 "baseline": baseline, "scenario": scenario,

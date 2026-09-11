@@ -263,85 +263,76 @@ class ValidationTests(unittest.TestCase):
 
 
 class AblationArmTests(unittest.TestCase):
-    """Every declared arm must apply cleanly and move something."""
+    """The arm registry must still express the designs it replaced."""
 
-    def test_component_arms_move_only_their_declared_components(self):
-        from src.ablations import COMPONENT_ABLATION_ARMS
+    def _settings(self, arm):
+        return replace(DEFAULT_SETTINGS, **dict(arm.overrides))
+
+    def test_component_arms_move_only_their_declared_component(self):
+        from src.ablations import arms_by_name
 
         expected = {
-            "full": (True, True, True),
             "full_no_pin": (False, True, True),
             "full_no_semantic_fallback": (True, False, True),
             "full_no_latent_residual": (True, True, False),
-            "full_no_support": (False, False, False),
         }
-        for arm in COMPONENT_ABLATION_ARMS:
-            with self.subTest(arm=arm.name):
-                settings = arm.settings(DEFAULT_SETTINGS)
+        arms = arms_by_name()
+        for name, want in expected.items():
+            with self.subTest(arm=name):
+                settings = self._settings(arms[name])
                 self.assertEqual(
                     (settings.pin_latest, settings.semantic_fallback_enabled,
-                     settings.latent_strategy_enabled),
-                    expected[arm.name],
+                     settings.latent_strategy_enabled), want,
                 )
-                # Retention must not move; that is the other suite's factor.
+                # Retention must not move; that is the other group's factor.
                 self.assertEqual(settings.retention_policy, "adaptive")
                 self.assertEqual(settings.horizon_estimator, "hierarchical")
 
     def test_retention_arms_hold_predictor_support_at_full(self):
-        from src.ablations import RETENTION_ABLATION_ARMS
+        from src.ablations import ARMS
 
-        for arm in RETENTION_ABLATION_ARMS:
+        for arm in ARMS:
+            if "retention" not in arm.groups:
+                continue
             with self.subTest(arm=arm.name):
-                settings = arm.settings(DEFAULT_SETTINGS)
+                settings = self._settings(arm)
                 self.assertTrue(settings.semantic_fallback_enabled)
                 self.assertTrue(settings.latent_strategy_enabled)
 
-    def test_every_arm_differs_from_the_reference(self):
-        from src.ablations import COMPONENT_ABLATION_ARMS, RETENTION_ABLATION_ARMS
+    def test_every_arm_differs_from_the_reference_it_is_compared_against(self):
+        """No arm may be Full under another name; Full comes from the roster."""
+        from src.ablations import ARMS
 
-        for arms in (COMPONENT_ABLATION_ARMS, RETENTION_ABLATION_ARMS):
-            reference = arms[0]
-            self.assertEqual(reference.name, "full")
-            self.assertEqual(reference.model_overrides(), {})
-            for arm in arms[1:]:
-                with self.subTest(arm=arm.name):
-                    self.assertNotEqual(arm.model_overrides(), {})
-                    self.assertNotEqual(
-                        arm.settings(DEFAULT_SETTINGS), DEFAULT_SETTINGS,
-                    )
+        for arm in ARMS:
+            with self.subTest(arm=arm.name):
+                if arm.agent == "full" and arm.route != "local":
+                    self.assertNotEqual(dict(arm.overrides), {})
+                    self.assertNotEqual(self._settings(arm), DEFAULT_SETTINGS)
 
-    def test_memory_cells_form_a_factorial_with_matched_maxent_support(self):
-        from src.ablations import (
-            MEMORY_LEVELS, MEMORY_PREDICTOR_ABLATION_CELLS, PREDICTOR_LEVELS,
-        )
+    def test_memory_group_forms_a_factorial_with_matched_maxent_support(self):
+        from src.ablations import arms_by_name, group_arms
 
-        arms = [str(cell["arm"]) for cell in MEMORY_PREDICTOR_ABLATION_CELLS]
-        self.assertEqual(len(set(arms)), len(arms))
-        self.assertEqual(arms[0], "full")
+        arms = arms_by_name()
+        # Two cells come from the deployable roster: Full and BC.
         self.assertEqual(
-            {(str(cell["predictor"]), str(cell["memory"]))
-             for cell in MEMORY_PREDICTOR_ABLATION_CELLS},
-            {(predictor, memory)
-             for predictor in PREDICTOR_LEVELS for memory in MEMORY_LEVELS},
+            set(group_arms("memory")),
+            {"full", "bc", "bc_adaptive", "maxent_retain_all"},
         )
-        # The repair: both MaxEnt cells keep Full's predictor support, so the
-        # memory factor is not confounded with the semantic components.
-        maxent = [
-            cell for cell in MEMORY_PREDICTOR_ABLATION_CELLS
-            if str(cell["predictor"]) == "maxent"
-        ]
-        self.assertEqual(len(maxent), 2)
-        for cell in maxent:
-            settings = replace(DEFAULT_SETTINGS, **dict(cell.get("overrides") or {}))
-            with self.subTest(arm=cell["arm"]):
-                self.assertTrue(settings.semantic_fallback_enabled)
-                self.assertTrue(settings.latent_strategy_enabled)
-        # ...and they differ in the retention bundle the level names.
-        by_arm = {str(cell["arm"]): dict(cell.get("overrides") or {}) for cell in maxent}
-        self.assertEqual(by_arm["full"], {})
+        levels = {
+            (arms[name].facets["predictor"], arms[name].facets["memory"])
+            for name in ("bc_adaptive", "maxent_retain_all")
+        }
         self.assertEqual(
-            by_arm["maxent_retain_all"], {"retention_policy": "none", "pin_latest": False},
+            levels,
+            {("behavior_cloning", "adaptive_pinned"), ("maxent", "retain_all")},
         )
+        # The repair: the MaxEnt retain-all cell keeps Full's predictor
+        # support, so the memory factor is not confounded with it.
+        settings = self._settings(arms["maxent_retain_all"])
+        self.assertTrue(settings.semantic_fallback_enabled)
+        self.assertTrue(settings.latent_strategy_enabled)
+        self.assertEqual(settings.retention_policy, "none")
+        self.assertFalse(settings.pin_latest)
 
 
 if __name__ == "__main__":

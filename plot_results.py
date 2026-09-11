@@ -2,7 +2,7 @@
 
     venv/bin/python plot_results.py [eval_results/latest] [--window 10]
     # Add a row showing individual component ablations in each Pareto:
-    venv/bin/python plot_results.py --ablations eval_results/ablation_runs/ABLATION_RUN
+    venv/bin/python plot_results.py --components
 
 Outputs: accuracy, phase/workload summary, dataset growth, retention, two Paretos,
 and compute CSVs. Curves/bars show seed means +/- one standard error (not a CI).
@@ -12,8 +12,9 @@ seeds. Retention uses matched frozen robot-turn probes during preference absence
 The memory oracle is a future-informed reference, not an upper bound.
 Pareto costs are mean time and estimated FLOPs per retrain within each seed.
 Paretos include adaptive, no-decay and fixed-decay arms with support disabled.
-With --ablations, a second row shows paired component removals. Each suite
-supplies its own Full timing. The standard oracle supplies accuracy only.
+With --components, a second row shows paired component removals, read from
+the same run: the ablation arms live beside the baselines, so Full is the one
+cell both rows are plotted from. The standard oracle supplies accuracy only.
 """
 
 import argparse
@@ -46,7 +47,9 @@ COMPONENT_METHODS = {
     "full_no_semantic_fallback": ("Without semantic", "#4477AA", "s"),
     "full_no_latent_residual": ("Without latent", "#CC8800", "^"),
     "full_no_pin": ("Without latest pin", "#AA4499", "v"),
-    "full_no_support": ("Without all three", "#555555", "P"),
+    # Removing all three is settings-identical to the deployable baseline,
+    # so the roster arm is read rather than re-run under a second name.
+    "unpinned": ("Without all three", "#555555", "P"),
 }
 SCENARIOS = {"homogeneous": "Homogeneous", "heterogeneous": "Heterogeneous", "holdout": "Holdout"}
 KEYS = ("scenario", "baseline", "seed")
@@ -118,31 +121,27 @@ def load_run(path):
     return data
 
 
-def load_ablation(path, methods, reference):
-    """Read paired seed summaries; reject missing arms or a mismatched Full run."""
-    path = Path(path)
-    manifest = read_json(path.parent / "manifest.json")
-    if manifest["state"] != "complete" or manifest["jobs"][path.stem]["return_code"] != 0:
-        raise ValueError(f"Ablation is not complete: {path}")
-    rows = [r for r in read_json(path)["rows"] if r["arm"] in methods]
-    cohort = {(r["scenario"], r["seed"]) for r in reference["pareto_accuracy"] if r["baseline"] == "full"}
-    expected = {(s, arm, seed) for s, seed in cohort for arm in methods}
-    actual = [(r["scenario"], r["arm"], r["seed"]) for r in rows]
-    if set(actual) != expected or len(actual) != len(expected):
-        raise ValueError(f"Ablation arms must have the same scenario/seed cohort as the run: {path}")
+def load_arms(run, arms):
+    """Per-arm system and accuracy rows from a completed run.
+
+    Ablation arms are contributed to the same run directory as the
+    deployable roster, so there is no second run to reconcile: `full` here is
+    the identical cell the baselines are plotted from.
+    """
+    run = Path(run).resolve()
     data = {"systems": [], "pareto_accuracy": []}
-    for row in rows:
-        key = dict(scenario=row["scenario"], baseline=row["arm"], seed=row["seed"])
-        metrics = row["detailed_metrics"]
-        data["systems"].append({**metrics["system"], **key})
-        data["pareto_accuracy"].append({**key, "value": metrics["assist"]["overall"]["live_top_1"]})
-    for table, fields in (("systems", ("training_retrain_count", "training_estimated_fit_flops")),
-                          ("pareto_accuracy", ("value",))):
-        def full_values(source):
-            return {tuple(r[k] for k in KEYS): tuple(r[f] for f in fields)
-                    for r in source[table] if r["baseline"] == "full"}
-        if full_values(data) != full_values(reference):
-            raise ValueError(f"Full {table} differ from the reference run: {path}")
+    for job in read_json(run / "manifest.json")["expected_jobs"]:
+        scenario, seed = job["scenario"], job["seed"]
+        for arm in arms:
+            folder = cell_dir(run, arm, scenario, seed)
+            summary = read_json(folder / "summary.json")
+            if summary["state"] != "complete":
+                raise ValueError(f"Cell is not complete: {folder}")
+            metrics = summary["per_baseline"][arm]
+            key = dict(scenario=scenario, baseline=arm, seed=seed)
+            data["systems"].append({**metrics["system"], **key})
+            data["pareto_accuracy"].append(
+                {**key, "value": metrics["assist"]["overall"]["live_top_1"]})
     return data
 
 
@@ -429,8 +428,8 @@ def plot_run(run, output, window=1, ablations=None):
     data = load_run(run)
     comparisons = [("baselines", "Decay baselines · support = semantic + latent + latest pin", PARETO_METHODS,
                     pareto_points(data["pareto_accuracy"], data["systems"]))]
-    if ablations is not None:
-        components = load_ablation(Path(ablations) / "components.json", COMPONENT_METHODS, data)
+    if ablations:
+        components = load_arms(run, COMPONENT_METHODS)
         comparisons.append(("components", "Component ablation · adaptive decay throughout", COMPONENT_METHODS,
                             pareto_points(components["pareto_accuracy"], components["systems"])))
     output = Path(output)
@@ -461,7 +460,7 @@ def plot_run(run, output, window=1, ablations=None):
     (output / "notes.txt").write_text(
         f"Run: {Path(run).resolve()}\nAccuracy window: {window} trailing executions.\n"
         f"Pareto baseline source: {Path(run).resolve()}\n"
-        f"Pareto component source: {Path(ablations).resolve() / 'components.json' if ablations is not None else 'not included'}\n"
+        f"Pareto component source: {'component arms of this run' if ablations else 'not included'}\n"
         "Means +/- one standard error across seeds; missing values are not zero.\n"
         "Curves use available seeds at each execution; their support range is labelled.\n"
         "Unequal seed durations change the contributing cohort near the end of a curve.\n"
@@ -476,7 +475,7 @@ def plot_run(run, output, window=1, ablations=None):
         "Standard No decay and Fixed decay disable semantic fallback, latent residual, and latest pin; this is not a retention-only comparison.\n"
         "The added unpinned arm is adaptive decay with all three support components disabled, not just the pin.\n"
         "Compare unpinned, no_decay and fixed to hold predictor support constant; Full also includes all support.\n"
-        "With --ablations, a second Pareto row uses components.json: Full and removals of semantic, latent, latest pin, and all three together.\n"
+        "With --components, a second Pareto row reads this run's component arms: Full and removals of semantic, latent, latest pin, and all three together.\n"
         "Each comparison uses its own suite's measured Full timing; ablation cohorts and Full accuracy/counts/FLOPs must match the run.\n"
         "Rings and dashed lines mark the empirical frontier of the displayed means; they do not establish statistical dominance.\n"
         "The oracle's dotted line is reference accuracy from the standard run; it has no cost coordinate and is excluded from frontiers.\n"
@@ -498,6 +497,6 @@ if __name__ == "__main__":
     parser.add_argument("run", nargs="?", type=Path, default=Path("eval_results/latest"))
     parser.add_argument("--output", type=Path, default=Path("figures"))
     parser.add_argument("--window", type=int, default=1, help="Trailing execution window for accuracy (default: raw)")
-    parser.add_argument("--ablations", type=Path, help="Completed ablation directory containing components.json")
+    parser.add_argument("--components", action="store_true", help="Add a Pareto row for this run's component-ablation arms.")
     args = parser.parse_args()
-    plot_run(args.run, args.output, args.window, args.ablations)
+    plot_run(args.run, args.output, args.window, args.components)
