@@ -96,7 +96,7 @@ def main() -> int:
         return 0
     if not args.config:
         parser.error(f"{args.command} requires --config")
-    from .evaluation import run_experiment, validate_result
+    from .evaluation import run_experiment, summary_report, validate_result
 
     result = run_experiment(
         args.config, output_root=args.output, resume_from=args.resume,
@@ -105,32 +105,11 @@ def main() -> int:
     validation = (
         validate_result(result, args.config) if args.command == "validate" else None
     )
-    summary = result["summary"]
-    print(json.dumps({
-        "run_dir": result["run_dir"],
-        "status": summary["status"],
-        "episode_count": summary["episode_count"],
-        "failure_count": summary["failure_count"],
-        "primary_metric": summary["primary_metric"],
-        "normalized_human_action_load": summary["normalized_human_action_load"],
-        "normalized_human_action_load_floor": summary[
-            "normalized_human_action_load_floor"
-        ],
-        "human_action_load_excess": summary["human_action_load_excess"],
-        "primary_accuracy_metric": summary["primary_accuracy_metric"],
-        "preference_discriminating_top_1": summary[
-            "preference_discriminating_top_1"
-        ],
-        "robot_top_1_diagnostic": summary["robot_top_1"],
-        "teacher_forced_preference_discriminating_top_1": summary[
-            "teacher_forced_preference_discriminating_top_1"
-        ],
-        "single_legal_action_fraction": summary["single_legal_action_fraction"],
-        "excluded_incomplete_cells": summary["excluded_incomplete_cells"],
-        "groups": summary["groups"],
-        "pre_event_probe_groups": summary["pre_event_probe_groups"],
-        **({"validation": validation} if validation is not None else {}),
-    }, indent=2, sort_keys=True))
+    # The report is built by the module that produces the summary, so its key
+    # list cannot drift from the summary again, and a missing key is reported
+    # rather than raised: every artifact is already durable at this point and a
+    # crash here would discard a finished run.
+    print(json.dumps(summary_report(result, validation), indent=2, sort_keys=True))
     return 0
 
 

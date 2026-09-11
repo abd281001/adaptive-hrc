@@ -12,6 +12,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import pickle
 import platform
 import random
 import re
@@ -77,12 +78,6 @@ class ScenarioSpec:
     phases: Tuple[Tuple[str, str], ...]
 
 
-@dataclass(frozen=True)
-class BaselineStyle:
-    label: str
-    color: str
-
-
 HOMOGENEOUS = "homogeneous"
 HETEROGENEOUS = "heterogeneous"
 HOLDOUT = "holdout"
@@ -120,37 +115,15 @@ SCENARIO_SPECS: Mapping[str, ScenarioSpec] = {
 SCENARIOS = tuple(SCENARIO_SPECS)
 
 DEFAULT_BASELINES = (
-    "full", "frozen", "offline_default",
+    "full", "frozen", "offline_default", "offline_all",
     "unpinned", "latest", "fixed", "no_decay", "bc", "ewc",
     "replay_bc",
 )
 MEMORY_ORACLE = "memory_oracle"
-BASELINE_ORDER = (
-    "full", "in_context_llm", "no_decay", "replay_bc", "bc", "unpinned", "ewc",
-    "latest", "fixed", "offline_default",
-    "frozen", MEMORY_ORACLE,
-)
-BASELINE_STYLES: Mapping[str, BaselineStyle] = {
-    name: BaselineStyle(label, color) for name, label, color in (
-        ("full", "Full", "#0072B2"),
-        ("in_context_llm", "In-context LLM", "#6A3D9A"),
-        ("no_decay", "No decay", "#009E73"),
-        ("replay_bc", "ER-BC", "#D55E00"),
-        ("bc", "BC", "#CC79A7"),
-        ("unpinned", "Adaptive", "#56B4E9"),
-        ("ewc", "EWC", "#E69F00"),
-        ("latest", "Latest", "#999999"),
-        ("fixed", "Fixed", "#C44E52"),
-        ("offline_default", "Offline-ID", "#8172B3"),
-        ("frozen", "Offline-pre", "#64B5CD"),
-        (MEMORY_ORACLE, "Oracle†", "#222222"),
-    )
-}
-DEPLOYABLE_BASELINES = tuple(
-    name for name in BASELINE_ORDER if name not in {"full", MEMORY_ORACLE}
-)
-
-
+# The optional GPU arm. It owns a quantized model and cannot share a process
+# with another cell, so the scheduler treats it differently from every
+# symbolic arm.
+LLM_BASELINE = "in_context_llm"
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, bool)) or value is None:
         return value
@@ -234,17 +207,6 @@ def _mean(values: Iterable[Any], default: float = 0.0) -> float:
     return float(sum(numbers) / len(numbers)) if numbers else float(default)
 
 
-def _mean_std(values: Iterable[Any]) -> Tuple[float, float]:
-    numbers = _finite(values)
-    if not numbers:
-        return 0.0, 0.0
-    average = _mean(numbers)
-    if len(numbers) == 1:
-        return average, 0.0
-    variance = sum((value - average) ** 2 for value in numbers) / (len(numbers) - 1)
-    return average, math.sqrt(variance)
-
-
 def _value(value: Any, default: float = 0.0) -> float:
     return (
         float(value)
@@ -283,16 +245,6 @@ def bootstrap(
     ).mean(axis=1)
 
 
-def _bootstrap_ci(
-    values: Sequence[Any], *, key: str, draws: int = 100_000,
-) -> Tuple[float, float]:
-    means = bootstrap(values, key=key, draws=draws)
-    if means.size == 0:
-        return 0.0, 0.0
-    low, high = np.quantile(means, (0.025, 0.975))
-    return float(low), float(high)
-
-
 def _sign_flip_test(deltas: Sequence[float]) -> Tuple[float, float]:
     """Return exact one-sided and two-sided paired randomization p-values."""
     values = [float(value) for value in deltas if abs(float(value)) > 1e-15]
@@ -306,103 +258,6 @@ def _sign_flip_test(deltas: Sequence[float]) -> Tuple[float, float]:
     one_sided = sum(draw >= observed - 1e-15 for draw in draws) / len(draws)
     two_sided = sum(abs(draw) >= abs(observed) - 1e-15 for draw in draws) / len(draws)
     return one_sided, two_sided
-
-
-def _holm_adjust(p_values: Mapping[str, float]) -> Dict[str, float]:
-    ordered = sorted(p_values.items(), key=lambda item: item[1])
-    running = 0.0
-    adjusted: Dict[str, float] = {}
-    for index, (name, p_value) in enumerate(ordered):
-        running = max(running, min(1.0, (len(ordered) - index) * p_value))
-        adjusted[name] = running
-    return adjusted
-
-
-def _summary_metric_values(
-    summaries: Sequence[Mapping[str, Any]],
-    baseline: str,
-    phase: str,
-    metric: str,
-) -> List[float]:
-    scope = "by_holdout_phase_role" if phase.startswith("heldout_") else "by_phase_role"
-    return [
-        _value(
-            summary["per_baseline"][baseline]["assist"][scope]
-            .get(phase, {}).get(metric)
-        )
-        for summary in summaries
-    ]
-
-
-def compare_groups(
-    scenario: str, summaries: Sequence[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    """Phase-specific, seed-paired inference for one holdout cell."""
-    endpoints = (
-        ("heldout_climb", "teacher_forced_top_1", "higher_is_better", "confirmatory"),
-        ("heldout_settled", "teacher_forced_top_1", "higher_is_better", "secondary"),
-        ("heldout_climb", "normalized_human_action_load", "lower_is_better", "secondary"),
-        ("heldout_settled", "normalized_human_action_load", "lower_is_better", "secondary"),
-        # Interaction latency: the blocking wait between two demonstrations.
-        ("heldout_climb", "online_p95_retrain_fit_wall_s", "lower_is_better", "secondary"),
-        ("heldout_settled", "online_p95_retrain_fit_wall_s", "lower_is_better", "secondary"),
-    )
-    common = set.intersection(*(set(summary["per_baseline"]) for summary in summaries))
-    comparators = [baseline for baseline in DEPLOYABLE_BASELINES if baseline in common]
-    tests: Dict[str, Any] = {}
-    for phase, metric, direction, role in endpoints:
-        family: Dict[str, Any] = {}
-        raw_p: Dict[str, float] = {}
-        full_values = _summary_metric_values(summaries, "full", phase, metric)
-        for baseline in comparators:
-            baseline_values = _summary_metric_values(summaries, baseline, phase, metric)
-            deltas = [
-                (full - other) if direction == "higher_is_better" else (other - full)
-                for full, other in zip(full_values, baseline_values)
-            ]
-            one_sided, two_sided = _sign_flip_test(deltas)
-            ci_low, ci_high = _bootstrap_ci(
-                deltas, key=f"{scenario}|{phase}|{metric}|{baseline}",
-            )
-            raw_p[baseline] = one_sided
-            mean, standard_deviation = _mean_std(deltas)
-            family[baseline] = {
-                "full_advantage_direction": direction,
-                "mean_full_advantage": mean,
-                "std_full_advantage": standard_deviation,
-                "paired_seed_deltas_full_advantage": {
-                    str(summary["seed"]): delta
-                    for summary, delta in zip(summaries, deltas)
-                },
-                "paired_bootstrap_ci95": [ci_low, ci_high],
-                "exact_sign_flip_p_one_sided": one_sided,
-                "exact_sign_flip_p_two_sided": two_sided,
-            }
-        adjusted = _holm_adjust(raw_p)
-        for baseline, result in family.items():
-            result["holm_adjusted_p_one_sided_within_endpoint"] = adjusted[baseline]
-        tests[f"{phase}/{metric}"] = {
-            "role": role,
-            "phase": phase,
-            "metric": metric,
-            "comparison_family": f"Full versus {len(comparators)} deployable baselines",
-            "results": family,
-        }
-    return {
-        "scenario": scenario,
-        "experimental_unit": f"paired seed-level phase aggregate (n={len(summaries)})",
-        "confirmatory_hypothesis": "Full has higher held-out-climb teacher-forced Top-1 than each deployable baseline.",
-        "secondary_endpoints": [
-            "held-out-settled teacher-forced Top-1",
-            "held-out-climb normalized human action load",
-            "held-out-settled normalized human action load",
-            "held-out-climb p95 retrain fit latency",
-            "held-out-settled p95 retrain fit latency",
-        ],
-        "test": "Exact paired sign-flip randomization test; one-sided p-values are Holm-adjusted within each endpoint.",
-        "caution": "Inference may be low-powered. Bootstrap intervals are descriptive and do not replace the exact tests.",
-        "endpoints": tests,
-    }
 
 
 def _positive_int(value: Any, default: int = 1) -> int:
@@ -1952,13 +1807,6 @@ def build_schedule(
 
 
 CLAIRVOYANT_REFERENCE_TAG = "dashed_reference_not_deployable"
-CLAIRVOYANT_LEAKAGE_WARNING = (
-    "Non-deployable oracle: retention decisions read the future recurrence "
-    "schedule. It matches Full exactly on a pair's first exposure, because "
-    "there is nothing to retain or prune before a pair is learned, and "
-    "thereafter keeps whatever its future-filtered retention produces, "
-    "including outcomes worse than Full. Use only as a reference curve."
-)
 
 POST_MISMATCH_WINDOWS = (1, 2, 3)
 RECOVERY_BASELINE_EXPOSURES = 3
@@ -2022,6 +1870,12 @@ class EvalSettings:
     output: str = DEFAULT_RESULTS_ROOT
     run: Optional[str] = None
     resume: bool = False
+    # Save each stream's agent and accumulated rows after every event, and
+    # continue from there on a later attempt. Seed-level resume alone requires
+    # a completed seed, so a native crash part-way through discards the whole
+    # seed; on a runtime that crashes every few million GPU calls that means a
+    # long scenario never finishes.
+    event_resume: bool = False
     # Process cap for complete scenario cohorts.  With the paper schedule this
     # admits all 3 scenarios x 5 seeds at once (15 workers).
     workers: int = DEFAULT_EVALUATION_WORKER_CAP
@@ -2052,9 +1906,6 @@ class EvalSettings:
     top_k: int = 3
     profile: bool = False
     sensitivity: bool = False
-    # Permanent opt-in one-step component counterfactuals. These are logged
-    # after the deployed prediction and never fed to execution or learning.
-    component_counterfactuals: bool = False
     model_settings: Mapping[str, Any] = field(default_factory=dict)
     # Reporting label with no behavioral effect.
     experiment: str = "standard_evaluation"
@@ -2822,9 +2673,6 @@ def decision_ceiling(pairs: Sequence[TaskVariant]) -> Dict[str, Any]:
     state_bound = bound(by_state)
     prefix_bound = bound(by_prefix)
     return {
-        "definition": ("Upper bound on Top-1 given the information a predictor actually has. Conditioning on state bounds "
-                       "any state-feature reward; conditioning on prefix bounds any history-aware predictor. A bound of 1.0 "
-                       "means no decision in this stream is contested, so the stream cannot evidence preference learning."),
         "given_state": state_bound,
         "given_prefix": prefix_bound,
         # Positive means history carries preference information the state does
@@ -3134,88 +2982,6 @@ def observe_demo(
     }
 
 
-def _counterfactual_policy_record(
-    distribution: Mapping[str, float], actual: str, floor: float,
-) -> Dict[str, Any]:
-    """Compact, RNG-free paired outcomes for one shadow policy."""
-    if not distribution:
-        return {
-            "argmax_action": None,
-            "argmax_probability": None,
-            "actual_action_probability": None,
-            "actual_action_nll": -math.log(max(float(floor), 1e-12)),
-            "actual_in_top_tie": False,
-            "expected_top_1": 0.0,
-            "top_tie_size": 0,
-        }
-    peak = max(float(value) for value in distribution.values())
-    tied = sorted(
-        str(action) for action, probability in distribution.items()
-        if math.isclose(float(probability), peak, rel_tol=0.0, abs_tol=1e-12)
-    )
-    actual_probability = distribution.get(str(actual))
-    actual_in_top_tie = str(actual) in tied
-    return {
-        "argmax_action": tied[0],
-        "argmax_probability": peak,
-        "actual_action_probability": (
-            float(actual_probability) if actual_probability is not None else None
-        ),
-        "actual_action_nll": -math.log(max(
-            float(actual_probability) if actual_probability is not None else 0.0,
-            max(float(floor), 1e-12),
-        )),
-        "actual_in_top_tie": actual_in_top_tie,
-        "expected_top_1": (
-            1.0 / len(tied) if actual_in_top_tie and tied else 0.0
-        ),
-        "top_tie_size": len(tied),
-    }
-
-
-_COUNTERFACTUAL_POLICY_NAMES = {
-    "maxent_only",
-    "semantic_current",
-    "deployed_current",
-    "semantic_completion",
-    "semantic_completion_current_gate",
-    "latent_relaxed",
-    "latent_two_role",
-}
-
-
-def _validate_component_counterfactual_rows(
-    rows: Sequence[Mapping[str, Any]],
-) -> None:
-    """Fail before a partial or final artifact can contain silent gaps."""
-    required_policy_fields = {
-        "argmax_action", "argmax_probability", "actual_action_probability",
-        "actual_action_nll", "actual_in_top_tie", "expected_top_1",
-        "top_tie_size",
-    }
-    for index, row in enumerate(rows):
-        for field in ("semantic_gate_outcome", "latent_gate_outcome"):
-            if row.get(field) is None:
-                raise RuntimeError(
-                    f"component diagnostic turn {index} is missing {field}"
-                )
-        policies = row.get("counterfactual_policies")
-        if not isinstance(policies, Mapping):
-            raise RuntimeError(
-                f"component diagnostic turn {index} has no counterfactual policies"
-            )
-        if set(policies) != _COUNTERFACTUAL_POLICY_NAMES:
-            raise RuntimeError(
-                f"component diagnostic turn {index} has unexpected branches: "
-                f"{sorted(policies)}"
-            )
-        for name, policy in policies.items():
-            if not isinstance(policy, Mapping) or not required_policy_fields.issubset(policy):
-                raise RuntimeError(
-                    f"component diagnostic turn {index} has incomplete branch {name!r}"
-                )
-
-
 def assist_demo(
     agent: AdaptiveAgent,
     pair: TaskVariant,
@@ -3254,34 +3020,14 @@ def assist_demo(
         deployed_t0 = time.perf_counter()
         distribution = agent.predict_actions(list(prefix))
         deployed_wall_s = time.perf_counter() - deployed_t0
-        # Capture decision-time telemetry before any shadow branch can touch
-        # diagnostic state. This is also what makes human-shadow rows complete.
+        # Capture decision-time telemetry immediately. This is also what
+        # makes human-shadow rows complete.
         decision_stats = dict(agent.varying_policy_stats())
-        counterfactual: Optional[Dict[str, Any]] = None
-        candidates: Tuple[str, ...] = ()
-        shadow_wall_s = 0.0
-        if config.component_counterfactuals:
-            state = agent.domain.state_from_actions(prefix)
-            candidates = tuple(agent.domain.legal_actions(
-                state, agent._known_action_universe(),
-            ))
-            shadow_t0 = time.perf_counter()
-            counterfactual = agent.maxent.counterfactual_policies(
-                state,
-                candidates,
-                prefix=prefix,
-                allow_latent_strategy=agent._latent_strategy_confirmed,
-                deployed_distribution=distribution,
-            )
-            shadow_wall_s = time.perf_counter() - shadow_t0
         pending_prediction.clear()
         pending_prediction.update({
             "prefix": tuple(prefix),
             "decision_stats": decision_stats,
             "deployed_prediction_wall_s": float(deployed_wall_s),
-            "counterfactual_prediction_wall_s": float(shadow_wall_s),
-            "counterfactual": counterfactual,
-            "candidates": candidates,
         })
         return distribution
 
@@ -3308,35 +3054,7 @@ def assist_demo(
             **stats,
             "actual_action_probability": float(actual_probability) if actual_probability is not None else None,
             "deployed_prediction_wall_s": pending_prediction.get("deployed_prediction_wall_s"),
-            "counterfactual_prediction_wall_s": pending_prediction.get("counterfactual_prediction_wall_s"),
         }
-        counterfactual = pending_prediction.get("counterfactual")
-        if counterfactual is not None:
-            candidates = tuple(pending_prediction.get("candidates") or ())
-            role_counts = Counter(
-                agent.domain.action_role(action) for action in candidates
-            )
-            actual_role = agent.domain.action_role(str(context.actual))
-            metadata.update({
-                **dict(counterfactual.get("stats") or {}),
-                "counterfactual_policies": {
-                    name: _counterfactual_policy_record(
-                        distribution, context.actual,
-                        agent.settings.min_probability,
-                    )
-                    for name, distribution in counterfactual["policies"].items()
-                },
-                "candidate_role_count": len(role_counts),
-                "same_role_candidate_group_count": sum(
-                    int(count > 1) for count in role_counts.values()
-                ),
-                "max_same_role_candidate_multiplicity": max(
-                    role_counts.values(), default=0,
-                ),
-                "actual_role_candidate_multiplicity": int(
-                    role_counts.get(actual_role, 0)
-                ),
-            })
         pending_prediction.clear()
         return metadata
 
@@ -3895,7 +3613,11 @@ def _apply_oracle_pruning(
             default=None,
         )
         if replacement is not None:
-            agent.replay.mark_latest(recipe_id, replacement.variant_id)
+            # Pass the replacement's own clock so a recent-set pin scope keeps
+            # the sibling window it would have kept during normal operation.
+            agent.replay.mark_latest(
+                recipe_id, replacement.variant_id, now=replacement.last_seen_step,
+            )
             agent.library.latest[recipe_id] = replacement.variant_id
 
     if active_discard or restored_future or weight_changed:
@@ -4164,6 +3886,61 @@ def _prepare_offline_default(
     )
 
 
+def _prepare_offline_all(
+    agent: AdaptiveAgent,
+    plan: Plan,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Pretrain on every selected recipe under every preference, then lock.
+
+    "Every recipe" is this seed's panel, not the whole library: a seed draws
+    20 of the 30 recipes and never schedules the other 10, so training on them
+    would hand this control a corpus no other arm could have. Preferences need
+    no such restriction because the candidate preference set is identical for
+    every seed. The corpus is therefore the seed's frozen-probe panel, which
+    makes this arm the offline reference for those probes: what one frozen
+    model scores when it was handed every behaviour upfront instead of
+    acquiring them one demonstration at a time. Non-effective and semantically
+    duplicate presets are dropped per recipe, exactly as the probe panel drops
+    them, so a recipe contributes one demonstration per distinct behavior.
+
+    In the holdout this arm trains on the source progression like the other two
+    frozen controls: training it on the full preference library there would
+    hand it the held-out axis value the scenario exists to withhold.
+    """
+    recipe_names = tuple(sorted({str(recipe_name) for recipe_name in plan.selected_recipes}))
+    if not recipe_names:
+        raise ValueError("cannot pretrain all-pairs baseline: scenario has no recipes")
+    library = recipe_builders()
+    pairs: List[TaskVariant] = []
+    preference_names: set[str] = set()
+    for recipe in recipe_names:
+        effective, _applicability = _preference_panel(
+            recipe, library[recipe], PREFERENCE_IDS,
+        )
+        for preference_name, pair in effective.items():
+            pairs.append(pair)
+            preference_names.add(str(preference_name))
+    if not pairs:
+        raise ValueError("cannot pretrain all-pairs baseline: no effective pairs")
+    return _fit_frozen(
+        agent,
+        pairs=pairs,
+        metadata={
+            "offline_training_design": "all_recipes_all_preferences",
+            "offline_training_recipe_fraction_requested": 1.0,
+            "offline_training_preference_fraction_requested": 1.0,
+            "offline_training_recipe_scope": "all_selected_scenario_recipes",
+            "offline_training_preference_scope": "all_declared_preferences",
+            "offline_training_declared_preference_count": int(len(PREFERENCE_IDS)),
+            "offline_training_recipe_count": int(len(recipe_names)),
+            "offline_training_preference_count": int(len(preference_names)),
+            "offline_training_pair_count": int(len(pairs)),
+            "offline_training_recipe_names": list(recipe_names),
+            "offline_training_preference_names": sorted(preference_names),
+        },
+    )
+
+
 def _prepare_holdout_frozen(
     agent: AdaptiveAgent,
     plan: Plan,
@@ -4196,6 +3973,102 @@ def _prepare_holdout_frozen(
     )
 
 
+EVENT_RESUME_FORMAT = 1
+
+
+def _event_resume_path(out_dir: Path, baseline: str) -> Path:
+    return out_dir / "partial" / "resume" / f"{baseline}.pickle"
+
+
+def _save_event_resume(
+    path: Path,
+    baseline: str,
+    plan: Plan,
+    state: "RunState",
+    event_index: int,
+    loop_state: Mapping[str, Any],
+) -> None:
+    """Persist enough state to continue this stream at the next event.
+
+    The GPU model is not part of it: the scorer is reattached on restore, and
+    its prompt memoization is a pure cache that costs only time to rebuild.
+    Written to a temporary file and renamed, so a crash during the write cannot
+    leave a half-written state that a later run would trust.
+    """
+    agent = state.agent
+    scorer = getattr(agent, "scorer", None)
+    payload = {
+        "format": EVENT_RESUME_FORMAT,
+        "baseline": baseline,
+        "scenario": plan.scenario,
+        "seed": int(plan.seed),
+        "event_count": len(plan.events),
+        "event_index": int(event_index),
+        "wall_s": float(state.wall_s),
+        "loop_state": dict(loop_state),
+        "rows": {
+            "episode_rows": state.episode_rows,
+            "frozen_rows": state.frozen_rows,
+            "memory_rows": state.memory_rows,
+            "active_audit_rows": state.active_audit_rows,
+            "oracle_pruning_rows": state.oracle_pruning_rows,
+            "turn_rows": state.turn_rows,
+        },
+        "initial_memory": state.initial_memory,
+        "recipe_ids": dict(state.recipe_ids),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".pickle.partial")
+    try:
+        if scorer is not None:
+            agent.scorer = None
+        payload["agent"] = agent
+        with open(temporary, "wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temporary, path)
+    finally:
+        if scorer is not None:
+            agent.scorer = scorer
+        temporary.unlink(missing_ok=True)
+
+
+def _load_event_resume(
+    path: Path,
+    baseline: str,
+    plan: Plan,
+) -> Optional[Dict[str, Any]]:
+    """Return a usable resume payload for this exact stream, or None.
+
+    Every mismatch is treated as "start over" rather than an error: a resume
+    state is an optimization, and continuing a different plan from it would
+    silently produce a run that never happened.
+    """
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "rb") as handle:
+            payload = pickle.load(handle)
+    except (OSError, pickle.UnpicklingError, EOFError, AttributeError, ImportError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    expected = {
+        "format": EVENT_RESUME_FORMAT,
+        "baseline": baseline,
+        "scenario": plan.scenario,
+        "seed": int(plan.seed),
+        "event_count": len(plan.events),
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        return None
+    event_index = payload.get("event_index")
+    if not isinstance(event_index, int) or not 0 <= event_index < len(plan.events):
+        return None
+    if payload.get("agent") is None:
+        return None
+    return payload
+
+
 def run_stream(
     baseline: str,
     plan: Plan,
@@ -4204,6 +4077,7 @@ def run_stream(
     execution_mode_schedule: Optional[Sequence[str]] = None,
     mode_schedule_policy: str = "baseline_local",
     event_progress: Optional[Callable[[RunState, int], None]] = None,
+    resume_dir: Optional[Path] = None,
 ) -> RunState:
     if execution_mode_schedule is not None:
         if len(execution_mode_schedule) != len(plan.events):
@@ -4244,16 +4118,28 @@ def run_stream(
     last_frozen_event: Optional[int] = None
     start_time = time.perf_counter()
     baseline_context: Dict[str, Any] = {}
+    # Events already completed by an earlier attempt at this stream. The
+    # oracle arm is excluded because it also carries a counterfactual Full
+    # agent, which this state does not describe.
+    resumed_wall_s = 0.0
+    resume_from = -1
+    resume_path = (
+        _event_resume_path(resume_dir, baseline)
+        if resume_dir is not None and not is_clairvoyant else None
+    )
     holdout_scenario = plan.scenario == HOLDOUT
     if holdout_scenario and baseline in {
         "frozen",
         "offline_default",
+        "offline_all",
     }:
         recipe_ids, baseline_context = _prepare_holdout_frozen(agent, plan)
     elif baseline == "frozen":
         recipe_ids, baseline_context = _prepare_frozen(agent, plan, config)
     elif baseline == "offline_default":
         recipe_ids, baseline_context = _prepare_offline_default(agent, plan)
+    elif baseline == "offline_all":
+        recipe_ids, baseline_context = _prepare_offline_all(agent, plan)
     # Report offline work separately from online phase costs.
     initial_memory = snapshot_memory(agent)
     offline_training_pairs = {
@@ -4264,7 +4150,55 @@ def run_stream(
         )
     }
 
+    if resume_path is not None:
+        payload = _load_event_resume(resume_path, baseline, plan)
+        if payload is not None:
+            scorer = getattr(agent, "scorer", None)
+            agent = payload["agent"]
+            if scorer is not None:
+                # The restored agent was saved without its GPU scorer.
+                agent.scorer = scorer
+            loop_state = payload["loop_state"]
+            recipe_ids = dict(payload["recipe_ids"])
+            observed_recipes = set(loop_state["observed_recipes"])
+            observed_preferences = set(loop_state["observed_preferences"])
+            observed_pairs = set(loop_state["observed_pairs"])
+            preferences_by_recipe = defaultdict(set, {
+                key: set(value)
+                for key, value in loop_state["preferences_by_recipe"].items()
+            })
+            axis_values_by_recipe = defaultdict(set, {
+                key: set(value)
+                for key, value in loop_state["axis_values_by_recipe"].items()
+            })
+            last_frozen_event = loop_state["last_frozen_event"]
+            baseline_context = dict(loop_state["baseline_context"])
+            offline_training_pairs = set(loop_state["offline_training_pairs"])
+            initial_memory = payload["initial_memory"]
+            rows = payload["rows"]
+            episode_rows = list(rows["episode_rows"])
+            frozen_rows = list(rows["frozen_rows"])
+            memory_rows = list(rows["memory_rows"])
+            audit_rows = list(rows["active_audit_rows"])
+            oracle_rows = list(rows["oracle_pruning_rows"])
+            turn_rows = list(rows["turn_rows"])
+            resumed_wall_s = float(payload["wall_s"])
+            resume_from = int(payload["event_index"])
+            # A previous attempt may have written a checkpoint and then died
+            # before recording it as resumable. Those events are about to be
+            # replayed, so their old rows must not survive alongside the new.
+            _trim_checkpoints_after(resume_dir, baseline, resume_from)
+            print(
+                f"[evaluation] resuming {baseline} {plan.scenario} "
+                f"seed={int(plan.seed)} after event {resume_from + 1}"
+                f"/{len(plan.events)}; "
+                f"{resumed_wall_s:.0f}s of earlier work retained",
+                flush=True,
+            )
+
     for event_index, event in enumerate(plan.events):
+        if event_index <= resume_from:
+            continue
         pair = event.pair
         pair_seen_before = pair.label in observed_pairs
         if is_clairvoyant and not pair_seen_before:
@@ -4363,7 +4297,6 @@ def run_stream(
             tags.update({
                 "oracle_reference": MEMORY_ORACLE,
                 "reported_as": CLAIRVOYANT_REFERENCE_TAG,
-                "leakage_warning": CLAIRVOYANT_LEAKAGE_WARNING,
                 "oracle_retention_policy": "future_filtered_after_first_exposure",
                 "oracle_decay_policy": "binary_keep_until_final_occurrence",
             })
@@ -4668,7 +4601,6 @@ def run_stream(
                 "timing": "after_event",
                 "oracle_reference": MEMORY_ORACLE,
                 "reported_as": CLAIRVOYANT_REFERENCE_TAG,
-                "leakage_warning": CLAIRVOYANT_LEAKAGE_WARNING,
                 "oracle_selection": oracle_selection,
                 "oracle_full_fallback": bool(
                     oracle_selection == "full_for_unseen_pair"
@@ -4742,24 +4674,51 @@ def run_stream(
                 frozen_rows.extend(candidate_probe_rows)
             last_frozen_event = event_index
 
+        event_state = RunState(
+            baseline=baseline,
+            scenario=plan.scenario,
+            seed=plan.seed,
+            agent=agent,
+            recipe_ids=recipe_ids,
+            episode_rows=episode_rows,
+            frozen_rows=frozen_rows,
+            memory_rows=memory_rows,
+            active_audit_rows=audit_rows,
+            oracle_pruning_rows=oracle_rows,
+            turn_rows=turn_rows,
+            initial_memory=initial_memory,
+            # Includes work retained from an earlier attempt, so a resumed run
+            # reports the cost of producing the results, not of this process.
+            wall_s=resumed_wall_s + float(time.perf_counter() - start_time),
+        )
         if event_progress is not None:
-            event_progress(
-                RunState(
-                    baseline=baseline,
-                    scenario=plan.scenario,
-                    seed=plan.seed,
-                    agent=agent,
-                    recipe_ids=recipe_ids,
-                    episode_rows=episode_rows,
-                    frozen_rows=frozen_rows,
-                    memory_rows=memory_rows,
-                    active_audit_rows=audit_rows,
-                    oracle_pruning_rows=oracle_rows,
-                    turn_rows=turn_rows,
-                    initial_memory=initial_memory,
-                    wall_s=float(time.perf_counter() - start_time),
-                ),
+            event_progress(event_state, event_index)
+        # Written after the checkpoint, never before: a resume state that named
+        # an event whose rows were not persisted would leave a hole in the
+        # per-event series that nothing could later detect.
+        if resume_path is not None:
+            _save_event_resume(
+                resume_path,
+                baseline,
+                plan,
+                event_state,
                 event_index,
+                {
+                    "observed_recipes": set(observed_recipes),
+                    "observed_preferences": set(observed_preferences),
+                    "observed_pairs": set(observed_pairs),
+                    "preferences_by_recipe": {
+                        key: set(value)
+                        for key, value in preferences_by_recipe.items()
+                    },
+                    "axis_values_by_recipe": {
+                        key: set(value)
+                        for key, value in axis_values_by_recipe.items()
+                    },
+                    "last_frozen_event": last_frozen_event,
+                    "baseline_context": dict(baseline_context),
+                    "offline_training_pairs": set(offline_training_pairs),
+                },
             )
 
     final_context = {
@@ -4835,7 +4794,7 @@ def run_stream(
         oracle_pruning_rows=oracle_rows,
         turn_rows=turn_rows,
         initial_memory=initial_memory,
-        wall_s=float(time.perf_counter() - start_time),
+        wall_s=resumed_wall_s + float(time.perf_counter() - start_time),
     )
 
 
@@ -5123,7 +5082,6 @@ def summarize_adaptation(
 
     if not records:
         return {
-            "definition": "Model-specific adaptation after non-initial preference changes.",
             "status": "not_run",
             "early_window_exposures": 1,
             "n_switch_targets": 0,
@@ -5141,13 +5099,6 @@ def summarize_adaptation(
         if isinstance(record.get("recovery_exposure"), int)
     ]
     return {
-        "definition": (
-            "The first decision is a non-controlling teacher-forced prediction "
-            "at recipe step zero. The early endpoint uses one complete "
-            "post-switch demonstration. Recovery is the first post-switch "
-            "exposure whose teacher-forced Top-1 reaches 90% of that model's "
-            "mean over its last three same-recipe pre-switch demonstrations."
-        ),
         "status": "completed",
         "early_window_exposures": 1,
         "recovery_baseline_exposures": RECOVERY_BASELINE_EXPOSURES,
@@ -5315,12 +5266,6 @@ def _phase_training_costs(
         agent, memory_rows, initial_memory,
     )
     return {
-        "definition": (
-            "Online training cost is the non-negative event-to-event delta of cumulative retraining snapshots; "
-            "upfront cost is pre-deployment work and is not allocated to a phase. FLOPs are fit-only, model-specific estimates. "
-            "Retrain latency is the distribution over individual fits attributed to the phase they ran in: "
-            "p95 is the blocking wait a person sees between two demonstrations, which cumulative totals do not expose."
-        ),
         "upfront_training": offline,
         "per_phase_role": {
             phase: {**dict(values), **latency_by_phase.get(phase, {})}
@@ -5364,7 +5309,6 @@ def summarize_frozen(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     """Summarize frozen probes without treating an omitted audit as success."""
     if not rows:
         return {
-            "definition": "Frozen, non-mutating evaluation of the current active-memory model at scheduled checkpoints.",
             "status": "not_run",
             "n_checkpoints": 0,
             "n_rows": 0,
@@ -5414,7 +5358,6 @@ def summarize_frozen(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         for checkpoint, checkpoint_rows in sorted(grouped.items())
     }
     return {
-        "definition": "Frozen, non-mutating evaluation of the current active-memory model at scheduled checkpoints.",
         "status": "completed",
         "n_checkpoints": len(checkpoints),
         "n_rows": len(rows),
@@ -5460,13 +5403,6 @@ def summarize_cohorts(
         ],
     }
     return {
-        "definition": (
-            "Evaluator-only temporal cohorts from the fixed simulator schedule. "
-            "Old preferences are recurrent when another scheduled occurrence "
-            "remains and intentionally stale when none remains. Held-out status "
-            "requires a designated holdout pair absent from that model's offline "
-            "and deployment training history."
-        ),
         "uses_future_schedule_for_evaluation_only": True,
         **{
             cohort: summarize_frozen(cohort_rows)
@@ -5480,7 +5416,6 @@ def summarize_recurrence(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     probes = [row for row in rows if bool(row.get("delayed_recurrence_probe"))]
     if not probes:
         return {
-            "definition": "Pre-event memory state for horizon-calibrated delayed-recurrence probes.",
             "status": "not_run",
             "n_probes": 0,
         }
@@ -5490,7 +5425,6 @@ def summarize_recurrence(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         return _mean(1.0 if value else 0.0 for value in values) if values else None
 
     return {
-        "definition": "Pre-event memory state for horizon-calibrated delayed-recurrence probes. A Full probe engages the intended removal mechanism when the target is active/latest and all known historical conflicts are pruned.",
         "status": "completed",
         "n_probes": len(probes),
         "target_active_before_rate": rate("delayed_recurrence_target_active_before"),
@@ -5527,7 +5461,6 @@ def summarize_calibration(turn_rows: Sequence[Mapping[str, Any]], n_bins: int = 
     ]
     if not rows:
         return {
-            "definition": "Top-1 confidence calibration on robot turns.",
             "status": "not_run",
             "robot_turn_count": 0,
             "ece": None,
@@ -5548,7 +5481,6 @@ def summarize_calibration(turn_rows: Sequence[Mapping[str, Any]], n_bins: int = 
         ece += (len(values) / len(rows)) * abs(accuracy - confidence)
         bin_rows.append({"bin": index, "n": len(values), "mean_confidence": confidence, "accuracy": accuracy})
     return {
-        "definition": "Top-1 confidence calibration on robot turns.",
         "status": "completed",
         "robot_turn_count": len(rows),
         "ece": float(ece),
@@ -5611,12 +5543,8 @@ def summarize_decision_regimes(turn_rows: Sequence[Mapping[str, Any]]) -> Dict[s
             continue
         buckets[regime].append(row)
     classified = sum(len(rows) for rows in buckets.values())
-    definition = ("Top-1 split by how much choice the decision offered: single_option_lookup (one action observed at "
-                  "this exact state, so memorisation suffices and the reward cannot matter), branching (two or more "
-                  "observed, a genuine ranking problem), unseen_state_fallback (state never observed, answered by "
-                  "generalisation). Shares are reported because the memory policy changes them.")
     if not classified:
-        return {"definition": definition, "status": "not_run", "n_classified": 0, "n_unclassified": unclassified, "by_regime": {}}
+        return {"status": "not_run", "n_classified": 0, "n_unclassified": unclassified, "by_regime": {}}
     by_regime: Dict[str, Any] = {}
     for regime in DECISION_REGIMES:
         rows = buckets[regime]
@@ -5628,7 +5556,6 @@ def summarize_decision_regimes(turn_rows: Sequence[Mapping[str, Any]]) -> Dict[s
             "mean_observed_action_count": (_mean(_regime_action_count(row) for row in rows) if rows else None),
         }
     return {
-        "definition": definition,
         "status": "completed",
         "n_classified": classified,
         # Turns with no exact-state count: predictors that never consult the
@@ -5719,28 +5646,15 @@ def summarize_transfer(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         grouped_value[str(row.get("axis_value_label"))].append(row)
         grouped_cell[str(row.get("axis_transfer_cell"))].append(row)
     return {
-        "definition": "Per-axis-value transfer diagnostics; composed preferences contribute one row per non-default axis.",
         "n_axis_value_rows": len(axis_rows),
         "by_axis": {k: aggregate_episodes(v) for k, v in sorted(grouped_axis.items())},
         "by_axis_value": {k: aggregate_episodes(v) for k, v in sorted(grouped_value.items())},
         "by_axis_transfer_cell": {k: aggregate_episodes(v) for k, v in sorted(grouped_cell.items())},
     }
 
-_ACTIVE_AUDIT_DEFINITION = (
-    "Three separate quantities. The contract is that the records handed to each "
-    "fit exclude every pruned variant, and it is the only term that can fail. "
-    "Redundancy is a cold fit on active memory against a cold fit on active plus "
-    "pruned memory: it measures how much the retention decision actually cost. "
-    "Deployed path dependence is the deployed model against a fresh cold fit on "
-    "the same active set, which is non-zero whenever the deployed weights were "
-    "warm-started and is not a violation."
-)
-
-
 def summarize_active_audit(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {
-            "definition": _ACTIVE_AUDIT_DEFINITION,
             "status": "not_run",
             "n_audits": 0,
             "n_available": 0,
@@ -5761,7 +5675,6 @@ def summarize_active_audit(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     ]
     with_pruned = [row for row in available if row.get("pruned_available")]
     return {
-        "definition": _ACTIVE_AUDIT_DEFINITION,
         "status": "completed" if available else "unavailable",
         "n_audits": len(rows),
         "n_available": len(available),
@@ -5801,7 +5714,6 @@ def summarize_commit_safety(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]
 
     return {
         **lifecycle,
-        "definition": "Ground-truth-aware candidate, commit, promotion, latest-pin, recovery, and calibration audit for assist-mode self-training.",
         "commit_scoring_wall_scope": "online_identity_classification_and_confidence_scoring_excluding_retraining",
         "identity_registry_scope": "persistent default archive; active/pruned decay state is unchanged",
         "n_assist_episodes": len(assist),
@@ -5861,12 +5773,6 @@ def summarize_reentry(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     ]
     confirmed = [row for row in assist if row.get("actual_reentry_from_pruned")]
     return {
-        "definition": (
-            "Assist performance stratified by the evaluator-observed pre-episode state of the "
-            "target variant. Only pruned-target episodes support the selective-forgetting "
-            "recovery claim; active-target episodes are the explicit retention control. An agent "
-            "that never prunes has no pruned-target episodes by construction."
-        ),
         "target_pruned_before_episode": aggregate_episodes(pruned_target),
         "target_active_before_episode_control": aggregate_episodes(active_target),
         "target_known_recipe_new_variant": aggregate_episodes(known_recipe_new_variant),
@@ -5999,7 +5905,6 @@ def summarize_oracle(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         grouped[(str(row.get("baseline", "unknown")), str(row.get("metric", "unknown")))].append(row)
     references = sorted({str(row.get("oracle_reference")) for row in rows if row.get("oracle_reference")})
     return {
-        "definition": "Positive oracle_advantage means the future-aware memory-pruning reference is better.",
         "oracle_reference": references[0] if len(references) == 1 else references,
         "n_rows": len(rows),
         "by_baseline": {
@@ -6170,15 +6075,134 @@ def _mode_schedule_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def run_plan(
-    plan: Plan,
-    config: EvalSettings,
-    out_dir: Path,
-    *,
-    progress_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
-) -> Dict[str, Any]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    start_time = time.perf_counter()
+class _EventProgressWriter:
+    """Write one atomic checkpoint per completed event, plus a partial summary.
+
+    Held as an object rather than a closure so a per-baseline cell and a
+    whole-plan run can share it: the row offsets and the partial roll-up are
+    keyed by baseline either way, so a directory holding one arm and a
+    directory holding all of them are read back the same way.
+    """
+
+    def __init__(
+        self,
+        plan: Plan,
+        out_dir: Path,
+        progress_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    ) -> None:
+        self.plan = plan
+        self.out_dir = out_dir
+        self.progress_callback = progress_callback
+        self.offsets: Dict[str, Dict[str, int]] = {}
+        self.partial_baselines: Dict[str, Dict[str, Any]] = {}
+        self.phase_ids = tuple(dict.fromkeys(
+            str(event.tags.get("phase_id", "unknown"))
+            for event in plan.events
+        ))
+        self.phase_numbers = {
+            phase_id: index + 1
+            for index, phase_id in enumerate(self.phase_ids)
+        }
+        self.stages = tuple(dict.fromkeys(
+            str(event.tags.get("stage", "unknown"))
+            for event in plan.events
+        ))
+        self.stage_numbers = {
+            stage: index + 1 for index, stage in enumerate(self.stages)
+        }
+
+    def __call__(self, stream: "RunState", event_index: int) -> None:
+        plan = self.plan
+        out_dir = self.out_dir
+        event = plan.events[event_index]
+        phase_id = str(event.tags.get("phase_id", "unknown"))
+        stage = str(event.tags.get("stage", "unknown"))
+        row_groups = {
+            "episodes": stream.episode_rows,
+            "turns": stream.turn_rows,
+            "frozen_probes": stream.frozen_rows,
+            "diagnostics": (
+                stream.memory_rows
+                + stream.active_audit_rows
+                + stream.oracle_pruning_rows
+            ),
+        }
+        offsets = self.offsets.setdefault(
+            stream.baseline,
+            {name: 0 for name in row_groups},
+        )
+        new_rows = {
+            name: rows[offsets[name]:]
+            for name, rows in row_groups.items()
+        }
+        checkpoint_path = (
+            out_dir / "partial" / "checkpoints" / stream.baseline
+            / f"event_{event_index:06d}.json"
+        )
+        payload = {
+            "state": "event_complete",
+            "scenario": plan.scenario,
+            "seed": int(plan.seed),
+            "baseline": stream.baseline,
+            "event_index": int(event_index),
+            "events_completed": len(stream.episode_rows),
+            "events_total": len(plan.events),
+            "phase_id": phase_id,
+            "phase_number": self.phase_numbers[phase_id],
+            "phase_count": len(self.phase_ids),
+            "stage": stage,
+            "stage_number": self.stage_numbers[stage],
+            "stage_count": len(self.stages),
+            "phase_complete": _is_phase_boundary(plan, event_index),
+            "pair": event.pair.label,
+            "mode": event.mode,
+            "elapsed_s": float(stream.wall_s),
+            "created_at_utc": _utc_now(),
+            "row_counts": {
+                name: len(rows) for name, rows in row_groups.items()
+            },
+            "tables": new_rows,
+        }
+        _write_json(checkpoint_path, payload)
+        for name, rows in row_groups.items():
+            offsets[name] = len(rows)
+
+        self.partial_baselines[stream.baseline] = {
+            "events_completed": len(stream.episode_rows),
+            "events_total": len(plan.events),
+            "latest_event_index": int(event_index),
+            "elapsed_s": float(stream.wall_s),
+            "episodes": aggregate_episodes(stream.episode_rows),
+            "assist": aggregate_episodes([
+                row for row in stream.episode_rows
+                if row.get("mode") == "assist"
+            ]),
+            "row_counts": payload["row_counts"],
+        }
+        relative_checkpoint = str(checkpoint_path.relative_to(out_dir))
+        progress = {
+            key: value for key, value in payload.items()
+            if key != "tables"
+        }
+        progress["checkpoint"] = relative_checkpoint
+        _write_json(out_dir / "partial" / "summary.json", {
+            "state": "running",
+            "scenario": plan.scenario,
+            "seed": int(plan.seed),
+            "updated_at_utc": progress["created_at_utc"],
+            "latest": progress,
+            "per_baseline": self.partial_baselines,
+            "analysis_note": (
+                "Each checkpoint is atomic and contains only rows added by its "
+                "completed event. Concatenate checkpoints by baseline and event_index."
+            ),
+        })
+        if self.progress_callback is not None:
+            self.progress_callback(progress)
+
+
+def _write_plan(plan: Plan, out_dir: Path) -> None:
+    """Record the schedule a cell was run against, next to its results."""
     _write_json(out_dir / "plan.json", {
         "scenario": plan.scenario,
         "seed": plan.seed,
@@ -6214,188 +6238,349 @@ def run_plan(
             for index, event in enumerate(plan.events)
         ],
     })
-    per_baseline: Dict[str, Any] = {}
-    all_episode_rows: List[Dict[str, Any]] = []
-    all_frozen_rows: List[Dict[str, Any]] = []
-    all_diagnostic_rows: List[Dict[str, Any]] = []
-    all_turn_rows: List[Dict[str, Any]] = []
-    checkpoint_offsets: Dict[str, Dict[str, int]] = {}
-    partial_baselines: Dict[str, Dict[str, Any]] = {}
-    phase_ids = tuple(dict.fromkeys(
-        str(event.tags.get("phase_id", "unknown"))
-        for event in plan.events
-    ))
-    phase_numbers = {phase_id: index + 1 for index, phase_id in enumerate(phase_ids)}
-    stages = tuple(dict.fromkeys(
-        str(event.tags.get("stage", "unknown"))
-        for event in plan.events
-    ))
-    stage_numbers = {stage: index + 1 for index, stage in enumerate(stages)}
 
-    def persist_event_progress(stream: RunState, event_index: int) -> None:
-        event = plan.events[event_index]
-        phase_id = str(event.tags.get("phase_id", "unknown"))
-        stage = str(event.tags.get("stage", "unknown"))
-        row_groups = {
-            "episodes": stream.episode_rows,
-            "turns": stream.turn_rows,
-            "frozen_probes": stream.frozen_rows,
-            "diagnostics": (
-                stream.memory_rows
-                + stream.active_audit_rows
-                + stream.oracle_pruning_rows
-            ),
-        }
-        offsets = checkpoint_offsets.setdefault(
-            stream.baseline,
-            {name: 0 for name in row_groups},
-        )
-        new_rows = {
-            name: rows[offsets[name]:]
-            for name, rows in row_groups.items()
-        }
-        if config.component_counterfactuals:
-            _validate_component_counterfactual_rows(new_rows["turns"])
-        checkpoint_path = (
-            out_dir / "partial" / "checkpoints" / stream.baseline
-            / f"event_{event_index:06d}.json"
-        )
-        payload = {
-            "state": "event_complete",
-            "scenario": plan.scenario,
-            "seed": int(plan.seed),
-            "baseline": stream.baseline,
-            "event_index": int(event_index),
-            "events_completed": len(stream.episode_rows),
-            "events_total": len(plan.events),
-            "phase_id": phase_id,
-            "phase_number": phase_numbers[phase_id],
-            "phase_count": len(phase_ids),
-            "stage": stage,
-            "stage_number": stage_numbers[stage],
-            "stage_count": len(stages),
-            "phase_complete": _is_phase_boundary(plan, event_index),
-            "pair": event.pair.label,
-            "mode": event.mode,
-            "elapsed_s": float(stream.wall_s),
-            "created_at_utc": _utc_now(),
-            "row_counts": {
-                name: len(rows) for name, rows in row_groups.items()
-            },
-            "tables": new_rows,
-        }
-        _write_json(checkpoint_path, payload)
-        for name, rows in row_groups.items():
-            offsets[name] = len(rows)
 
-        partial_baselines[stream.baseline] = {
-            "events_completed": len(stream.episode_rows),
-            "events_total": len(plan.events),
-            "latest_event_index": int(event_index),
-            "elapsed_s": float(stream.wall_s),
-            "episodes": aggregate_episodes(stream.episode_rows),
-            "assist": aggregate_episodes([
-                row for row in stream.episode_rows
-                if row.get("mode") == "assist"
-            ]),
-            "row_counts": payload["row_counts"],
-        }
-        relative_checkpoint = str(checkpoint_path.relative_to(out_dir))
-        progress = {
-            key: value for key, value in payload.items()
-            if key != "tables"
-        }
-        progress["checkpoint"] = relative_checkpoint
-        _write_json(out_dir / "partial" / "summary.json", {
-            "state": "running",
-            "scenario": plan.scenario,
-            "seed": int(plan.seed),
-            "updated_at_utc": progress["created_at_utc"],
-            "latest": progress,
-            "per_baseline": partial_baselines,
-            "analysis_note": (
-                "Each checkpoint is atomic and contains only rows added by its "
-                "completed event. Concatenate checkpoints by baseline and event_index."
-            ),
-        })
-        if progress_callback is not None:
-            progress_callback(progress)
+def baseline_run_order(config: EvalSettings) -> Tuple[str, ...]:
+    """Order the arms so the shared route is produced before it is consumed.
 
-    baselines = [b for b in config.baselines if b != MEMORY_ORACLE]
+    Under shared routing every other arm replays ``full``'s realized
+    observe/assist schedule, so ``full`` has to go first whatever order the
+    caller asked for. The memory oracle goes last: it is a reference curve read
+    against the arms above it, not a system competing with them.
+    """
+    baselines = [name for name in config.baselines if name != MEMORY_ORACLE]
     if config.shared_routing and "full" not in baselines:
         raise ValueError(
             "shared_routing=True requires the deployable 'full' system "
             "to be included in EvalSettings.baselines"
         )
-    canonical_full_modes: Optional[Tuple[str, ...]] = None
-    ordered_baselines = list(baselines)
     if config.shared_routing:
-        ordered_baselines = ["full", *[baseline for baseline in baselines if baseline != "full"]]
-
-    run_order = list(ordered_baselines)
+        baselines = ["full", *[name for name in baselines if name != "full"]]
+    order = list(dict.fromkeys(str(name) for name in baselines))
     if config.include_oracle:
-        run_order.append(MEMORY_ORACLE)
+        order.append(MEMORY_ORACLE)
+    return tuple(order)
 
-    for baseline in run_order:
-        clear_caches()
-        if baseline == "full" and config.shared_routing:
-            stream = run_stream(
-                baseline,
-                plan,
-                config,
-                mode_schedule_policy="full_realized_canonical",
-                event_progress=persist_event_progress,
-            )
-            canonical_full_modes = tuple(
-                str(row.get("mode")) for row in stream.episode_rows
-            )
-        else:
-            stream = run_stream(
-                baseline,
-                plan,
-                config,
-                execution_mode_schedule=(
-                    canonical_full_modes
-                ),
-                mode_schedule_policy=(
-                    "matched_full_realized_execution_schedule_oracle"
-                    if baseline == MEMORY_ORACLE
-                    else "matched_full_realized_execution_schedule"
-                    if canonical_full_modes is not None
-                    else "baseline_local"
-                ),
-                event_progress=persist_event_progress,
-            )
 
-        baseline_summary = summarize_stream(stream)
-        if baseline == MEMORY_ORACLE:
-            baseline_summary["oracle"] = {
-                "presentation": CLAIRVOYANT_REFERENCE_TAG,
-                "warning": CLAIRVOYANT_LEAKAGE_WARNING,
-                "retention": "future_filtered_after_first_exposure",
-                "decay": "binary_keep_until_final_occurrence",
-                "selection": {
-                    "full_for_unseen_pair": int(sum(
-                        row.get("oracle_selection") == "full_for_unseen_pair"
-                        for row in stream.oracle_pruning_rows
-                    )),
-                    "future_filtered": int(sum(
-                        row.get("oracle_selection") == "future_filtered"
-                        for row in stream.oracle_pruning_rows
-                    )),
-                },
-                "pruning": {
-                    "n_prune_decisions": len(stream.oracle_pruning_rows),
-                    "total_pruned_active_variants": int(sum(
-                        _numeric(row, "oracle_pruned_active_variants")
-                        for row in stream.oracle_pruning_rows
-                    )),
-                    "total_pruned_archived_variants": int(sum(
-                        _numeric(row, "oracle_pruned_archived_variants")
-                        for row in stream.oracle_pruning_rows
-                    )),
-                },
-            }
+def produces_shared_route(baseline: str, config: EvalSettings) -> bool:
+    """Whether this arm is the one that defines the schedule others replay."""
+    return str(baseline) == "full" and bool(config.shared_routing)
+
+
+def realized_route(stream: "RunState") -> Tuple[str, ...]:
+    """The execution mode actually taken at each event of a finished stream."""
+    return tuple(str(row.get("mode")) for row in stream.episode_rows)
+
+
+def execute_baseline_stream(
+    baseline: str,
+    plan: Plan,
+    config: EvalSettings,
+    *,
+    route: Optional[Sequence[str]] = None,
+    event_progress: Optional[Callable[["RunState", int], None]] = None,
+    resume_dir: Optional[Path] = None,
+) -> Tuple["RunState", Dict[str, Any]]:
+    """Run one arm over one plan and summarize it.
+
+    ``route`` is ``full``'s realized execution schedule. It is None for the arm
+    that produces it and whenever routing is not shared; passing it in is what
+    lets an arm be run on its own, long after ``full`` finished, and still be
+    scored on the identical sequence of observations and assists.
+    """
+    clear_caches()
+    if produces_shared_route(baseline, config):
+        stream = run_stream(
+            baseline,
+            plan,
+            config,
+            mode_schedule_policy="full_realized_canonical",
+            event_progress=event_progress,
+            resume_dir=resume_dir,
+        )
+    else:
+        stream = run_stream(
+            baseline,
+            plan,
+            config,
+            execution_mode_schedule=(
+                tuple(str(mode) for mode in route) if route is not None else None
+            ),
+            mode_schedule_policy=(
+                "matched_full_realized_execution_schedule_oracle"
+                if baseline == MEMORY_ORACLE
+                else "matched_full_realized_execution_schedule"
+                if route is not None
+                else "baseline_local"
+            ),
+            event_progress=event_progress,
+            resume_dir=resume_dir,
+        )
+    baseline_summary = summarize_stream(stream)
+    if baseline == MEMORY_ORACLE:
+        baseline_summary["oracle"] = {
+            "presentation": CLAIRVOYANT_REFERENCE_TAG,
+            "retention": "future_filtered_after_first_exposure",
+            "decay": "binary_keep_until_final_occurrence",
+            "selection": {
+                "full_for_unseen_pair": int(sum(
+                    row.get("oracle_selection") == "full_for_unseen_pair"
+                    for row in stream.oracle_pruning_rows
+                )),
+                "future_filtered": int(sum(
+                    row.get("oracle_selection") == "future_filtered"
+                    for row in stream.oracle_pruning_rows
+                )),
+            },
+            "pruning": {
+                "n_prune_decisions": len(stream.oracle_pruning_rows),
+                "total_pruned_active_variants": int(sum(
+                    _numeric(row, "oracle_pruned_active_variants")
+                    for row in stream.oracle_pruning_rows
+                )),
+                "total_pruned_archived_variants": int(sum(
+                    _numeric(row, "oracle_pruned_archived_variants")
+                    for row in stream.oracle_pruning_rows
+                )),
+            },
+        }
+    return stream, baseline_summary
+
+
+def merge_cell(
+    run_dir: Path,
+    scenario: str,
+    seed: int,
+    baselines: Sequence[str],
+) -> Dict[str, Any]:
+    """Stitch one scenario/seed's per-arm folders into a cross-arm view.
+
+    The arms are run and stored separately, but several claims are only
+    defined across them -- the oracle gaps, and every paired full-minus-
+    baseline delta. Rather than keep a second copy of the data, this reads
+    each arm's own summary back and writes only what the comparison adds.
+    """
+    per_baseline: Dict[str, Any] = {}
+    wall_s = 0.0
+    table_rows: Dict[str, int] = defaultdict(int)
+    for baseline in baselines:
+        summary_path = (
+            _baseline_cell_dir(run_dir, baseline, scenario, int(seed)) / "summary.json"
+        )
+        if not summary_path.is_file():
+            continue
+        cell = _load_json(summary_path)
+        for name, value in dict(cell.get("per_baseline", {})).items():
+            per_baseline[str(name)] = value
+        wall_s += float(cell.get("wall_s", 0.0))
+        for name, count in dict(cell.get("table_rows", {})).items():
+            table_rows[str(name)] += int(count)
+    oracle_comparisons = build_oracle_rows(per_baseline)
+    out_dir = (
+        run_dir / "aggregate" / "cells"
+        / _safe_component(str(scenario), "scenario") / f"{int(seed):010d}"
+    )
+    _write_jsonl_gz(out_dir / "tables" / "oracle_gaps.jsonl.gz", oracle_comparisons)
+    table_rows["oracle_gaps"] = len(oracle_comparisons)
+    summary = {
+        "state": "complete",
+        "scenario": str(scenario),
+        "seed": int(seed),
+        "baselines": [str(name) for name in per_baseline],
+        "per_baseline": per_baseline,
+        "oracle_summary": summarize_oracle(oracle_comparisons),
+        "table_rows": dict(table_rows),
+        "cell_paths": {
+            str(baseline): str(
+                _baseline_cell_dir(run_dir, baseline, scenario, int(seed))
+                .relative_to(run_dir)
+            )
+            for baseline in per_baseline
+        },
+        "wall_s": float(wall_s),
+    }
+    _write_json(out_dir / "summary.json", summary)
+    return summary
+
+
+BASELINES_DIRNAME = "baselines"
+SHARED_DIRNAME = "shared"
+
+
+def _baseline_cell_dir(
+    run_dir: Path, baseline: str, scenario: str, seed: int,
+) -> Path:
+    """Where one (arm, scenario, seed) cell keeps everything it produced."""
+    return (
+        run_dir / BASELINES_DIRNAME / _safe_component(str(baseline), "baseline")
+        / "scenarios" / _safe_component(str(scenario), "scenario")
+        / "seeds" / f"{int(seed):010d}"
+    )
+
+
+def _baseline_dir(run_dir: Path, baseline: str) -> Path:
+    return run_dir / BASELINES_DIRNAME / _safe_component(str(baseline), "baseline")
+
+
+def _route_path(run_dir: Path, scenario: str, seed: int) -> Path:
+    """Where ``full``'s realized schedule is published for the other arms.
+
+    It lives outside every arm's directory on purpose: an arm's folder can be
+    deleted and re-run without destroying the route its scoring depends on.
+    """
+    return (
+        run_dir / SHARED_DIRNAME / "routing"
+        / _safe_component(str(scenario), "scenario") / f"{int(seed):010d}.json"
+    )
+
+
+def save_route(
+    run_dir: Path, scenario: str, seed: int, route: Sequence[str],
+) -> None:
+    _write_json(_route_path(run_dir, scenario, seed), {
+        "scenario": str(scenario),
+        "seed": int(seed),
+        "source": "full",
+        "policy": "full_realized_canonical",
+        "event_count": len(tuple(route)),
+        "modes": [str(mode) for mode in route],
+    })
+
+
+def load_route(
+    run_dir: Path, scenario: str, seed: int,
+) -> Optional[Tuple[str, ...]]:
+    path = _route_path(run_dir, scenario, seed)
+    if not path.is_file():
+        return None
+    try:
+        payload = _load_json(path)
+    except (OSError, ValueError):
+        return None
+    modes = payload.get("modes")
+    if not isinstance(modes, list):
+        return None
+    return tuple(str(mode) for mode in modes)
+
+
+def run_baseline_cell(
+    baseline: str,
+    plan: Plan,
+    config: EvalSettings,
+    out_dir: Path,
+    *,
+    route: Optional[Sequence[str]] = None,
+    progress_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Run exactly one arm over one plan and write its own result folder.
+
+    This is the unit the suite schedules. Everything a cell needs is either in
+    its arguments or in the shared route, so an arm whose implementation
+    changed can be deleted and re-run on its own without disturbing the arms
+    that did not change.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    start_time = time.perf_counter()
+    _write_plan(plan, out_dir)
+    stream, baseline_summary = execute_baseline_stream(
+        baseline,
+        plan,
+        config,
+        route=route,
+        event_progress=_EventProgressWriter(plan, out_dir, progress_callback),
+        resume_dir=out_dir if config.event_resume else None,
+    )
+    diagnostic_rows = (
+        stream.memory_rows
+        + stream.active_audit_rows
+        + stream.oracle_pruning_rows
+    )
+    axis_rows = transfer_rows(stream.episode_rows)
+    tables = out_dir / "tables"
+    _write_jsonl_gz(tables / "episodes.jsonl.gz", stream.episode_rows)
+    _write_jsonl_gz(tables / "turns.jsonl.gz", stream.turn_rows)
+    _write_jsonl_gz(tables / "frozen_probes.jsonl.gz", stream.frozen_rows)
+    _write_jsonl_gz(tables / "diagnostics.jsonl.gz", diagnostic_rows)
+    _write_jsonl_gz(tables / "axis_transfer.jsonl.gz", axis_rows)
+
+    realized = (
+        realized_route(stream) if produces_shared_route(baseline, config) else None
+    )
+    summary = {
+        "state": "complete",
+        "scenario": plan.scenario,
+        "seed": int(plan.seed),
+        "baseline": str(baseline),
+        "plan": "plan.json",
+        "mode_schedule": {
+            "policy": (
+                "full_realized_shared_across_all_methods"
+                if config.shared_routing else "local_routing"
+            ),
+            "produced_shared_route": realized is not None,
+            "replayed_shared_route": route is not None,
+            "canonical_full_mode_counts": (
+                dict(Counter(realized)) if realized is not None
+                else dict(Counter(route)) if route is not None
+                else None
+            ),
+        },
+        "table_rows": {
+            "episodes": len(stream.episode_rows),
+            "turns": len(stream.turn_rows),
+            "frozen_probes": len(stream.frozen_rows),
+            "diagnostics": len(diagnostic_rows),
+            "axis_transfer": len(axis_rows),
+        },
+        # Keyed by arm even though there is only one, so a single-arm folder
+        # and a merged cell are read back with the same code.
+        "per_baseline": {str(baseline): baseline_summary},
+        "wall_s": float(time.perf_counter() - start_time),
+    }
+    if realized is not None:
+        summary["realized_route"] = list(realized)
+    _write_json(out_dir / "summary.json", summary)
+    partial_summary_path = out_dir / "partial" / "summary.json"
+    if partial_summary_path.is_file():
+        partial_summary = _load_json(partial_summary_path)
+        partial_summary.update({
+            "state": "complete",
+            "completed_at_utc": _utc_now(),
+            "final_summary": "../summary.json",
+        })
+        _write_json(partial_summary_path, partial_summary)
+    return summary
+
+
+def run_plan(
+    plan: Plan,
+    config: EvalSettings,
+    out_dir: Path,
+    *,
+    progress_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    start_time = time.perf_counter()
+    _write_plan(plan, out_dir)
+    per_baseline: Dict[str, Any] = {}
+    all_episode_rows: List[Dict[str, Any]] = []
+    all_frozen_rows: List[Dict[str, Any]] = []
+    all_diagnostic_rows: List[Dict[str, Any]] = []
+    all_turn_rows: List[Dict[str, Any]] = []
+    persist_event_progress = _EventProgressWriter(plan, out_dir, progress_callback)
+
+    canonical_full_modes: Optional[Tuple[str, ...]] = None
+    for baseline in baseline_run_order(config):
+        stream, baseline_summary = execute_baseline_stream(
+            baseline,
+            plan,
+            config,
+            route=canonical_full_modes,
+            event_progress=persist_event_progress,
+            resume_dir=out_dir if config.event_resume else None,
+        )
+        if produces_shared_route(baseline, config):
+            canonical_full_modes = realized_route(stream)
         per_baseline[baseline] = baseline_summary
         all_episode_rows.extend(stream.episode_rows)
         all_frozen_rows.extend(stream.frozen_rows)
@@ -6408,8 +6593,6 @@ def run_plan(
     axis_rows = transfer_rows(all_episode_rows)
     oracle_comparisons = build_oracle_rows(per_baseline)
     tables = out_dir / "tables"
-    if config.component_counterfactuals:
-        _validate_component_counterfactual_rows(all_turn_rows)
     _write_jsonl_gz(tables / "episodes.jsonl.gz", all_episode_rows)
     _write_jsonl_gz(tables / "turns.jsonl.gz", all_turn_rows)
     _write_jsonl_gz(tables / "frozen_probes.jsonl.gz", all_frozen_rows)
@@ -6460,10 +6643,16 @@ def _mp_context() -> mp.context.BaseContext:
     return mp.get_context("spawn")
 
 
-def _worker_count(config: EvalSettings, pending_jobs: Optional[int] = None) -> int:
-    # One worker owns the quantized GPU model; seed-level GPU replication can
-    # otherwise exhaust memory before evaluation begins.
-    if "in_context_llm" in config.baselines:
+def _worker_count(
+    config: EvalSettings,
+    pending_jobs: Optional[int] = None,
+    baseline: Optional[str] = None,
+) -> int:
+    # One worker owns the quantized GPU model; cell-level GPU replication can
+    # otherwise exhaust memory before evaluation begins. Arms run one at a
+    # time, so only the GPU arm itself is held to a single process -- the
+    # symbolic arms in the same run keep the full cohort.
+    if (LLM_BASELINE in config.baselines) if baseline is None else (baseline == LLM_BASELINE):
         return 1
     # Admit only complete scenario cohorts: every seed for an admitted scenario
     # starts together, and additional scenarios wait when the process cap would
@@ -6639,13 +6828,51 @@ def _runtime_provenance() -> Dict[str, Any]:
     }
 
 
-def _seed_dir(run_dir: Path, scenario: str, seed: int) -> Path:
-    scenario = _safe_component(str(scenario), "scenario")
-    return run_dir / "scenarios" / scenario / "seeds" / f"{int(seed):010d}"
-
-
 def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def find_resumable_run(config: EvalSettings) -> Optional[str]:
+    """Name the newest incomplete run this exact config can continue.
+
+    Without this, per-event resume is unreachable: every invocation mints a new
+    timestamped directory, so the state a crashed run left behind is never
+    looked at. Matching on the config hash and experiment label is the same
+    check ``_create_or_resume_run`` applies to an explicit ``--resume``, so a
+    directory found here is one that resume would already have accepted.
+    """
+    runs = Path(config.output).expanduser().resolve() / RUNS_DIRNAME
+    if not runs.is_dir():
+        return None
+    digest = _config_hash(config)
+    candidates: List[Tuple[float, str]] = []
+    for run_dir in runs.iterdir():
+        manifest_path = run_dir / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = _load_json(manifest_path)
+        except (OSError, ValueError):
+            continue
+        if manifest.get("config_hash") != digest:
+            continue
+        if manifest.get("experiment") != config.experiment:
+            continue
+        status = run_dir / "status.json"
+        try:
+            state = _load_json(status).get("state") if status.is_file() else None
+        except (OSError, ValueError):
+            state = None
+        if state == "complete":
+            continue
+        # Any per-event state to continue from? A run that never reached one
+        # offers nothing a fresh directory does not.
+        if not any(run_dir.glob("baselines/*/scenarios/*/seeds/*/partial/resume/*.pickle")):
+            continue
+        candidates.append((manifest_path.stat().st_mtime, run_dir.name))
+    if not candidates:
+        return None
+    return max(candidates)[1]
 
 
 def _create_or_resume_run(config: EvalSettings) -> Tuple[Path, Path, str]:
@@ -6675,7 +6902,8 @@ def _create_or_resume_run(config: EvalSettings) -> Tuple[Path, Path, str]:
             raise ValueError(f"Run {run!r} has a different experiment label")
         _write_json(run_dir / "status.json", {
             "state": "running", "resumed_at_utc": _utc_now(),
-            "completed_jobs": 0, "expected_jobs": len(config.scenarios) * len(config.seeds),
+            "completed_jobs": 0,
+            "expected_jobs": _expected_cell_count(config),
         })
         return root, run_dir, digest
 
@@ -6694,26 +6922,49 @@ def _create_or_resume_run(config: EvalSettings) -> Tuple[Path, Path, str]:
         "action_mask_contract": dict(ACTION_MASK_CONTRACT),
         "code": _git_provenance(),
         "runtime": _runtime_provenance(),
+        "baseline_order": list(baseline_run_order(config)),
         "expected_jobs": [
             {"scenario": scenario, "seed": int(seed)}
             for scenario in config.scenarios for seed in config.seeds
         ],
+        "expected_cells": [
+            {"baseline": baseline, "scenario": scenario, "seed": int(seed)}
+            for baseline in baseline_run_order(config)
+            for scenario in config.scenarios for seed in config.seeds
+        ],
         "artifacts": {
-            "summary": "scenarios/<scenario>/seeds/<seed>/summary.json",
-            "tables": "scenarios/<scenario>/seeds/<seed>/tables/*.jsonl.gz",
-            "partial_progress": "scenarios/<scenario>/seeds/<seed>/partial/summary.json",
-            "event_checkpoints": (
-                "scenarios/<scenario>/seeds/<seed>/partial/checkpoints/"
-                "<baseline>/event_<index>.json"
+            "cell_summary": (
+                "baselines/<baseline>/scenarios/<scenario>/seeds/<seed>/summary.json"
             ),
+            "cell_tables": (
+                "baselines/<baseline>/scenarios/<scenario>/seeds/<seed>/tables/*.jsonl.gz"
+            ),
+            "partial_progress": (
+                "baselines/<baseline>/scenarios/<scenario>/seeds/<seed>/partial/summary.json"
+            ),
+            "event_checkpoints": (
+                "baselines/<baseline>/scenarios/<scenario>/seeds/<seed>/partial/"
+                "checkpoints/<baseline>/event_<index>.json"
+            ),
+            "baseline_status": "baselines/<baseline>/status.json",
+            "shared_route": "shared/routing/<scenario>/<seed>.json",
+            "merged_cell": "aggregate/cells/<scenario>/<seed>/summary.json",
             "aggregate": "aggregate/",
         },
     })
     _write_json(run_dir / "status.json", {
         "state": "running", "started_at_utc": created_at,
-        "completed_jobs": 0, "expected_jobs": len(config.scenarios) * len(config.seeds),
+        "completed_jobs": 0, "expected_jobs": _expected_cell_count(config),
     })
     return root, run_dir, digest
+
+
+def _expected_cell_count(config: EvalSettings) -> int:
+    return (
+        len(baseline_run_order(config))
+        * len(config.scenarios)
+        * len(config.seeds)
+    )
 
 
 def _update_latest(root: Path, run_dir: Path) -> None:
@@ -6729,20 +6980,36 @@ def _update_latest(root: Path, run_dir: Path) -> None:
             temporary.unlink()
 
 
-def _completed_seed_result(run_dir: Path, scenario: str, seed: int) -> Optional[Dict[str, Any]]:
-    seed_dir = _seed_dir(run_dir, scenario, seed)
-    status_path = seed_dir / "status.json"
-    summary_path = seed_dir / "summary.json"
+def _completed_cell_result(
+    run_dir: Path, baseline: str, scenario: str, seed: int,
+) -> Optional[Dict[str, Any]]:
+    """Reuse one finished arm/scenario/seed cell instead of re-running it.
+
+    This is what makes an arm independently re-runnable: delete one arm's
+    folder and every other cell still reports complete, so a resumed run
+    re-runs only the arm that changed.
+    """
+    cell_dir = _baseline_cell_dir(run_dir, baseline, scenario, seed)
+    status_path = cell_dir / "status.json"
+    summary_path = cell_dir / "summary.json"
     if not status_path.is_file() or not summary_path.is_file():
         return None
     status = _load_json(status_path)
     if status.get("state") != "complete":
         return None
+    summary = _load_json(summary_path)
+    # The published route can be reconstructed from the arm that produced it,
+    # so losing the shared directory does not invalidate a finished full cell.
+    route = summary.get("realized_route")
+    if isinstance(route, list) and route:
+        if load_route(run_dir, scenario, seed) is None:
+            save_route(run_dir, scenario, seed, [str(mode) for mode in route])
     return {
+        "baseline": str(baseline),
         "scenario": scenario,
         "seed": int(seed),
-        "key": f"{scenario}/{int(seed):010d}",
-        "summary": _load_json(summary_path),
+        "key": f"{baseline}/{scenario}/{int(seed):010d}",
+        "summary": summary,
         "summary_path": str(summary_path.relative_to(run_dir)),
         "wall_s": float(status.get("wall_s", 0.0)),
     }
@@ -6768,6 +7035,25 @@ def _clear_stale_checkpoints(out_dir: Path) -> int:
     return removed
 
 
+def _trim_checkpoints_after(
+    out_dir: Path, baseline: str, event_index: int,
+) -> int:
+    """Delete one baseline's checkpoints past a resume point."""
+    directory = out_dir / "partial" / "checkpoints" / baseline
+    if not directory.is_dir():
+        return 0
+    removed = 0
+    for path in directory.glob("event_*.json"):
+        try:
+            index = int(path.stem.split("_")[-1])
+        except ValueError:
+            continue
+        if index > int(event_index):
+            path.unlink()
+            removed += 1
+    return removed
+
+
 def _open_worker_fault_log(out_dir: Path) -> Optional[Any]:
     """Point faulthandler at a file so a native crash leaves a stack behind.
 
@@ -6789,12 +7075,14 @@ def _open_worker_fault_log(out_dir: Path) -> Optional[Any]:
         return None
 
 
-def _run_seed_scenario_job(
-    scenario: str, seed: int, config: EvalSettings, run_dir: str,
+def _run_baseline_cell_job(
+    baseline: str, scenario: str, seed: int, config: EvalSettings, run_dir: str,
 ) -> Dict[str, Any]:
+    """Process entry point for one arm/scenario/seed cell."""
     _pin_to_performance_cores()
     _apply_native_thread_limit(_native_thread_count(config))
-    out_dir = _seed_dir(Path(run_dir), scenario, seed)
+    run_path = Path(run_dir)
+    out_dir = _baseline_cell_dir(run_path, baseline, scenario, seed)
     out_dir.mkdir(parents=True, exist_ok=True)
     start_time = time.perf_counter()
     started_at = _utc_now()
@@ -6806,6 +7094,7 @@ def _run_seed_scenario_job(
         latest_progress.update(dict(progress))
         _write_json(out_dir / "status.json", {
             "state": "running",
+            "baseline": str(baseline),
             "started_at_utc": started_at,
             "updated_at_utc": _utc_now(),
             "progress": latest_progress,
@@ -6816,8 +7105,8 @@ def _run_seed_scenario_job(
         ):
             print(
                 "[evaluation] progress "
-                f"scenario={scenario} seed={int(seed)} "
                 f"baseline={progress.get('baseline')} "
+                f"scenario={scenario} seed={int(seed)} "
                 f"event={progress.get('events_completed')}/{progress.get('events_total')} "
                 f"stage={progress.get('stage_number')}/{progress.get('stage_count')} "
                 f"elapsed={_format_seconds(progress.get('elapsed_s'))} "
@@ -6825,22 +7114,50 @@ def _run_seed_scenario_job(
                 flush=True,
             )
 
-    _clear_stale_checkpoints(out_dir)
+    if not config.event_resume:
+        # With event resume the low range belongs to the same logical run and
+        # is not stale; run_stream trims only what sits past its resume point.
+        _clear_stale_checkpoints(out_dir)
     _write_json(out_dir / "status.json", {
         "state": "running",
+        "baseline": str(baseline),
         "started_at_utc": started_at,
     })
     try:
         plan = build_plan(scenario, config, int(seed))
-        summary = run_plan(
+        route: Optional[Tuple[str, ...]] = None
+        if config.shared_routing and not produces_shared_route(baseline, config):
+            route = load_route(run_path, scenario, int(seed))
+            if route is None:
+                raise FileNotFoundError(
+                    f"{baseline} replays full's realized schedule, but no route "
+                    f"is published for scenario={scenario} seed={int(seed)}. "
+                    "Run the 'full' arm for this cell first."
+                )
+            if len(route) != len(plan.events):
+                raise ValueError(
+                    f"published route for scenario={scenario} seed={int(seed)} "
+                    f"has {len(route)} events but the plan has {len(plan.events)}; "
+                    "the schedule changed since full was run, so every arm must "
+                    "be re-run"
+                )
+        summary = run_baseline_cell(
+            baseline,
             plan,
             config,
             out_dir,
+            route=route,
             progress_callback=report_progress,
         )
+        realized = summary.get("realized_route")
+        if realized:
+            # Published before this cell is marked complete: a resumed run
+            # must never see a finished full cell with no route beside it.
+            save_route(run_path, scenario, int(seed), [str(m) for m in realized])
     except BaseException as error:
         _write_json(out_dir / "status.json", {
-            "state": "failed", "started_at_utc": started_at, "failed_at_utc": _utc_now(),
+            "state": "failed", "baseline": str(baseline),
+            "started_at_utc": started_at, "failed_at_utc": _utc_now(),
             "error": f"{type(error).__name__}: {error}", "traceback": traceback.format_exc(),
             "wall_s": float(time.perf_counter() - start_time),
             "progress": latest_progress or None,
@@ -6848,47 +7165,52 @@ def _run_seed_scenario_job(
         raise
     wall_s = float(time.perf_counter() - start_time)
     _write_json(out_dir / "status.json", {
-        "state": "complete", "started_at_utc": started_at, "completed_at_utc": _utc_now(),
+        "state": "complete", "baseline": str(baseline),
+        "started_at_utc": started_at, "completed_at_utc": _utc_now(),
         "wall_s": wall_s,
         "progress": latest_progress or None,
     })
     return {
+        "baseline": str(baseline),
         "scenario": scenario,
         "seed": int(seed),
-        "key": f"{scenario}/{int(seed):010d}",
+        "key": f"{baseline}/{scenario}/{int(seed):010d}",
         "summary": summary,
-        "summary_path": str((out_dir / "summary.json").relative_to(run_dir)),
+        "summary_path": str((out_dir / "summary.json").relative_to(run_path)),
         "wall_s": wall_s,
     }
 
 
-def _pending_job_results(
-    jobs: Sequence[Tuple[str, int]],
+def _pending_cell_results(
+    baseline: str,
+    cells: Sequence[Tuple[str, int]],
     config: EvalSettings,
     run_dir: Path,
     workers: int,
 ) -> Iterable[Mapping[str, Any]]:
-    """Run pending jobs in complete, process-cap-bounded scenario cohorts."""
-    if "in_context_llm" in config.baselines:
-        for scenario, seed in jobs:
-            yield from _pending_seed_results(
-                scenario, [int(seed)], config, run_dir, 1,
+    """Run one arm's outstanding cells in process-cap-bounded cohorts.
+
+    Only the scenario/seed grid is parallel here. Arms are sequential by
+    construction: the suite finishes one before starting the next, which is
+    what keeps the shared route available and lets a single arm be re-run.
+    """
+    if baseline == LLM_BASELINE:
+        yield from _pending_llm_cell_results(baseline, cells, config, run_dir)
+        return
+    if workers <= 1 or len(cells) <= 1:
+        for scenario, seed in cells:
+            yield _run_baseline_cell_job(
+                str(baseline), str(scenario), int(seed), config, str(run_dir),
             )
         return
-    if workers <= 1 or len(jobs) <= 1:
-        for scenario, seed in jobs:
-            yield _run_seed_scenario_job(
-                str(scenario), int(seed), config, str(run_dir),
-            )
-        return
-    for batch in _scenario_job_batches(jobs, config):
+    for batch in _scenario_job_batches(cells, config):
         with ProcessPoolExecutor(
             max_workers=min(workers, len(batch)), mp_context=_mp_context(),
         ) as executor:
             futures = [
                 executor.submit(
-                    _run_seed_scenario_job,
-                    str(scenario), int(seed), config, str(run_dir),
+                    _run_baseline_cell_job,
+                    str(baseline), str(scenario), int(seed), config, str(run_dir),
                 )
                 for scenario, seed in batch
             ]
@@ -6896,72 +7218,56 @@ def _pending_job_results(
                 yield future.result()
 
 
-def _pending_seed_results(
-    scenario: str,
-    seeds: Sequence[int],
+def _pending_llm_cell_results(
+    baseline: str,
+    cells: Sequence[Tuple[str, int]],
     config: EvalSettings,
     run_dir: Path,
-    workers: int,
 ) -> Iterable[Mapping[str, Any]]:
-    if "in_context_llm" in config.baselines:
-        # Use a fresh CUDA process per seed. Native failures are not retried:
-        # repeating a long seed on an unqualified runtime hides instability and
-        # wastes compute without improving scientific reproducibility.
-        for seed in seeds:
-            try:
-                with ProcessPoolExecutor(
-                    max_workers=1,
-                    mp_context=_mp_context(),
-                ) as executor:
-                    future = executor.submit(
-                        _run_seed_scenario_job,
-                        scenario,
-                        int(seed),
-                        config,
-                        str(run_dir),
-                    )
-                    result = dict(future.result())
-            except BrokenProcessPool as exc:
-                # BrokenProcessPool says only that the child died. What it died
-                # in is in the worker's own fault log, if it took a signal
-                # faulthandler could catch; name the file either way so the
-                # first thing anyone reads is the one that has the answer.
-                fault_log = _seed_dir(Path(run_dir), scenario, int(seed)) / "worker_fault.log"
-                detail = (
-                    f"see {fault_log} for the native stack"
-                    if fault_log.is_file() and fault_log.stat().st_size
-                    else f"no stack was written to {fault_log}, so the worker "
-                    "was killed by an uncatchable signal (SIGKILL) rather than "
-                    "faulting"
+    """One fresh CUDA process per cell for the GPU arm.
+
+    Native failures are not retried: repeating a long cell on an unqualified
+    runtime hides instability and wastes compute without improving
+    reproducibility.
+    """
+    for scenario, seed in cells:
+        try:
+            with ProcessPoolExecutor(
+                max_workers=1, mp_context=_mp_context(),
+            ) as executor:
+                future = executor.submit(
+                    _run_baseline_cell_job,
+                    str(baseline), str(scenario), int(seed), config, str(run_dir),
                 )
-                raise RuntimeError(
-                    "LLM GPU worker terminated natively for "
-                    f"scenario={scenario}, seed={int(seed)}; automatic retry "
-                    "is disabled because this runtime is not reproducible. "
-                    f"{detail}"
-                ) from exc
-            result.update({
-                "native_worker_attempts": 1,
-                "native_worker_failed_attempts": 0,
-                "native_worker_failed_wall_s": 0.0,
-            })
-            yield result
-        return
-    if workers <= 1 or len(seeds) <= 1:
-        for seed in seeds:
-            yield _run_seed_scenario_job(scenario, int(seed), config, str(run_dir))
-        return
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=_mp_context(),
-    ) as executor:
-        futures = [
-            executor.submit(
-                _run_seed_scenario_job, scenario, int(seed), config, str(run_dir),
+                result = dict(future.result())
+        except BrokenProcessPool as exc:
+            # BrokenProcessPool says only that the child died. What it died in
+            # is in the worker's own fault log, if it took a signal
+            # faulthandler could catch; name the file either way so the first
+            # thing anyone reads is the one that has the answer.
+            fault_log = (
+                _baseline_cell_dir(Path(run_dir), baseline, scenario, int(seed))
+                / "worker_fault.log"
             )
-            for seed in seeds
-        ]
-        for future in as_completed(futures):
-            yield future.result()
+            detail = (
+                f"see {fault_log} for the native stack"
+                if fault_log.is_file() and fault_log.stat().st_size
+                else f"no stack was written to {fault_log}, so the worker "
+                "was killed by an uncatchable signal (SIGKILL) rather than "
+                "faulting"
+            )
+            raise RuntimeError(
+                "LLM GPU worker terminated natively for "
+                f"baseline={baseline}, scenario={scenario}, seed={int(seed)}; "
+                "automatic retry is disabled because this runtime is not "
+                f"reproducible. {detail}"
+            ) from exc
+        result.update({
+            "native_worker_attempts": 1,
+            "native_worker_failed_attempts": 0,
+            "native_worker_failed_wall_s": 0.0,
+        })
+        yield result
 
 
 def _paired_bootstrap_ci(
@@ -7047,7 +7353,6 @@ def summarize_pairs(
             "comparisons_against_full": comparisons,
         }
     return {
-        "definition": "Paired, non-parametric bootstrap percentile intervals over full-minus-baseline seed-matched differences. Positive values favor the full agent; bootstrap_full_better_fraction is a direction frequency, not a hypothesis-test p-value.",
         "bootstrap_samples": int(n_samples),
         "by_scenario": results,
     }
@@ -7058,7 +7363,6 @@ def _summarize_sensitivity(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     for row in rows:
         grouped[(str(row.get("scenario")), str(row.get("sensitivity_setting")))].append(row)
     return {
-        "definition": "One-factor-at-a-time sensitivity analysis of the online self-training confidence rule. Each setting is evaluated on the same scenario plans and seeds as the main full-agent run.",
         "settings": [
             {
                 "scenario": scenario,
@@ -7139,21 +7443,13 @@ def run_sensitivity(config: EvalSettings) -> Dict[str, Any]:
 
 
 def run_evaluation(config: EvalSettings) -> Dict[str, Any]:
-    if config.component_counterfactuals:
-        if tuple(config.baselines) != ("full",):
-            raise ValueError(
-                "component counterfactual diagnostics require --baselines full"
-            )
-        if config.include_oracle:
-            raise ValueError(
-                "component counterfactual diagnostics require --no-oracle"
-            )
     llm_runtime = _configure_llm_runtime(config)
     workers = _worker_count(config)
     native_threads = _native_thread_count(config)
     thread_control = _apply_native_thread_limit(native_threads)
     root, run_dir, config_hash = _create_or_resume_run(config)
-    expected_jobs = len(config.scenarios) * len(config.seeds)
+    run_order = baseline_run_order(config)
+    expected_jobs = len(run_order) * len(config.scenarios) * len(config.seeds)
     suite: Dict[str, Any] = {
         "state": "running",
         "run": run_dir.name,
@@ -7161,7 +7457,10 @@ def run_evaluation(config: EvalSettings) -> Dict[str, Any]:
         "config_hash": config_hash,
         "execution": {
             "parallelism": "processes",
-            "seed_parallelism": "complete seed cohorts are scheduled for as many scenarios as fit within the 20-process cap",
+            "unit": "one (baseline, scenario, seed) cell",
+            "baseline_execution": "sequential; one arm completes the whole scenario/seed grid before the next starts",
+            "baseline_order": list(run_order),
+            "seed_parallelism": "within one arm, complete seed cohorts are scheduled for as many scenarios as fit within the 20-process cap",
             "workers": workers,
             "threads": native_threads,
             "estimated_max_native_threads": workers * native_threads,
@@ -7169,9 +7468,9 @@ def run_evaluation(config: EvalSettings) -> Dict[str, Any]:
             "clairvoyant_oracle_included": bool(config.include_oracle),
             "llm_runtime": llm_runtime,
         },
-        "scenarios": {},
+        "cells": {},
     }
-    scenario_summaries: Dict[str, Mapping[str, Any]] = {}
+    cell_summaries: Dict[str, Mapping[str, Any]] = {}
     suite_start = time.perf_counter()
     completed_jobs = 0
     aggregate_dir = run_dir / "aggregate"
@@ -7184,10 +7483,11 @@ def run_evaluation(config: EvalSettings) -> Dict[str, Any]:
     def record(result: Mapping[str, Any]) -> None:
         nonlocal completed_jobs
         key = str(result["key"])
-        if key in scenario_summaries:
+        if key in cell_summaries:
             return
-        scenario_summaries[key] = result["summary"]
-        suite["scenarios"][key] = {
+        cell_summaries[key] = result["summary"]
+        suite["cells"][key] = {
+            "baseline": str(result["baseline"]),
             "scenario": result["scenario"],
             "seed": int(result["seed"]),
             "state": "complete",
@@ -7211,47 +7511,83 @@ def run_evaluation(config: EvalSettings) -> Dict[str, Any]:
         })
 
     try:
-        jobs: List[Tuple[str, int]] = []
-        for scenario in config.scenarios:
-            for seed in config.seeds:
-                result = _completed_seed_result(run_dir, scenario, int(seed))
+        grid = [
+            (str(scenario), int(seed))
+            for scenario in config.scenarios for seed in config.seeds
+        ]
+        job_wall: Dict[str, List[float]] = defaultdict(list)
+        baseline_wall: Dict[str, float] = {}
+        if config.show_eta:
+            print(
+                f"[evaluation] start arms={len(run_order)} "
+                f"x cells={len(grid)} "
+                f"(scenarios={len(config.scenarios)} x seeds={len(config.seeds)}) "
+                f"order={', '.join(run_order)}",
+                flush=True,
+            )
+        # One arm at a time, each over the whole scenario/seed grid. The order
+        # matters: 'full' publishes the route the other arms replay.
+        for baseline in run_order:
+            baseline_start = time.perf_counter()
+            pending: List[Tuple[str, int]] = []
+            for scenario, seed in grid:
+                result = _completed_cell_result(run_dir, baseline, scenario, seed)
                 if result is not None:
                     record(result)
                 else:
-                    jobs.append((str(scenario), int(seed)))
-        workers = _worker_count(config, len(jobs))
-        suite["execution"]["workers"] = workers
-        suite["execution"]["estimated_max_native_threads"] = (
-            workers * native_threads
-        )
-        if config.show_eta:
-            print(
-                f"[evaluation] start jobs={len(jobs)} "
-                f"(scenarios={len(config.scenarios)} x seeds={len(config.seeds)}) "
-                f"workers={workers}",
-                flush=True,
+                    pending.append((scenario, seed))
+            workers = _worker_count(config, len(pending), baseline)
+            suite["execution"]["workers"] = workers
+            suite["execution"]["estimated_max_native_threads"] = (
+                workers * native_threads
             )
-        job_wall: Dict[str, List[float]] = defaultdict(list)
-        for result in _pending_job_results(jobs, config, run_dir, workers):
-            record(result)
-            job_wall[str(result["scenario"])].append(float(result["wall_s"]))
             if config.show_eta:
                 print(
-                    f"[evaluation] done scenario={result['scenario']} "
-                    f"seed={result['seed']} "
-                    f"job_wall={_format_seconds(result['wall_s'])} "
-                    f"{_job_eta(suite_start, completed_jobs, expected_jobs)}",
+                    f"[evaluation] arm {baseline} "
+                    f"pending={len(pending)}/{len(grid)} workers={workers}",
                     flush=True,
                 )
-        # Scenarios no longer own a wall-clock phase, so report the job time
+            for result in _pending_cell_results(
+                baseline, pending, config, run_dir, workers,
+            ):
+                record(result)
+                job_wall[str(result["scenario"])].append(float(result["wall_s"]))
+                if config.show_eta:
+                    print(
+                        f"[evaluation] done baseline={result['baseline']} "
+                        f"scenario={result['scenario']} "
+                        f"seed={result['seed']} "
+                        f"cell_wall={_format_seconds(result['wall_s'])} "
+                        f"{_job_eta(suite_start, completed_jobs, expected_jobs)}",
+                        flush=True,
+                    )
+            baseline_wall[baseline] = float(time.perf_counter() - baseline_start)
+            _write_json(_baseline_dir(run_dir, baseline) / "status.json", {
+                "state": "complete",
+                "baseline": baseline,
+                "completed_at_utc": _utc_now(),
+                "cells": len(grid),
+                "wall_s": baseline_wall[baseline],
+            })
+            persist()
+
+        # Arms are stored apart; the cross-arm claims are assembled here.
+        merged: Dict[str, Mapping[str, Any]] = {}
+        for scenario, seed in grid:
+            merged[f"{scenario}/{seed:010d}"] = merge_cell(
+                run_dir, scenario, seed, run_order,
+            )
+        suite["cells_path"] = "aggregate/cells/<scenario>/<seed>/summary.json"
+        # Scenarios no longer own a wall-clock phase, so report the cell time
         # each one consumed and the suite's actual span separately.
         suite["scenario_job_wall_s"] = {
             scenario: float(sum(values)) for scenario, values in job_wall.items()
         }
+        suite["baseline_wall_s"] = dict(baseline_wall)
         suite["suite_wall_s"] = float(time.perf_counter() - suite_start)
         persist()
 
-        paired = summarize_pairs(scenario_summaries)
+        paired = summarize_pairs(merged)
         _write_json(aggregate_dir / "paired_bootstrap.json", paired)
         suite["paired_bootstrap_path"] = "aggregate/paired_bootstrap.json"
         if config.sensitivity:
@@ -7393,16 +7729,17 @@ def parse_args(
             "Use 0 only on a GPU that drives no display."
         ),
     )
-    parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--sensitivity", action="store_true", help="Run the opt-in H3 online-commit sensitivity audit after the main suite.")
     parser.add_argument(
-        "--component-counterfactuals", action="store_true",
+        "--event-resume",
+        action="store_true",
         help=(
-            "Log pure MaxEnt, semantic-completion, and relaxed-latent "
-            "counterfactuals without changing the deployed policy. "
-            "Diagnostic prediction times are not benchmark-comparable."
+            "Checkpoint each stream after every event and continue from the "
+            "last completed one. Makes a scenario survive a native GPU crash "
+            "instead of restarting from its first event."
         ),
     )
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--sensitivity", action="store_true", help="Run the opt-in H3 online-commit sensitivity audit after the main suite.")
     args = parser.parse_args(argv)
 
     overrides: Dict[str, Any] = {}
@@ -7462,18 +7799,15 @@ def parse_args(
         ),
         frozen_pairs=int(args.frozen_pairs),
         audit_period=int(args.audit_period),
+        event_resume=bool(args.event_resume),
         audit_prefixes=int(args.audit_prefixes),
         audit_tolerance=float(args.audit_tolerance),
         shared_routing=not bool(args.local_routing),
         top_k=int(args.top_k),
         profile=bool(args.profile),
         sensitivity=bool(args.sensitivity),
-        component_counterfactuals=bool(args.component_counterfactuals),
         model_settings=overrides,
-        experiment=(
-            "component_counterfactual_diagnostic"
-            if args.component_counterfactuals else "standard_evaluation"
-        ),
+        experiment="standard_evaluation",
     )
 
 

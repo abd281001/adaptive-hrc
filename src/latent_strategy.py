@@ -280,18 +280,6 @@ class LatentStrategyResidual:
         self.last_score_stats = stats
         return result
 
-    def score_snapshot(
-        self,
-        prefix: Sequence[str],
-        candidates: Sequence[str],
-        *,
-        min_observed_roles: int = 3,
-    ) -> Tuple[StrategyScore, Dict[str, Any]]:
-        """Pure counterfactual score; never overwrites correction-time state."""
-        return self._score_result(
-            prefix, candidates, min_observed_roles=min_observed_roles,
-        )
-
     @staticmethod
     def _aligned_next_role(observed: Tuple[int, ...], prototype: Tuple[int, ...],) -> Tuple[int | None, float, float]:
         """Align an observed role prefix and return the prototype frontier."""

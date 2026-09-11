@@ -293,6 +293,14 @@ class ReplayMemory:
         self.reuse_min_samples: int = min(self.reuse_window, max(1, int(settings.parent_weight_samples)))
         self.pair_downward_half_life: float = float(settings.pair_prior_half_life)
         if not math.isfinite(self.pair_downward_half_life) or self.pair_downward_half_life <= 0.0: raise ValueError("pair_prior_half_life must be finite and positive")
+        # Retention-mechanism ablation controls. `hierarchical`/`asymmetric`/
+        # `latest` are the deployed settings, so an unmodified Settings gives
+        # exactly the previously reported behaviour.
+        self.horizon_estimator: str = str(settings.horizon_estimator)
+        self.constant_grace_horizon: int = max(0, int(settings.constant_grace_horizon))
+        self.pair_adaptation: str = str(settings.pair_adaptation)
+        self.pin_mode: str = str(settings.pin_mode)
+        self.pin_window: int = max(0, int(settings.pin_window))
         self.reuse_quantile: float = min(1.0, max(0.0, float(settings.gap_quantile)))
         self.reuse_iqr_multiplier: float = max(0.0, float(settings.gap_iqr_scale))
         self.recipe_reuse_window: int = max(self.reuse_window, int(settings.recipe_gap_window))
@@ -325,7 +333,7 @@ class ReplayMemory:
             entry.last_seen_step = now
             entry.ordering = ordering
             if transitions is not None: entry.transitions = transition_trace
-            if should_pin_latest: self.mark_latest(recipe_id, variant_id)
+            if should_pin_latest: self.mark_latest(recipe_id, variant_id, now=now)
             return entry
 
         reentering = key in self.pruned
@@ -336,7 +344,7 @@ class ReplayMemory:
         entry = MemoryItem(recipe_id=recipe_id, variant_id=variant_id, ordering=ordering, weight=initial_weight, added_step=now, added_cycle=cycle, last_seen_step=now, transitions=transition_trace)
         self.active[key] = entry
         if reentering: self.reentry_events.append((int(now), key, int(reuse_gap or 0)))
-        if should_pin_latest: self.mark_latest(recipe_id, variant_id)
+        if should_pin_latest: self.mark_latest(recipe_id, variant_id, now=now)
         return entry
 
     def step(self, now: int, cycle: int, protected_keys: Optional[Sequence[VariantKey]] = None) -> List[VariantKey]:
@@ -391,7 +399,13 @@ class ReplayMemory:
         """Adapt down asymptotically and preserve the fast linear upward response."""
         if not gaps: return float(prior), 0.0, "prior_only"
         estimate = self._robust_upper_gap(gaps)
-        if estimate < float(prior):
+        # `symmetric` is the control for the deployed asymmetry: it applies the
+        # linear upward response in both directions, so shortening a horizon
+        # becomes exactly as fast as lengthening one.
+        if self.pair_adaptation == "symmetric":
+            evidence_weight = self._linear_evidence_weight(len(gaps))
+            pooling_mode = "linear_symmetric"
+        elif estimate < float(prior):
             evidence_weight = 1.0 - math.pow(2.0, -len(gaps) / self.pair_downward_half_life)
             pooling_mode = "exponential_downward"
         else:
@@ -400,12 +414,58 @@ class ReplayMemory:
         pooled = ((1.0 - evidence_weight) * float(prior) + evidence_weight * estimate)
         return pooled, evidence_weight, pooling_mode
 
+    def _tracked_pair_keys(self) -> List[VariantKey]:
+        """Every pair the horizon machinery currently knows about, in a stable order."""
+        return sorted(set(self.active) | set(self.pruned) | set(self._pair_gap_window))
+
+    def _shuffled_evidence_key(self, key: VariantKey) -> VariantKey:
+        """Deterministically reassign one pair's recurrence samples to another pair.
+
+        This is the matched-budget control for the estimator. The population of
+        recurrence windows is untouched, so the distribution of horizons the
+        policy produces is preserved; only the assignment of a window to the
+        pair that generated it is destroyed. A difference against
+        ``hierarchical`` is therefore attributable to using *this pair's own*
+        recurrence evidence rather than to retaining more or less overall.
+        """
+        candidates = [tracked for tracked in self._tracked_pair_keys() if tracked in self._pair_gap_window]
+        if len(candidates) < 2:
+            return key
+        digest = hashlib.sha256(f"horizon-shuffle\x1f{key[0]}\x1f{key[1]}".encode("utf-8")).digest()
+        offset = int.from_bytes(digest[:8], "big") % len(candidates)
+        chosen = candidates[offset]
+        if chosen != key:
+            return chosen
+        # A pair may not read its own window; step to the next candidate.
+        return candidates[(offset + 1) % len(candidates)]
+
     def horizon_stats(self, key: VariantKey) -> Dict[str, Any]:
         """Return the pair horizon and its disjoint hierarchical evidence."""
         recipe_id = key[0]
+        estimator = self.horizon_estimator
+        if estimator == "constant":
+            # One horizon for every pair. Calibrated to the deployed mean, so
+            # the contrast is "is the horizon pair-specific", not "is there a
+            # grace period at all" -- which is what the `fixed` decay policy
+            # already answers, and answers with three variables at once.
+            horizon = max(float(self.constant_grace_horizon), float(self.min_grace))
+            return {"horizon_demos": horizon, "pair_gap_samples": int(len(self._pair_gap_window.get(key, ()))),
+                    "recipe_prior_gap_samples": 0, "global_prior_gap_samples": 0, "pair_evidence_weight": 0.0,
+                    "pair_pooling_mode": "constant_horizon", "pair_downward_half_life_samples": float(self.pair_downward_half_life),
+                    "recipe_evidence_weight": 0.0, "global_evidence_weight": 0.0, "pair_robust_upper_demos": 0.0,
+                    "recipe_prior_horizon_demos": horizon, "global_prior_horizon_demos": horizon,
+                    "horizon_estimator": estimator}
+
+        evidence_key = self._shuffled_evidence_key(key) if estimator == "shuffled" else key
         global_gaps = [gap for event_key, gap in self._global_gap_events if event_key[0] != recipe_id]
         recipe_gaps = [gap for event_key, gap in self._recipe_gap_events.get(recipe_id, ()) if event_key != key]
-        pair_gaps = list(self._pair_gap_window.get(key, ()))
+        pair_gaps = list(self._pair_gap_window.get(evidence_key, ()))
+        if estimator == "pair_only":
+            # No parent pooling: the pair either has its own evidence or falls
+            # back to the global prior constant. This is the control for the
+            # hierarchical pair -> recipe -> global structure.
+            global_gaps = []
+            recipe_gaps = []
 
         global_estimate, global_weight = self._pool_parent_prior(float(self.default_grace_horizon), global_gaps)
         recipe_estimate, recipe_weight = self._pool_parent_prior(global_estimate, recipe_gaps)
@@ -413,7 +473,8 @@ class ReplayMemory:
         horizon = max(float(math.ceil(pair_estimate)), float(self.min_grace))
         return { "horizon_demos": horizon, "pair_gap_samples": int(len(pair_gaps)), "recipe_prior_gap_samples": int(len(recipe_gaps)), "global_prior_gap_samples": int(len(global_gaps)), "pair_evidence_weight": float(pair_weight),
                 "pair_pooling_mode": pair_pooling_mode, "pair_downward_half_life_samples": float(self.pair_downward_half_life), "recipe_evidence_weight": float(recipe_weight), "global_evidence_weight": float(global_weight),
-                "pair_robust_upper_demos": (float(self._robust_upper_gap(pair_gaps)) if pair_gaps else 0.0), "recipe_prior_horizon_demos": float(recipe_estimate), "global_prior_horizon_demos": float(global_estimate)}
+                "pair_robust_upper_demos": (float(self._robust_upper_gap(pair_gaps)) if pair_gaps else 0.0), "recipe_prior_horizon_demos": float(recipe_estimate), "global_prior_horizon_demos": float(global_estimate),
+                "horizon_estimator": estimator}
 
     def horizon(self, key: VariantKey) -> float:
         return self.horizon_stats(key)["horizon_demos"]
@@ -426,15 +487,32 @@ class ReplayMemory:
         keys = set(self.active) | set(self.pruned) | set(self._pair_gap_window)
         return {f"{recipe_id}/{variant_id}": self.horizon_stats((recipe_id, variant_id)) for recipe_id, variant_id in sorted(keys)}
 
-    def mark_latest(self, recipe_id: str, variant_id: str) -> None:
-        """Pin the latest variant and release the recipe's previous pin."""
-        previous_variant_id = self.latest_by_recipe.get(recipe_id)
-        if previous_variant_id is not None:
-            previous_key = (recipe_id, previous_variant_id)
-            self.latest_keys.discard(previous_key)
-        self.latest_by_recipe[recipe_id] = variant_id
+    def mark_latest(self, recipe_id: str, variant_id: str, now: Optional[int] = None) -> None:
+        """Pin the latest variant and release the recipe's superseded pins.
+
+        Under the deployed ``latest`` mode exactly one variant per recipe stays
+        pinned, so a preference change always releases its predecessor. Under
+        ``recent_set`` a superseded sibling keeps its pin while it remains
+        within ``pin_window`` demonstrations, which is the control for whether
+        the single pin is what degrades assistance when several preferences for
+        one recipe are concurrently active.
+        """
         key = (recipe_id, variant_id)
+        retained: Set[VariantKey] = set()
+        if self.pin_mode == "recent_set" and now is not None:
+            cutoff = int(now) - self.pin_window
+            retained = {
+                pinned for pinned in self.latest_keys
+                if pinned[0] == recipe_id and pinned != key
+                and pinned in self.active
+                and int(self.active[pinned].last_seen_step) >= cutoff
+            }
+        for pinned in [pinned for pinned in self.latest_keys if pinned[0] == recipe_id and pinned != key]:
+            if pinned not in retained: self.latest_keys.discard(pinned)
+        self.latest_by_recipe[recipe_id] = variant_id
         self.latest_keys.add(key)
+        for pinned in retained:
+            self.active[pinned].weight = 1.0
         if key in self.active: self.active[key].weight = 1.0
 
     def unmark_latest(self, recipe_id: str, variant_id: str) -> None:
@@ -455,7 +533,7 @@ class ReplayMemory:
         if was_latest:
             self.latest_by_recipe.pop(recipe_id, None)
             replacement = max(self.recipe_items(recipe_id), key=lambda entry: (entry.last_seen_step, entry.variant_id), default=None)
-            if replacement is not None: self.mark_latest(recipe_id, replacement.variant_id)
+            if replacement is not None: self.mark_latest(recipe_id, replacement.variant_id, now=replacement.last_seen_step)
 
     def gap_history(self) -> List[int]:
         """Return the bounded diagnostic trace of exact-pair reuse gaps."""

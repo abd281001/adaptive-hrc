@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -28,6 +30,13 @@ from src.evaluation import (
     _pair_key,
     _periodic_probe_due,
     _pre_event_probe_due,
+    _preference_panel,
+    _baseline_cell_dir,
+    _run_baseline_cell_job,
+    baseline_run_order,
+    load_route,
+    run_baseline_cell,
+    save_route,
     aggregate_episodes,
     assist_demo,
     evaluate_frozen,
@@ -40,6 +49,7 @@ from src.evaluation import (
 )
 from src.models import Settings
 from src.memory import MatchResult
+from src.preferences import PREFERENCE_IDS
 
 
 def _fast_eval_config(**overrides):
@@ -829,7 +839,7 @@ class EvaluationRunnerContractTests(unittest.TestCase):
         self.assertEqual(offline["train_count"], 1)
         self.assertFalse(offline["updates_allowed"])
 
-    def test_offline_all_recipes_identity_baseline_covers_every_recipe_but_no_preference_axes(self):
+    def test_offline_default_baseline_covers_every_recipe_but_no_preference_axes(self):
         (first_name, first_builder), (second_name, second_builder) = list(recipe_builders().items())[:2]
         first_pair = build_task(first_name, "prep_first", first_builder)
         second_pair = build_task(second_name, "equipment_jit_serving_early", second_builder)
@@ -862,6 +872,258 @@ class EvaluationRunnerContractTests(unittest.TestCase):
         self.assertEqual(offline["offline_training_pair_count"], 2)
         self.assertEqual(len(stream.agent.retrain_events), 2)
         self.assertFalse(offline["updates_allowed"])
+
+    def test_offline_all_baseline_trains_on_the_whole_preference_library(self):
+        """The corpus is the seed's frozen-probe panel, not its scheduled pairs.
+
+        The schedule supplies one preference here; the arm must still pretrain
+        on every behaviourally distinct preset of both recipes, because the
+        candidate preference set does not vary by seed.
+        """
+        (first_name, first_builder), (second_name, second_builder) = list(recipe_builders().items())[:2]
+        first_pair = build_task(first_name, "prep_first", first_builder)
+        second_pair = build_task(second_name, "prep_first", second_builder)
+        expected_pairs = sum(
+            len(_preference_panel(name, builder, PREFERENCE_IDS)[0])
+            for name, builder in ((first_name, first_builder), (second_name, second_builder))
+        )
+        plan = Plan(
+            scenario="unit_all_pairs_frozen",
+            seed=23,
+            events=(
+                Event("observe", first_pair, {"event_type": "unit_deployment_observation"}),
+                Event("observe", second_pair, {"event_type": "unit_deployment_observation"}),
+            ),
+            eval_pairs=(first_pair, second_pair),
+            selected_recipes=(first_name, second_name),
+            selected_preferences=("prep_first",),
+            description="Unit all-recipes all-preferences offline training schedule.",
+        )
+
+        stream = run_stream(
+            "offline_all",
+            plan,
+            _fast_eval_config(),
+        )
+
+        snapshot = snapshot_memory(stream.agent)
+        offline = snapshot["offline_pretraining"]
+        self.assertTrue(stream.agent._deployment_locked)
+        self.assertEqual(offline["offline_training_design"], "all_recipes_all_preferences")
+        self.assertEqual(offline["offline_training_recipe_count"], 2)
+        self.assertEqual(offline["offline_training_recipe_names"], sorted([first_name, second_name]))
+        self.assertEqual(offline["offline_training_declared_preference_count"], len(PREFERENCE_IDS))
+        # Far more than the single preference this schedule ever presents.
+        self.assertGreater(offline["offline_training_preference_count"], 1)
+        self.assertEqual(offline["offline_training_pair_count"], expected_pairs)
+        self.assertEqual(len(stream.agent.retrain_events), expected_pairs)
+        self.assertFalse(offline["updates_allowed"])
+
+    def test_offline_all_baseline_strictly_contains_the_frozen_subset_corpus(self):
+        """`frozen` is this arm at half coverage, so its pairs must nest here."""
+        (first_name, first_builder), (second_name, second_builder) = list(recipe_builders().items())[:2]
+        first_pair = build_task(first_name, "prep_first", first_builder)
+        second_pair = build_task(second_name, "serving_early", second_builder)
+        plan = Plan(
+            scenario="unit_frozen_nesting",
+            seed=23,
+            events=(
+                Event("observe", first_pair, {"event_type": "unit_deployment_observation"}),
+                Event("observe", second_pair, {"event_type": "unit_deployment_observation"}),
+            ),
+            eval_pairs=(first_pair, second_pair),
+            selected_recipes=(first_name, second_name),
+            selected_preferences=("prep_first", "serving_early"),
+            description="Unit nesting check for the two cross-product frozen arms.",
+        )
+        config = _fast_eval_config(
+            offline_recipe_fraction=0.50,
+            offline_preference_fraction=0.50,
+        )
+
+        subset = snapshot_memory(
+            run_stream("frozen", plan, config).agent,
+        )["offline_pretraining"]
+        everything = snapshot_memory(
+            run_stream("offline_all", plan, config).agent,
+        )["offline_pretraining"]
+
+        self.assertLessEqual(
+            set(subset["offline_training_recipe_names"]),
+            set(everything["offline_training_recipe_names"]),
+        )
+        self.assertLessEqual(
+            set(subset["offline_training_preference_names"]),
+            set(everything["offline_training_preference_names"]),
+        )
+        self.assertLess(
+            subset["offline_training_pair_count"],
+            everything["offline_training_pair_count"],
+        )
+
+    def test_offline_all_baseline_never_sees_a_recipe_outside_this_seed(self):
+        """Unscheduled recipes stay out: no other arm is ever shown them."""
+        names = list(recipe_builders().items())
+        (first_name, first_builder), (second_name, _second_builder) = names[:2]
+        first_pair = build_task(first_name, "default", first_builder)
+        plan = Plan(
+            scenario="unit_all_pairs_frozen_panel",
+            seed=23,
+            events=(
+                Event("observe", first_pair, {"event_type": "unit_deployment_observation"}),
+            ),
+            eval_pairs=(first_pair,),
+            selected_recipes=(first_name,),
+            selected_preferences=("default",),
+            description="Unit panel-restricted all-pairs offline training schedule.",
+        )
+
+        stream = run_stream("offline_all", plan, _fast_eval_config())
+
+        offline = snapshot_memory(stream.agent)["offline_pretraining"]
+        self.assertEqual(offline["offline_training_recipe_names"], [first_name])
+        self.assertNotIn(second_name, offline["offline_training_recipe_names"])
+        self.assertLess(
+            offline["offline_training_recipe_count"], len(recipe_builders()),
+        )
+
+    # Wall-clock readings measure the machine, not the method, and never
+    # reproduce across processes. Everything else must.
+    _TIMING_FIELD = re.compile(
+        r"(wall_s|_at_utc|elapsed_s|latency|_per_s|_time|gflops_s)$"
+    )
+
+    @classmethod
+    def _without_timings(cls, value):
+        if isinstance(value, dict):
+            return {
+                key: cls._without_timings(item)
+                for key, item in value.items()
+                if not cls._TIMING_FIELD.search(key)
+            }
+        if isinstance(value, list):
+            return [cls._without_timings(item) for item in value]
+        return value
+
+    @classmethod
+    def _canonical(cls, value):
+        return json.dumps(cls._without_timings(value), sort_keys=True)
+
+    @staticmethod
+    def _gz_rows(path):
+        if not Path(path).is_file():
+            return []
+        with gzip.open(path, "rt") as handle:
+            return [json.loads(line) for line in handle]
+
+    def test_running_one_arm_at_a_time_scores_exactly_as_running_them_together(self):
+        """The suite runs arm-major; that must not change a single number.
+
+        Every arm but ``full`` replays ``full``'s realized observe/assist
+        schedule. Running the arms in separate cells only works if handing
+        that schedule through the shared route is equivalent to holding it in
+        memory across one plan, so this compares the two paths directly.
+        """
+        recipe_name, pair, _agent = self._pair_and_agent()
+        plan = Plan(
+            scenario=HOMOGENEOUS,
+            seed=31,
+            events=(
+                Event("observe", pair, {"event_type": "unit_onboarding"}),
+                Event("assist", pair, {"event_type": "unit_assist"}),
+                Event("assist", pair, {"event_type": "unit_assist"}),
+            ),
+            eval_pairs=(pair,),
+            selected_recipes=(recipe_name,),
+            selected_preferences=(pair.preference_name,),
+            description="Arm-major execution must match arm-together execution.",
+        )
+        config = _fast_eval_config(
+            baselines=("full", "no_decay", "bc"),
+            include_oracle=True,
+            shared_routing=True,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            together = run_plan(plan, config, root / "together")
+
+            route = None
+            apart = {}
+            for baseline in baseline_run_order(config):
+                summary = run_baseline_cell(
+                    baseline, plan, config, root / "apart" / baseline, route=route,
+                )
+                if summary.get("realized_route"):
+                    route = tuple(summary["realized_route"])
+                apart[baseline] = summary["per_baseline"][baseline]
+
+            self.assertEqual(
+                sorted(together["per_baseline"]), sorted(apart),
+            )
+            for baseline in sorted(apart):
+                with self.subTest(baseline=baseline):
+                    self.assertEqual(
+                        self._canonical(together["per_baseline"][baseline]),
+                        self._canonical(apart[baseline]),
+                    )
+                    for table in (
+                        "episodes", "turns", "frozen_probes", "axis_transfer",
+                    ):
+                        merged = [
+                            row for row in self._gz_rows(
+                                root / "together" / "tables" / f"{table}.jsonl.gz"
+                            )
+                            if row.get("baseline") == baseline
+                        ]
+                        cell = self._gz_rows(
+                            root / "apart" / baseline / "tables" / f"{table}.jsonl.gz"
+                        )
+                        self.assertEqual(
+                            self._canonical(merged),
+                            self._canonical(cell),
+                            f"{baseline}/{table}",
+                        )
+
+    def test_an_arm_cell_refuses_to_run_without_the_route_it_replays(self):
+        """A cell must fail loudly rather than silently score its own route."""
+        recipe_name, pair, _agent = self._pair_and_agent()
+        plan = Plan(
+            scenario=HOMOGENEOUS,
+            seed=31,
+            events=(Event("observe", pair, {"event_type": "unit_onboarding"}),),
+            eval_pairs=(pair,),
+            selected_recipes=(recipe_name,),
+            selected_preferences=(pair.preference_name,),
+            description="A replaying arm needs a published route.",
+        )
+        config = _fast_eval_config(
+            baselines=("full", "no_decay"), shared_routing=True,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            with self.assertRaisesRegex(FileNotFoundError, "no route"):
+                _run_baseline_cell_job(
+                    "no_decay", HOMOGENEOUS, 31, config, str(run_dir),
+                )
+            status = json.loads(
+                (
+                    _baseline_cell_dir(run_dir, "no_decay", HOMOGENEOUS, 31)
+                    / "status.json"
+                ).read_text()
+            )
+            self.assertEqual(status["state"], "failed")
+
+    def test_a_published_route_survives_deleting_the_arm_that_consumed_it(self):
+        """Re-running one arm must not require re-running 'full'."""
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            save_route(run_dir, HOMOGENEOUS, 31, ["observe", "assist"])
+            self.assertEqual(
+                load_route(run_dir, HOMOGENEOUS, 31), ("observe", "assist"),
+            )
+            self.assertIsNone(load_route(run_dir, HOMOGENEOUS, 99))
 
     def test_primary_assist_has_a_matched_nonmutating_pre_event_probe(self):
         recipe_name, pair, _agent = self._pair_and_agent()
@@ -1085,3 +1347,263 @@ class CliDefaultsMatchDataclassDefaults(unittest.TestCase):
                 mismatched.append((name, value, fields[name]))
 
         self.assertEqual(mismatched, [], f"CLI defaults contradict dataclass defaults: {mismatched}")
+
+
+class WorkerCrashDiagnosticsTests(unittest.TestCase):
+    """A worker that dies natively has to leave evidence and clean state."""
+
+    def test_stale_checkpoints_from_an_earlier_attempt_are_cleared(self):
+        from src.evaluation import _clear_stale_checkpoints
+
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            checkpoints = out_dir / "partial" / "checkpoints" / "in_context_llm"
+            checkpoints.mkdir(parents=True)
+            for index in (0, 71, 131):
+                (checkpoints / f"event_{index:06d}.json").write_text("{}")
+            keep = out_dir / "partial" / "summary.json"
+            keep.write_text("{}")
+
+            removed = _clear_stale_checkpoints(out_dir)
+
+            self.assertEqual(removed, 3)
+            self.assertEqual(list(checkpoints.glob("event_*.json")), [])
+            # Only per-event checkpoints are stale; the summary is not.
+            self.assertTrue(keep.is_file())
+
+    def test_clearing_checkpoints_is_safe_before_any_exist(self):
+        from src.evaluation import _clear_stale_checkpoints
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(_clear_stale_checkpoints(Path(directory)), 0)
+
+    def test_worker_fault_log_captures_a_native_stack(self):
+        import faulthandler
+        from src.evaluation import _open_worker_fault_log
+
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            previously_enabled = faulthandler.is_enabled()
+            handle = _open_worker_fault_log(out_dir)
+            try:
+                self.assertIsNotNone(handle)
+                self.assertTrue(faulthandler.is_enabled())
+                faulthandler.dump_traceback(file=handle, all_threads=False)
+            finally:
+                if previously_enabled:
+                    faulthandler.enable()
+                else:
+                    faulthandler.disable()
+
+            written = (out_dir / "worker_fault.log").read_text()
+            self.assertIn("test_worker_fault_log_captures_a_native_stack", written)
+
+
+class EventResumeTests(unittest.TestCase):
+    """Per-event resume must reproduce an uninterrupted run exactly."""
+
+    @staticmethod
+    def _config(tmp, **overrides):
+        from src.evaluation import EvalSettings
+
+        base = dict(
+            baselines=("bc",),
+            scenarios=("homogeneous",),
+            seeds=(1337,),
+            include_oracle=False,
+            top_k=3,
+            audit_period=0,
+            output=str(tmp),
+            event_resume=True,
+        )
+        base.update(overrides)
+        return EvalSettings(**base)
+
+    def _short_plan(self, config, events=6):
+        from dataclasses import replace as dc_replace
+        from src.evaluation import build_plan
+
+        plan = build_plan("homogeneous", config, 1337)
+        return dc_replace(plan, events=tuple(plan.events[:events]))
+
+    def test_resumed_stream_matches_an_uninterrupted_stream(self):
+        from src.evaluation import run_stream
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            plan = self._short_plan(config)
+
+            reference = run_stream("bc", plan, config)
+
+            # Run again, stopping after event 2 by way of the resume state the
+            # stream writes, then continue in a fresh call.
+            partial_dir = root / "partial_run"
+            partial_dir.mkdir()
+            stop_after = 2
+
+            class Stop(RuntimeError):
+                pass
+
+            def stop(_state, event_index):
+                if event_index >= stop_after:
+                    raise Stop
+
+            with self.assertRaises(Stop):
+                run_stream(
+                    "bc", plan, config,
+                    event_progress=stop,
+                    resume_dir=partial_dir,
+                )
+            self.assertTrue(
+                (partial_dir / "partial" / "resume" / "bc.pickle").is_file()
+            )
+
+            resumed = run_stream("bc", plan, config, resume_dir=partial_dir)
+
+            self.assertEqual(
+                len(resumed.episode_rows), len(reference.episode_rows),
+            )
+            for key in ("teacher_forced_top_1", "live_top_1", "recipe", "preference"):
+                self.assertEqual(
+                    [row.get(key) for row in resumed.episode_rows],
+                    [row.get(key) for row in reference.episode_rows],
+                    msg=f"episode column {key} diverged after resume",
+                )
+            self.assertEqual(
+                len(resumed.turn_rows), len(reference.turn_rows),
+            )
+            self.assertEqual(
+                [row.get("predicted") for row in resumed.turn_rows],
+                [row.get("predicted") for row in reference.turn_rows],
+            )
+
+    def test_resume_state_is_refused_when_the_plan_differs(self):
+        from src.evaluation import _load_event_resume, _event_resume_path, run_stream
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            plan = self._short_plan(config, events=6)
+            shorter = self._short_plan(config, events=4)
+
+            class Stop(RuntimeError):
+                pass
+
+            with self.assertRaises(Stop):
+                def stop(_state, event_index):
+                    if event_index >= 1:
+                        raise Stop
+                run_stream("bc", plan, config, event_progress=stop, resume_dir=root)
+
+            path = _event_resume_path(root, "bc")
+            self.assertIsNotNone(_load_event_resume(path, "bc", plan))
+            # A different event count, baseline or seed must not be continued.
+            self.assertIsNone(_load_event_resume(path, "bc", shorter))
+            self.assertIsNone(_load_event_resume(path, "unpinned", plan))
+
+    def test_corrupt_resume_state_restarts_instead_of_failing(self):
+        from src.evaluation import _load_event_resume, _event_resume_path
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            plan = self._short_plan(config, events=4)
+            path = _event_resume_path(root, "bc")
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"not a pickle")
+
+            self.assertIsNone(_load_event_resume(path, "bc", plan))
+
+    def test_checkpoints_past_the_resume_point_are_trimmed(self):
+        from src.evaluation import _trim_checkpoints_after
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoints = root / "partial" / "checkpoints" / "in_context_llm"
+            checkpoints.mkdir(parents=True)
+            for index in range(6):
+                (checkpoints / f"event_{index:06d}.json").write_text("{}")
+
+            removed = _trim_checkpoints_after(root, "in_context_llm", 3)
+
+            self.assertEqual(removed, 2)
+            self.assertEqual(
+                sorted(p.name for p in checkpoints.glob("event_*.json")),
+                [f"event_{i:06d}.json" for i in range(4)],
+            )
+
+
+class ResumableRunDiscoveryTests(unittest.TestCase):
+    """Only a directory that explicit --resume would accept may be continued."""
+
+    def _config(self, output):
+        return EvalSettings(
+            output=str(output),
+            experiment="llm_single_seed_evaluation",
+            baselines=("full", "in_context_llm"),
+            scenarios=("homogeneous",),
+            seeds=(1337,),
+            include_oracle=False,
+            event_resume=True,
+        )
+
+    def _make_run(
+        self, runs, name, digest, *,
+        config_hash=None, experiment="llm_single_seed_evaluation",
+        state="failed", resume_state=True,
+    ):
+        run_dir = runs / name
+        cell_dir = (
+            run_dir
+            / "baselines/in_context_llm/scenarios/homogeneous/seeds/0000001337"
+        )
+        (cell_dir / "partial/resume").mkdir(parents=True)
+        if resume_state:
+            (cell_dir / "partial/resume/in_context_llm.pickle").write_bytes(b"x")
+        (run_dir / "manifest.json").write_text(json.dumps({
+            "config_hash": config_hash or digest,
+            "experiment": experiment,
+        }))
+        if state is not None:
+            (run_dir / "status.json").write_text(json.dumps({"state": state}))
+        return run_dir
+
+    def test_only_matching_incomplete_runs_with_state_are_offered(self):
+        from src.evaluation import _config_hash, find_resumable_run
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            digest = _config_hash(config)
+            runs = root / "runs"
+            runs.mkdir()
+
+            self.assertIsNone(find_resumable_run(config))
+            for name, kwargs in (
+                ("wrong-hash", {"config_hash": "different"}),
+                ("wrong-experiment", {"experiment": "other"}),
+                ("already-complete", {"state": "complete"}),
+                ("no-state", {"resume_state": False}),
+            ):
+                self._make_run(runs, name, digest, **kwargs)
+                with self.subTest(rejected=name):
+                    self.assertIsNone(find_resumable_run(config))
+
+            self._make_run(runs, "genuine", digest)
+            self.assertEqual(find_resumable_run(config), "genuine")
+
+    def test_the_newest_matching_run_wins(self):
+        from src.evaluation import _config_hash, find_resumable_run
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            digest = _config_hash(config)
+            runs = root / "runs"
+            runs.mkdir()
+            older = self._make_run(runs, "older", digest)
+            os.utime(older / "manifest.json", (1, 1))
+            self._make_run(runs, "newer", digest)
+
+            self.assertEqual(find_resumable_run(config), "newer")

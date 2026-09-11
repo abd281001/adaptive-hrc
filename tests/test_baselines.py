@@ -52,6 +52,7 @@ class RunnableBaselineTests(unittest.TestCase):
             {
                 "frozen",
                 "offline_default",
+                "offline_all",
                 "unpinned",
                 "latest",
                 "fixed",
@@ -68,6 +69,7 @@ class RunnableBaselineTests(unittest.TestCase):
         self.assertIs(BASELINE_AGENTS["unpinned"], UnpinnedAgent)
         self.assertIs(BASELINE_AGENTS["frozen"], FrozenAgent)
         self.assertIs(BASELINE_AGENTS["offline_default"], FrozenAgent)
+        self.assertIs(BASELINE_AGENTS["offline_all"], FrozenAgent)
         self.assertIs(BASELINE_AGENTS["in_context_llm"], InContextLlmAgent)
 
     def test_publication_baselines_disable_fulls_latest_variant_pin(self):

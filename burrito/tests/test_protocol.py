@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import numpy as np
@@ -212,6 +213,152 @@ class PhysicalAndProtocolTests(unittest.TestCase):
         return CookingHrcRunner(
             agent, self.runtime, domain, horizon=1800, planner_seed=11
         ), agent
+
+    def test_candidate_lists_are_the_structural_frontier(self):
+        """The candidate list must not be a function of the ground truth.
+
+        It used to be the physically-legal subset at the first tick where the
+        *preferred* option became executable, so competing options that were
+        not ready yet silently vanished from the list the predictor was scored
+        on.  Readiness is now waited out after the decision, against whichever
+        option is actually executed.
+        """
+        runner, _agent = self._runner()
+        graph = CookingTaskGraph.create("burrito_steak_burrito")
+        results = runner.run_stream((
+            CookingTask.create("burrito_steak_burrito", "plate_protein_early"),
+            CookingTask.create(
+                "burrito_steak_burrito", "plate_protein_early", phase=1,
+            ),
+        ))
+        for result in results:
+            completed = []
+            for decision in result.decisions:
+                self.assertEqual(
+                    tuple(decision.legal_actions), graph.frontier(completed),
+                )
+                completed.append(decision.actual)
+        # Waiting still happens -- it just happens after the decision.
+        self.assertGreater(sum(r.passive_wait_ticks for r in results), 0)
+
+    def test_candidate_lists_match_across_methods(self):
+        """Two arms must be scored on identical states, prefixes and candidates.
+
+        The executed prefix is the human's ordering either way, so the
+        structural frontier is method-independent by construction; when the
+        candidate list was the physically-legal subset it was not, because the
+        two arms reach a given step with different pot timers.
+        """
+        stream = (
+            CookingTask.create("burrito_steak_burrito", "pot_rice_early"),
+            CookingTask.create("burrito_steak_burrito", "pot_rice_early", phase=1),
+        )
+        traces = []
+        for arm in ("full", "canonical_order"):
+            from adaptive_hrc_burrito.evaluation import _build_agent
+            from src.models import Settings
+
+            domain = CookingDomainAdapter()
+            agent = _build_agent(arm, Settings(
+                verbose=False, seed=1337, irl_cold_steps=4, irl_warm_steps=2,
+                irl_horizon=12, initial_grace=2, min_grace=1,
+                semantic_fallback_max_rms_distance=(
+                    SEMANTIC_FALLBACK_MAX_RMS_DISTANCE
+                ),
+            ), domain=domain)
+            runner = CookingHrcRunner(
+                agent, self.runtime, domain, horizon=1800, planner_seed=11,
+                require_shift_update=False,
+            )
+            traces.append([
+                (d.recipe_step, tuple(d.legal_actions), d.ground_truth_action)
+                for result in runner.run_stream(stream)
+                for d in result.decisions
+            ])
+        self.assertEqual(traces[0], traces[1])
+
+    def test_an_arm_that_emits_nothing_is_scored_not_dropped(self):
+        """Unanswered decisions belong in the denominator, not outside it.
+
+        Filtering them out removed the decisions an arm failed to answer from
+        every rate, which inflated precisely the arms that fail to answer.
+        """
+        from adaptive_hrc_burrito.evaluation import _build_agent, _episode_record
+        from src.models import Settings
+
+        domain = CookingDomainAdapter()
+        agent = _build_agent("canonical_order", Settings(verbose=False), domain)
+        runner = CookingHrcRunner(
+            agent, self.runtime, domain, horizon=1800, planner_seed=11,
+            require_shift_update=False,
+        )
+        task = CookingTask.create("overcooked_onion_tomato", "tomato_early")
+        runner.run_task(task)                                  # observation
+        agent.predict_actions = lambda *a, **k: {}              # goes mute
+        result = runner.run_task(task)                          # assist
+        record = _episode_record(
+            result, metadata={"arm": "mute", "seed": 1, "cell_complete": True},
+            wall_s=0.0, agent=agent,
+        )
+
+        steps = len(result.decisions)
+        self.assertEqual(record["teacher_forced_decision_count"], steps)
+        self.assertEqual(record["teacher_forced_top_1_hits"], 0)
+        self.assertEqual(record["prediction_available_decisions"], 0)
+        self.assertEqual(record["prediction_unavailable_decisions"], steps)
+        # The robot denominator is the schedule, not the answers.
+        self.assertEqual(record["robot_decision_count"], result.robot_turns)
+        self.assertGreater(record["robot_decision_count"], 0)
+        self.assertEqual(record["robot_top_1_hits"], 0)
+        # Every robot turn it could not answer became a human correction.
+        self.assertEqual(record["human_corrections"], result.robot_turns)
+        self.assertLessEqual(
+            record["human_corrections"], record["robot_decision_count"],
+        )
+        self.assertEqual(record["corrections_per_robot_decision"], 1.0)
+        # Silence and "emitted a distribution that excluded the truth" are the
+        # same event for a scoring rule, so both are charged the shared floor
+        # -- the one src.evaluation uses, not a uniform distribution the
+        # predictor never produced.
+        self.assertEqual(record["nll_probability_floor"], 1e-6)
+        self.assertAlmostEqual(
+            record["teacher_forced_nll"], -math.log(1e-6), places=6,
+        )
+        self.assertEqual(record["teacher_forced_nll_decisions"], steps)
+        self.assertAlmostEqual(
+            record["teacher_forced_nll_total"], steps * -math.log(1e-6),
+            places=4,
+        )
+
+    def test_the_opening_move_is_scored_and_separable(self):
+        """Under human_first no robot-turn metric can see the opening move.
+
+        It is the most preference-informative decision in these task graphs,
+        and on the container-axis transfer cell it is discriminating in every
+        episode -- which makes it *the* transfer measurement, invisible to
+        every metric that only counts robot turns.
+        """
+        from adaptive_hrc_burrito.evaluation import _episode_record
+
+        runner, agent = self._runner()
+        task = CookingTask.create("overcooked_onion_onion", "wash_plates_early")
+        runner.run_task(task)
+        result = runner.run_task(CookingTask.create(
+            "overcooked_onion_onion", "wash_plates_early", phase=1,
+        ))
+        record = _episode_record(
+            result, metadata={"arm": "full", "seed": 1337, "cell_complete": True},
+            wall_s=0.0, agent=agent,
+        )
+        self.assertTrue(record["opening_scored"])
+        self.assertEqual(record["opening_scheduled_actor"], "human")
+        self.assertEqual(record["opening_decision_count"], 1)
+        self.assertTrue(record["opening_preference_discriminating"])
+        self.assertEqual(record["opening_discriminating_decision_count"], 1)
+        self.assertIn(record["opening_top_1_hits"], (0, 1))
+        # This cell has no scorable robot decision at all, so the opening is
+        # the only place its preference can be measured.
+        self.assertEqual(record["preference_discriminating_robot_decisions"], 0)
 
     def test_first_shift_updates_then_natural_recurrence_assists(self):
         runner, agent = self._runner()

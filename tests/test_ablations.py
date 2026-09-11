@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.ablations import (
+    COMPONENT_ABLATION_ARMS,
+    _arm_cell_job,
+    _arm_suite_specs,
+    run_arm_major_suite,
     REPRESENTATION_ABLATION_ARMS,
+    RETENTION_ABLATION_ARMS,
     COMMIT_FULL,
     COMMIT_PROMOTION,
     COMMIT_TENTATIVE,
@@ -68,6 +74,7 @@ def _ablation_payload(name, seeds, scenarios=ABLATION_SCENARIOS):
             "rows": [
                 {
                     "scenario": scenario, "seed": seed,
+                    "arm": str(cell["arm"]),
                     "baseline": str(cell["baseline"]),
                     "memory_level": str(cell["memory"]),
                     "memory_policy": (
@@ -81,7 +88,31 @@ def _ablation_payload(name, seeds, scenarios=ABLATION_SCENARIOS):
                 for scenario in scenarios for seed in seeds
                 for cell in MEMORY_PREDICTOR_ABLATION_CELLS
             ],
-            "summary": {"memory_levels_are_internally_consistent": True},
+            "summary": {
+                "memory_levels_are_internally_consistent": True,
+                "maxent_cells_share_predictor_support": True,
+            },
+        }
+    if name == "components":
+        return {
+            "rows": [
+                {"scenario": scenario, "seed": seed, "arm": arm.name}
+                for scenario in scenarios for seed in seeds
+                for arm in COMPONENT_ABLATION_ARMS
+            ],
+            "summary": {
+                "declared_factors_were_applied": True,
+                "retention_held_constant": True,
+            },
+        }
+    if name == "retention":
+        return {
+            "rows": [
+                {"scenario": scenario, "seed": seed, "arm": arm.name}
+                for scenario in scenarios for seed in seeds
+                for arm in RETENTION_ABLATION_ARMS
+            ],
+            "summary": {"predictor_support_held_constant": True},
         }
     return {
         "rows": [
@@ -121,15 +152,13 @@ class AllAblationRunnerTests(unittest.TestCase):
             manifest = json.loads(Path(result["manifest"]).read_text())
 
         self.assertEqual(result["state"], "complete")
-        self.assertEqual(
-            set(result["outputs"]),
-            {"matcher", "routing", "latent", "memory", "representation"},
-        )
+        expected_suites = {
+            "matcher", "routing", "latent", "memory", "representation",
+            "components", "retention",
+        }
+        self.assertEqual(set(result["outputs"]), expected_suites)
         self.assertEqual(manifest["state"], "complete")
-        self.assertEqual(
-            set(manifest["jobs"]),
-            {"matcher", "routing", "latent", "memory", "representation"},
-        )
+        self.assertEqual(set(manifest["jobs"]), expected_suites)
         self.assertEqual(manifest["longitudinal_scenarios"], list(scenarios))
         self.assertEqual(manifest["longitudinal_seeds"], list(seeds))
 
@@ -183,6 +212,8 @@ class AllAblationRunnerTests(unittest.TestCase):
             ("routing", "--routing-seeds"),
             ("latent", "--latent-seeds"),
             ("memory", "--memory-seeds"),
+            ("components", "--components-seeds"),
+            ("retention", "--retention-seeds"),
         ):
             command = commands[suite]
             self.assertEqual(command[command.index(flag) + 1], seed_csv)
@@ -216,14 +247,45 @@ class MemoryPredictorFactorialAblationTests(unittest.TestCase):
         )
         # 'full' must lead: it defines the shared interaction route the other
         # three cells replay, so the comparison stays paired.
-        self.assertEqual(cells[0]["baseline"], "full")
+        self.assertEqual(cells[0]["arm"], "full")
+        # Two cells share the 'full' baseline and differ only in their
+        # settings overrides, so the arm name is the cell identity.
+        self.assertEqual(
+            {cell["arm"] for cell in cells},
+            {"full", "bc_adaptive", "maxent_retain_all", "bc"},
+        )
         self.assertEqual(
             {cell["baseline"] for cell in cells},
-            {"full", "bc_adaptive", "no_decay", "bc"},
+            {"full", "bc_adaptive", "bc"},
         )
+
+    def test_both_maxent_cells_keep_fulls_predictor_support(self):
+        """The repair: the memory factor must not move the semantic components.
+
+        The MaxEnt retain-all cell used to be the `no_decay` baseline, which is
+        built through `_without_proposed_components` and therefore also dropped
+        the semantic fallback and the latent residual. That left the MaxEnt
+        simple effect and the interaction term confounded.
+        """
+        from dataclasses import replace as replace_settings
+        from src.models import DEFAULT_SETTINGS
+
+        maxent = [
+            cell for cell in MEMORY_PREDICTOR_ABLATION_CELLS
+            if cell["predictor"] == "maxent"
+        ]
+        self.assertEqual(len(maxent), 2)
+        for cell in maxent:
+            with self.subTest(arm=cell["arm"]):
+                settings = replace_settings(
+                    DEFAULT_SETTINGS, **dict(cell.get("overrides") or {}),
+                )
+                self.assertTrue(settings.semantic_fallback_enabled)
+                self.assertTrue(settings.latent_strategy_enabled)
 
     def test_registered_cells_agree_with_the_agents_they_name(self):
         """The design is only meaningful if the arms behave as labelled."""
+        from dataclasses import replace
         from src.baselines import BASELINE_AGENTS
         from src.models import Settings
 
@@ -233,12 +295,15 @@ class MemoryPredictorFactorialAblationTests(unittest.TestCase):
         )
         expected_policy = {"adaptive_pinned": "adaptive", "retain_all": "none"}
         for cell in MEMORY_PREDICTOR_ABLATION_CELLS:
-            with self.subTest(baseline=cell["baseline"]):
+            with self.subTest(arm=cell["arm"]):
+                # A cell is its baseline *plus* its settings overrides; the
+                # MaxEnt row distinguishes its two cells that way.
+                cell_config = replace(config, **dict(cell.get("overrides") or {}))
                 if cell["baseline"] == "full":
                     from src.adaptive_agent import AdaptiveAgent
-                    agent = AdaptiveAgent(settings=config)
+                    agent = AdaptiveAgent(settings=cell_config)
                 else:
-                    agent = BASELINE_AGENTS[cell["baseline"]](config)
+                    agent = BASELINE_AGENTS[cell["baseline"]](cell_config)
                 self.assertEqual(
                     agent.replay.policy, expected_policy[cell["memory"]],
                 )
@@ -252,9 +317,9 @@ class MemoryPredictorFactorialAblationTests(unittest.TestCase):
                 )
 
     def test_summary_signs_every_effect_so_positive_favours_the_treatment(self):
-        def row(scenario, seed, baseline, memory, top_1, load):
+        def row(scenario, seed, arm, memory, top_1, load):
             return {
-                "scenario": scenario, "seed": seed, "baseline": baseline,
+                "scenario": scenario, "seed": seed, "arm": arm,
                 "memory_level": memory,
                 "memory_policy": (
                     "adaptive" if memory == "adaptive_pinned" else "none"
@@ -268,7 +333,7 @@ class MemoryPredictorFactorialAblationTests(unittest.TestCase):
         # is zero even though the cloner is the more accurate model here.
         rows = [
             row("homogeneous", 7, "full", "adaptive_pinned", 0.90, 0.50),
-            row("homogeneous", 7, "no_decay", "retain_all", 0.85, 0.55),
+            row("homogeneous", 7, "maxent_retain_all", "retain_all", 0.85, 0.55),
             row("homogeneous", 7, "bc_adaptive", "adaptive_pinned", 0.95, 0.45),
             row("homogeneous", 7, "bc", "retain_all", 0.90, 0.50),
         ]
@@ -771,3 +836,108 @@ class SemanticActionAndCommitAuditTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ArmMajorAblationSchedulingTests(unittest.TestCase):
+    """Suites run arm by arm; that must not move a single ablation number."""
+
+    TIMING = re.compile(r"(wall_s|_at_utc|elapsed_s|latency|_per_s|_time|gflops_s)$")
+
+    @classmethod
+    def _without_timings(cls, value):
+        if isinstance(value, dict):
+            return {
+                key: cls._without_timings(item)
+                for key, item in value.items()
+                if not cls.TIMING.search(key)
+            }
+        if isinstance(value, list):
+            return [cls._without_timings(item) for item in value]
+        return value
+
+    @staticmethod
+    def _config(experiment):
+        from src.evaluation import EvalSettings, ScheduleSettings
+
+        return EvalSettings(
+            seeds=(1337,), scenarios=("homogeneous",), baselines=("full",),
+            include_oracle=False, show_eta=False, recipe_count=2,
+            schedule=ScheduleSettings(
+                panel_size=2, phases=2, demos=24, min_recipes=1, max_recipes=2,
+            ),
+            audit_period=0, workers=1, experiment=experiment,
+            model_settings={
+                "irl_cold_steps": 1, "irl_warm_steps": 1,
+                "bc_cold_epochs": 1, "bc_warm_epochs": 1,
+            },
+        )
+
+    @classmethod
+    def _cell_major(cls, suite, arms, config):
+        """The previous nesting: one cell at a time, every arm inside it."""
+        spec = _arm_suite_specs()[suite]
+        rows = []
+        for scenario in config.scenarios:
+            for seed in config.seeds:
+                route = None
+                for arm in arms:
+                    row, realized = _arm_cell_job(
+                        (suite, str(scenario), int(seed), config, arm, route)
+                    )
+                    if realized is not None:
+                        route = realized
+                    rows.append(row)
+        order = {spec.name(arm): index for index, arm in enumerate(arms)}
+        rows.sort(key=lambda row: (
+            str(row["scenario"]), int(row["seed"]), order[str(row["arm"])],
+        ))
+        return rows
+
+    def test_arm_major_scheduling_matches_cell_major_scheduling(self):
+        suites = (
+            ("component_ablation", tuple(COMPONENT_ABLATION_ARMS)),
+            ("latent_strategy_ablation", tuple(LATENT_STRATEGY_ABLATION_ARMS)),
+            ("memory_predictor_ablation",
+             tuple(dict(cell) for cell in MEMORY_PREDICTOR_ABLATION_CELLS)),
+            ("representation_ablation", tuple(REPRESENTATION_ABLATION_ARMS)),
+        )
+        for suite, arms in suites:
+            with self.subTest(suite=suite):
+                config = self._config(suite)
+                self.assertEqual(
+                    self._without_timings(self._cell_major(suite, arms, config)),
+                    self._without_timings(run_arm_major_suite(suite, arms, config)),
+                )
+
+    def test_each_arm_gets_its_own_result_file(self):
+        arms = tuple(COMPONENT_ABLATION_ARMS)
+        config = self._config("component_ablation")
+        with tempfile.TemporaryDirectory() as directory:
+            arms_dir = Path(directory) / "arms"
+            rows = run_arm_major_suite(
+                "component_ablation", arms, config, arms_dir=arms_dir,
+            )
+            written = {path.stem for path in arms_dir.iterdir()}
+            self.assertEqual(written, {arm.name for arm in arms})
+            split = [
+                row
+                for path in sorted(arms_dir.iterdir())
+                for row in json.loads(path.read_text())["rows"]
+            ]
+            self.assertCountEqual(split, rows)
+            # Exactly one arm defines the route the others replay.
+            reference = [
+                json.loads(path.read_text())["arm"]
+                for path in arms_dir.iterdir()
+                if json.loads(path.read_text())["reference_arm"]
+            ]
+            self.assertEqual(reference, ["full"])
+
+    def test_an_arm_name_that_is_not_a_safe_filename_is_rejected(self):
+        from src.ablations import _safe_arm_component
+
+        self.assertEqual(_safe_arm_component("full_no_pin"), "full_no_pin")
+        for bad in ("../escape", "with/slash", ""):
+            with self.subTest(name=bad):
+                with self.assertRaises(ValueError):
+                    _safe_arm_component(bad)

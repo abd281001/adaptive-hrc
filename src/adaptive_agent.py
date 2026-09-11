@@ -60,11 +60,26 @@ class TrainPolicy:
     warm_on_weight_change: bool = False
     cold_threshold_basis: str = "additions_only"
 
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "TrainPolicy":
+        """Build the scheduler an arm asked for; defaults reproduce the deployed policy."""
+        counts_removals = bool(settings.retrain_cold_counts_removals)
+        return cls(
+            cold_after=max(1, int(settings.retrain_cold_after)),
+            warm_on_weight_change=bool(settings.retrain_warm_on_weight_change),
+            cold_threshold_basis=("additions_and_removals" if counts_removals else "additions_only"),
+        )
+
     def decide(self, additions: int, removals: int, weight_changed: bool, since_cold: int) -> Tuple[str, str, int]:
         additions = int(additions)
         removals = int(removals)
-        projected = int(since_cold) + additions
-        if additions > 0:
+        # `additions_and_removals` is the control for the deployed rule: it
+        # restores the behaviour where decay-driven churn pays for cold
+        # restarts, which is what the additions-only counter exists to avoid.
+        counts_removals = self.cold_threshold_basis == "additions_and_removals"
+        advancing = additions + (removals if counts_removals else 0)
+        projected = int(since_cold) + advancing
+        if advancing > 0:
             if projected >= max(1, int(self.cold_after)):
                 return "cold", "cumulative_addition_threshold_reached", projected
             return "warm", "cumulative_additions_below_threshold", projected
@@ -83,11 +98,28 @@ class AdaptiveAgent:
 
     RETRAIN_POLICY = FULL_TRAIN_POLICY
 
+    @classmethod
+    def _resolve_train_policy(cls, settings: Settings) -> TrainPolicy:
+        """Prefer the class scheduler unless the run explicitly asked for another.
+
+        A subclass that pins its own ``RETRAIN_POLICY`` keeps it under default
+        settings, so this cannot silently change any existing arm. Only a run
+        that sets one of the ``retrain_*`` fields away from its default gets the
+        settings-derived scheduler, which is how the retention suite varies
+        consolidation without needing a new agent class per arm.
+        """
+        derived = TrainPolicy.from_settings(settings)
+        if derived == TrainPolicy.from_settings(DEFAULT_SETTINGS): return cls.RETRAIN_POLICY
+        return derived
+
     def __init__(self, settings: Settings = DEFAULT_SETTINGS, narrate: Optional[Callable[[str], None]] = None, retrain_policy: Optional[TrainPolicy] = None, domain: Optional[DomainAdapter] = None):
         self.settings = settings
         self.domain = domain or default_domain()
-        self.retrain_policy = retrain_policy or self.RETRAIN_POLICY
-        self.replay = ReplayMemory(settings)
+        self.retrain_policy = retrain_policy or self._resolve_train_policy(settings)
+        # Baseline subclasses that own a retention policy reassign `self.replay`
+        # after this call, so `retention_policy` only reaches arms that would
+        # otherwise take the adaptive default.
+        self.replay = ReplayMemory(settings, policy=settings.retention_policy)
         self.library = VariantLibrary()
         self.matcher = RecipeMatcher(settings)
         self.commit_events: List[Dict[str, Any]] = []
@@ -381,6 +413,14 @@ class AdaptiveAgent:
                 raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest key is pruned")
             if self.replay.active[latest_key].weight != 1.0:
                 raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: latest weight is not 1.0")
+            # `recent_set` may hold extra sibling pins; each must still be an
+            # active, unit-weight entry, and `latest` must hold none at all.
+            siblings = [key for key in self.replay.latest_keys if key[0] == recipe_id and key != latest_key]
+            if siblings and self.settings.pin_mode != "recent_set":
+                raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: {len(siblings)} extra pins under pin_mode='latest'")
+            for sibling in siblings:
+                if sibling not in self.replay.active or self.replay.active[sibling].weight != 1.0:
+                    raise RuntimeError(f"latest-pin invariant failed for {recipe_id}: pinned sibling {sibling} is not active at unit weight")
 
     def _finish_observation(self, apply_decay: bool = False) -> MatchResult:
         actions = list(self.pending_demo)

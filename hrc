@@ -19,13 +19,15 @@ Commands:
   test-cooking Run the pinned-Burrito test suite in burrito/.venv
   run         Run the full normal evaluation
   cooking     Run and validate the full Overcooked/Burrito evaluation
-  ablation    Run all ablations; pass --suite matcher|routing|latent|memory for one
+  ablation    Run all ablations; pass --suite matcher|routing|latent|memory|
+              representation|components|retention for one
   robot-ui    Run the real-robot operator UI (dry-run unless --hardware-url is set)
   robot-bridge Run the local Stretch hardware bridge (motion off unless --enable-motion)
   robot-doctor Check robot config/runtime/bridge without commanding motion
   robot-report Summarize and integrity-check a completed robot run
   robot-calibration-probe Run one explicitly confirmed calibration-mode action
-  llm [scope] Run full-schedule one-seed Full + LLM; scope: homogeneous|heterogeneous|holdout
+  llm [scope] Run full-schedule one-seed Full + LLM; scope: all|homogeneous|heterogeneous|holdout
+              Re-run the same command after a crash to continue where it stopped
   doctor      Check the normal and LLM runtimes without starting an experiment
 EOF
 }

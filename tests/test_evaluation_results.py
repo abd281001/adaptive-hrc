@@ -32,32 +32,35 @@ class EvaluationResultLayoutTests(unittest.TestCase):
 
     @staticmethod
     def _fake_job(
-        scenario: str, seed: int, _config: evaluation.EvalSettings, run_dir: str,
+        baseline: str, scenario: str, seed: int,
+        _config: evaluation.EvalSettings, run_dir: str,
     ) -> dict:
         root = Path(run_dir)
-        seed_dir = evaluation._seed_dir(root, scenario, seed)
+        cell_dir = evaluation._baseline_cell_dir(root, baseline, scenario, seed)
         summary = {
             "scenario": scenario,
             "seed": seed,
+            "baseline": baseline,
             "per_baseline": {},
         }
-        evaluation._write_json(seed_dir / "summary.json", summary)
-        evaluation._write_json(seed_dir / "status.json", {"state": "complete", "wall_s": 0.1})
+        evaluation._write_json(cell_dir / "summary.json", summary)
+        evaluation._write_json(cell_dir / "status.json", {"state": "complete", "wall_s": 0.1})
         evaluation._write_jsonl_gz(
-            seed_dir / "tables" / "episodes.jsonl.gz",
-            ({"scenario": scenario, "seed": seed, "baseline": "full"},),
+            cell_dir / "tables" / "episodes.jsonl.gz",
+            ({"scenario": scenario, "seed": seed, "baseline": baseline},),
         )
         return {
-            "scenario": scenario, "seed": seed, "key": f"{scenario}/{seed:010d}",
+            "baseline": baseline, "scenario": scenario, "seed": seed,
+            "key": f"{baseline}/{scenario}/{seed:010d}",
             "summary": summary,
-            "summary_path": str((seed_dir / "summary.json").relative_to(root)),
+            "summary_path": str((cell_dir / "summary.json").relative_to(root)),
             "wall_s": 0.1,
         }
 
     def test_suite_publishes_compact_completed_run_at_latest(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(directory, "layout_test")
-            with patch.object(evaluation, "_run_seed_scenario_job", side_effect=self._fake_job):
+            with patch.object(evaluation, "_run_baseline_cell_job", side_effect=self._fake_job):
                 returned = evaluation.run_evaluation(config)
 
             run_dir = Path(directory) / "runs" / "layout_test"
@@ -77,7 +80,7 @@ class EvaluationResultLayoutTests(unittest.TestCase):
             saved = json.loads((latest / "aggregate" / "suite_summary.json").read_text())
             self.assertEqual(saved["state"], "complete")
             self.assertEqual(saved["completed_jobs"], 2)
-            self.assertNotIn("per_baseline", next(iter(saved["scenarios"].values())))
+            self.assertNotIn("per_baseline", next(iter(saved["cells"].values())))
             self.assertEqual(Path(returned["run_dir"]), run_dir)
 
             expected = {7, 9}
@@ -89,14 +92,14 @@ class EvaluationResultLayoutTests(unittest.TestCase):
     def test_failed_run_does_not_replace_latest(self):
         with tempfile.TemporaryDirectory() as directory:
             first = self._config(directory, "first")
-            with patch.object(evaluation, "_run_seed_scenario_job", side_effect=self._fake_job):
+            with patch.object(evaluation, "_run_baseline_cell_job", side_effect=self._fake_job):
                 evaluation.run_evaluation(first)
             latest = Path(directory) / "latest"
             first_target = latest.resolve()
 
             second = self._config(directory, "second")
             with patch.object(
-                evaluation, "_run_seed_scenario_job", side_effect=RuntimeError("planned failure"),
+                evaluation, "_run_baseline_cell_job", side_effect=RuntimeError("planned failure"),
             ), self.assertRaisesRegex(RuntimeError, "planned failure"):
                 evaluation.run_evaluation(second)
 
@@ -107,10 +110,10 @@ class EvaluationResultLayoutTests(unittest.TestCase):
     def test_resume_skips_completed_seed_jobs(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(directory, "resumable")
-            with patch.object(evaluation, "_run_seed_scenario_job", side_effect=self._fake_job):
+            with patch.object(evaluation, "_run_baseline_cell_job", side_effect=self._fake_job):
                 evaluation.run_evaluation(config)
 
-            with patch.object(evaluation, "_run_seed_scenario_job") as worker:
+            with patch.object(evaluation, "_run_baseline_cell_job") as worker:
                 resumed = evaluation.run_evaluation(replace(config, resume=True))
             worker.assert_not_called()
             self.assertEqual(resumed["completed_jobs"], 2)

@@ -145,26 +145,51 @@ class EvaluationParallelismTests(unittest.TestCase):
         self.assertEqual(evaluation._worker_count(settings, 3), 3)
         self.assertGreaterEqual(evaluation._worker_count(settings), 1)
 
-    def test_pending_jobs_span_scenarios(self):
-        """Jobs from different scenarios must be able to run concurrently."""
+    def test_pending_cells_span_scenarios(self):
+        """One arm's cells from different scenarios run concurrently."""
         settings = evaluation.EvalSettings(
             scenarios=("homogeneous", "holdout"), seeds=(1, 2), workers=4,
         )
         seen = []
 
-        def fake_job(scenario, seed, _config, _run_dir):
-            seen.append((scenario, int(seed)))
-            return {"scenario": scenario, "seed": int(seed), "wall_s": 0.0}
+        def fake_job(baseline, scenario, seed, _config, _run_dir):
+            seen.append((baseline, scenario, int(seed)))
+            return {
+                "baseline": baseline, "scenario": scenario,
+                "seed": int(seed), "wall_s": 0.0,
+            }
 
-        with patch.object(evaluation, "_run_seed_scenario_job", fake_job):
-            results = list(evaluation._pending_job_results(
+        with patch.object(evaluation, "_run_baseline_cell_job", fake_job):
+            results = list(evaluation._pending_cell_results(
+                "full",
                 [("homogeneous", 1), ("holdout", 2)],
-                settings, Path("/tmp/jobs-test"), workers=1,
+                settings, Path("/tmp/cells-test"), workers=1,
             ))
         self.assertEqual(len(results), 2)
         self.assertEqual(
             {row["scenario"] for row in results}, {"homogeneous", "holdout"}
         )
+        self.assertEqual({row["baseline"] for row in results}, {"full"})
+
+    def test_baselines_run_one_at_a_time_with_full_first(self):
+        """Arm order is the schedule: full publishes the route others replay."""
+        settings = evaluation.EvalSettings(
+            scenarios=("homogeneous",),
+            seeds=(1,),
+            baselines=("bc", "full", "no_decay"),
+            include_oracle=True,
+        )
+        order = evaluation.baseline_run_order(settings)
+        self.assertEqual(order[0], "full")
+        self.assertEqual(order[-1], evaluation.MEMORY_ORACLE)
+        self.assertEqual(set(order), {"full", "bc", "no_decay", evaluation.MEMORY_ORACLE})
+
+    def test_baseline_run_order_requires_full_under_shared_routing(self):
+        settings = evaluation.EvalSettings(
+            baselines=("bc", "no_decay"), shared_routing=True,
+        )
+        with self.assertRaisesRegex(ValueError, "requires the deployable 'full'"):
+            evaluation.baseline_run_order(settings)
 
     def test_in_context_llm_uses_one_gpu_worker(self):
         settings = evaluation.EvalSettings(
@@ -174,13 +199,21 @@ class EvaluationParallelismTests(unittest.TestCase):
         )
         self.assertEqual(evaluation._worker_count(settings), 1)
 
+    def test_only_the_gpu_arm_is_held_to_one_worker(self):
+        """A GPU arm in the roster must not serialize the symbolic arms."""
+        settings = evaluation.EvalSettings(
+            scenarios=("homogeneous", "heterogeneous", "holdout"),
+            seeds=tuple(range(8)),
+            baselines=("full", "in_context_llm"),
+            workers=evaluation.DEFAULT_EVALUATION_WORKER_CAP,
+        )
+        self.assertEqual(evaluation._worker_count(settings, None, "full"), 8)
+        self.assertEqual(
+            evaluation._worker_count(settings, None, evaluation.LLM_BASELINE), 1,
+        )
+
     def test_in_context_llm_does_not_retry_a_native_worker_failure(self):
         attempts = []
-        expected = {
-            "scenario": "homogeneous",
-            "seed": 1337,
-            "key": "homogeneous/0000001337",
-        }
 
         class FakeFuture:
             def result(self):
@@ -208,9 +241,9 @@ class EvaluationParallelismTests(unittest.TestCase):
         )
         with patch.object(evaluation, "ProcessPoolExecutor", FakeExecutor):
             with self.assertRaisesRegex(RuntimeError, "automatic retry is disabled"):
-                list(evaluation._pending_seed_results(
-                    "homogeneous",
-                    settings.seeds,
+                list(evaluation._pending_cell_results(
+                    evaluation.LLM_BASELINE,
+                    [("homogeneous", seed) for seed in settings.seeds],
                     settings,
                     Path("/tmp/llm-retry-test"),
                     workers=1,

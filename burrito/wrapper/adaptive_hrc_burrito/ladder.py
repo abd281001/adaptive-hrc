@@ -23,6 +23,10 @@ SCENARIOS = ("homogeneous", "heterogeneous", "holdout")
 CANONICAL_STRATEGY = "canonical"
 SUPPORT_FIRST_STRATEGY = "support_branch_first"
 CONTAINER_FIRST_STRATEGY = "container_first"
+# The preference that *is* the held-out container axis.  The ladder's own
+# invariant checker keys on this name, and so do the evaluator's transfer
+# groups, so it is named once here rather than spelled out in three places.
+CONTAINER_FIRST_PREFERENCE = "wash_plates_early"
 DEMOS_PER_GAP = 3
 _SHARED_STRATEGIES = (
     CANONICAL_STRATEGY,
@@ -245,7 +249,7 @@ def strategy_grounding(recipe_ids: Sequence[str]) -> Dict[str, Any]:
             if strategy == CANONICAL_STRATEGY:
                 continue
             target = {
-                CONTAINER_FIRST_STRATEGY: "wash_plates_early",
+                CONTAINER_FIRST_STRATEGY: CONTAINER_FIRST_PREFERENCE,
             }.get(strategy)
             if target is not None and target not in choices:
                 substituted.append((recipe_id, strategy, preference))
@@ -1169,24 +1173,27 @@ def ladder_audit(
     if scenario == "holdout":
         acquisitions = [
             (index, task) for index, task in enumerate(tasks)
-            if task.preference == "wash_plates_early" and task.preference_changed
+            if task.preference == CONTAINER_FIRST_PREFERENCE
+            and task.preference_changed
         ]
         if not acquisitions:
             raise ValueError("held-out container axis was never introduced")
         holdout_intro = min(task.phase for _index, task in acquisitions)
         first_holdout_index = min(index for index, _task in acquisitions)
         if any(
-            task.preference == "wash_plates_early"
+            task.preference == CONTAINER_FIRST_PREFERENCE
             for task in tasks[:first_holdout_index]
         ):
             raise ValueError("container-first value leaked before introduction")
         for recipe in holdout_targets:
             target_first = min(
                 index for index, task in enumerate(tasks)
-                if task.recipe_id == recipe and task.preference == "wash_plates_early"
+                if task.recipe_id == recipe
+                and task.preference == CONTAINER_FIRST_PREFERENCE
             )
             if not any(
-                task.recipe_id == recipe and task.preference != "wash_plates_early"
+                task.recipe_id == recipe
+                and task.preference != CONTAINER_FIRST_PREFERENCE
                 for task in tasks[:target_first]
             ):
                 raise ValueError("holdout target recipe was not known before composition")
@@ -1246,7 +1253,8 @@ def ladder_audit(
 
 
 __all__ = [
-    "CANONICAL_STRATEGY", "CONTAINER_FIRST_STRATEGY", "DEMOS_PER_GAP",
+    "CANONICAL_STRATEGY", "CONTAINER_FIRST_PREFERENCE",
+    "CONTAINER_FIRST_STRATEGY", "DEMOS_PER_GAP",
     "LadderSettings", "SCENARIOS", "SUPPORT_FIRST_STRATEGY",
     "generate_ladder", "ladder_audit", "strategy_grounding",
 ]

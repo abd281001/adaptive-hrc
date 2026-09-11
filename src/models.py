@@ -44,6 +44,44 @@ class Settings:
     diagnostic_gap_window: int = 30
     pin_latest: bool = True
 
+    # Retention-mechanism ablation knobs. Every default reproduces the
+    # deployed policy exactly, so a run that does not set them is bit-for-bit
+    # the configuration the main evaluation already reported.
+    #
+    # `retention_policy` selects the decay rule the agent builds its own
+    # ReplayMemory with. Baseline classes that assign `self.replay` explicitly
+    # (the BC family, EWC, the decay controls) still win, so this field only
+    # reaches arms that would otherwise take the adaptive default.
+    retention_policy: str = "adaptive"
+    # How the per-variant grace horizon is produced.
+    #   hierarchical -- deployed: pair evidence pooled onto recipe and global priors
+    #   pair_only    -- pair evidence only, falling back to `initial_grace`
+    #   constant     -- one horizon for every pair (`constant_grace_horizon`)
+    #   shuffled     -- hierarchical, but each pair reads another pair's
+    #                   recurrence samples, preserving the population horizon
+    #                   distribution while destroying the pair assignment
+    horizon_estimator: str = "hierarchical"
+    # Horizon used by `constant`. The default matches the realized adaptive
+    # mean on the paper seeds, so the constant arm differs from the deployed
+    # policy in whether the horizon is pair-specific, not in how much total
+    # retention pressure it applies.
+    constant_grace_horizon: int = 40
+    # Deployed pair adaptation lengthens linearly and shortens on an
+    # exponential half-life. `symmetric` uses the linear response in both
+    # directions, which is the control for that asymmetry.
+    pair_adaptation: str = "asymmetric"
+    # `latest` pins one variant per recipe. `recent_set` additionally keeps
+    # any sibling variant of that recipe demonstrated within `pin_window`
+    # demonstrations, which is the control for the single-pin behaviour under
+    # concurrently active preferences.
+    pin_mode: str = "latest"
+    pin_window: int = 8
+    # Retrain scheduler. The deployed policy advances the cold-start counter
+    # on additions only and skips a fit when nothing but weights moved.
+    retrain_cold_after: int = 3
+    retrain_warm_on_weight_change: bool = False
+    retrain_cold_counts_removals: bool = False
+
     # Recipe matching.
     match_threshold: float = 0.96
     match_margin: float = 0.03
@@ -191,6 +229,13 @@ class Settings:
         if not 0.0 < float(self.margin_scale):                                      raise ValueError("margin_scale must be positive")
         if (not math.isfinite(float(self.pair_prior_half_life)) or float(self.pair_prior_half_life) <= 0.0):                                raise ValueError("pair_prior_half_life must be finite and positive")
         if self.provisional_weight > self.provisional_cap:                          raise ValueError("provisional commit weight cannot exceed its cap")
+        if self.retention_policy not in {"adaptive", "fixed", "none"}:            raise ValueError("retention_policy must be 'adaptive', 'fixed', or 'none'")
+        if self.horizon_estimator not in {"hierarchical", "pair_only", "constant", "shuffled"}:  raise ValueError("horizon_estimator must be 'hierarchical', 'pair_only', 'constant', or 'shuffled'")
+        if self.pair_adaptation not in {"asymmetric", "symmetric"}:                raise ValueError("pair_adaptation must be 'asymmetric' or 'symmetric'")
+        if self.pin_mode not in {"latest", "recent_set"}:                          raise ValueError("pin_mode must be 'latest' or 'recent_set'")
+        if int(self.constant_grace_horizon) < 0:                                   raise ValueError("constant_grace_horizon cannot be negative")
+        if int(self.pin_window) < 0:                                               raise ValueError("pin_window cannot be negative")
+        if int(self.retrain_cold_after) < 1:                                       raise ValueError("retrain_cold_after must be positive")
         if self.irl_features not in {"semantic", "engineered", "raw_state"}:        raise ValueError("irl_features must be 'semantic', 'engineered', or 'raw_state'")
         if self.predictor not in {"maxent", "in_context_llm"}:                      raise ValueError("predictor must be 'maxent' or 'in_context_llm'")
         if int(self.llm_context_tokens) < 0:                                        raise ValueError("llm_context_tokens cannot be negative")
@@ -887,19 +932,15 @@ class MaxEntIrl:
         self,
         state: StateVector,
         candidates: Sequence[str],
-        *,
-        semantic_mode: str = "current",
     ) -> Tuple[Dict[str, float], Tuple[int, int, int], int, str]:
         """Build one feasible policy without mutating prediction telemetry."""
-        if semantic_mode not in {"current", "disabled", "completion"}:
-            raise ValueError(f"unknown semantic policy mode {semantic_mode!r}")
         if self.reward_weights is None:
             return {}, (0, 0, 0), 0, "unavailable"
         state_id = self.state_ids.get(tuple(state))
         candidate_actions = list(self.domain.legal_actions(tuple(state), tuple(str(value) for value in candidates)))
         learned = [(action, float(self.q_values[(state_id, action_id)])) for action in candidate_actions for action_id in (self.action_ids.get(action),) if state_id is not None and action_id is not None and (state_id, action_id) in self.q_values]
         learned_count = len(learned)
-        if learned and semantic_mode != "completion":
+        if learned:
             probabilities = _softmax_probs([value for _action, value in learned], self.settings.irl_temperature)
             distribution = {action: probability for (action, _value), probability in zip(learned, probabilities)}
             # Preserve the complete state-valid distribution requested by the evaluation contract. Unlearned semantic estimates do not compete with an exact-state MaxEnt policy; they retain floor support for calibration and NLL.
@@ -912,33 +953,27 @@ class MaxEntIrl:
         if current_features is None:
             return {}, (0, 0, 0), learned_count, "unavailable"
         current_reward = float(current_features @ self.reward_weights)
-        scored: List[Tuple[str, float]] = list(learned)
-        learned_actions = {action for action, _value in learned}
-        semantic_enabled = bool(
-            semantic_mode != "disabled"
-            and self.settings.semantic_fallback_enabled
-        )
+        # The exact-policy return above already handled every state with a
+        # learned Q-value, so only the semantic fallback path reaches here.
+        scored: List[Tuple[str, float]] = []
+        semantic_enabled = bool(self.settings.semantic_fallback_enabled)
         fallback_counts = [0, 0, 0]
         for action in candidate_actions:
-            if action in learned_actions:
-                continue
             successor = self.domain.successor(tuple(state), action)
             if successor is None:
                 continue
             if not semantic_enabled:
-                if not learned:
-                    # MaxEnt has no learned Q-value here, so the no-semantic
-                    # counterfactual retains uniform state-valid support.
-                    scored.append((action, current_reward))
+                # MaxEnt has no learned Q-value here, so the policy retains
+                # uniform state-valid support.
+                scored.append((action, current_reward))
                 continue
             fallback_counts[0] += 1
             neighbor_value = self._semantic_neighbor_value(successor)
             if neighbor_value is None:
                 fallback_counts[2] += 1
                 # The deployed fallback is neutral when no exact action is
-                # learned. Completion leaves rejected candidates at the floor.
-                if not learned:
-                    scored.append((action, current_reward))
+                # learned.
+                scored.append((action, current_reward))
                 continue
             fallback_counts[1] += 1
             scored.append((action, current_reward + float(self.settings.irl_discount) * neighbor_value))
@@ -947,22 +982,13 @@ class MaxEntIrl:
             return {}, counts, learned_count, "unavailable"
         probabilities = _softmax_probs([value for _action, value in scored], self.settings.irl_temperature)
         distribution = {action: probability for (action, _value), probability in zip(scored, probabilities)}
-        if learned:
-            for action in candidate_actions:
-                if action not in distribution:
-                    distribution[action] = 0.0
-        if semantic_mode == "disabled":
-            outcome = "disabled"
-        elif learned:
-            outcome = "completion_used" if fallback_counts[1] else "completion_rejected" if fallback_counts[0] else "exact_policy"
-        else:
-            outcome = "fallback_used" if fallback_counts[1] else "fallback_rejected" if fallback_counts[0] else "unavailable"
+        outcome = "fallback_used" if fallback_counts[1] else "fallback_rejected" if fallback_counts[0] else "unavailable"
         return (_normalize_probs(distribution, self.settings.min_probability),
                 counts, learned_count, outcome)
 
     def _feasible_distribution(self, state: StateVector, candidates: Sequence[str]) -> Dict[str, float]:
         distribution, counts, learned_count, outcome = self._feasible_policy(
-            state, candidates, semantic_mode="current",
+            state, candidates,
         )
         self._fallback_counts = counts
         self._last_exact_learned_action_count = learned_count
@@ -984,109 +1010,6 @@ class MaxEntIrl:
         if not policy_support:
             return "blocked_policy_support"
         return "applied" if float(alpha) > 0.0 else "zero_alpha"
-
-    def counterfactual_policies(
-        self,
-        state: StateVector,
-        candidates: Sequence[str],
-        *,
-        prefix: Sequence[str],
-        allow_latent_strategy: bool,
-        deployed_distribution: Mapping[str, float],
-    ) -> Dict[str, Any]:
-        """Pure one-step component and intervention branches."""
-        state_before = (
-            self._fallback_counts,
-            self._last_exact_learned_action_count,
-            self._last_semantic_gate_outcome,
-            dict(self.last_prediction_stats),
-            self.latent_strategy.last_score,
-            dict(self.latent_strategy.last_score_stats),
-        )
-        maxent_only, _base_counts, _base_learned, base_semantic = self._feasible_policy(
-            state, candidates, semantic_mode="disabled",
-        )
-        semantic_current, current_counts, learned_count, current_semantic = self._feasible_policy(
-            state, candidates, semantic_mode="current",
-        )
-        semantic_completion, completion_counts, _completion_learned, completion_semantic = self._feasible_policy(
-            state, candidates, semantic_mode="completion",
-        )
-        score_three, score_three_stats = self.latent_strategy.score_snapshot(
-            prefix, candidates, min_observed_roles=3,
-        )
-        score_two, score_two_stats = self.latent_strategy.score_snapshot(
-            prefix, candidates, min_observed_roles=2,
-        )
-        latent_enabled = bool(self.settings.latent_strategy_enabled)
-        policy_support = bool(current_counts[0]) or learned_count >= 2
-        current_gate = bool(latent_enabled and allow_latent_strategy and policy_support)
-        completion_current_gate, completion_alpha = (
-            fuse_strategy_residual(semantic_completion, score_three, float(self.settings.latent_strategy_strength))
-            if current_gate else (dict(semantic_completion), 0.0)
-        )
-        latent_relaxed, relaxed_alpha = (
-            fuse_strategy_residual(semantic_current, score_three, float(self.settings.latent_strategy_strength))
-            if latent_enabled else (dict(semantic_current), 0.0)
-        )
-        latent_two_role, two_role_alpha = (
-            fuse_strategy_residual(semantic_current, score_two, float(self.settings.latent_strategy_strength))
-            if latent_enabled else (dict(semantic_current), 0.0)
-        )
-        result = {
-            "policies": {
-                "maxent_only": maxent_only,
-                "semantic_current": semantic_current,
-                "deployed_current": dict(deployed_distribution),
-                "semantic_completion": semantic_completion,
-                "semantic_completion_current_gate": completion_current_gate,
-                "latent_relaxed": latent_relaxed,
-                "latent_two_role": latent_two_role,
-            },
-            "stats": {
-                "semantic_maxent_only_outcome": base_semantic,
-                "semantic_current_outcome": current_semantic,
-                "semantic_completion_outcome": completion_semantic,
-                "semantic_completion_attempted_actions": int(completion_counts[0]),
-                "semantic_completion_accepted_actions": int(completion_counts[1]),
-                "semantic_completion_rejected_actions": int(completion_counts[2]),
-                "latent_relaxed_alpha": float(relaxed_alpha),
-                "latent_two_role_alpha": float(two_role_alpha),
-                "semantic_completion_current_gate_alpha": float(completion_alpha),
-                "latent_relaxed_score_outcome": score_three_stats.get("latent_strategy_score_outcome"),
-                "latent_two_role_score_outcome": score_two_stats.get("latent_strategy_score_outcome"),
-                "latent_two_role_observed_roles": int(score_two.observed_roles),
-                "latent_two_role_observed_relations": int(score_two.observed_relations),
-            },
-        }
-        expected_support = set(map(str, deployed_distribution))
-        for name, distribution in result["policies"].items():
-            if set(distribution) != expected_support:
-                raise RuntimeError(
-                    f"counterfactual policy {name!r} changed feasible support"
-                )
-            total = sum(float(value) for value in distribution.values())
-            if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-9):
-                raise RuntimeError(
-                    f"counterfactual policy {name!r} is not normalized: {total}"
-                )
-            if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in distribution.values()):
-                raise RuntimeError(
-                    f"counterfactual policy {name!r} contains an invalid probability"
-                )
-        state_after = (
-            self._fallback_counts,
-            self._last_exact_learned_action_count,
-            self._last_semantic_gate_outcome,
-            dict(self.last_prediction_stats),
-            self.latent_strategy.last_score,
-            dict(self.latent_strategy.last_score_stats),
-        )
-        if state_after != state_before:
-            raise RuntimeError(
-                "counterfactual policy computation mutated deployed prediction state"
-            )
-        return result
 
     def _record_prediction_stats(self, candidate_count: int) -> None:
         attempted, accepted, rejected = self._fallback_counts

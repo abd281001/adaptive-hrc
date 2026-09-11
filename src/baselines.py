@@ -663,6 +663,7 @@ class ReplayBcAgent(BehaviorCloningAgent):
 BASELINE_AGENTS = {
     "frozen": FrozenAgent,
     "offline_default": FrozenAgent,
+    "offline_all": FrozenAgent,
     "unpinned": UnpinnedAgent,
     "latest": LatestAgent,
     "fixed": FixedDecayAgent,

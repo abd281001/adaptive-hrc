@@ -20,6 +20,7 @@ from .domain import (
 )
 from .ladder import LadderSettings, SCENARIOS, generate_ladder, ladder_audit
 from .legacy_options import LegacyBurritoOptionExecutor
+from .null_agents import NULL_AGENTS, CanonicalOrderAgent
 from .options import BurritoOptionExecutor, OptionExecution, OptionExecutionError
 from .overcooked_options import OvercookedOptionExecutor
 from .protocol import (
@@ -49,6 +50,9 @@ from .task_graph import (
     CookingPreferencePolicy,
     CookingTaskGraph,
     PREFERENCE_NAMES,
+    is_preference_discriminating,
+    is_prefix_conditioned_discriminating,
+    preferences_consistent_with_prefix,
 )
 
 

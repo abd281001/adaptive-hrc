@@ -10,6 +10,7 @@ import json
 import math
 import multiprocessing
 import os
+import re
 from pathlib import Path
 import platform
 import statistics
@@ -38,7 +39,13 @@ from .domain import (
     SEMANTIC_FEATURE_VERSION,
     STRATEGY_ROLE_VERSION,
 )
-from .ladder import LadderSettings, SCENARIOS, generate_ladder, ladder_audit
+from .ladder import (
+    CONTAINER_FIRST_PREFERENCE,
+    LadderSettings,
+    SCENARIOS,
+    generate_ladder,
+    ladder_audit,
+)
 from .options import OptionExecutionError
 from .protocol import (
     ASSIST,
@@ -48,16 +55,23 @@ from .protocol import (
     CookingTask,
 )
 from .runtime import BurritoRuntime, UpstreamPaths, verify_pins
-from .task_graph import CookingPreferencePolicy, CookingTaskGraph, is_preference_discriminating
+from .null_agents import NULL_AGENTS
+from .task_graph import (
+    CookingPreferencePolicy,
+    CookingTaskGraph,
+    is_preference_discriminating,
+    is_prefix_conditioned_discriminating,
+)
 
 
 CONFIG_SCHEMA_VERSION = 4
-RESULT_SCHEMA_VERSION = 6
+RESULT_SCHEMA_VERSION = 7
 FULL_ARM = "full"
 ARM_NAMES: Tuple[str, ...] = (
     FULL_ARM,
     "frozen",
     "offline_default",
+    "offline_all",
     "unpinned",
     "latest",
     "fixed",
@@ -67,6 +81,12 @@ ARM_NAMES: Tuple[str, ...] = (
     "replay_bc",
     "memory_oracle",
 )
+# Zero-learning references, not deployable systems.  They are excluded from the
+# Adaptive-HRC parity roster on purpose: parity is about matching the symbolic
+# baseline set, and these arms have no symbolic counterpart.  They are required
+# in the full config because a Full-versus-baseline margin is uninterpretable
+# without knowing what a fixed rule scores on the same episodes.
+NULL_ARM_NAMES: Tuple[str, ...] = ("canonical_order",)
 VALIDATION_REQUIREMENTS: Tuple[str, ...] = (
     "adaptation_linkage",
     "holdout_transfer_is_generalisation",
@@ -85,6 +105,7 @@ VALIDATION_REQUIREMENTS: Tuple[str, ...] = (
     "scenario_invariants",
     "transfer_mechanisms_exercised",
     "verified_shift_update",
+    "zero_learning_reference",
 )
 
 
@@ -99,6 +120,7 @@ def _json_bytes(value: Any) -> bytes:
 
 
 def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
         json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
@@ -115,6 +137,48 @@ def _git(repository: Path, *args: str) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+# The core modules a cooking cell's result actually depends on.  The wrapper
+# supplies the environment and the protocol; everything the learner does comes
+# from src, so hashing only the wrapper left a checkpoint valid across an edit
+# to the agent, the model, the memory policy or the baselines.
+_CORE_SOURCE_MODULES: Tuple[str, ...] = (
+    "adaptive_agent.py",
+    "baselines.py",
+    "domain.py",
+    "environment.py",
+    "latent_strategy.py",
+    "memory.py",
+    "models.py",
+    "preferences.py",
+    "representations.py",
+)
+
+
+def _source_fingerprint() -> str:
+    """Digest of the wrapper package plus the core learner implementation.
+
+    A checkpoint records the code that produced it.  The config digest alone
+    was not enough: an edit to the evaluator, the protocol, or the learner
+    changes what a cell means without changing the config, and a resume would
+    then splice cells produced by two different implementations into one
+    artifact.
+    """
+    paths = UpstreamPaths.discover()
+    package = Path(__file__).resolve().parent
+    core = paths.integration_root.parent / "src"
+    digest = hashlib.sha256()
+    for path in sorted(package.glob("*.py")):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    for name in _CORE_SOURCE_MODULES:
+        path = core / name
+        digest.update(f"src/{name}".encode("utf-8"))
+        # A module that has moved or been renamed is itself a change worth
+        # invalidating on, so record its absence rather than skipping it.
+        digest.update(path.read_bytes() if path.exists() else b"<missing>")
+    return digest.hexdigest()[:16]
 
 
 def _finite_mean(values: Iterable[Any]) -> float | None:
@@ -162,7 +226,9 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     unknown_recipes = set(map(str, config["recipe_ids"])) - set(RECIPES)
     if unknown_recipes:
         raise ValueError(f"unknown recipes: {sorted(unknown_recipes)}")
-    unknown_arms = set(map(str, config["arms"])) - set(ARM_NAMES)
+    unknown_arms = (
+        set(map(str, config["arms"])) - set(ARM_NAMES) - set(NULL_ARM_NAMES)
+    )
     if unknown_arms:
         raise ValueError(f"unknown arms: {sorted(unknown_arms)}")
     requirements = set(map(str, config.get("validation_requirements", ())))
@@ -186,10 +252,16 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     ]
     if trivial:
         raise ValueError(f"single-ingredient recipes are prohibited: {trivial}")
-    if tuple(map(str, config["arms"])) != ARM_NAMES:
+    # The deployable roster must match Adaptive-HRC in order; the
+    # zero-learning references follow it.  They are required, not optional: a
+    # Full-versus-baseline margin cannot be read without knowing what a fixed
+    # rule scores on the same episodes, and roughly half of this catalog's
+    # robot turns have one legal option.
+    if tuple(map(str, config["arms"])) != ARM_NAMES + NULL_ARM_NAMES:
         raise ValueError(
             "the full cooking evaluation must use the Adaptive-HRC baseline "
-            f"roster in order: {ARM_NAMES}"
+            f"roster in order, followed by the zero-learning references: "
+            f"{ARM_NAMES + NULL_ARM_NAMES}"
         )
     # Taken from Adaptive-HRC rather than restated, so the replication cannot
     # silently fall behind the paired grid the symbolic evaluation runs. It
@@ -262,6 +334,8 @@ def load_config(path: str | Path) -> Dict[str, Any]:
 def _build_agent(arm: str, settings: Any, domain: CookingDomainAdapter) -> Any:
     from src.adaptive_agent import AdaptiveAgent
 
+    if arm in NULL_AGENTS:
+        return NULL_AGENTS[arm](settings, domain=domain)
     if arm in {FULL_ARM, "memory_oracle"}:
         agent = AdaptiveAgent(settings, domain=domain)
         if arm == "memory_oracle":
@@ -330,8 +404,8 @@ def _prepare_offline_baseline(
     seed: int,
     scenario: str,
 ) -> Mapping[str, Any]:
-    """Match Adaptive-HRC's two frozen training regimes."""
-    if arm not in {"frozen", "offline_default"}:
+    """Match Adaptive-HRC's three frozen training regimes."""
+    if arm not in {"frozen", "offline_default", "offline_all"}:
         return {}
     started = time.perf_counter()
     if scenario == "holdout":
@@ -359,10 +433,20 @@ def _prepare_offline_baseline(
             if preference in applicable_preferences(recipe)
         ]
         design = "subset_recipes_subset_preferences"
-    else:
+    elif arm == "offline_default":
         recipes = sorted({task.recipe_id for task in tasks})
         pairs = [(recipe, _canonical_preference(recipe)) for recipe in recipes]
         design = "all_recipes_default_only"
+    else:
+        # Every behaviourally distinct preference of every recipe this seed
+        # schedules.  Recipes outside the seed's set stay out: no other arm
+        # ever sees them.
+        recipes = sorted({task.recipe_id for task in tasks})
+        pairs = [
+            (recipe, preference)
+            for recipe in recipes for preference in applicable_preferences(recipe)
+        ]
+        design = "all_recipes_all_preferences"
     if not pairs:
         raise ValueError(f"{arm} has no effective offline training pairs")
     for recipe, preference in pairs:
@@ -458,10 +542,10 @@ def _frozen_probe(
                 "legal_count": len(legal),
                 "correct": predicted == truth,
                 "correct_top_k": truth in ranked,
-                "scored": predicted is not None,
-                "discriminating": bool(
-                    predicted is not None
-                    and is_preference_discriminating(legal, graph)
+                "available": predicted is not None,
+                "discriminating": is_preference_discriminating(legal, graph),
+                "conditioned": is_prefix_conditioned_discriminating(
+                    legal, graph, completed,
                 ),
                 "probability": float(distribution.get(truth, 0.0)),
             })
@@ -475,8 +559,11 @@ def _frozen_probe(
             agent.maxent.domain = domain
         if hasattr(agent, "cloner"):
             agent.cloner.domain = domain
-    scored = [row for row in rows if row["scored"]]
+    # As above: a probe decision the arm could not answer is a miss, not an
+    # absence.
+    scored = rows
     discriminating = [row for row in rows if row["discriminating"]]
+    conditioned = [row for row in rows if row["conditioned"]]
     nontrivial = [row for row in scored if row["legal_count"] > 1]
     return {
         **dict(metadata),
@@ -485,6 +572,9 @@ def _frozen_probe(
         "environment": RECIPES[task.recipe_id].stratum,
         "preference": task.preference,
         "decision_count": len(scored),
+        "prediction_available_decisions": sum(
+            row["available"] for row in rows
+        ),
         "top_1_hits": sum(row["correct"] for row in scored),
         "top_1": _finite_mean(row["correct"] for row in scored),
         "top_k_hits": sum(row["correct_top_k"] for row in scored),
@@ -495,6 +585,11 @@ def _frozen_probe(
         ),
         "preference_discriminating_top_1": _finite_mean(
             row["correct"] for row in discriminating
+        ),
+        "prefix_conditioned_decision_count": len(conditioned),
+        "prefix_conditioned_top_1_hits": sum(row["correct"] for row in conditioned),
+        "prefix_conditioned_top_1": _finite_mean(
+            row["correct"] for row in conditioned
         ),
         "nontrivial_choice_decision_count": len(nontrivial),
         "nontrivial_choice_top_1_hits": sum(row["correct"] for row in nontrivial),
@@ -556,6 +651,8 @@ def _decision_record(row: Any) -> Dict[str, Any]:
             row.ground_truth_nll if math.isfinite(row.ground_truth_nll) else None
         ),
         "preference_discriminating": row.preference_discriminating,
+        "prefix_conditioned_discriminating": row.prefix_conditioned_discriminating,
+        "prediction_available": row.prediction_available,
         "human_corrected": row.human_corrected,
         "proposal_executed": row.proposal_executed,
         "invalid_prediction": row.invalid_prediction,
@@ -580,11 +677,43 @@ def _episode_record(
     wall_s: float,
     agent: Any,
 ) -> Dict[str, Any]:
-    assist = [row for row in result.decisions if row.mode == ASSIST and row.predicted is not None]
+    # Every assist decision is a scored opportunity.  Filtering on
+    # ``predicted is not None`` removed the decisions an arm failed to answer
+    # from the denominator of every rate, which inflated precisely the arms
+    # that fail to answer; availability is reported instead of subtracted.
+    assist = [row for row in result.decisions if row.mode == ASSIST]
     robot = [row for row in assist if row.scheduled_actor == "robot"]
+    if len(robot) != result.robot_turns:
+        raise RuntimeError(
+            f"robot decision count {len(robot)} disagrees with the "
+            f"{result.robot_turns} scheduled robot turns"
+        )
+    if result.corrections > len(robot):
+        raise RuntimeError(
+            f"{result.corrections} corrections exceed {len(robot)} robot turns"
+        )
     discriminating = [row for row in robot if row.preference_discriminating]
+    # The accuracy denominator: decisions where the preferences still
+    # consistent with this episode's prefix disagree.  ``discriminating``
+    # counts decisions the prefix has already settled.
+    conditioned = [row for row in robot if row.prefix_conditioned_discriminating]
+    scored_conditioned = [
+        row for row in assist if row.prefix_conditioned_discriminating
+    ]
     choice = [row for row in robot if len(row.legal_actions) > 1]
     forced = [row for row in robot if len(row.legal_actions) == 1]
+    fits = [
+        event for event in result.retrain_events
+        if not bool(event.get("skipped", False))
+    ]
+    # The opening move is the most preference-informative decision in these
+    # task graphs and under human_first it is never a robot turn, so no
+    # robot-turn metric can see it.  On the container-axis transfer cell it is
+    # discriminating in every episode, which makes it the transfer measurement.
+    opening = assist[0] if assist else None
+    # From the result, not the agent: the runner owns the effective floor and
+    # may have been given an explicit override.
+    nll_floor = float(result.nll_probability_floor)
     recipe = RECIPES[result.task.recipe_id]
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -640,6 +769,17 @@ def _episode_record(
         "teacher_forced_top_1_hits": sum(row.correct_top_1 for row in assist),
         "teacher_forced_top_k_hits": sum(row.correct_top_k for row in assist),
         "teacher_forced_nll": _finite_mean(row.ground_truth_nll for row in assist),
+        # Pooling needs the sum and its denominator.  Averaging episode means
+        # is a macro-average over episodes of unequal length, which is not the
+        # per-decision loss anyone reads it as.
+        "teacher_forced_nll_total": sum(
+            row.ground_truth_nll for row in assist
+            if math.isfinite(row.ground_truth_nll)
+        ),
+        "teacher_forced_nll_decisions": sum(
+            1 for row in assist if math.isfinite(row.ground_truth_nll)
+        ),
+        "nll_probability_floor": nll_floor,
         "teacher_forced_preference_discriminating_decisions": (
             result.scored_discriminating_decisions
         ),
@@ -648,6 +788,58 @@ def _episode_record(
         ),
         "teacher_forced_preference_discriminating_top_1": (
             result.scored_discriminating_top_1
+        ),
+        "prefix_conditioned_robot_decisions": len(conditioned),
+        "prefix_conditioned_top_1_hits": sum(
+            row.correct_top_1 for row in conditioned
+        ),
+        "prefix_conditioned_top_1": _finite_mean(
+            row.correct_top_1 for row in conditioned
+        ),
+        "teacher_forced_prefix_conditioned_decisions": len(scored_conditioned),
+        "teacher_forced_prefix_conditioned_top_1_hits": sum(
+            row.correct_top_1 for row in scored_conditioned
+        ),
+        "teacher_forced_prefix_conditioned_top_1": _finite_mean(
+            row.correct_top_1 for row in scored_conditioned
+        ),
+        "opening_scored": opening is not None,
+        "opening_scheduled_actor": (
+            None if opening is None else opening.scheduled_actor
+        ),
+        "opening_preference_discriminating": (
+            None if opening is None else opening.preference_discriminating
+        ),
+        "opening_prefix_conditioned_discriminating": (
+            None if opening is None
+            else opening.prefix_conditioned_discriminating
+        ),
+        "opening_top_1_hits": (
+            0 if opening is None else int(opening.correct_top_1)
+        ),
+        "opening_decision_count": int(opening is not None),
+        "opening_discriminating_top_1_hits": (
+            int(opening.correct_top_1)
+            if opening is not None and opening.preference_discriminating else 0
+        ),
+        "opening_discriminating_decision_count": int(
+            opening is not None and opening.preference_discriminating
+        ),
+        "prediction_wall_s": result.prediction_wall_s,
+        # Reported next to every rate, never folded into one.
+        "prediction_available_decisions": result.scored_available_decisions,
+        "prediction_unavailable_decisions": (
+            result.scored_turns - result.scored_available_decisions
+        ),
+        "robot_prediction_available_decisions": result.robot_available_decisions,
+        "robot_prediction_unavailable_decisions": (
+            result.robot_turns - result.robot_available_decisions
+        ),
+        "fit_count": len(fits),
+        "fit_total_wall_s": sum(float(event.get("total_wall_s", 0.0)) for event in fits),
+        "fit_wall_s_values": [float(event.get("fit_wall_s", 0.0)) for event in fits],
+        "fit_flop_estimate": sum(
+            float(event.get("flop_estimate", 0.0)) for event in fits
         ),
         "nontrivial_choice_decision_count": len(choice),
         "nontrivial_choice_top_1_hits": sum(row.correct_top_1 for row in choice),
@@ -764,7 +956,7 @@ def _run_cell(
         horizon=int(config.get("horizon", 1800)),
         planner_seed=int(config.get("planner_seed", 11)),
         top_k=int(config.get("top_k", 3)),
-        memory_updates_enabled=arm not in {"frozen", "offline_default"},
+        memory_updates_enabled=arm not in {"frozen", "offline_default", "offline_all"},
         require_shift_update=arm == FULL_ARM,
         lead_actor_policy=str(config.get("lead_actor_policy", "human_first")),
     )
@@ -998,70 +1190,412 @@ def _adaptation_records(episodes: Sequence[Mapping[str, Any]]) -> list[Dict[str,
     ))
 
 
-def _human_action_load(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Human action load, plus the floor the turn-taking protocol imposes.
+def _percentile(values: Sequence[float], fraction: float) -> Optional[float]:
+    ordered = sorted(float(value) for value in values if value is not None)
+    if not ordered:
+        return None
+    index = min(len(ordered) - 1, max(0, math.ceil(fraction * len(ordered)) - 1))
+    return ordered[index]
 
-    The protocol is human-first strict alternation, so even a perfect robot
-    performs ceil(n/2) of an n-step recipe.  The raw ratio therefore lives in
-    roughly [0.5, 1.0] and looks saturated when it is merely bounded.
-    ``excess`` rescales it onto [0, 1], where 0 is a robot that took every turn
-    available to it and 1 is a robot that took none.
+
+def _performance(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Compute cost, latency, memory and calibration, aggregated.
+
+    Every column here was already recorded per episode and reported nowhere,
+    so a cross-environment claim about the system's cost could not be checked
+    against this run at all.  Prediction latency is per decision (a blocking
+    wait inside an episode); fit latency is per fit (the blocking wait between
+    two demonstrations), which is why both a total and a p95 are reported
+    rather than one mean over a mixture of the two.
     """
-    steps = sum(int(row["recipe_steps"]) for row in rows)
-    human = sum(int(row["human_action_count"]) for row in rows)
-    floor = sum(-(-int(row["recipe_steps"]) // 2) for row in rows)
-    if not steps:
-        return {
-            "normalized_human_action_load": None,
-            "normalized_human_action_load_floor": None,
-            "human_action_load_excess": None,
-        }
-    span = steps - floor
+    def total(key: str) -> float:
+        return sum(float(row.get(key, 0.0) or 0.0) for row in rows)
+
+    fit_waits = [
+        value for row in rows for value in (row.get("fit_wall_s_values") or ())
+    ]
+    decisions = sum(
+        int(row.get("teacher_forced_decision_count", 0) or 0) for row in rows
+    )
+    prediction_wall = total("prediction_wall_s")
+    available = sum(
+        int(row.get("prediction_available_decisions", 0) or 0) for row in rows
+    )
+    robot_available = sum(
+        int(row.get("robot_prediction_available_decisions", 0) or 0)
+        for row in rows
+    )
+    robot_decisions = sum(
+        int(row.get("robot_decision_count", 0) or 0) for row in rows
+    )
+    nll_decisions = sum(
+        int(row.get("teacher_forced_nll_decisions", 0) or 0) for row in rows
+    )
+    sizes = [
+        int(row["learner_dense_array_bytes"]) for row in rows
+        if row.get("learner_dense_array_bytes") is not None
+    ]
     return {
-        "normalized_human_action_load": human / steps,
-        "normalized_human_action_load_floor": floor / steps,
-        "human_action_load_excess": (human - floor) / span if span else None,
+        "episode_wall_s": total("task_wall_s"),
+        "prediction_wall_s": prediction_wall,
+        "mean_prediction_wall_s": (
+            prediction_wall / decisions if decisions else None
+        ),
+        "fit_count": sum(int(row.get("fit_count", 0) or 0) for row in rows),
+        "fit_total_wall_s": total("fit_total_wall_s"),
+        "p50_fit_wall_s": _percentile(fit_waits, 0.50),
+        "p95_fit_wall_s": _percentile(fit_waits, 0.95),
+        "fit_flop_estimate": total("fit_flop_estimate"),
+        "peak_learner_dense_array_bytes": max(sizes, default=None),
+        "mean_memory_active_variants": _finite_mean(
+            row.get("memory_active_variants") for row in rows
+        ),
+        "mean_replay_transition_count": _finite_mean(
+            row.get("learner_replay_transition_count") for row in rows
+        ),
+        # Total loss over total decisions.  This previously averaged the
+        # per-episode means, which with unequal episode lengths is a different
+        # number entirely -- 1.0 against a true 0.2 per decision in the
+        # regression that now guards it.
+        "teacher_forced_nll": (
+            total("teacher_forced_nll_total") / nll_decisions
+            if nll_decisions else None
+        ),
+        "teacher_forced_nll_decisions": nll_decisions,
+        "nll_probability_floor": next(
+            (
+                row["nll_probability_floor"] for row in rows
+                if row.get("nll_probability_floor") is not None
+            ),
+            None,
+        ),
+        # Availability is a property of the arm, reported beside the rates
+        # rather than removed from their denominators.
+        "prediction_availability": (available / decisions if decisions else None),
+        "prediction_unavailable_decisions": decisions - available,
+        "robot_prediction_availability": (
+            robot_available / robot_decisions if robot_decisions else None
+        ),
+        "robot_prediction_unavailable_decisions": robot_decisions - robot_available,
+        "invalid_prediction_count": sum(
+            int(row.get("invalid_predictions", 0) or 0) for row in rows
+        ),
+        "task_completion_rate": _finite_mean(
+            row.get("task_completed") for row in rows
+        ),
+    }
+
+
+# Two-sided 95% Student-t multipliers by degrees of freedom, for the paired
+# seed differences below.  With eight seeds the normal multiplier understates
+# the interval by about 20%, and the whole point of reporting seeds as the unit
+# of replication is not to overstate what eight of them support.
+_T95 = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+    8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145,
+    15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+    21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060, 26: 2.056,
+    27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+}
+
+SEED_UNIT_METRICS: Tuple[Tuple[str, str, str], ...] = (
+    ("opening_discriminating_top_1",
+     "opening_discriminating_top_1_hits",
+     "opening_discriminating_decision_count"),
+    ("teacher_forced_top_1",
+     "teacher_forced_top_1_hits", "teacher_forced_decision_count"),
+    ("prefix_conditioned_top_1",
+     "prefix_conditioned_top_1_hits", "prefix_conditioned_robot_decisions"),
+    ("teacher_forced_prefix_conditioned_top_1",
+     "teacher_forced_prefix_conditioned_top_1_hits",
+     "teacher_forced_prefix_conditioned_decisions"),
+    ("preference_discriminating_top_1",
+     "preference_discriminating_top_1_hits",
+     "preference_discriminating_robot_decisions"),
+    ("teacher_forced_preference_discriminating_top_1",
+     "teacher_forced_preference_discriminating_top_1_hits",
+     "teacher_forced_preference_discriminating_decisions"),
+    ("robot_top_1", "robot_top_1_hits", "robot_decision_count"),
+    ("corrections_per_robot_decision",
+     "human_corrections", "robot_decision_count"),
+)
+
+
+def _paired_difference(values: Sequence[float]) -> Dict[str, Any]:
+    """Mean, spread and a t-based 95% interval for one paired contrast."""
+    usable = [
+        float(value) for value in values
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+    if not usable:
+        return {
+            "n_seeds": 0, "mean": None, "sd": None,
+            "ci95_half_width": None, "ci95": None,
+        }
+    mean = statistics.fmean(usable)
+    if len(usable) < 2:
+        return {
+            "n_seeds": len(usable), "mean": mean, "sd": None,
+            "ci95_half_width": None, "ci95": None,
+        }
+    sd = statistics.stdev(usable)
+    half = _T95.get(len(usable) - 1, 1.96) * sd / math.sqrt(len(usable))
+    return {
+        "n_seeds": len(usable),
+        "mean": mean,
+        "sd": sd,
+        "ci95_half_width": half,
+        "ci95": [mean - half, mean + half],
     }
 
 
 def _by_seed(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Per-seed rates plus their macro-average.
+    """Seed-level cells, their macro-averages, and paired contrasts against Full.
 
-    Pooling sums numerators and denominators across every row, so a seed whose
-    heterogeneous ladder ran 1,395 episodes outweighs one that ran 1,080.
-    Seeds are the unit of replication, so the seed-mean is the figure to draw
-    inferences from and the pooled value is descriptive.
+    The unit of replication is one (seed, arm, scenario, environment) cell.
+    Grouping by seed alone pooled all twelve arms into a single per-seed rate,
+    which is not a quantity anyone can draw an inference from, and it left the
+    run with no unit in which a Full-versus-arm difference or an
+    environment-by-method interaction could be tested at all.
+
+    Pooling within a cell still sums numerators and denominators across
+    episodes, so a longer heterogeneous ladder weighs more inside its own cell;
+    across seeds the macro-average is what the contrasts use.
     """
-    grouped: Dict[Any, list[Mapping[str, Any]]] = defaultdict(list)
+    cells: Dict[Tuple[Any, str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
-        grouped[row["seed"]].append(row)
-    metrics = (
-        ("preference_discriminating_top_1",
-         "preference_discriminating_top_1_hits",
-         "preference_discriminating_robot_decisions"),
-        ("teacher_forced_preference_discriminating_top_1",
-         "teacher_forced_preference_discriminating_top_1_hits",
-         "teacher_forced_preference_discriminating_decisions"),
-        ("robot_top_1", "robot_top_1_hits", "robot_decision_count"),
-    )
-    per_seed = []
-    for seed, seed_rows in sorted(grouped.items(), key=lambda item: str(item[0])):
-        entry: Dict[str, Any] = {"seed": seed, "n_episodes": len(seed_rows)}
-        for name, numerator, denominator in metrics:
-            entry[name] = _pooled_rate(seed_rows, numerator, denominator)
-        entry.update(_human_action_load(seed_rows))
-        per_seed.append(entry)
-    seed_means = {
-        f"{name}_seed_mean": _finite_mean(entry[name] for entry in per_seed)
-        for name, _numerator, _denominator in metrics
+        cells[(
+            row["seed"], row["arm"], row["scenario"], row["environment"],
+        )].append(row)
+
+    per_cell = []
+    indexed: Dict[Tuple[str, str, str], Dict[Any, Dict[str, Any]]] = defaultdict(dict)
+    for (seed, arm, scenario, environment), cell_rows in sorted(
+        cells.items(), key=lambda item: tuple(map(str, item[0])),
+    ):
+        entry: Dict[str, Any] = {
+            "seed": seed, "arm": arm, "scenario": scenario,
+            "environment": environment, "n_episodes": len(cell_rows),
+        }
+        for name, numerator, denominator in SEED_UNIT_METRICS:
+            entry[name] = _pooled_rate(cell_rows, numerator, denominator)
+        per_cell.append(entry)
+        indexed[(arm, scenario, environment)][seed] = entry
+
+    seed_means = []
+    for (arm, scenario, environment), by_seed_entry in sorted(indexed.items()):
+        row: Dict[str, Any] = {
+            "arm": arm, "scenario": scenario, "environment": environment,
+            "n_seeds": len(by_seed_entry),
+        }
+        for name, _numerator, _denominator in SEED_UNIT_METRICS:
+            row[f"{name}_seed_mean"] = _finite_mean(
+                entry[name] for entry in by_seed_entry.values()
+            )
+        seed_means.append(row)
+
+    # Paired within seed, so a seed whose panel happens to be hard does not
+    # count as evidence against a method.
+    contrasts = []
+    for (arm, scenario, environment), by_seed_entry in sorted(indexed.items()):
+        if arm == FULL_ARM:
+            continue
+        reference = indexed.get((FULL_ARM, scenario, environment), {})
+        shared = sorted(set(reference) & set(by_seed_entry), key=str)
+        if not shared:
+            continue
+        contrast: Dict[str, Any] = {
+            "arm": arm, "scenario": scenario, "environment": environment,
+            "contrast": f"{FULL_ARM}_minus_{arm}",
+        }
+        for name, _numerator, _denominator in SEED_UNIT_METRICS:
+            paired = [
+                reference[seed][name] - by_seed_entry[seed][name]
+                for seed in shared
+                if reference[seed][name] is not None
+                and by_seed_entry[seed][name] is not None
+            ]
+            contrast[name] = _paired_difference(paired)
+        contrasts.append(contrast)
+
+    return {
+        "unit": "seed_x_arm_x_scenario_x_environment",
+        "per_cell": per_cell,
+        "seed_means": seed_means,
+        "paired_vs_full": contrasts,
     }
-    seed_means["normalized_human_action_load_seed_mean"] = _finite_mean(
-        entry["normalized_human_action_load"] for entry in per_seed
+
+
+HOLDOUT_SOURCE_TRAINING = "holdout_source_training"
+HOLDOUT_AXIS_INTRODUCTION = "holdout_axis_source_introduction"
+HOLDOUT_AXIS_TARGET = "holdout_axis_target_composition"
+
+
+def _holdout_stage(row: Mapping[str, Any]) -> Tuple[str, str, bool, str]:
+    """Classify one holdout episode: stage, recipe role, is-it-the-axis, exposure.
+
+    Stage and recipe role are independent and both are needed.  The stage comes
+    from the ladder's own ``strategy`` label -- which phase of the holdout this
+    episode belongs to -- and the role comes from ``holdout_target``, which
+    says whether this episode's *recipe* is a held-out target.  Source recipes
+    keep appearing throughout the target-composition phase, so the stage alone
+    does not isolate targets: on the saved run the axis "later exposure" group
+    was 1,022 Overcooked episodes of which 250 were source recipes, and 384
+    native-Burrito episodes of which 211 were.
+
+    Neither does the role alone, which is what an earlier version tried:
+    combining ``holdout_target`` with ``exposure_after_change <= 1`` counted
+    ordinary source training and acquisitions of unrelated preferences as
+    transfer, 1,500 and 257 episodes against 24 and 12 actual ones.
+    """
+    strategy = str(row.get("strategy", ""))
+    role = "target" if row.get("holdout_target") else "source"
+    axis = row.get("preference") == CONTAINER_FIRST_PREFERENCE
+    if strategy == HOLDOUT_AXIS_TARGET and axis and role == "target":
+        exposure = (
+            "first" if int(row["exposure_after_change"]) == 1 else "later"
+        )
+    else:
+        exposure = "not_applicable"
+    return strategy or "unlabelled", role, axis, exposure
+
+
+def _holdout_groups(rows: Sequence[Mapping[str, Any]]) -> list[Dict[str, Any]]:
+    """Split the holdout into its four stages, keeping seeds as separate rows.
+
+    Only one cell is the transfer measurement: the *first* exposure of the
+    container-first preference on a held-out target
+    (``holdout_axis_target_composition``, ``axis_preference``,
+    ``target_exposure == "first"``).  Source training never contains the axis
+    at all, the introduction stage teaches it on an already-known source, and
+    later target exposures are ordinary adaptation on a now-demonstrated pair
+    -- and they outnumber the first ones by roughly fifty to one, so a pooled
+    holdout figure is almost entirely adaptation reported as transfer.
+
+    Seeds stay separate here rather than being pooled away, because with two
+    dozen first exposures per environment the seed is the only honest unit.
+    Read the teacher-forced columns: at 24 first exposures the robot-turn
+    metrics miss every human-first opening, and the opening move is the most
+    preference-informative decision in these task graphs.
+    """
+    holdout = [row for row in rows if row["scenario"] == "holdout"]
+    grouped: Dict[Tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in holdout:
+        stage, role, axis, exposure = _holdout_stage(row)
+        grouped[(
+            row["arm"], row["seed"], row["environment"], stage, role, axis,
+            bool(row.get("holdout_transfer_isomorphic")), exposure,
+        )].append(row)
+
+    groups = []
+    for key, cell in sorted(grouped.items(), key=lambda item: tuple(map(str, item[0]))):
+        arm, seed, environment, stage, role, axis, isomorphic, exposure = key
+        groups.append({
+            "arm": arm,
+            "seed": seed,
+            "environment": environment,
+            "holdout_stage": stage,
+            "holdout_recipe_role": role,
+            "axis_preference": axis,
+            "holdout_transfer_isomorphic": isomorphic,
+            "target_exposure": exposure,
+            "is_transfer_measurement": (
+                stage == HOLDOUT_AXIS_TARGET
+                and role == "target"
+                and axis
+                and exposure == "first"
+            ),
+            "n_episodes": len(cell),
+            "teacher_forced_top_1": _pooled_rate(
+                cell, "teacher_forced_top_1_hits", "teacher_forced_decision_count",
+            ),
+            "teacher_forced_decision_count": sum(
+                row.get("teacher_forced_decision_count", 0) or 0 for row in cell
+            ),
+            "teacher_forced_prefix_conditioned_top_1": _pooled_rate(
+                cell,
+                "teacher_forced_prefix_conditioned_top_1_hits",
+                "teacher_forced_prefix_conditioned_decisions",
+            ),
+            "teacher_forced_prefix_conditioned_decisions": sum(
+                row.get("teacher_forced_prefix_conditioned_decisions", 0) or 0
+                for row in cell
+            ),
+            "prefix_conditioned_top_1": _pooled_rate(
+                cell,
+                "prefix_conditioned_top_1_hits",
+                "prefix_conditioned_robot_decisions",
+            ),
+            "prefix_conditioned_robot_decisions": sum(
+                row.get("prefix_conditioned_robot_decisions", 0) or 0
+                for row in cell
+            ),
+            "opening_top_1": _pooled_rate(
+                cell, "opening_top_1_hits", "opening_decision_count",
+            ),
+            "opening_discriminating_top_1": _pooled_rate(
+                cell,
+                "opening_discriminating_top_1_hits",
+                "opening_discriminating_decision_count",
+            ),
+            "opening_discriminating_decision_count": sum(
+                row.get("opening_discriminating_decision_count", 0) or 0
+                for row in cell
+            ),
+            "corrections_per_robot_decision": _pooled_rate(
+                cell, "human_corrections", "robot_decision_count",
+            ),
+        })
+    return groups
+
+
+def _holdout_transfer_contrasts(
+    groups: Sequence[Mapping[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Full-minus-arm on the transfer cell alone, paired within seed."""
+    transfer = [row for row in groups if row["is_transfer_measurement"]]
+    indexed: Dict[Tuple[str, str, bool], Dict[Any, Mapping[str, Any]]] = (
+        defaultdict(dict)
     )
-    seed_means["human_action_load_excess_seed_mean"] = _finite_mean(
-        entry["human_action_load_excess"] for entry in per_seed
+    for row in transfer:
+        indexed[(
+            row["arm"], row["environment"], row["holdout_transfer_isomorphic"],
+        )][row["seed"]] = row
+
+    metrics = (
+        "teacher_forced_top_1",
+        "teacher_forced_prefix_conditioned_top_1",
+        "prefix_conditioned_top_1",
+        "opening_discriminating_top_1",
     )
-    return {"per_seed": per_seed, **seed_means}
+    contrasts = []
+    for (arm, environment, isomorphic), by_seed in sorted(
+        indexed.items(), key=lambda item: tuple(map(str, item[0])),
+    ):
+        if arm == FULL_ARM:
+            continue
+        reference = indexed.get((FULL_ARM, environment, isomorphic), {})
+        shared = sorted(set(reference) & set(by_seed), key=str)
+        if not shared:
+            continue
+        entry: Dict[str, Any] = {
+            "arm": arm,
+            "environment": environment,
+            "holdout_transfer_isomorphic": isomorphic,
+            "contrast": f"{FULL_ARM}_minus_{arm}",
+            "n_transfer_episodes": sum(
+                by_seed[seed]["n_episodes"] for seed in shared
+            ),
+        }
+        for name in metrics:
+            entry[name] = _paired_difference([
+                reference[seed][name] - by_seed[seed][name]
+                for seed in shared
+                if reference[seed][name] is not None
+                and by_seed[seed][name] is not None
+            ])
+        contrasts.append(entry)
+    return contrasts
 
 
 def _aggregate(
@@ -1092,16 +1626,47 @@ def _aggregate(
             "robot_top_1": _pooled_rate(
                 rows, "robot_top_1_hits", "robot_decision_count",
             ),
-            "robot_top_k": _pooled_rate(
-                rows, "robot_top_k_hits", "robot_decision_count",
+            "teacher_forced_top_1": _pooled_rate(
+                rows, "teacher_forced_top_1_hits", "teacher_forced_decision_count",
+            ),
+            "teacher_forced_decision_count": sum(
+                row.get("teacher_forced_decision_count", 0) or 0 for row in rows
+            ),
+            "prefix_conditioned_top_1": _pooled_rate(
+                rows,
+                "prefix_conditioned_top_1_hits",
+                "prefix_conditioned_robot_decisions",
+            ),
+            "prefix_conditioned_robot_decisions": sum(
+                row.get("prefix_conditioned_robot_decisions", 0) or 0 for row in rows
+            ),
+            "teacher_forced_prefix_conditioned_top_1": _pooled_rate(
+                rows,
+                "teacher_forced_prefix_conditioned_top_1_hits",
+                "teacher_forced_prefix_conditioned_decisions",
+            ),
+            "opening_top_1": _pooled_rate(
+                rows, "opening_top_1_hits", "opening_decision_count",
+            ),
+            "opening_discriminating_top_1": _pooled_rate(
+                rows,
+                "opening_discriminating_top_1_hits",
+                "opening_discriminating_decision_count",
+            ),
+            "opening_discriminating_decision_count": sum(
+                row.get("opening_discriminating_decision_count", 0) or 0
+                for row in rows
+            ),
+            "teacher_forced_prefix_conditioned_decisions": sum(
+                row.get("teacher_forced_prefix_conditioned_decisions", 0) or 0 for row in rows
             ),
             "preference_discriminating_top_1": _pooled_rate(
                 rows,
                 "preference_discriminating_top_1_hits",
                 "preference_discriminating_robot_decisions",
             ),
-            "nontrivial_choice_top_1": _pooled_rate(
-                rows, "nontrivial_choice_top_1_hits", "nontrivial_choice_decision_count",
+            "preference_discriminating_robot_decisions": sum(
+                row.get("preference_discriminating_robot_decisions", 0) or 0 for row in rows
             ),
             "single_legal_action_fraction": (
                 sum(row["single_legal_action_decision_count"] for row in rows)
@@ -1112,13 +1677,14 @@ def _aggregate(
                 "teacher_forced_preference_discriminating_top_1_hits",
                 "teacher_forced_preference_discriminating_decisions",
             ),
-            **_human_action_load(rows),
+            "performance": _performance(rows),
             "corrections_per_robot_decision": (
                 sum(row["human_corrections"] for row in rows)
                 / max(1, sum(row["robot_decision_count"] for row in rows))
             ),
             "correction_free_rate": _finite_mean(row["correction_free"] for row in rows),
         })
+    holdout_groups = _holdout_groups(assist)
     full_post = [row for row in post_update if row["arm"] == FULL_ARM]
     primary_probes = [
         row for row in probes
@@ -1139,8 +1705,15 @@ def _aggregate(
                 "preference_discriminating_top_1_hits",
                 "preference_discriminating_decision_count",
             ),
+            "prefix_conditioned_top_1": _pooled_rate(
+                rows,
+                "prefix_conditioned_top_1_hits",
+                "prefix_conditioned_decision_count",
+            ),
+            "prefix_conditioned_decision_count": sum(
+                row.get("prefix_conditioned_decision_count", 0) or 0 for row in rows
+            ),
             "top_1": _pooled_rate(rows, "top_1_hits", "decision_count"),
-            "top_k": _pooled_rate(rows, "top_k_hits", "decision_count"),
         })
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -1162,34 +1735,80 @@ def _aggregate(
         "covered_preference_count": len({row["preference"] for row in episodes}),
         "covered_preference_ids": sorted({row["preference"] for row in episodes}),
         "covered_strategy_count": len({row["strategy"] for row in episodes}),
-        "primary_metric": "normalized_human_action_load",
-        "primary_accuracy_metric": "preference_discriminating_top_1",
-        "teacher_forced_accuracy_metric": (
-            "teacher_forced_preference_discriminating_top_1"
-        ),
+        # Primary is the metric the symbolic evaluation also reports as its
+        # primary prediction metric (src.evaluation: primary_prediction_metric
+        # == "teacher_forced_top_1"), so the two environments are compared on
+        # one definition.  The preference-discriminating family is
+        # cooking-specific and has no symbolic counterpart, which is why it is
+        # a secondary here rather than the headline.
+        "primary_accuracy_metric": "teacher_forced_top_1",
+        "cross_environment_parity_metric": "teacher_forced_top_1",
+        "secondary_accuracy_metrics": [
+            "prefix_conditioned_top_1",
+            "teacher_forced_prefix_conditioned_top_1",
+            "preference_discriminating_top_1",
+            "teacher_forced_preference_discriminating_top_1",
+        ],
         "metric_warning": (
-            "overall top-1 includes forced single-legal-action decisions; "
-            "use preference_discriminating_top_1 as the primary accuracy"
+            "robot_top_1 pools structurally forced single-legal-action "
+            "decisions and is a diagnostic only. Of the accuracy metrics, "
+            "prefix_conditioned_top_1 is the only one whose denominator is "
+            "restricted to decisions still ambiguous given the episode "
+            "prefix; preference_discriminating_top_1 counts decisions the "
+            "prefix has already settled, because it tests the recipe's whole "
+            "declared preference set rather than the surviving one. Report "
+            "the zero-learning canonical_order arm alongside any of them."
         ),
         "robot_top_1": _pooled_rate(
             assist, "robot_top_1_hits", "robot_decision_count",
         ),
-        "robot_top_k": _pooled_rate(
-            assist, "robot_top_k_hits", "robot_decision_count",
+        "teacher_forced_top_1": _pooled_rate(
+            assist, "teacher_forced_top_1_hits", "teacher_forced_decision_count",
+        ),
+        "teacher_forced_decision_count": sum(
+            row.get("teacher_forced_decision_count", 0) or 0 for row in assist
+        ),
+        "opening_top_1": _pooled_rate(
+            assist, "opening_top_1_hits", "opening_decision_count",
+        ),
+        "opening_discriminating_top_1": _pooled_rate(
+            assist,
+            "opening_discriminating_top_1_hits",
+            "opening_discriminating_decision_count",
+        ),
+        "opening_discriminating_decision_count": sum(
+            row.get("opening_discriminating_decision_count", 0) or 0
+            for row in assist
+        ),
+        "prefix_conditioned_top_1": _pooled_rate(
+            assist,
+            "prefix_conditioned_top_1_hits",
+            "prefix_conditioned_robot_decisions",
+        ),
+        "prefix_conditioned_robot_decisions": sum(
+            row.get("prefix_conditioned_robot_decisions", 0) or 0 for row in assist
+        ),
+        "teacher_forced_prefix_conditioned_top_1": _pooled_rate(
+            assist,
+            "teacher_forced_prefix_conditioned_top_1_hits",
+            "teacher_forced_prefix_conditioned_decisions",
+        ),
+        "teacher_forced_prefix_conditioned_decisions": sum(
+            row.get("teacher_forced_prefix_conditioned_decisions", 0) or 0 for row in assist
         ),
         "preference_discriminating_top_1": _pooled_rate(
             assist,
             "preference_discriminating_top_1_hits",
             "preference_discriminating_robot_decisions",
         ),
-        "nontrivial_choice_top_1": _pooled_rate(
-            assist, "nontrivial_choice_top_1_hits", "nontrivial_choice_decision_count",
+        "preference_discriminating_robot_decisions": sum(
+            row.get("preference_discriminating_robot_decisions", 0) or 0 for row in assist
         ),
         "single_legal_action_fraction": (
             sum(row["single_legal_action_decision_count"] for row in assist)
             / max(1, sum(row["robot_decision_count"] for row in assist))
         ),
-        **_human_action_load(assist),
+        "performance": _performance(assist),
         "teacher_forced_preference_discriminating_top_1": _pooled_rate(
             assist,
             "teacher_forced_preference_discriminating_top_1_hits",
@@ -1224,6 +1843,10 @@ def _aggregate(
             )
         ),
         "by_seed": _by_seed(assist),
+        "holdout_transfer_groups": holdout_groups,
+        "holdout_transfer_paired_vs_full": _holdout_transfer_contrasts(
+            holdout_groups
+        ),
         "excluded_incomplete_cell_episode_count": len(excluded),
         "excluded_incomplete_cells": sorted({
             (row["seed"], row["scenario"], row["arm"]) for row in excluded
@@ -1245,6 +1868,67 @@ def _aggregate(
     }
 
 
+# What the CLI prints when a run finishes.  This lives beside ``_aggregate``
+# deliberately: it used to live in ``__main__`` and drifted from the summary it
+# reads, so a completed two-hour run wrote every artifact, passed validation,
+# and then died on ``KeyError: 'primary_metric'`` in its own success report.
+CLI_REPORT_KEYS: Tuple[str, ...] = (
+    "status",
+    "episode_count",
+    "assist_episode_count",
+    "failure_count",
+    "delivery_rate",
+    "primary_accuracy_metric",
+    "cross_environment_parity_metric",
+    "teacher_forced_top_1",
+    "teacher_forced_decision_count",
+    "prefix_conditioned_top_1",
+    "prefix_conditioned_robot_decisions",
+    "teacher_forced_prefix_conditioned_top_1",
+    "opening_top_1",
+    "opening_discriminating_top_1",
+    "opening_discriminating_decision_count",
+    "preference_discriminating_top_1",
+    "preference_discriminating_robot_decisions",
+    "robot_top_1",
+    "single_legal_action_fraction",
+    "semantic_fallback_discriminating_top_1",
+    "own_model_discriminating_top_1",
+    "metric_warning",
+    "excluded_incomplete_cells",
+    "assistance_unscored_cells",
+    "lead_actor_policies",
+    "performance",
+    "groups",
+    "pre_event_probe_groups",
+    "holdout_transfer_paired_vs_full",
+)
+
+
+def summary_report(
+    result: Mapping[str, Any], validation: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Assemble the end-of-run report, without being able to fail.
+
+    Every artifact is already on disk by the time this is called, so a missing
+    key must not raise: it is listed under ``missing_summary_keys`` so the
+    drift is visible in the output instead of discarding the run.
+    """
+    summary = result["summary"]
+    report: Dict[str, Any] = {"run_dir": result["run_dir"]}
+    missing = []
+    for key in CLI_REPORT_KEYS:
+        if key in summary:
+            report[key] = summary[key]
+        else:
+            missing.append(key)
+    if missing:
+        report["missing_summary_keys"] = missing
+    if validation is not None:
+        report["validation"] = dict(validation)
+    return report
+
+
 def _manifest(config: Mapping[str, Any], run_dir: Path) -> Dict[str, Any]:
     paths = UpstreamPaths.discover()
     project = paths.integration_root.parent
@@ -1256,6 +1940,7 @@ def _manifest(config: Mapping[str, Any], run_dir: Path) -> Dict[str, Any]:
         "started_at": _utc_now(),
         "completed_at": None,
         "run_dir": str(run_dir),
+        "source_fingerprint": _source_fingerprint(),
         "command": list(sys.argv),
         "config_path": config["_config_path"],
         "config_sha256": hashlib.sha256(_json_bytes(public)).hexdigest(),
@@ -1310,14 +1995,15 @@ def _manifest(config: Mapping[str, Any], run_dir: Path) -> Dict[str, Any]:
             "shared_routing": bool(config.get("shared_routing", True)),
             "action_mask": "exact completion-checked task frontier",
             "accuracy_caveat": (
-                "single-legal-action decisions are structurally forced and are "
-                "excluded from the primary preference-discriminating metric"
+                "single-legal-action decisions are structurally forced; "
+                "prefix_conditioned_top_1 additionally excludes decisions the "
+                "episode prefix has already settled, and canonical_order "
+                "reports what a fixed rule scores on the same episodes"
             ),
-            "primary_workload_metric": "normalized_human_action_load",
-            "primary_accuracy_metric": "preference_discriminating_top_1",
-        "teacher_forced_accuracy_metric": (
-            "teacher_forced_preference_discriminating_top_1"
-        ),
+            "primary_accuracy_metric": "teacher_forced_top_1",
+            "cross_environment_parity_metric": "teacher_forced_top_1",
+            "ambiguity_conditioned_accuracy_metric": "prefix_conditioned_top_1",
+            "zero_learning_reference_arm": "canonical_order",
         },
         "scenario_design": {
             "homogeneous": (
@@ -1475,16 +2161,117 @@ def _cell_sort_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
     )
 
 
-def _load_checkpoint(
+def cell_execution_order(
+    config: Mapping[str, Any],
+) -> list[Tuple[int, str, str]]:
+    """Every (seed, scenario, arm) cell, arm-major.
+
+    One arm completes the whole seed/scenario grid before the next starts.
+    Cells are independent here -- unlike the symbolic evaluation there is no
+    shared route to publish -- so the order is purely about where results
+    land and what has to be recomputed: an arm whose behaviour changed can
+    have its folder deleted and be re-run without touching the others.
+    """
+    return [
+        (int(seed), str(scenario), str(arm))
+        for arm in map(str, config["arms"])
+        for seed in map(int, config["seeds"])
+        for scenario in map(str, config["scenarios"])
+    ]
+
+
+def _arm_dir(checkpoint_dir: Path, arm: str) -> Path:
+    """One arm's own folder, holding every cell it produced.
+
+    Arms are stored apart so a changed arm can be deleted and re-run on its
+    own: a resumed run finds every other arm's cells intact and recomputes
+    only what is missing.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(arm)):
+        raise ValueError(f"arm name is not usable as a directory: {arm!r}")
+    return checkpoint_dir / str(arm)
+
+
+def _cell_checkpoint_path(
     checkpoint_dir: Path, seed: int, scenario: str, arm: str,
+) -> Path:
+    return _arm_dir(checkpoint_dir, arm) / f"{int(seed)}__{scenario}.json"
+
+
+def _load_checkpoint(
+    checkpoint_dir: Path,
+    seed: int,
+    scenario: str,
+    arm: str,
+    *,
+    config_digest: str,
+    source_fingerprint: str,
 ) -> Dict[str, Any] | None:
-    path = checkpoint_dir / f"{seed}__{scenario}__{arm}.json"
+    """Return a reusable checkpoint, or None so the cell re-runs.
+
+    Returning None is always safe -- the cell is simply recomputed -- so every
+    check here fails closed.  Two of them were missing: a checkpoint carried no
+    record of the code or schema that produced it, and an *incomplete* cell was
+    absorbed as though it had finished, so a cell that died partway through
+    could never be recovered by resuming and stayed permanently excluded from
+    every pooled statistic.
+    """
+    path = _cell_checkpoint_path(checkpoint_dir, seed, scenario, arm)
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        cell = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+    if not isinstance(cell, dict):
+        return None
+    provenance = cell.get("provenance")
+    if not isinstance(provenance, dict):
+        return None
+    if (
+        provenance.get("result_schema_version") != RESULT_SCHEMA_VERSION
+        or provenance.get("config_digest") != config_digest
+        or provenance.get("source_fingerprint") != source_fingerprint
+    ):
+        return None
+    if (
+        cell.get("seed") != seed
+        or cell.get("scenario") != scenario
+        or cell.get("arm") != arm
+    ):
+        return None
+    episodes = cell.get("episodes")
+    if not isinstance(episodes, list) or not episodes:
+        return None
+    if not all(isinstance(row, dict) for row in episodes):
+        return None
+    if not all(row.get("cell_complete", False) for row in episodes):
+        return None
+    if cell.get("failures"):
+        return None
+    # A completion flag is a claim, not evidence.  A checkpoint holding one of
+    # its 630 planned episodes, with the flag set, was accepted as a finished
+    # cell; so verify the count the cell itself recorded as planned, and that
+    # the event indices cover the schedule exactly once.
+    planned = {row.get("cell_planned_episodes") for row in episodes}
+    if len(planned) != 1:
+        return None
+    expected = planned.pop()
+    if not isinstance(expected, int) or expected <= 0:
+        return None
+    if len(episodes) != expected:
+        return None
+    indices = [row.get("event_index") for row in episodes]
+    if any(index is None for index in indices):
+        return None
+    if sorted(int(index) for index in indices) != list(range(expected)):
+        return None
+    for row in episodes:
+        if row.get("seed") != seed or row.get("scenario") != scenario:
+            return None
+        if row.get("arm") != arm:
+            return None
+    return cell
 
 
 def run_experiment(
@@ -1500,6 +2287,7 @@ def run_experiment(
         config = {**config, "workers": int(workers)}
     public = {key: value for key, value in config.items() if not key.startswith("_")}
     digest = hashlib.sha256(_json_bytes(public)).hexdigest()[:10]
+    source_fingerprint = _source_fingerprint()
     root = Path(
         config["output"] if output_root is None else output_root
     ).resolve()
@@ -1522,6 +2310,7 @@ def run_experiment(
             )
         manifest = _manifest(config, run_dir)
         manifest["resumed_from"] = str(run_dir)
+        manifest["source_fingerprint"] = source_fingerprint
         checkpoint_dir = run_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
     else:
@@ -1531,6 +2320,13 @@ def run_experiment(
         run_dir.mkdir(parents=False, exist_ok=False)
         checkpoint_dir = run_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=False, exist_ok=False)
+    manifest["cell_execution"] = "arm-major: one arm completes the whole seed/scenario grid before the next starts"
+    manifest["arm_order"] = [str(arm) for arm in config["arms"]]
+    manifest["artifacts"] = {
+        "arm_cells": "checkpoints/<arm>/<seed>__<scenario>.json",
+        "arm_summary": "checkpoints/<arm>/summary.json",
+        "combined": "episodes.json, probes.json, audits.json, summary.json",
+    }
     _atomic_json(run_dir / "config.json", public)
     _atomic_json(run_dir / "manifest.json", manifest)
     episodes: list[Dict[str, Any]] = []
@@ -1542,10 +2338,7 @@ def run_experiment(
     reused_cells: list[Dict[str, Any]] = []
     pending: list[Tuple[int, str, str]] = []
     try:
-        for seed in map(int, config["seeds"]):
-            for scenario in map(str, config["scenarios"]):
-                for arm in map(str, config["arms"]):
-                    pending.append((seed, scenario, arm))
+        pending.extend(cell_execution_order(config))
 
         def absorb(cell: Mapping[str, Any], *, reused: bool) -> None:
             episodes.extend(cell["episodes"])
@@ -1564,9 +2357,17 @@ def run_experiment(
                 reused_cells.append(record)
             else:
                 _atomic_json(
-                    checkpoint_dir
-                    / f"{cell['seed']}__{cell['scenario']}__{cell['arm']}.json",
-                    dict(cell),
+                    _cell_checkpoint_path(
+                        checkpoint_dir, cell["seed"], cell["scenario"], cell["arm"],
+                    ),
+                    {
+                        **dict(cell),
+                        "provenance": {
+                            "result_schema_version": RESULT_SCHEMA_VERSION,
+                            "config_digest": digest,
+                            "source_fingerprint": source_fingerprint,
+                        },
+                    },
                 )
             completed_cells.append({
                 **record,
@@ -1589,7 +2390,11 @@ def run_experiment(
         outstanding: list[Tuple[int, str, str]] = []
         for seed, scenario, arm in pending:
             cached = (
-                _load_checkpoint(checkpoint_dir, seed, scenario, arm)
+                _load_checkpoint(
+                    checkpoint_dir, seed, scenario, arm,
+                    config_digest=digest,
+                    source_fingerprint=source_fingerprint,
+                )
                 if resume_from is not None else None
             )
             if cached is not None:
@@ -1645,6 +2450,32 @@ def run_experiment(
         completed_cells.sort(key=_cell_sort_key)
         reused_cells.sort(key=_cell_sort_key)
         summary = _aggregate(episodes, failures, probes, audits)
+        # A per-arm roll-up beside that arm's cells. The heavy per-episode
+        # rows are not copied: they already live in the arm's own cell files.
+        for arm in map(str, config["arms"]):
+            arm_episodes = [row for row in episodes if row.get("arm") == arm]
+            if not arm_episodes:
+                continue
+            _atomic_json(_arm_dir(checkpoint_dir, arm) / "summary.json", {
+                "arm": arm,
+                "episode_count": len(arm_episodes),
+                "failure_count": sum(
+                    1 for row in failures if row.get("arm") == arm
+                ),
+                "cells": sorted(
+                    {
+                        f"{row['scenario']}__{row['seed']}"
+                        for row in arm_episodes
+                        if "scenario" in row and "seed" in row
+                    }
+                ),
+                "summary": _aggregate(
+                    arm_episodes,
+                    [row for row in failures if row.get("arm") == arm],
+                    [row for row in probes if row.get("arm") == arm],
+                    [row for row in audits if row.get("arm") == arm],
+                ),
+            })
         _atomic_json(run_dir / "episodes.json", episodes)
         _atomic_json(run_dir / "failures.json", failures)
         _atomic_json(run_dir / "probes.json", probes)
@@ -1712,6 +2543,32 @@ def validate_result(
         row["preference_discriminating_robot_decisions"] > 0 for row in full
     ):
         failures.append("no preference-discriminating robot decision was scored")
+    if "zero_learning_reference" in requirements:
+        missing = set(NULL_ARM_NAMES) - {row["arm"] for row in episodes}
+        if missing:
+            failures.append(
+                "zero-learning reference arms did not complete: "
+                f"{sorted(missing)}"
+            )
+        null_rows = [row for row in episodes if row["arm"] in NULL_ARM_NAMES]
+        # A null arm that fitted a model is not a null arm.  Its retrain
+        # bookkeeping still runs (so routing and audits stay comparable), but
+        # no weights may ever be learned.
+        fitted = [
+            row for row in null_rows
+            if row["learner_model_structure"] != "unfitted"
+        ]
+        if fitted:
+            failures.append(
+                "a zero-learning reference arm fitted a predictor "
+                f"({fitted[0]['learner_model_structure']})"
+            )
+        if any(row["semantic_fallback_decisions"] for row in null_rows) or any(
+            row["latent_strategy_decisions"] for row in null_rows
+        ):
+            failures.append(
+                "a zero-learning reference arm consulted a learned component"
+            )
     if "multiple_seeds" in requirements and len({row["seed"] for row in episodes}) < 2:
         failures.append("fewer than two seeds completed")
     if "comparison_arms" in requirements and {
@@ -1719,7 +2576,13 @@ def validate_result(
     } != set(config["arms"]):
         failures.append("not every configured arm completed")
     if "adaptive_hrc_baseline_parity" in requirements:
-        if tuple(config["arms"]) != ARM_NAMES:
+        # Parity is about the deployable roster.  The zero-learning references
+        # are cooking-only diagnostics with no symbolic counterpart, so they
+        # are held apart rather than counted as a roster difference.
+        deployable = tuple(
+            arm for arm in config["arms"] if arm not in NULL_ARM_NAMES
+        )
+        if deployable != ARM_NAMES:
             failures.append("baseline roster differs from Adaptive-HRC")
         if not probes or not any(
             row.get("diagnostic_type") == "pre_event_climb_probe" for row in probes
@@ -1890,6 +2753,8 @@ def validate_result(
 
 
 __all__ = [
-    "ARM_NAMES", "FULL_ARM", "VALIDATION_REQUIREMENTS", "load_config",
-    "run_experiment", "validate_result",
+    "ARM_NAMES", "CLI_REPORT_KEYS", "FULL_ARM", "NULL_ARM_NAMES",
+    "cell_execution_order",
+    "VALIDATION_REQUIREMENTS", "load_config", "run_experiment",
+    "summary_report", "validate_result",
 ]

@@ -14,6 +14,7 @@ from .task_graph import (
     CookingPreferencePolicy,
     CookingTaskGraph,
     is_preference_discriminating,
+    is_prefix_conditioned_discriminating,
 )
 
 
@@ -111,6 +112,8 @@ class CookingDecision:
     ground_truth_probability: float
     ground_truth_nll: float
     preference_discriminating: bool
+    prefix_conditioned_discriminating: bool
+    prediction_available: bool
     invalid_prediction: bool
     prediction_wall_s: float
     prediction_stats: Mapping[str, Any]
@@ -145,6 +148,9 @@ class CookingEpisodeResult:
     scored_top_k_hits: int
     scored_discriminating_decisions: int
     scored_discriminating_top_1_hits: int
+    # Prediction availability is reported, never used to trim a denominator.
+    scored_available_decisions: int
+    robot_available_decisions: int
     prediction_wall_s: float
     low_level_ticks: int
     passive_wait_ticks: int
@@ -159,6 +165,10 @@ class CookingEpisodeResult:
     compatibility_dynamics: bool
     compatibility_calls: Tuple[str, ...]
     lead_actor_policy: str
+    # The floor actually applied to this episode's losses.  Reading it back off
+    # the agent's settings ignores an explicit runner override and records a
+    # convention that was not the one in force.
+    nll_probability_floor: float
 
     @property
     def robot_top_1(self) -> float:
@@ -208,6 +218,7 @@ class CookingHrcRunner:
         memory_updates_enabled: bool = True,
         require_shift_update: bool = True,
         lead_actor_policy: str = HUMAN_FIRST,
+        nll_probability_floor: float | None = None,
     ):
         if getattr(agent, "domain", None) is not domain:
             raise ValueError("agent and runner must share one domain adapter")
@@ -218,6 +229,17 @@ class CookingHrcRunner:
         self.planner_seed = int(planner_seed)
         self.max_passive_wait_ticks = max(1, int(max_passive_wait_ticks))
         self.top_k = max(1, int(top_k))
+        # Matches src.evaluation, which floors at
+        # max(agent.settings.min_probability, 1e-12); taking it from the agent
+        # keeps one convention across both environments instead of two
+        # constants that happen to differ by six orders of magnitude.
+        self.nll_probability_floor = max(
+            float(
+                getattr(getattr(agent, "settings", None), "min_probability", 1e-6)
+                if nll_probability_floor is None else nll_probability_floor
+            ),
+            1e-12,
+        )
         self.memory_updates_enabled = bool(memory_updates_enabled)
         self.require_shift_update = bool(require_shift_update)
         if lead_actor_policy not in LEAD_ACTOR_POLICIES:
@@ -271,6 +293,7 @@ class CookingHrcRunner:
         robot_turns = robot_hits = robot_top_k_hits = corrections = 0
         scored_turns = scored_hits = scored_top_k_hits = 0
         scored_discriminating = scored_discriminating_hits = 0
+        scored_available = robot_available = 0
         human_actions = robot_actions = macro_ticks = passive_wait_ticks = 0
         invalid_predictions = 0
         prediction_wall_s = reward = 0.0
@@ -283,31 +306,22 @@ class CookingHrcRunner:
                 "human" if mode == OBSERVE or not robot_turn_next else "robot"
             )
             decision_actor = 0 if scheduled_actor == "human" else 1
-            waited = 0
-            structural = graph.frontier(completed)
             # A preference ranges over the task-graph frontier, not over
             # whatever happens to be cooked yet.  "Plate the protein first"
             # means waiting for the protein; picking greedily from the
             # currently-legal subset instead lets readiness timing dictate the
             # order, which collapsed every assembly preference into one
-            # realized behaviour.  Every structural precondition here is
-            # satisfied by elapsed time alone (a plate action is only in the
-            # frontier once its pot or grill has been started), so this
-            # terminates; max_passive_wait_ticks remains the backstop.
-            ground_truth = policy.choose_action(structural, graph)
-            while True:
-                physical = executor.legal_actions(structural, actor_id=decision_actor)
-                legal = graph.available_actions(completed, physical)
-                if ground_truth in legal:
-                    break
-                if waited >= self.max_passive_wait_ticks:
-                    raise RuntimeError(
-                        f"{task.recipe_id}: preferred option {ground_truth} "
-                        f"never became physically legal (legal now: {legal})"
-                    )
-                executor.advance_environment(1)
-                waited += 1
-            passive_wait_ticks += waited
+            # realized behaviour.
+            legal = graph.frontier(completed)
+            ground_truth = policy.choose_action(legal, graph)
+            # The candidate list is the structural frontier and nothing else.
+            # It used to be the physically-legal subset at the first tick where
+            # the *ground truth* became executable, which made the predictor's
+            # candidate list a function of the answer: competing options that
+            # were not ready yet silently disappeared, and 670 of one seed's
+            # 45,641 forced robot decisions were forced only by that waiting.
+            # Readiness is now waited out after the decision, against whichever
+            # option is actually executed.
             state = self.domain.state_from_completed(task.recipe_id, completed)
 
             distribution: Dict[str, float] = {}
@@ -328,6 +342,7 @@ class CookingHrcRunner:
             # several recipe/preference pairs it was the *only* discriminating
             # decision and no reported metric could see it.  Shadow predictions
             # never control execution.
+            prediction_available = False
             if mode == ASSIST:
                 started = time.perf_counter()
                 distribution = dict(self.agent.predict_actions(
@@ -340,6 +355,7 @@ class CookingHrcRunner:
                 prediction_elapsed = time.perf_counter() - started
                 prediction_wall_s += prediction_elapsed
                 predicted = ranked[0] if ranked else None
+                prediction_available = predicted is not None
                 invalid_prediction = predicted is not None and predicted not in legal
                 invalid_predictions += int(invalid_prediction)
                 correct = predicted == ground_truth
@@ -347,13 +363,40 @@ class CookingHrcRunner:
                 ground_truth_probability = max(
                     0.0, float(distribution.get(ground_truth, 0.0))
                 )
-                ground_truth_nll = -math.log(max(ground_truth_probability, 1e-12))
+                # One scoring convention, shared with the symbolic evaluator:
+                # floor the ground-truth probability at settings.min_probability
+                # (src.evaluation uses max(min_probability, 1e-12) for exactly
+                # this) and take the loss.  An arm that emitted nothing has
+                # ground-truth probability zero and is charged the floor, the
+                # same as an arm that emitted a distribution excluding the
+                # truth -- because they are the same event for a scoring rule.
+                #
+                # A uniform-over-candidates fallback was tried here and is
+                # wrong twice over: it silently swaps in a distribution the
+                # predictor never emitted, and on a single-candidate frontier
+                # it scores an arm that said nothing at zero loss, which is a
+                # perfect score for silence.  Availability is reported
+                # separately instead.
+                ground_truth_nll = -math.log(
+                    max(ground_truth_probability, self.nll_probability_floor)
+                )
 
             discriminating = is_preference_discriminating(legal, graph)
-            if predicted is not None:
+            # Two denominators, deliberately both recorded.  ``discriminating``
+            # is task-intrinsic: could this recipe's preferences ever disagree
+            # here.  ``conditioned`` is what the predictor actually faced: do
+            # the preferences still consistent with this episode's prefix
+            # disagree.  Under human_first the human takes the widest frontier
+            # of every episode, so the two differ by a large factor and only
+            # the second is an accuracy denominator.
+            conditioned = discriminating and is_prefix_conditioned_discriminating(
+                legal, graph, completed,
+            )
+            if mode == ASSIST:
                 scored_turns += 1
                 scored_hits += int(correct)
                 scored_top_k_hits += int(correct_top_k)
+                scored_available += int(prediction_available)
                 if discriminating:
                     scored_discriminating += 1
                     scored_discriminating_hits += int(correct)
@@ -363,6 +406,7 @@ class CookingHrcRunner:
                 robot_turns += 1
                 robot_hits += int(correct)
                 robot_top_k_hits += int(correct_top_k)
+                robot_available += int(prediction_available)
                 if correct and predicted is not None:
                     executed_action = predicted
                     physical_actor = 1
@@ -386,6 +430,25 @@ class CookingHrcRunner:
                     robot_turn_next = True
 
             before = state
+            # Readiness waiting belongs here, after the decision: the option
+            # being executed is already chosen, so waiting for the pot cannot
+            # feed back into the candidate list.  Every structural
+            # precondition in this catalog is satisfied by elapsed time alone
+            # (a plate action only enters the frontier once its pot or grill
+            # has been started), so this terminates; max_passive_wait_ticks
+            # remains the backstop.
+            waited = 0
+            while executed_action not in executor.legal_actions(
+                (executed_action,), actor_id=physical_actor,
+            ):
+                if waited >= self.max_passive_wait_ticks:
+                    raise RuntimeError(
+                        f"{task.recipe_id}: selected option {executed_action} "
+                        "never became physically legal"
+                    )
+                executor.advance_environment(1)
+                waited += 1
+            passive_wait_ticks += waited
             execution = executor.execute(executed_action, actor_id=physical_actor)
             macro_ticks += execution.low_level_ticks
             reward += execution.sparse_reward
@@ -416,6 +479,8 @@ class CookingHrcRunner:
                 ground_truth_probability=ground_truth_probability,
                 ground_truth_nll=ground_truth_nll,
                 preference_discriminating=discriminating,
+                prefix_conditioned_discriminating=conditioned,
+                prediction_available=prediction_available,
                 invalid_prediction=invalid_prediction,
                 prediction_wall_s=prediction_elapsed,
                 prediction_stats=prediction_stats,
@@ -549,6 +614,8 @@ class CookingHrcRunner:
             scored_top_k_hits=scored_top_k_hits,
             scored_discriminating_decisions=scored_discriminating,
             scored_discriminating_top_1_hits=scored_discriminating_hits,
+            scored_available_decisions=scored_available,
+            robot_available_decisions=robot_available,
             prediction_wall_s=prediction_wall_s,
             low_level_ticks=macro_ticks + passive_wait_ticks,
             passive_wait_ticks=passive_wait_ticks,
@@ -563,6 +630,7 @@ class CookingHrcRunner:
             compatibility_dynamics=bool(executor.compatibility_dynamics),
             compatibility_calls=tuple(getattr(executor, "compatibility_calls", ())),
             lead_actor_policy=self.lead_actor_policy,
+            nll_probability_floor=self.nll_probability_floor,
         )
 
     def run_stream(

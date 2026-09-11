@@ -167,54 +167,10 @@ class MaxEntIrlTests(unittest.TestCase):
             model.features.shape[1], model.semantic_features.shape[1],
         )
 
-    def test_counterfactual_policies_are_normalized_and_do_not_mutate_decision_state(self):
-        model = MaxEntIrl(_settings())
-        model.fit([self.demo], [1.0])
-        state = self.demo[0][0]
-        candidates = model.domain.legal_actions(
-            state, tuple(model.action_ids),
-        )
-        deployed = model.predict(
-            state, candidates, prefix=(), allow_latent_strategy=False,
-        )
-        before = (
-            model._fallback_counts,
-            model._last_exact_learned_action_count,
-            model._last_semantic_gate_outcome,
-            dict(model.last_prediction_stats),
-            model.latent_strategy.last_score,
-            dict(model.latent_strategy.last_score_stats),
-        )
-
-        result = model.counterfactual_policies(
-            state,
-            candidates,
-            prefix=(),
-            allow_latent_strategy=False,
-            deployed_distribution=deployed,
-        )
-
-        self.assertEqual(
-            set(result["policies"]),
-            {
-                "maxent_only", "semantic_current", "deployed_current",
-                "semantic_completion", "semantic_completion_current_gate",
-                "latent_relaxed", "latent_two_role",
-            },
-        )
-        self.assertEqual(result["policies"]["deployed_current"], deployed)
-        for distribution in result["policies"].values():
-            self.assertEqual(set(distribution), set(deployed))
-            self.assertAlmostEqual(sum(distribution.values()), 1.0)
-        after = (
-            model._fallback_counts,
-            model._last_exact_learned_action_count,
-            model._last_semantic_gate_outcome,
-            dict(model.last_prediction_stats),
-            model.latent_strategy.last_score,
-            dict(model.latent_strategy.last_score_stats),
-        )
-        self.assertEqual(after, before)
+    def test_validated_lightweight_sequence_setting_is_the_default(self):
+        self.assertEqual(Settings().latent_strategy_rank, 8)
+        self.assertEqual(Settings().latent_strategy_knn, 3)
+        self.assertEqual(Settings().latent_strategy_sequence_weight, 0.5)
 
     def test_default_uses_only_demonstrated_actions(self):
         model = MaxEntIrl(_settings())

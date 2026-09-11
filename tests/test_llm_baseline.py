@@ -19,6 +19,7 @@ from src.environment import StateTracker, recipe_builders
 from src.evaluation import EvalSettings, assist_demo, build_agent, build_task, observe_demo
 from src.llm_baseline import (
     InContextLlmAgent,
+    LLM_EVALUATION_SEED,
     PromptDemo,
     PromptTooLongError,
     ScoreResult,
@@ -1425,3 +1426,70 @@ class InContextLlmTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunnerDefaultsTests(unittest.TestCase):
+    """A bare invocation must be the configuration this hardware needs."""
+
+    def _captured_config(self, argv):
+        captured = {}
+
+        def fake_run(config):
+            captured["config"] = config
+            return {"run_dir": "r", "latest_dir": "l", "scenarios": {}}
+
+        with (
+            patch("src.evaluation.run_evaluation", side_effect=fake_run),
+            patch("src.llm_baseline.preflight_llm_runtime", return_value="ok"),
+            patch("src.evaluation.find_resumable_run", return_value=None),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            main(argv)
+        return captured["config"]
+
+    def test_bare_invocation_runs_every_scenario_and_survives_crashes(self):
+        config = self._captured_config([])
+
+        self.assertEqual(
+            config.scenarios, ("homogeneous", "heterogeneous", "holdout"),
+        )
+        self.assertEqual(config.baselines, ("full", "in_context_llm"))
+        self.assertEqual(config.seeds, (LLM_EVALUATION_SEED,))
+        # Without this a crash restarts the seed from its first event.
+        self.assertTrue(config.event_resume)
+        settings = dict(config.model_settings)
+        self.assertEqual(settings["llm_prefill_chunk_tokens"], 1024)
+        self.assertEqual(settings["llm_context_encoding"], "action_only")
+
+    def test_explicit_flags_override_the_runner_defaults(self):
+        config = self._captured_config([
+            "--llm-prefill-chunk-tokens", "0",
+            "--llm-context-encoding", "state_delta",
+        ])
+
+        settings = dict(config.model_settings)
+        self.assertEqual(settings["llm_prefill_chunk_tokens"], 0)
+        self.assertEqual(settings["llm_context_encoding"], "state_delta")
+
+    def test_an_incomplete_run_is_continued_rather_than_replaced(self):
+        captured = {}
+
+        def fake_run(config):
+            captured["config"] = config
+            return {"run_dir": "r", "latest_dir": "l", "scenarios": {}}
+
+        with (
+            patch("src.evaluation.run_evaluation", side_effect=fake_run),
+            patch("src.llm_baseline.preflight_llm_runtime", return_value="ok"),
+            patch(
+                "src.evaluation.find_resumable_run",
+                return_value="llm-single-seed-evaluation__X__abc",
+            ),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            main([])
+
+        self.assertEqual(
+            captured["config"].run, "llm-single-seed-evaluation__X__abc",
+        )
+        self.assertTrue(captured["config"].resume)

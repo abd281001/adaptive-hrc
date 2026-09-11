@@ -1,19 +1,4 @@
-"""Ablations and stress tests for recipe/preference disambiguation.
-
-This module is intentionally separate from the main evaluation runner. It holds
-reviewer-facing diagnostics for semantic-action workflow matching and
-baseline-specific observation recovery.
-
-The components are independent:
-    * perturbation generators create controlled query cases;
-    * matcher classes implement alternative recipe-identification rules;
-    * metric helpers summarize confusion, false same-recipe rates, overlap bins,
-      and threshold sensitivity.
-    * routing experiments quantify baseline-requested demonstrations separately
-      from corrective teaching under a shared scenario plan.
-
-Standalone runners construct isolated agents and never mutate a caller's agent.
-"""
+"""Ablations and stress tests for recipe/preference disambiguation."""
 from __future__ import annotations
 
 import argparse
@@ -24,6 +9,7 @@ import math
 import multiprocessing as mp
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -33,7 +19,7 @@ from datetime import datetime, timezone
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .environment import parse_action_label, recipe_builders, task_goal_signature, validate_ordering
 from .memory import (
@@ -84,27 +70,21 @@ ROUTING_BASELINES: Tuple[str, ...] = (
     "replay_bc",
 )
 DEFAULT_ABLATION_RESULTS_ROOT = "eval_results/ablation_runs"
-# Suites run one at a time, so a suite may use the whole performance-core
-# budget for its own scenario-seed grid. Eight matches both the paired seed
-# count and the P-core count of the reference host.
+# Suites run one at a time, so a suite may use the whole performance-core budget for its own scenario-seed grid. 
 DEFAULT_ABLATION_WORKERS = 8
 
-# Memory-policy x predictor factorial.  ``bc`` differs from ``full`` in two
-# places at once -- linear cloner instead of MaxEnt, and retain-everything
-# instead of adaptive decay with a latest pin -- so neither arm's margin is
-# attributable.  ``bc_adaptive`` and ``no_decay`` fill the two off-diagonal
-# cells, which makes the memory policy separable from the model family.
 PREDICTOR_LEVELS: Tuple[str, str] = ("maxent", "behavior_cloning")
 MEMORY_LEVELS: Tuple[str, str] = ("adaptive_pinned", "retain_all")
-MEMORY_PREDICTOR_ABLATION_CELLS: Tuple[Dict[str, str], ...] = (
-    {"baseline": "full", "label": "MaxEnt + adaptive memory",
-     "predictor": "maxent", "memory": "adaptive_pinned"},
-    {"baseline": "bc_adaptive", "label": "BC + adaptive memory",
-     "predictor": "behavior_cloning", "memory": "adaptive_pinned"},
-    {"baseline": "no_decay", "label": "MaxEnt + retain-all",
-     "predictor": "maxent", "memory": "retain_all"},
-    {"baseline": "bc", "label": "BC + retain-all",
-     "predictor": "behavior_cloning", "memory": "retain_all"},
+MEMORY_PREDICTOR_ABLATION_CELLS: Tuple[Dict[str, Any], ...] = (
+    {"arm": "full", "baseline": "full", "label": "MaxEnt + adaptive memory",
+     "predictor": "maxent", "memory": "adaptive_pinned", "overrides": {}},
+    {"arm": "bc_adaptive", "baseline": "bc_adaptive", "label": "BC + adaptive memory",
+     "predictor": "behavior_cloning", "memory": "adaptive_pinned", "overrides": {}},
+    {"arm": "maxent_retain_all", "baseline": "full", "label": "MaxEnt + retain-all",
+     "predictor": "maxent", "memory": "retain_all",
+     "overrides": {"retention_policy": "none", "pin_latest": False}},
+    {"arm": "bc", "baseline": "bc", "label": "BC + retain-all",
+     "predictor": "behavior_cloning", "memory": "retain_all", "overrides": {}},
 )
 MEMORY_PREDICTOR_ABLATION_METRICS: Tuple[Tuple[str, str], ...] = (
     ("teacher_forced_top_1", "higher_is_better"),
@@ -118,12 +98,8 @@ MEMORY_PREDICTOR_ABLATION_METRICS: Tuple[Tuple[str, str], ...] = (
 
 @dataclass(frozen=True)
 class LatentStrategyAblationArm:
-    """One controlled MaxEnt/latent-strategy ablation condition.
-
-    Correction-confirmation gating remains part of the shared agent protocol;
-    it is deliberately not varied here.  The capacity-matched timing and
-    hybrid arms differ only in trajectory weight, making that the valid causal
-    contrast for trajectory alignment.
+    """One controlled MaxEnt/latent-strategy ablation condition. Correction-confirmation gating remains part of the shared agent protocol;
+    it is deliberately not varied here.
     """
 
     name: str
@@ -132,7 +108,6 @@ class LatentStrategyAblationArm:
     latent_strategy_rank: int
     latent_strategy_knn: int
     latent_strategy_sequence_weight: float
-    purpose: str
 
     def model_overrides(self) -> Dict[str, Any]:
         return {
@@ -158,7 +133,6 @@ LATENT_STRATEGY_ABLATION_ARMS: Tuple[LatentStrategyAblationArm, ...] = (
         latent_strategy_rank=8,
         latent_strategy_knn=3,
         latent_strategy_sequence_weight=0.0,
-        purpose="Reference condition without a latent-strategy residual.",
     ),
     LatentStrategyAblationArm(
         name="latent_timing_lightweight",
@@ -167,10 +141,6 @@ LATENT_STRATEGY_ABLATION_ARMS: Tuple[LatentStrategyAblationArm, ...] = (
         latent_strategy_rank=8,
         latent_strategy_knn=3,
         latent_strategy_sequence_weight=0.0,
-        purpose=(
-            "Tests whether low-cost, recipe-independent role timing and counts "
-            "improve on MaxEnt."
-        ),
     ),
     LatentStrategyAblationArm(
         name="latent_timing_capacity_matched",
@@ -179,9 +149,6 @@ LATENT_STRATEGY_ABLATION_ARMS: Tuple[LatentStrategyAblationArm, ...] = (
         latent_strategy_rank=32,
         latent_strategy_knn=8,
         latent_strategy_sequence_weight=0.0,
-        purpose=(
-            "Separates additional latent capacity from trajectory alignment."
-        ),
     ),
     LatentStrategyAblationArm(
         name="latent_timing_trajectory_hybrid",
@@ -190,10 +157,6 @@ LATENT_STRATEGY_ABLATION_ARMS: Tuple[LatentStrategyAblationArm, ...] = (
         latent_strategy_rank=32,
         latent_strategy_knn=8,
         latent_strategy_sequence_weight=0.5,
-        purpose=(
-            "Adds masked-role partial-trajectory alignment at capacity matched "
-            "to the preceding timing-only arm."
-        ),
     ),
 )
 
@@ -236,7 +199,6 @@ def latent_strategy_ablation_design() -> Dict[str, Any]:
                 "name": arm.name,
                 "label": arm.label,
                 "model_overrides": arm.model_overrides(),
-                "purpose": arm.purpose,
             }
             for arm in LATENT_STRATEGY_ABLATION_ARMS
         ],
@@ -259,6 +221,157 @@ def latent_strategy_ablation_design() -> Dict[str, Any]:
 # --- predictor-representation ablation -------------------------------------
 # The memory policy is held at Full's adaptive decay with the latest pin in
 # every arm, so the only factor that moves is what the predictor is allowed to
+# --------------------------------------------------------------------------
+# Component ablation: which part of Full's predictor support earns its place.
+COMPONENT_LEVELS: Tuple[str, ...] = (
+    "all", "no_latest_pin", "no_semantic_fallback", "no_latent_residual", "none",
+)
+
+
+@dataclass(frozen=True)
+class ComponentAblationArm:
+    """One predictor-support condition, holding retention at Full's policy."""
+
+    name: str
+    label: str
+    component_level: str
+    removes: Tuple[str, ...]
+    overrides: Mapping[str, Any] = field(default_factory=dict)
+
+    def model_overrides(self) -> Dict[str, Any]:
+        return dict(self.overrides)
+
+    def settings(self, base: Settings = DEFAULT_SETTINGS) -> Settings:
+        """Apply this arm without changing any non-component setting."""
+        return replace(base, **self.model_overrides())
+
+
+COMPONENT_ABLATION_ARMS: Tuple[ComponentAblationArm, ...] = (
+    ComponentAblationArm(
+        name="full",
+        label="Full",
+        component_level="all",
+        removes=(),
+        overrides={},
+    ),
+    ComponentAblationArm(
+        name="full_no_pin",
+        label="Full without the latest pin",
+        component_level="no_latest_pin",
+        removes=("latest_pin",),
+        overrides={"pin_latest": False},
+    ),
+    ComponentAblationArm(
+        name="full_no_semantic_fallback",
+        label="Full without the semantic fallback",
+        component_level="no_semantic_fallback",
+        removes=("semantic_fallback",),
+        overrides={"semantic_fallback_enabled": False},
+    ),
+    ComponentAblationArm(
+        name="full_no_latent_residual",
+        label="Full without the latent residual",
+        component_level="no_latent_residual",
+        removes=("latent_residual",),
+        overrides={"latent_strategy_enabled": False},
+    ),
+    ComponentAblationArm(
+        name="full_no_support",
+        label="Full without any predictor support",
+        component_level="none",
+        removes=("latest_pin", "semantic_fallback", "latent_residual"),
+        overrides={
+            "pin_latest": False,
+            "semantic_fallback_enabled": False,
+            "latent_strategy_enabled": False,
+        },
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# Retention ablation: which part of the recurrence-aware memory policy works.
+RETENTION_FACTORS: Tuple[str, ...] = (
+    "reference", "retention_rule", "horizon_estimator", "pair_adaptation",
+    "horizon_assignment", "pin_scope", "consolidation_schedule",
+)
+
+
+@dataclass(frozen=True)
+class RetentionAblationArm:
+    """One retention-mechanism condition under Full's predictor support."""
+
+    name: str
+    label: str
+    factor: str
+    overrides: Mapping[str, Any] = field(default_factory=dict)
+
+    def model_overrides(self) -> Dict[str, Any]:
+        return dict(self.overrides)
+
+    def settings(self, base: Settings = DEFAULT_SETTINGS) -> Settings:
+        """Apply this arm without changing any non-retention setting."""
+        return replace(base, **self.model_overrides())
+
+
+RETENTION_ABLATION_ARMS: Tuple[RetentionAblationArm, ...] = (
+    RetentionAblationArm(
+        name="full",
+        label="Full",
+        factor="reference",
+        overrides={},
+    ),
+    RetentionAblationArm(
+        name="full_retain_all",
+        label="Full, retain everything",
+        factor="retention_rule",
+        overrides={"retention_policy": "none"},
+    ),
+    RetentionAblationArm(
+        name="constant_grace",
+        label="Constant grace horizon",
+        factor="horizon_estimator",
+        overrides={"horizon_estimator": "constant"},
+    ),
+    RetentionAblationArm(
+        name="pair_only_horizon",
+        label="Pair evidence only, no parent pooling",
+        factor="horizon_estimator",
+        overrides={"horizon_estimator": "pair_only"},
+    ),
+    RetentionAblationArm(
+        name="shuffled_horizon",
+        label="Recurrence evidence reassigned across pairs",
+        factor="horizon_assignment",
+        overrides={"horizon_estimator": "shuffled"},
+    ),
+    RetentionAblationArm(
+        name="symmetric_adaptation",
+        label="Symmetric horizon adaptation",
+        factor="pair_adaptation",
+        overrides={"pair_adaptation": "symmetric"},
+    ),
+    RetentionAblationArm(
+        name="recent_set_pin",
+        label="Pin the recently active preference set",
+        factor="pin_scope",
+        overrides={"pin_mode": "recent_set"},
+    ),
+    RetentionAblationArm(
+        name="schedule_warm_on_weight_change",
+        label="Warm fit on every weight change",
+        factor="consolidation_schedule",
+        overrides={"retrain_warm_on_weight_change": True},
+    ),
+    RetentionAblationArm(
+        name="schedule_removals_count_cold",
+        label="Removals advance the cold-start counter",
+        factor="consolidation_schedule",
+        overrides={"retrain_cold_counts_removals": True},
+    ),
+)
+
+
 # see. Two families are varied on their own axis: the reward representation
 # the MaxEnt policy scores states with, and the within-episode history the
 # cloner conditions on. That separates "this model family is weaker" from
@@ -286,7 +399,6 @@ class RepresentationAblationArm:
     family: str
     representation: str
     within_episode_history: str
-    purpose: str
     overrides: Mapping[str, Any] = field(default_factory=dict)
 
     def model_overrides(self) -> Dict[str, Any]:
@@ -304,7 +416,6 @@ REPRESENTATION_ABLATION_ARMS: Tuple[RepresentationAblationArm, ...] = (
         baseline="full", family="maxent",
         representation="engineered_reward_features",
         within_episode_history="none",
-        purpose="Deployed reference condition.",
         overrides={"irl_features": "engineered"},
     ),
     RepresentationAblationArm(
@@ -313,10 +424,6 @@ REPRESENTATION_ABLATION_ARMS: Tuple[RepresentationAblationArm, ...] = (
         baseline="full", family="maxent",
         representation="semantic_reward_features",
         within_episode_history="none",
-        purpose=(
-            "Tests whether the reward representation, rather than the absence "
-            "of within-episode history, is what limits the MaxEnt head."
-        ),
         overrides={"irl_features": "semantic"},
     ),
     RepresentationAblationArm(
@@ -325,10 +432,6 @@ REPRESENTATION_ABLATION_ARMS: Tuple[RepresentationAblationArm, ...] = (
         baseline="full", family="maxent",
         representation="raw_state_features",
         within_episode_history="none",
-        purpose=(
-            "Removes feature engineering entirely, bounding how much of the "
-            "MaxEnt gap the reward representation can account for."
-        ),
         overrides={"irl_features": "raw_state"},
     ),
     RepresentationAblationArm(
@@ -337,7 +440,6 @@ REPRESENTATION_ABLATION_ARMS: Tuple[RepresentationAblationArm, ...] = (
         baseline="bc_adaptive", family="behavior_cloning",
         representation="state_plus_action_history",
         within_episode_history="three_action_lags_and_step_count",
-        purpose="Deployed cloner reference condition.",
         overrides={"bc_history": 3, "bc_prefix_length_feature": True},
     ),
     RepresentationAblationArm(
@@ -346,7 +448,6 @@ REPRESENTATION_ABLATION_ARMS: Tuple[RepresentationAblationArm, ...] = (
         baseline="bc_adaptive", family="behavior_cloning",
         representation="state_plus_action_history",
         within_episode_history="one_action_lag_and_step_count",
-        purpose="Graded reduction of the cloner's history window.",
         overrides={"bc_history": 1, "bc_prefix_length_feature": True},
     ),
     RepresentationAblationArm(
@@ -355,10 +456,6 @@ REPRESENTATION_ABLATION_ARMS: Tuple[RepresentationAblationArm, ...] = (
         baseline="bc_adaptive", family="behavior_cloning",
         representation="state_plus_step_count",
         within_episode_history="step_count_only",
-        purpose=(
-            "Keeps episode position but removes which actions produced it, "
-            "separating ordering evidence from bare progress."
-        ),
         overrides={"bc_history": 0, "bc_prefix_length_feature": True},
     ),
     RepresentationAblationArm(
@@ -367,13 +464,6 @@ REPRESENTATION_ABLATION_ARMS: Tuple[RepresentationAblationArm, ...] = (
         baseline="bc_adaptive", family="behavior_cloning",
         representation="state_only",
         within_episode_history="none",
-        purpose=(
-            "The primary contrast. Prefix features become prefix-invariant, "
-            "so this cloner sees exactly what the MaxEnt head sees. If its "
-            "advantage on unseen states and coexisting preferences "
-            "disappears here, that advantage was access to within-episode "
-            "history rather than the model family."
-        ),
         overrides={"bc_history": 0, "bc_prefix_length_feature": False},
     ),
 )
@@ -451,7 +541,6 @@ def representation_ablation_design() -> Dict[str, Any]:
                 "representation": arm.representation,
                 "within_episode_history": arm.within_episode_history,
                 "model_overrides": arm.model_overrides(),
-                "purpose": arm.purpose,
             }
             for arm in REPRESENTATION_ABLATION_ARMS
         ],
@@ -2856,59 +2945,6 @@ def _latent_ablation_row(
     }
 
 
-def _latent_job(
-    job: Tuple[
-        str,
-        int,
-        Any,
-        Tuple[LatentStrategyAblationArm, ...],
-    ],
-) -> List[Dict[str, Any]]:
-    """Run all latent arms on one paired scenario/seed plan."""
-    scenario, seed, config, arms = job
-    from .evaluation import (
-        _apply_native_thread_limit,
-        _native_thread_count,
-        _pin_to_performance_cores,
-        build_plan,
-        run_stream,
-        summarize_stream,
-    )
-    from .memory import clear_caches
-
-    _pin_to_performance_cores()
-    _apply_native_thread_limit(_native_thread_count(config))
-    plan = build_plan(scenario, config, seed)
-    rows: List[Dict[str, Any]] = []
-    reference_schedule: Optional[Tuple[str, ...]] = None
-    shared_settings = dict(config.model_settings)
-    for arm in arms:
-        arm_config = replace(
-            config,
-            model_settings={**shared_settings, **arm.model_overrides()},
-        )
-        clear_caches()
-        stream = run_stream(
-            "full",
-            plan,
-            arm_config,
-            execution_mode_schedule=reference_schedule,
-            mode_schedule_policy=(
-                "latent_ablation_maxent_reference_route"
-                if reference_schedule is None
-                else "latent_ablation_matched_maxent_route"
-            ),
-        )
-        if reference_schedule is None:
-            reference_schedule = tuple(
-                str(row.get("mode")) for row in stream.episode_rows
-            )
-        rows.append(_latent_ablation_row(
-            stream, arm, summarize_stream(stream),
-        ))
-    return rows
-
-
 def summarize_latent_strategy_ablation(
     rows: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
@@ -2987,6 +3023,7 @@ def summarize_latent_strategy_ablation(
 def run_latent_strategy_ablation(
     evaluation_config: Optional[Any] = None,
     arms: Sequence[LatentStrategyAblationArm] = LATENT_STRATEGY_ABLATION_ARMS,
+    arms_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run the four paired longitudinal MaxEnt/latent conditions."""
     from .evaluation import EvalSettings
@@ -3020,23 +3057,9 @@ def run_latent_strategy_ablation(
         sensitivity=False,
         experiment="latent_strategy_ablation",
     )
-    jobs = [
-        (str(scenario), int(seed), config, selected_arms)
-        for scenario in config.scenarios for seed in config.seeds
-    ]
-    workers = max(1, min(int(config.workers or 1), len(jobs)))
-    if workers == 1:
-        groups = [_latent_job(job) for job in jobs]
-    else:
-        context = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
-            groups = [future.result() for future in as_completed(
-                pool.submit(_latent_job, job) for job in jobs
-            )]
-    rows = [row for group in groups for row in group]
-    rows.sort(key=lambda row: (
-        str(row["scenario"]), int(row["seed"]), names.index(str(row["arm"])),
-    ))
+    rows = run_arm_major_suite(
+        "latent_strategy_ablation", selected_arms, config, arms_dir=arms_dir,
+    )
     return {
         "definition": (
             "Four-arm paired longitudinal ablation of MaxEnt, lightweight "
@@ -3054,6 +3077,713 @@ def run_latent_strategy_ablation(
     }
 
 
+ARM_ABLATION_METRICS: Tuple[Tuple[str, str], ...] = (
+    ("teacher_forced_top_1", "higher_is_better"),
+    ("teacher_forced_top_k", "higher_is_better"),
+    ("teacher_forced_mean_nll", "lower_is_better"),
+    ("live_top_1", "higher_is_better"),
+    ("normalized_human_action_load", "lower_is_better"),
+    ("corrections_per_recipe_step", "lower_is_better"),
+)
+
+
+def _arm_ablation_row(stream: Any, arm: Any, summary: Mapping[str, Any]) -> Dict[str, Any]:
+    """Flatten one settings-override arm, plus the state its factor moves.
+
+    Shared by the component and retention suites: both hold everything except
+    one declared factor at Full's configuration, so both need the same
+    accuracy, workload, retention-state and deployed-cost columns. The
+    retention-state columns are what let a summary verify that an arm's factor
+    actually moved rather than merely being labelled as moved.
+    """
+    assist = summary.get("assist") or {}
+    overall = assist.get("overall") or {}
+    diagnostics = summary.get("diagnostics") or {}
+    by_memory_state = assist.get("by_memory_state") or {}
+    by_preference_count = assist.get("by_active_preference_count") or {}
+    adaptation = diagnostics.get("adaptation_speed") or {}
+    system = summary.get("system") or {}
+    fit_stats = system.get("fit_stats") or {}
+    training = summary.get("training") or {}
+    per_phase_role = training.get("per_phase_role") or {}
+
+    def phase_max(metric: str) -> Optional[float]:
+        values = [
+            float(entry[metric]) for entry in per_phase_role.values()
+            if isinstance(entry, Mapping) and isinstance(entry.get(metric), (int, float))
+        ]
+        return max(values) if values else None
+
+    def phase_sum(metric: str) -> Optional[float]:
+        values = [
+            float(entry[metric]) for entry in per_phase_role.values()
+            if isinstance(entry, Mapping) and isinstance(entry.get(metric), (int, float))
+        ]
+        return sum(values) if values else None
+
+    def memory_state(name: str, metric: str) -> Optional[float]:
+        cell = by_memory_state.get(name) or {}
+        value = cell.get(metric)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    row: Dict[str, Any] = {
+        "scenario": str(stream.scenario),
+        "seed": int(stream.seed),
+        "arm": arm.name,
+        "label": arm.label,
+        "model_overrides": arm.model_overrides(),
+        # Realized configuration, read back from the run rather than from the
+        # arm definition, so a factor that silently failed to apply is visible.
+        "memory_policy": system.get("memory_policy"),
+        "latest_pin_enabled": system.get("latest_pin_enabled"),
+        "semantic_fallback_enabled": fit_stats.get("semantic_fallback_enabled"),
+        "latent_strategy_enabled": system.get("latent_strategy_enabled"),
+        "active_variants": system.get("active_variants"),
+        "pruned_variants": system.get("pruned_variants"),
+        "mean_active_weight": system.get("mean_active_weight"),
+        "mean_pair_grace_horizon_demos": system.get("mean_pair_grace_horizon_demos"),
+        "max_pair_grace_horizon_demos": system.get("max_pair_grace_horizon_demos"),
+        "mean_pair_recurrence_samples": system.get("mean_pair_recurrence_samples"),
+        # Selective-versus-catastrophic forgetting: accuracy on pairs whose
+        # variant is currently pruned out of active fitting, next to how many
+        # decisions were taken in that state. A retention rule is only better
+        # than another if it wins on both together.
+        "pruned_state_top_1": memory_state("pruned_memory", "teacher_forced_top_1"),
+        "pruned_state_decisions": memory_state("pruned_memory", "n_teacher_forced_predictions"),
+        "active_state_top_1": memory_state("active_memory", "teacher_forced_top_1"),
+        "active_state_decisions": memory_state("active_memory", "n_teacher_forced_predictions"),
+        "new_preference_top_1": memory_state("same_recipe_new_preference", "teacher_forced_top_1"),
+        "new_preference_decisions": memory_state("same_recipe_new_preference", "n_teacher_forced_predictions"),
+        # Concurrency: the regime a single per-recipe pin is expected to hurt.
+        "top_1_by_active_preference_count": {
+            str(count): (cell or {}).get("teacher_forced_top_1")
+            for count, cell in sorted(by_preference_count.items())
+        },
+        "decisions_by_active_preference_count": {
+            str(count): (cell or {}).get("n_teacher_forced_predictions")
+            for count, cell in sorted(by_preference_count.items())
+        },
+        "recovered_rate": adaptation.get("recovered_rate"),
+        "mean_exposures_to_recover_90pct": adaptation.get("mean_exposures_to_recover_90pct"),
+        "first_post_switch_exposure_top_1": adaptation.get(
+            "first_post_switch_exposure_teacher_forced_top_1"
+        ),
+        "mean_pre_switch_top_1": adaptation.get("mean_pre_switch_teacher_forced_top_1"),
+        # Deployed cost. p95 is the blocking wait between two demonstrations,
+        # which cumulative totals cannot express.
+        "online_p95_retrain_fit_wall_s": phase_max("online_p95_retrain_fit_wall_s"),
+        "online_training_fit_wall_s": phase_sum("online_training_fit_wall_s"),
+        "online_retrain_fit_count": phase_sum("online_retrain_fit_count"),
+        "online_training_estimated_fit_flops": phase_sum("online_training_estimated_fit_flops"),
+        "mean_prediction_wall_s": overall.get("mean_prediction_wall_s"),
+        "stream_wall_s": float(stream.wall_s),
+        "trend": _trend(stream),
+        "detailed_metrics": dict(summary),
+    }
+    row.update({metric: overall.get(metric) for metric, _direction in ARM_ABLATION_METRICS})
+    return row
+
+
+def _paired_arm_deltas(
+    indexed: Mapping[Tuple[str, int, str], Mapping[str, Any]],
+    scenario: str,
+    treatment: str,
+    reference: str,
+    metrics: Sequence[Tuple[str, str]] = ARM_ABLATION_METRICS,
+) -> Tuple[Dict[str, Any], Dict[str, List[float]]]:
+    """Seed-matched treatment-minus-reference deltas, signed so positive favours treatment."""
+    seeds = sorted({
+        seed for row_scenario, seed, arm in indexed
+        if row_scenario == scenario and arm == treatment
+        and (scenario, seed, reference) in indexed
+    })
+    metric_deltas: Dict[str, Any] = {}
+    raw: Dict[str, List[float]] = {}
+    for metric, direction in metrics:
+        deltas: List[float] = []
+        for seed in seeds:
+            treatment_value = indexed[(scenario, seed, treatment)].get(metric)
+            reference_value = indexed[(scenario, seed, reference)].get(metric)
+            if not isinstance(treatment_value, (int, float)) or not isinstance(reference_value, (int, float)):
+                continue
+            delta = float(treatment_value) - float(reference_value)
+            if direction == "lower_is_better":
+                delta = -delta
+            if math.isfinite(delta):
+                deltas.append(delta)
+        raw[metric] = deltas
+        metric_deltas[metric] = {
+            "direction": direction,
+            "n_paired_seeds": len(deltas),
+            "mean_treatment_advantage": _finite_mean(deltas),
+        }
+    return {"scenario": scenario, "n_paired_seeds": len(seeds), "metrics": metric_deltas}, raw
+
+
+def _index_arm_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> Tuple[Dict[Tuple[str, str], List[Mapping[str, Any]]], Dict[Tuple[str, int, str], Mapping[str, Any]]]:
+    grouped: Dict[Tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
+    indexed: Dict[Tuple[str, int, str], Mapping[str, Any]] = {}
+    for row in rows:
+        scenario = str(row.get("scenario"))
+        arm = str(row.get("arm"))
+        grouped[(scenario, arm)].append(row)
+        seed = row.get("seed")
+        if isinstance(seed, int):
+            indexed[(scenario, int(seed), arm)] = row
+    return grouped, indexed
+
+
+def _arm_cell_means(
+    grouped: Mapping[Tuple[str, str], Sequence[Mapping[str, Any]]],
+    extra_keys: Sequence[str],
+) -> List[Dict[str, Any]]:
+    cells: List[Dict[str, Any]] = []
+    for (scenario, arm), group in sorted(grouped.items()):
+        first = group[0]
+        cells.append({
+            "scenario": scenario,
+            "arm": arm,
+            "label": first.get("label"),
+            "n_seeds": len(group),
+            "model_overrides": first.get("model_overrides"),
+            **{key: first.get(key) for key in ("memory_policy", "latest_pin_enabled",
+                                               "semantic_fallback_enabled", "latent_strategy_enabled")},
+            **{
+                f"mean_{key}": _finite_mean(row.get(key) for row in group)
+                for key in extra_keys
+            },
+            **{
+                f"mean_{metric}": _finite_mean(row.get(metric) for row in group)
+                for metric, _direction in ARM_ABLATION_METRICS
+            },
+        })
+    return cells
+
+
+_ARM_SHARED_KEYS: Tuple[str, ...] = (
+    "active_variants", "pruned_variants", "mean_active_weight",
+    "mean_pair_grace_horizon_demos", "mean_pair_recurrence_samples",
+    "pruned_state_top_1", "pruned_state_decisions",
+    "active_state_top_1", "active_state_decisions",
+    "new_preference_top_1", "new_preference_decisions",
+    "recovered_rate", "mean_exposures_to_recover_90pct",
+    "first_post_switch_exposure_top_1",
+    "online_p95_retrain_fit_wall_s", "online_training_fit_wall_s",
+    "online_retrain_fit_count", "online_training_estimated_fit_flops",
+)
+
+
+def _concurrency_profile(
+    grouped: Mapping[Tuple[str, str], Sequence[Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Per-arm accuracy against the number of concurrently active preferences.
+
+    Reported separately because a single per-recipe pin is expected to degrade
+    precisely as this count rises, and the scenario where retention helps most
+    is also the one that never exercises the regime.
+    """
+    profile: List[Dict[str, Any]] = []
+    for (scenario, arm), group in sorted(grouped.items()):
+        counts: Dict[str, List[float]] = defaultdict(list)
+        decisions: Dict[str, List[float]] = defaultdict(list)
+        for row in group:
+            for count, value in (row.get("top_1_by_active_preference_count") or {}).items():
+                if isinstance(value, (int, float)):
+                    counts[str(count)].append(float(value))
+            for count, value in (row.get("decisions_by_active_preference_count") or {}).items():
+                if isinstance(value, (int, float)):
+                    decisions[str(count)].append(float(value))
+        ordered = sorted(counts, key=lambda item: (len(item), item))
+        single = _finite_mean(counts.get("1", []))
+        highest = _finite_mean(counts.get(ordered[-1], [])) if ordered else None
+        profile.append({
+            "scenario": scenario,
+            "arm": arm,
+            "n_seeds": len(group),
+            "mean_top_1_by_active_preference_count": {
+                count: _finite_mean(counts[count]) for count in ordered
+            },
+            "total_decisions_by_active_preference_count": {
+                count: sum(decisions.get(count, [])) for count in ordered
+            },
+            "highest_observed_active_preference_count": ordered[-1] if ordered else None,
+            # Negative means the arm loses accuracy as preferences pile up.
+            "concurrency_degradation_single_minus_highest": (
+                None if single is None or highest is None else float(single - highest)
+            ),
+        })
+    return profile
+
+
+def summarize_component_ablation(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Per-component simple effects and an additivity check against the joint drop."""
+    grouped, indexed = _index_arm_rows(rows)
+    scenarios = sorted({scenario for scenario, _seed, _arm in indexed})
+    single_factor = ("full_no_pin", "full_no_semantic_fallback", "full_no_latent_residual")
+
+    simple_effects: List[Dict[str, Any]] = []
+    raw_by_arm: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
+    for arm in (*single_factor, "full_no_support"):
+        for scenario in scenarios:
+            # Signed so a positive value means removing the component HURT,
+            # i.e. the component was contributing that much.
+            entry, raw = _paired_arm_deltas(indexed, scenario, "full", arm)
+            simple_effects.append({
+                "component_removed": arm,
+                "question": f"what does Full lose when {arm} drops its component(s)",
+                **entry,
+            })
+            raw_by_arm[(arm, scenario)] = raw
+
+    additivity: List[Dict[str, Any]] = []
+    for scenario in scenarios:
+        metrics: Dict[str, Any] = {}
+        for metric, direction in ARM_ABLATION_METRICS:
+            joint = raw_by_arm.get(("full_no_support", scenario), {}).get(metric) or []
+            parts = [raw_by_arm.get((arm, scenario), {}).get(metric) or [] for arm in single_factor]
+            paired = min([len(joint)] + [len(part) for part in parts]) if joint and all(parts) else 0
+            summed = [sum(part[index] for part in parts) for index in range(paired)]
+            metrics[metric] = {
+                "direction": direction,
+                "n_paired_seeds": paired,
+                "mean_joint_removal_cost": _finite_mean(joint[:paired]),
+                "mean_summed_single_removal_cost": _finite_mean(summed),
+                # Positive means the joint removal costs more than the parts
+                # sum to, i.e. the components are complementary rather than
+                # independent contributors.
+                "mean_superadditivity": _finite_mean(
+                    joint[index] - summed[index] for index in range(paired)
+                ),
+            }
+        additivity.append({
+            "scenario": scenario,
+            "definition": (
+                "joint removal of all three components minus the sum of the "
+                "three single-factor removals; near zero means the components "
+                "contribute independently"
+            ),
+            "metrics": metrics,
+        })
+
+    # Each arm must have moved exactly the component it names and nothing else.
+    expected = {
+        "full": (True, True, True),
+        "full_no_pin": (False, True, True),
+        "full_no_semantic_fallback": (True, False, True),
+        "full_no_latent_residual": (True, True, False),
+        "full_no_support": (False, False, False),
+    }
+    realized = {
+        arm: sorted({
+            (bool(row.get("latest_pin_enabled")), bool(row.get("semantic_fallback_enabled")),
+             bool(row.get("latent_strategy_enabled")))
+            for row in rows if str(row.get("arm")) == arm
+        })
+        for arm in expected
+    }
+    factors_applied = all(
+        len(realized.get(arm, [])) == 1 and realized[arm][0] == expected[arm]
+        for arm in expected if realized.get(arm)
+    )
+    return {
+        "mean_by_scenario_arm": _arm_cell_means(grouped, _ARM_SHARED_KEYS),
+        "paired_seed_component_costs": simple_effects,
+        "component_additivity": additivity,
+        "concurrency_profile": _concurrency_profile(grouped),
+        "realized_component_flags_by_arm": {
+            arm: [list(item) for item in value] for arm, value in realized.items()
+        },
+        "declared_factors_were_applied": bool(factors_applied),
+        "retention_held_constant": len({
+            str(row.get("memory_policy")) for row in rows
+        }) == 1,
+    }
+
+
+def summarize_retention_ablation(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Per-mechanism simple effects against Full, grouped by the factor moved."""
+    grouped, indexed = _index_arm_rows(rows)
+    scenarios = sorted({scenario for scenario, _seed, _arm in indexed})
+    arms_by_name = {arm.name: arm for arm in RETENTION_ABLATION_ARMS}
+    treatments = [name for name in arms_by_name if name != "full"]
+
+    simple_effects: List[Dict[str, Any]] = []
+    for arm in treatments:
+        for scenario in scenarios:
+            entry, _raw = _paired_arm_deltas(indexed, scenario, "full", arm)
+            simple_effects.append({
+                "reference_arm": arm,
+                "factor": arms_by_name[arm].factor,
+                "question": f"what does Full lose against {arm}",
+                **entry,
+            })
+
+    # Retention arms are only interpretable if predictor support really was
+    # held constant, which is the failure the roster baselines have.
+    support = sorted({
+        (bool(row.get("semantic_fallback_enabled")), bool(row.get("latent_strategy_enabled")))
+        for row in rows
+    })
+    return {
+        "mean_by_scenario_arm": _arm_cell_means(grouped, _ARM_SHARED_KEYS),
+        "paired_seed_simple_effects": simple_effects,
+        "concurrency_profile": _concurrency_profile(grouped),
+        "factors_by_arm": {
+            arm.name: {"factor": arm.factor, "overrides": arm.model_overrides()}
+            for arm in RETENTION_ABLATION_ARMS
+        },
+        "realized_predictor_support": [list(item) for item in support],
+        "predictor_support_held_constant": len(support) == 1,
+    }
+
+
+# --- Arm-major ablation driver ------------------------------------------
+#
+# Every longitudinal ablation suite has the same shape: a list of arms that
+# differ only in settings, run over the same scenario/seed grid, with the
+# first arm's realized observe/assist sequence becoming the route the rest
+# replay. They used to be scheduled cell-major -- one process per
+# scenario/seed running every arm -- which meant one changed arm invalidated
+# the whole grid. They are now scheduled arm-major: an arm finishes the whole
+# grid before the next starts, and its rows are written to its own folder.
+
+
+def _arm_suite_baseline_fixed_full(_arm: Any) -> str:
+    return "full"
+
+
+def _arm_suite_baseline_attribute(arm: Any) -> str:
+    return str(arm.baseline)
+
+
+def _arm_suite_baseline_mapping(arm: Any) -> str:
+    return str(arm["baseline"])
+
+
+def _arm_suite_overrides_method(arm: Any) -> Mapping[str, Any]:
+    return dict(arm.model_overrides())
+
+
+def _arm_suite_overrides_mapping(arm: Any) -> Mapping[str, Any]:
+    return dict(arm.get("overrides") or {})
+
+
+def _arm_suite_name_attribute(arm: Any) -> str:
+    return str(arm.name)
+
+
+def _arm_suite_name_mapping(arm: Any) -> str:
+    return str(arm["arm"])
+
+
+@dataclass(frozen=True)
+class ArmSuiteSpec:
+    """How one ablation suite names, configures and records its arms."""
+
+    reference_policy: str
+    matched_policy: str
+    baseline: Callable[[Any], str]
+    overrides: Callable[[Any], Mapping[str, Any]]
+    row: Callable[..., Dict[str, Any]]
+    name: Callable[[Any], str]
+    # The representation suite also narrows the roster to its arm's predictor.
+    set_roster: bool = False
+
+
+def _arm_suite_specs() -> Dict[str, ArmSuiteSpec]:
+    """Built lazily: the row builders are defined later in this module."""
+    return {
+        "component_ablation": ArmSuiteSpec(
+            "component_ablation_full_reference_route",
+            "component_ablation_matched_full_route",
+            _arm_suite_baseline_fixed_full, _arm_suite_overrides_method,
+            _arm_ablation_row, _arm_suite_name_attribute,
+        ),
+        "retention_ablation": ArmSuiteSpec(
+            "retention_ablation_full_reference_route",
+            "retention_ablation_matched_full_route",
+            _arm_suite_baseline_fixed_full, _arm_suite_overrides_method,
+            _arm_ablation_row, _arm_suite_name_attribute,
+        ),
+        "latent_strategy_ablation": ArmSuiteSpec(
+            "latent_ablation_maxent_reference_route",
+            "latent_ablation_matched_maxent_route",
+            _arm_suite_baseline_fixed_full, _arm_suite_overrides_method,
+            _latent_ablation_row, _arm_suite_name_attribute,
+        ),
+        "memory_predictor_ablation": ArmSuiteSpec(
+            "memory_predictor_ablation_full_reference_route",
+            "memory_predictor_ablation_matched_full_route",
+            _arm_suite_baseline_mapping, _arm_suite_overrides_mapping,
+            _memory_predictor_row, _arm_suite_name_mapping,
+        ),
+        "representation_ablation": ArmSuiteSpec(
+            "representation_ablation_reference_route",
+            "representation_ablation_matched_route",
+            _arm_suite_baseline_attribute, _arm_suite_overrides_method,
+            _representation_row, _arm_suite_name_attribute, set_roster=True,
+        ),
+    }
+
+
+def _arm_cell_job(
+    job: Tuple[str, str, int, Any, Any, Optional[Tuple[str, ...]]],
+) -> Tuple[Dict[str, Any], Optional[Tuple[str, ...]]]:
+    """Run one arm on one scenario/seed plan.
+
+    Returns the arm's row and, when this cell defined the route, the schedule
+    the remaining arms must replay.
+    """
+    suite, scenario, seed, config, arm, route = job
+    from .evaluation import (
+        _apply_native_thread_limit,
+        _native_thread_count,
+        _pin_to_performance_cores,
+        build_plan,
+        run_stream,
+        summarize_stream,
+    )
+    from .memory import clear_caches
+
+    spec = _arm_suite_specs()[str(suite)]
+    _pin_to_performance_cores()
+    _apply_native_thread_limit(_native_thread_count(config))
+    plan = build_plan(scenario, config, int(seed))
+    baseline = spec.baseline(arm)
+    replacements: Dict[str, Any] = {
+        "model_settings": {
+            **dict(config.model_settings), **dict(spec.overrides(arm)),
+        },
+    }
+    if spec.set_roster:
+        replacements["baselines"] = (baseline,)
+    arm_config = replace(config, **replacements)
+    clear_caches()
+    stream = run_stream(
+        baseline,
+        plan,
+        arm_config,
+        execution_mode_schedule=route,
+        mode_schedule_policy=(
+            spec.reference_policy if route is None else spec.matched_policy
+        ),
+    )
+    realized = (
+        tuple(str(row.get("mode")) for row in stream.episode_rows)
+        if route is None else None
+    )
+    return spec.row(stream, arm, summarize_stream(stream)), realized
+
+
+def run_arm_major_suite(
+    suite: str,
+    arms: Sequence[Any],
+    config: Any,
+    *,
+    arms_dir: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """Run one ablation suite arm by arm over the whole scenario/seed grid.
+
+    The first arm is the reference: it runs unconstrained and publishes the
+    route every later arm replays, so no arm can win or lose by being asked
+    for a different amount of teaching. Because that route is data rather
+    than a live variable, each later arm is independently re-runnable.
+    """
+    spec = _arm_suite_specs()[str(suite)]
+    selected = tuple(arms)
+    if not selected:
+        raise ValueError(f"{suite} needs at least one arm")
+    names = tuple(spec.name(arm) for arm in selected)
+    if len(set(names)) != len(names):
+        raise ValueError(f"{suite} arms must have distinct names")
+    grid = [
+        (str(scenario), int(seed))
+        for scenario in config.scenarios for seed in config.seeds
+    ]
+    workers = max(1, min(int(config.workers or 1), len(grid)))
+    routes: Dict[Tuple[str, int], Tuple[str, ...]] = {}
+    rows: List[Dict[str, Any]] = []
+    for index, arm in enumerate(selected):
+        arm_name = names[index]
+        is_reference = index == 0
+        jobs = {
+            cell: (
+                str(suite), cell[0], cell[1], config, arm,
+                None if is_reference else routes[cell],
+            )
+            for cell in grid
+        }
+        results: Dict[Tuple[str, int], Tuple[Dict[str, Any], Optional[Tuple[str, ...]]]] = {}
+        if workers == 1 or len(grid) == 1:
+            for cell, job in jobs.items():
+                results[cell] = _arm_cell_job(job)
+        else:
+            context = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
+                futures = {
+                    pool.submit(_arm_cell_job, job): cell
+                    for cell, job in jobs.items()
+                }
+                for future in as_completed(futures):
+                    results[futures[future]] = future.result()
+        arm_rows: List[Dict[str, Any]] = []
+        for cell in grid:
+            row, realized = results[cell]
+            if realized is not None:
+                routes[cell] = realized
+            arm_rows.append(row)
+        rows.extend(arm_rows)
+        if arms_dir is not None:
+            Path(arms_dir).mkdir(parents=True, exist_ok=True)
+            _atomic_json(Path(arms_dir) / f"{_safe_arm_component(arm_name)}.json", {
+                "suite": str(suite),
+                "arm": arm_name,
+                "reference_arm": bool(is_reference),
+                "route_policy": (
+                    spec.reference_policy if is_reference else spec.matched_policy
+                ),
+                "n_cells": len(arm_rows),
+                "rows": arm_rows,
+            })
+    order = {name: index for index, name in enumerate(names)}
+    rows.sort(key=lambda row: (
+        str(row["scenario"]), int(row["seed"]), order[str(row["arm"])],
+    ))
+    return rows
+
+
+def _safe_arm_component(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(value)):
+        raise ValueError(f"arm name is not usable as a filename: {value!r}")
+    return str(value)
+
+
+def _run_arm_override_suite(
+    arms: Sequence[Any],
+    experiment: str,
+    route_tag: str,
+    evaluation_config: Optional[Any] = None,
+    arms_dir: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """Shared paired scenario/seed grid for the component and retention suites."""
+    from .evaluation import EvalSettings
+
+    selected = tuple(arms)
+    names = tuple(arm.name for arm in selected)
+    if len(set(names)) != len(names):
+        raise ValueError(f"{experiment} arms must have distinct names")
+    if names[0] != "full":
+        raise ValueError(f"{experiment} requires the 'full' arm first; it sets the shared route")
+
+    config = evaluation_config or EvalSettings(
+        seeds=(1337,), baselines=("full",), include_oracle=False, experiment=experiment,
+    )
+    config = replace(
+        config,
+        baselines=("full",),
+        include_oracle=False,
+        shared_routing=True,
+        observe_missing_recipes=False,
+        allow_repeat_observation=False,
+        audit_period=0,
+        sensitivity=False,
+        experiment=experiment,
+    )
+    return run_arm_major_suite(
+        route_tag, selected, config, arms_dir=arms_dir,
+    )
+
+
+def run_component_ablation(
+    evaluation_config: Optional[Any] = None,
+    arms: Sequence[ComponentAblationArm] = COMPONENT_ABLATION_ARMS,
+    arms_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Run the one-factor-at-a-time predictor-support ablation on Full."""
+    rows = _run_arm_override_suite(
+        arms, "component_ablation", "component_ablation", evaluation_config,
+        arms_dir=arms_dir,
+    )
+    return {
+        "definition": (
+            "One-factor-at-a-time paired longitudinal ablation of Full's three "
+            "predictor-support components -- the latest-preference pin, bounded "
+            "semantic successor interpolation, and the workflow-strategy "
+            "residual -- plus their joint removal. Retention, admission, the "
+            "action mask and the consolidation schedule stay at Full's "
+            "configuration in every arm, and all arms follow Full's realized "
+            "interaction schedule on a shared plan."
+        ),
+        "design_type": "paired_predictor_support_component_ablation",
+        "rationale": (
+            "Every deployable memory baseline is constructed through "
+            "_without_proposed_components, which removes all three components "
+            "together, so a Full-versus-baseline margin cannot be assigned to "
+            "any one of them and the deployed adaptive-decay arm in particular "
+            "changes retention and support at the same time. Dropping one "
+            "component at a time reports what each is worth, and the joint arm "
+            "reports whether they are additive."
+        ),
+        "primary_contrast": "full minus full_no_pin",
+        "component_levels": list(COMPONENT_LEVELS),
+        "arms": [
+            {"name": arm.name, "label": arm.label, "component_level": arm.component_level,
+             "removes": list(arm.removes),
+             "overrides": arm.model_overrides()}
+            for arm in arms
+        ],
+        "rows": rows,
+        "summary": summarize_component_ablation(rows),
+    }
+
+
+def run_retention_ablation(
+    evaluation_config: Optional[Any] = None,
+    arms: Sequence[RetentionAblationArm] = RETENTION_ABLATION_ARMS,
+    arms_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Run the retention-mechanism ablation under Full's predictor support."""
+    rows = _run_arm_override_suite(
+        arms, "retention_ablation", "retention_ablation", evaluation_config,
+        arms_dir=arms_dir,
+    )
+    return {
+        "definition": (
+            "Paired longitudinal ablation of the recurrence-aware retention "
+            "policy. Arms move one retention mechanism each -- the retention "
+            "rule, the horizon estimator, the pair adaptation asymmetry, the "
+            "assignment of recurrence evidence to pairs, the pin scope, and "
+            "the consolidation schedule -- while predictor support, admission, "
+            "the action mask and the shared interaction route stay at Full's "
+            "configuration."
+        ),
+        "design_type": "paired_retention_mechanism_ablation",
+        "rationale": (
+            "The deployed 'fixed' baseline is not a control for horizon "
+            "estimation: ReplayMemory.step gates the grace check on the "
+            "adaptive policy, so that arm has no grace period at all and also "
+            "uses a different post-grace decrement, changing three things at "
+            "once. The constant-grace arm here keeps the grace period, the "
+            "decrement, the pin and every component and replaces only the "
+            "per-pair horizon, which is what isolates estimating horizons from "
+            "recurrence. The shuffled arm additionally holds the horizon "
+            "distribution fixed and destroys only its assignment, separating "
+            "the policy from the amount it happens to retain."
+        ),
+        "primary_contrast": "full minus constant_grace",
+        "factors": list(RETENTION_FACTORS),
+        "arms": [
+            {"name": arm.name, "label": arm.label, "factor": arm.factor,
+             "overrides": arm.model_overrides()}
+            for arm in arms
+        ],
+        "rows": rows,
+        "summary": summarize_retention_ablation(rows),
+    }
+
+
 def _memory_predictor_row(
     stream: Any,
     cell: Mapping[str, str],
@@ -3067,7 +3797,9 @@ def _memory_predictor_row(
     row: Dict[str, Any] = {
         "scenario": str(stream.scenario),
         "seed": int(stream.seed),
+        "arm": str(cell["arm"]),
         "baseline": str(cell["baseline"]),
+        "model_overrides": dict(cell.get("overrides") or {}),
         "label": str(cell["label"]),
         "predictor_level": str(cell["predictor"]),
         "memory_level": str(cell["memory"]),
@@ -3076,6 +3808,10 @@ def _memory_predictor_row(
         # really shared a policy rather than merely being labelled alike.
         "memory_policy": system.get("memory_policy"),
         "latest_pin_enabled": system.get("latest_pin_enabled"),
+        # Predictor support must be identical across the two MaxEnt cells for
+        # the memory factor to be attributable; the summary asserts it.
+        "semantic_fallback_enabled": fit_stats.get("semantic_fallback_enabled"),
+        "latent_strategy_enabled": system.get("latent_strategy_enabled"),
         "active_variants": system.get("active_variants"),
         "pruned_variants": system.get("pruned_variants"),
         "mean_active_weight": system.get("mean_active_weight"),
@@ -3094,49 +3830,6 @@ def _memory_predictor_row(
         for metric, _direction in MEMORY_PREDICTOR_ABLATION_METRICS
     })
     return row
-
-
-def _memory_predictor_job(
-    job: Tuple[str, int, Any, Tuple[Mapping[str, str], ...]],
-) -> List[Dict[str, Any]]:
-    """Run all four factorial cells on one paired scenario/seed plan."""
-    scenario, seed, config, cells = job
-    from .evaluation import (
-        _apply_native_thread_limit,
-        _native_thread_count,
-        _pin_to_performance_cores,
-        build_plan,
-        run_stream,
-        summarize_stream,
-    )
-    from .memory import clear_caches
-
-    _pin_to_performance_cores()
-    _apply_native_thread_limit(_native_thread_count(config))
-    plan = build_plan(scenario, config, seed)
-    rows: List[Dict[str, Any]] = []
-    reference_schedule: Optional[Tuple[str, ...]] = None
-    for cell in cells:
-        clear_caches()
-        stream = run_stream(
-            str(cell["baseline"]),
-            plan,
-            config,
-            execution_mode_schedule=reference_schedule,
-            mode_schedule_policy=(
-                "memory_predictor_ablation_full_reference_route"
-                if reference_schedule is None
-                else "memory_predictor_ablation_matched_full_route"
-            ),
-        )
-        if reference_schedule is None:
-            reference_schedule = tuple(
-                str(row.get("mode")) for row in stream.episode_rows
-            )
-        rows.append(_memory_predictor_row(
-            stream, cell, summarize_stream(stream),
-        ))
-    return rows
 
 
 def _route_job(job: Tuple[str, int, Any, Tuple[str, ...]]) -> List[Dict[str, Any]]:
@@ -3190,7 +3883,7 @@ def _route_job(job: Tuple[str, int, Any, Tuple[str, ...]]) -> List[Dict[str, Any
 
 MEMORY_PREDICTOR_CONTRASTS: Tuple[Dict[str, str], ...] = (
     {"name": "memory_effect_within_maxent",
-     "treatment": "full", "reference": "no_decay",
+     "treatment": "full", "reference": "maxent_retain_all",
      "question": "does the memory policy help the proposed predictor"},
     {"name": "memory_effect_within_behavior_cloning",
      "treatment": "bc_adaptive", "reference": "bc",
@@ -3199,7 +3892,7 @@ MEMORY_PREDICTOR_CONTRASTS: Tuple[Dict[str, str], ...] = (
      "treatment": "full", "reference": "bc_adaptive",
      "question": "predictor gap once both arms share Full's memory policy"},
     {"name": "predictor_effect_under_retain_all",
-     "treatment": "no_decay", "reference": "bc",
+     "treatment": "maxent_retain_all", "reference": "bc",
      "question": "predictor gap when neither arm forgets"},
 )
 
@@ -3212,8 +3905,8 @@ def _paired_cell_deltas(
 ) -> Tuple[Dict[str, Any], Dict[str, List[float]]]:
     """Seed-matched treatment-minus-reference deltas for one scenario."""
     seeds = sorted({
-        seed for row_scenario, seed, baseline in indexed
-        if row_scenario == scenario and baseline == treatment
+        seed for row_scenario, seed, arm in indexed
+        if row_scenario == scenario and arm == treatment
         and (scenario, seed, reference) in indexed
     })
     metric_deltas: Dict[str, Any] = {}
@@ -3252,18 +3945,19 @@ def summarize_memory_predictor_ablation(
     indexed: Dict[Tuple[str, int, str], Mapping[str, Any]] = {}
     for row in rows:
         scenario = str(row.get("scenario"))
-        baseline = str(row.get("baseline"))
-        grouped[(scenario, baseline)].append(row)
+        arm = str(row.get("arm", row.get("baseline")))
+        grouped[(scenario, arm)].append(row)
         seed = row.get("seed")
         if isinstance(seed, int):
-            indexed[(scenario, int(seed), baseline)] = row
+            indexed[(scenario, int(seed), arm)] = row
 
     cell_means = []
-    for (scenario, baseline), group in sorted(grouped.items()):
+    for (scenario, arm), group in sorted(grouped.items()):
         first = group[0]
         cell_means.append({
             "scenario": scenario,
-            "baseline": baseline,
+            "arm": arm,
+            "baseline": first.get("baseline"),
             "label": first.get("label"),
             "predictor_level": first.get("predictor_level"),
             "memory_level": first.get("memory_level"),
@@ -3282,7 +3976,7 @@ def summarize_memory_predictor_ablation(
             },
         })
 
-    scenarios = sorted({scenario for scenario, _seed, _baseline in indexed})
+    scenarios = sorted({scenario for scenario, _seed, _arm in indexed})
     simple_effects: List[Dict[str, Any]] = []
     raw_by_contrast: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
     for contrast in MEMORY_PREDICTOR_CONTRASTS:
@@ -3339,6 +4033,20 @@ def summarize_memory_predictor_ablation(
         })
         for level in MEMORY_LEVELS
     }
+    # Both MaxEnt cells must hold the two predictor-support components at
+    # Full's level; if they do not, the memory factor is confounded again and
+    # the interaction term below is not interpretable.
+    support_check = {
+        arm: sorted({
+            (bool(row.get("semantic_fallback_enabled")), bool(row.get("latent_strategy_enabled")))
+            for row in rows if str(row.get("arm", row.get("baseline"))) == arm
+        })
+        for arm in ("full", "maxent_retain_all")
+    }
+    maxent_support_matched = (
+        all(len(value) == 1 for value in support_check.values())
+        and len({value[0] for value in support_check.values() if value}) == 1
+    )
     return {
         "mean_by_scenario_cell": cell_means,
         "paired_seed_simple_effects": simple_effects,
@@ -3350,24 +4058,34 @@ def summarize_memory_predictor_ablation(
         "memory_levels_are_internally_consistent": all(
             len(value) == 1 for value in policy_check.values()
         ),
+        "realized_predictor_support_by_maxent_arm": {
+            arm: [list(item) for item in value]
+            for arm, value in support_check.items()
+        },
+        "maxent_cells_share_predictor_support": bool(maxent_support_matched),
     }
 
 
 def run_memory_predictor_ablation(
     evaluation_config: Optional[Any] = None,
     cells: Sequence[Mapping[str, str]] = MEMORY_PREDICTOR_ABLATION_CELLS,
+    arms_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run the paired 2x2 memory-policy by predictor longitudinal ablation."""
     from .evaluation import EvalSettings
 
     selected = tuple(dict(cell) for cell in cells)
-    baselines = tuple(str(cell["baseline"]) for cell in selected)
-    if len(set(baselines)) != len(baselines):
-        raise ValueError("memory ablation cells must name distinct baselines")
-    if baselines[0] != "full":
+    arms = tuple(str(cell["arm"]) for cell in selected)
+    # Two cells may share a baseline class and differ only in their settings
+    # overrides (the MaxEnt row does exactly that), so the arm name -- not the
+    # baseline -- is the cell identity.
+    if len(set(arms)) != len(arms):
+        raise ValueError("memory ablation cells must name distinct arms")
+    if arms[0] != "full":
         raise ValueError(
-            "memory ablation requires 'full' first; it sets the shared route"
+            "memory ablation requires the 'full' arm first; it sets the shared route"
         )
+    baselines = tuple(dict.fromkeys(str(cell["baseline"]) for cell in selected))
     observed = {
         (str(cell["predictor"]), str(cell["memory"])) for cell in selected
     }
@@ -3400,24 +4118,9 @@ def run_memory_predictor_ablation(
         experiment="memory_predictor_ablation",
     )
 
-    jobs = [
-        (str(scenario), int(seed), config, selected)
-        for scenario in config.scenarios for seed in config.seeds
-    ]
-    workers = max(1, min(int(config.workers or 1), len(jobs)))
-    if workers == 1:
-        groups = [_memory_predictor_job(job) for job in jobs]
-    else:
-        context = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
-            groups = [future.result() for future in as_completed(
-                pool.submit(_memory_predictor_job, job) for job in jobs
-            )]
-    rows = [row for group in groups for row in group]
-    order = {name: index for index, name in enumerate(baselines)}
-    rows.sort(key=lambda row: (
-        str(row["scenario"]), int(row["seed"]), order[str(row["baseline"])],
-    ))
+    rows = run_arm_major_suite(
+        "memory_predictor_ablation", selected, config, arms_dir=arms_dir,
+    )
     return {
         "definition": (
             "Paired 2x2 longitudinal ablation crossing the predictor (MaxEnt "
@@ -3433,7 +4136,11 @@ def run_memory_predictor_ablation(
             "attributed to either. Holding the cloner fixed and giving it "
             "Full's memory policy isolates the retention contribution, and "
             "the interaction term reports whether that contribution depends "
-            "on the model family."
+            "on the model family. The MaxEnt retain-all cell is Full with its "
+            "retention policy switched off rather than the 'no_decay' "
+            "baseline, which would also have removed the semantic fallback "
+            "and the latent residual and so reintroduced the confound this "
+            "design exists to remove."
         ),
         "primary_contrast": "memory_effect_within_behavior_cloning",
         "predictor_levels": list(PREDICTOR_LEVELS),
@@ -3571,53 +4278,6 @@ def _representation_row(
     return row
 
 
-def _representation_job(
-    job: Tuple[str, int, Any, Tuple[RepresentationAblationArm, ...]],
-) -> List[Dict[str, Any]]:
-    """Run every representation arm on one paired scenario/seed plan."""
-    scenario, seed, config, arms = job
-    from .evaluation import (
-        _apply_native_thread_limit,
-        _native_thread_count,
-        _pin_to_performance_cores,
-        build_plan,
-        run_stream,
-        summarize_stream,
-    )
-    from .memory import clear_caches
-
-    _pin_to_performance_cores()
-    _apply_native_thread_limit(_native_thread_count(config))
-    plan = build_plan(scenario, config, seed)
-    rows: List[Dict[str, Any]] = []
-    reference_schedule: Optional[Tuple[str, ...]] = None
-    shared_settings = dict(config.model_settings)
-    for arm in arms:
-        arm_config = replace(
-            config,
-            baselines=(arm.baseline,),
-            model_settings={**shared_settings, **arm.model_overrides()},
-        )
-        clear_caches()
-        stream = run_stream(
-            arm.baseline,
-            plan,
-            arm_config,
-            execution_mode_schedule=reference_schedule,
-            mode_schedule_policy=(
-                "representation_ablation_reference_route"
-                if reference_schedule is None
-                else "representation_ablation_matched_route"
-            ),
-        )
-        if reference_schedule is None:
-            reference_schedule = tuple(
-                str(row.get("mode")) for row in stream.episode_rows
-            )
-        rows.append(_representation_row(stream, arm, summarize_stream(stream)))
-    return rows
-
-
 def summarize_representation_ablation(
     rows: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
@@ -3732,6 +4392,7 @@ def summarize_representation_ablation(
 def run_representation_ablation(
     evaluation_config: Optional[Any] = None,
     arms: Sequence[RepresentationAblationArm] = REPRESENTATION_ABLATION_ARMS,
+    arms_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run the paired predictor-representation longitudinal ablation."""
     from .evaluation import EvalSettings
@@ -3774,23 +4435,9 @@ def run_representation_ablation(
         experiment="representation_ablation",
     )
 
-    jobs = [
-        (str(scenario), int(seed), config, selected)
-        for scenario in config.scenarios for seed in config.seeds
-    ]
-    workers = max(1, min(int(config.workers or 1), len(jobs)))
-    if workers == 1:
-        groups = [_representation_job(job) for job in jobs]
-    else:
-        context = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
-            groups = [future.result() for future in as_completed(
-                pool.submit(_representation_job, job) for job in jobs
-            )]
-    rows = [row for group in groups for row in group]
-    rows.sort(key=lambda row: (
-        str(row["scenario"]), int(row["seed"]), names.index(str(row["arm"])),
-    ))
+    rows = run_arm_major_suite(
+        "representation_ablation", selected, config, arms_dir=arms_dir,
+    )
     return {
         "definition": (
             "Paired longitudinal ablation of what the predictor is allowed to "
@@ -3953,7 +4600,7 @@ def run_routing_ablation(
     if "full" not in baseline_names:
         raise ValueError("routing ablation requires 'full' as the reference")
     frozen_references = {
-        "frozen", "offline_default",
+        "frozen", "offline_default", "offline_all",
     }
     invalid = sorted(set(baseline_names) & frozen_references)
     if invalid:
@@ -4052,7 +4699,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--suite",
-        choices=("all", "matcher", "routing", "latent", "memory", "representation"),
+        choices=("all", "matcher", "routing", "latent", "memory", "representation",
+                 "components", "retention"),
         default="all",
     )
     parser.add_argument("--seed", type=int, default=MatcherSettings.seed)
@@ -4069,6 +4717,18 @@ def _parse_args() -> argparse.Namespace:
         "--routing-baselines", default=",".join(ROUTING_BASELINES),
     )
     parser.add_argument("--routing-recipes", type=int, default=20)
+    parser.add_argument("--components-seeds", default=paired_seed_csv)
+    parser.add_argument(
+        "--components-scenarios",
+        default="homogeneous,heterogeneous,holdout",
+    )
+    parser.add_argument("--components-recipes", type=int, default=20)
+    parser.add_argument("--retention-seeds", default=paired_seed_csv)
+    parser.add_argument(
+        "--retention-scenarios",
+        default="homogeneous,heterogeneous,holdout",
+    )
+    parser.add_argument("--retention-recipes", type=int, default=20)
     parser.add_argument("--memory-seeds", default=paired_seed_csv)
     parser.add_argument(
         "--memory-scenarios",
@@ -4199,9 +4859,9 @@ def _validate_all_ablation_results(
     if not isinstance(memory_rows, list) or not memory_rows:
         raise RuntimeError("memory-policy ablation has no result rows")
     expected_cells = {
-        str(cell["baseline"]) for cell in MEMORY_PREDICTOR_ABLATION_CELLS
+        str(cell["arm"]) for cell in MEMORY_PREDICTOR_ABLATION_CELLS
     }
-    if {row.get("baseline") for row in memory_rows} != expected_cells:
+    if {row.get("arm") for row in memory_rows} != expected_cells:
         raise RuntimeError(
             "memory-policy ablation did not execute every factorial cell"
         )
@@ -4220,6 +4880,71 @@ def _validate_all_ablation_results(
         raise RuntimeError(
             "memory-policy ablation cells disagree with their declared "
             "retention level"
+        )
+    # The repaired factorial only means anything if both MaxEnt cells kept
+    # Full's predictor support; if they did not, the memory factor is
+    # confounded again and the interaction term is not interpretable.
+    if not (memory.get("summary") or {}).get(
+        "maxent_cells_share_predictor_support"
+    ):
+        raise RuntimeError(
+            "memory-policy ablation MaxEnt cells do not share Full's "
+            "predictor support"
+        )
+
+    components = results.get("components", {})
+    component_rows = components.get("rows")
+    if not isinstance(component_rows, list) or not component_rows:
+        raise RuntimeError("component ablation has no result rows")
+    expected_component_arms = {arm.name for arm in COMPONENT_ABLATION_ARMS}
+    if {row.get("arm") for row in component_rows} != expected_component_arms:
+        raise RuntimeError("component ablation did not execute all arms")
+    if {
+        row.get("scenario") for row in component_rows
+    } != set(scenarios) or {
+        row.get("seed") for row in component_rows
+    } != expected_seeds:
+        raise RuntimeError(
+            "component ablation did not cover its scenario-seed grid"
+        )
+    component_summary = components.get("summary") or {}
+    # Each arm must have dropped exactly the component it names, and none of
+    # them may have moved retention; otherwise the per-component costs are not
+    # attributable to the component.
+    if not component_summary.get("declared_factors_were_applied"):
+        raise RuntimeError(
+            "component ablation arms did not realize their declared component "
+            "configuration"
+        )
+    if not component_summary.get("retention_held_constant"):
+        raise RuntimeError(
+            "component ablation moved the retention policy; the per-component "
+            "costs would not be attributable"
+        )
+
+    retention = results.get("retention", {})
+    retention_rows = retention.get("rows")
+    if not isinstance(retention_rows, list) or not retention_rows:
+        raise RuntimeError("retention ablation has no result rows")
+    expected_retention_arms = {arm.name for arm in RETENTION_ABLATION_ARMS}
+    if {row.get("arm") for row in retention_rows} != expected_retention_arms:
+        raise RuntimeError("retention ablation did not execute all arms")
+    if {
+        row.get("scenario") for row in retention_rows
+    } != set(scenarios) or {
+        row.get("seed") for row in retention_rows
+    } != expected_seeds:
+        raise RuntimeError(
+            "retention ablation did not cover its scenario-seed grid"
+        )
+    # The whole point of this suite is that predictor support does not move,
+    # which is exactly what the deployed retention baselines get wrong.
+    if not (retention.get("summary") or {}).get(
+        "predictor_support_held_constant"
+    ):
+        raise RuntimeError(
+            "retention ablation arms disagree on predictor support; the "
+            "retention factor would be confounded"
         )
 
     representation = results.get("representation", {})
@@ -4320,6 +5045,20 @@ def run_all_ablations(
             "--workers", str(longitudinal_workers),
             "--output", str(run_dir / "representation.json"), "--quiet",
         ],
+        "components": [
+            sys.executable, "-X", "faulthandler", "-m", "src.ablations",
+            "--suite", "components", "--components-seeds", seed_csv,
+            "--components-scenarios", scenario_csv,
+            "--workers", str(longitudinal_workers),
+            "--output", str(run_dir / "components.json"), "--quiet",
+        ],
+        "retention": [
+            sys.executable, "-X", "faulthandler", "-m", "src.ablations",
+            "--suite", "retention", "--retention-seeds", seed_csv,
+            "--retention-scenarios", scenario_csv,
+            "--workers", str(longitudinal_workers),
+            "--output", str(run_dir / "retention.json"), "--quiet",
+        ],
     }
     environment = os.environ.copy()
     environment.update({name: "1" for name in NATIVE_THREAD_ENV_VARS})
@@ -4400,6 +5139,18 @@ def run_all_ablations(
     }
 
 
+def _arms_dir_for(args: Any) -> Optional[Path]:
+    """Give each arm its own folder beside the suite's combined JSON.
+
+    ``--output run/components.json`` also writes ``run/components/arms/*.json``
+    so one arm's rows can be inspected, diffed or replaced on their own.
+    """
+    if not getattr(args, "output", None):
+        return None
+    output = Path(args.output)
+    return output.parent / output.stem / "arms"
+
+
 def main() -> None:
     args = _parse_args()
     if args.suite == "all":
@@ -4409,6 +5160,42 @@ def main() -> None:
         )
         if not args.quiet:
             print(json.dumps(result, indent=args.indent, sort_keys=True))
+        return
+    if args.suite in {"components", "retention"}:
+        from .evaluation import EvalSettings, ScheduleSettings
+
+        is_components = args.suite == "components"
+        seeds = tuple(
+            int(value) for value in str(
+                args.components_seeds if is_components else args.retention_seeds
+            ).split(",") if value.strip()
+        )
+        scenarios = tuple(
+            value.strip() for value in str(
+                args.components_scenarios if is_components else args.retention_scenarios
+            ).split(",") if value.strip()
+        )
+        experiment = "component_ablation" if is_components else "retention_ablation"
+        # Every arm runs the 'full' agent and differs only in its settings
+        # overrides, so the roster here just has to be non-empty and valid.
+        evaluation_config = EvalSettings(
+            seeds=seeds,
+            scenarios=scenarios,
+            baselines=("full",),
+            include_oracle=False,
+            show_eta=False,
+            recipe_count=int(
+                args.components_recipes if is_components else args.retention_recipes
+            ),
+            schedule=ScheduleSettings(),
+            frozen_pairs=EvalSettings.frozen_pairs,
+            audit_period=0,
+            model_settings={},
+            experiment=experiment,
+            workers=max(0, int(args.workers)),
+        )
+        runner = run_component_ablation if is_components else run_retention_ablation
+        _emit(runner(evaluation_config, arms_dir=_arms_dir_for(args)), args)
         return
     if args.suite == "memory":
         from .evaluation import EvalSettings, ScheduleSettings
@@ -4438,7 +5225,9 @@ def main() -> None:
             experiment="memory_predictor_ablation",
             workers=max(0, int(args.workers)),
         )
-        _emit(run_memory_predictor_ablation(evaluation_config), args)
+        _emit(run_memory_predictor_ablation(
+            evaluation_config, arms_dir=_arms_dir_for(args),
+        ), args)
         return
     if args.suite == "latent":
         from .evaluation import EvalSettings, ScheduleSettings
@@ -4469,7 +5258,9 @@ def main() -> None:
             experiment="latent_strategy_ablation",
             workers=max(0, int(args.workers)),
         )
-        _emit(run_latent_strategy_ablation(evaluation_config), args)
+        _emit(run_latent_strategy_ablation(
+            evaluation_config, arms_dir=_arms_dir_for(args),
+        ), args)
         return
     if args.suite == "representation":
         from .evaluation import EvalSettings, ScheduleSettings
@@ -4499,7 +5290,9 @@ def main() -> None:
             experiment="representation_ablation",
             workers=max(0, int(args.workers)),
         )
-        _emit(run_representation_ablation(evaluation_config), args)
+        _emit(run_representation_ablation(
+            evaluation_config, arms_dir=_arms_dir_for(args),
+        ), args)
         return
     if args.suite == "routing":
         from .evaluation import EvalSettings, ScheduleSettings

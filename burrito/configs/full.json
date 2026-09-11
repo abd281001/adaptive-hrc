@@ -37,6 +37,7 @@
   "full",
   "frozen",
   "offline_default",
+  "offline_all",
   "unpinned",
   "latest",
   "fixed",
@@ -44,7 +45,8 @@
   "bc",
   "ewc",
   "replay_bc",
-  "memory_oracle"
+  "memory_oracle",
+  "canonical_order"
  ],
  "offline_recipe_fraction": 0.5,
  "offline_preference_fraction": 0.5,
@@ -112,7 +114,8 @@
   "scenario_invariants",
   "stratum_separation",
   "transfer_mechanisms_exercised",
-  "verified_shift_update"
+  "verified_shift_update",
+  "zero_learning_reference"
  ],
  "lead_actor_policy": "human_first",
  "workers": 0

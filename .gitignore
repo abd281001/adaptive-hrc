@@ -28,3 +28,10 @@ results/
 # Unrelated dropped-in code
 /Gabriel/
 /Gabriel.zip
+
+# Reference papers and LaTeX working copies (local only)
+*.pdf
+/ICRA_2027_Abdullah/
+/ICRA_2027_Abdullah.zip
+/Open_Ended_Continual_Adaptation_in_Human__Robot_Collaboration_with_Recurrence_Aware_Memory/
+/Open_Ended_Continual_Adaptation_in_Human__Robot_Collaboration_with_Recurrence_Aware_Memory.zip

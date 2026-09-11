@@ -1831,7 +1831,12 @@ class InContextLlmAgent(AdaptiveAgent):
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     """Run the paired or standalone LLM evaluation through the common harness."""
-    from .evaluation import _jsonable, parse_args, run_evaluation
+    from .evaluation import (
+        _jsonable,
+        find_resumable_run,
+        parse_args,
+        run_evaluation,
+    )
 
     paired_baselines = ("full", PREDICTOR_NAME)
     config = parse_args(
@@ -1872,12 +1877,42 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "scenario; pass one value to --seeds"
         )
     preflight_llm_runtime()
+    # Defaults this runner needs to produce a complete, single-condition run on
+    # a GPU that also drives a display. Applied with setdefault, so an explicit
+    # flag still wins and the choice stays visible in the run manifest.
+    model_settings = dict(config.model_settings)
+    # Bounds the attention intermediates that peak alongside the key/value
+    # cache, which raises the prompt budget from about 6600 tokens to 9900 and
+    # is what lets a full scenario's replay memory fit.
+    model_settings.setdefault("llm_prefill_chunk_tokens", 1024)
+    # One encoding for the whole run. The alternative, "auto", sends the
+    # per-step state annotation and drops it once the prompt stops fitting,
+    # which on this GPU happens partway through and leaves a run whose early
+    # and late episodes are not the same condition.
+    model_settings.setdefault("llm_context_encoding", "action_only")
     config = replace(
         config,
+        model_settings=model_settings,
         include_oracle=False,
         workers=1,
         experiment="llm_single_seed_evaluation",
+        # This runtime segfaults inside bitsandbytes' native 4-bit
+        # dequantization roughly once per one to two million calls, and a
+        # scenario makes about ten million, so several crashes per scenario are
+        # expected rather than exceptional. Without per-event resume the seed
+        # restarts from its first event each time and never finishes.
+        event_resume=True,
     )
+    if not config.run:
+        # A crash leaves per-event state inside its own run directory, and a
+        # fresh invocation would otherwise mint a new directory and start over.
+        resumable = find_resumable_run(config)
+        if resumable is not None:
+            config = replace(config, run=resumable, resume=True)
+            print(
+                f"[llm] continuing incomplete run {resumable}",
+                flush=True,
+            )
     summary = run_evaluation(config)
     print(json.dumps(_jsonable({
         "run_dir": summary["run_dir"],
