@@ -37,6 +37,7 @@ from adaptive_hrc_burrito.evaluation import (
     _load_checkpoint,
     _performance,
     load_config,
+    plan_preflight,
 )
 from adaptive_hrc_burrito.ladder import CONTAINER_FIRST_PREFERENCE, ladder_audit
 from adaptive_hrc_burrito.protocol import CookingHrcRunner, CookingTask
@@ -288,6 +289,41 @@ class ConfigRegressions(unittest.TestCase):
             path.write_text(json.dumps(config), encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_config(path)
+
+    def test_the_schedule_reaches_every_preference_the_catalog_declares(self):
+        """A declared preference no episode performs is an untested claim.
+
+        This failed once after the burrito recipes grew to sixteen and
+        seventeen preferences: a cell reaches two or three of a recipe's
+        preferences whatever it declares, every cell drew from the same
+        uniform pool, and ``plate_protein_early`` went unseen in all of them.
+        The union is a property of the configured seed set, so it is asserted
+        here rather than assumed.
+        """
+        report = plan_preflight(CONFIG)
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["planned_recipe_count"], 12)
+        self.assertEqual(report["planned_preference_count"], 25)
+
+    def test_preflight_catches_a_schedule_that_cannot_cover_the_catalog(self):
+        """The check has to run before the episodes, not after them.
+
+        Coverage is decided entirely by the catalog and the ladder settings,
+        but it used to be reported only by validate_result -- so outgrowing
+        the schedule cost a complete evaluation to discover and left nothing
+        to salvage. Disabling the sweep restores the old planner; the
+        preflight must name the missing preference without running anything.
+        """
+        from adaptive_hrc_burrito import ladder
+
+        original = ladder._preference_sweep
+        ladder._preference_sweep = lambda recipe_id, candidates, seed: ()
+        try:
+            report = plan_preflight(CONFIG)
+        finally:
+            ladder._preference_sweep = original
+        self.assertTrue(report["failures"])
+        self.assertIn("plate_protein_early", report["failures"][0])
 
     def test_frozen_panel_size_matches_the_real_pair_count(self):
         """The panel advertised 48 pairs the catalog could never supply."""

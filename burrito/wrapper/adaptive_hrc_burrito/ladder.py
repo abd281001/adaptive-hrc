@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+import hashlib
 import math
 import random
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
@@ -345,6 +346,31 @@ def _choose_operation(
     return rng.choices(feasible, weights=[weights[name] for name in feasible], k=1)[0]
 
 
+def _preference_sweep(
+    recipe_id: str, candidates: Sequence[str], seed: int,
+) -> Tuple[str, ...]:
+    """Where this cell starts introducing preferences it has not used yet.
+
+    A recipe is only in some phases, and only some of those phases add or
+    swap, so one cell reaches two or three of a recipe's preferences however
+    many it declares. Drawing those uniformly means every cell samples the
+    same pool, and a preference can go unseen in all of them at once -- which
+    is what left ``plate_protein_early`` with zero episodes once the burrito
+    recipes grew to sixteen. Rotating the start by seed spreads the cells
+    across the list instead. Coverage of the union is still a property of the
+    configured seed set rather than of this function, so ``plan_preflight``
+    checks it before a run begins.
+    """
+    order = tuple(dict.fromkeys(candidates))
+    if not order:
+        return ()
+    digest = hashlib.blake2b(
+        f"{recipe_id}|{int(seed)}".encode("utf-8"), digest_size=8,
+    ).digest()
+    offset = int.from_bytes(digest, "big") % len(order)
+    return order[offset:] + order[:offset]
+
+
 def _evolve(
     state: _Lifecycle,
     candidates: Sequence[str],
@@ -352,6 +378,7 @@ def _evolve(
     rng: random.Random,
     *,
     ordered: bool = False,
+    prefer: Sequence[str] = (),
 ) -> Tuple[set[str], Dict[str, set[str]], str, Tuple[str, ...]]:
     """Evolve an active set, conditioning only on operations that are possible."""
     candidate_order = list(dict.fromkeys(candidates))
@@ -359,10 +386,14 @@ def _evolve(
     previous = set(state.active) & candidate_set
     if not previous:
         desired = _cardinality(settings, len(candidate_order), rng)
-        active = set(
-            candidate_order[:desired]
-            if ordered else rng.sample(candidate_order, desired)
-        )
+        if ordered:
+            active = set(candidate_order[:desired])
+        elif prefer:
+            active = set(
+                [item for item in prefer if item in candidate_set][:desired]
+            )
+        else:
+            active = set(rng.sample(candidate_order, desired))
         operation = "initialization"
         feasible = ("initialization",)
     else:
@@ -385,7 +416,13 @@ def _evolve(
                 return next(item for item in candidate_order if item in inactive)
             if returning and (not fresh or rng.random() < settings.reentry_rate):
                 return rng.choice(sorted(returning))
-            return rng.choice(sorted(fresh or inactive))
+            pool = fresh or inactive
+            # Take the cell's own sweep order where it can, so two cells do
+            # not keep drawing the same few preferences out of a long list.
+            return next(
+                (item for item in prefer if item in pool),
+                rng.choice(sorted(pool)),
+            )
 
         if operation == "addition":
             active.add(incoming())
@@ -726,8 +763,10 @@ def _build_heterogeneous(
         operations: Dict[str, str] = {}
         removed: list[Tuple[str, str]] = []
         for recipe in recipes:
+            candidates = applicable_preferences(recipe)
             selected, delta, operation, feasible = _evolve(
-                states[recipe], applicable_preferences(recipe), settings, rng,
+                states[recipe], candidates, settings, rng,
+                prefer=_preference_sweep(recipe, candidates, seed),
             )
             feasible_counts.update(feasible)
             operation_counts[operation] += 1

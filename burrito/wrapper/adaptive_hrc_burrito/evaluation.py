@@ -2596,6 +2596,61 @@ def run_experiment(
         raise
 
 
+def plan_preflight(config_path: str | Path) -> Dict[str, Any]:
+    """Answer the validation questions that the schedule alone already decides.
+
+    Two validation requirements are properties of the plan rather than of the
+    outcome: whether the ladders visit every configured recipe, and whether
+    they exercise every preference those recipes declare. Both follow from the
+    catalog and the ladder settings, so both can be answered in about a second.
+
+    Both were nonetheless answered only by :func:`validate_result`, which runs
+    after every episode. A catalog that outgrew the schedule's budget was
+    therefore reported as a failure at the end of a complete evaluation, with
+    nothing salvageable and nothing to distinguish it from a real result. This
+    runs the same checks first, so that failure costs a second instead.
+    """
+    config = load_config(config_path)
+    recipe_ids = tuple(map(str, config["recipe_ids"]))
+    settings = _ladder_settings(config["ladder"])
+    requirements = set(config.get("validation_requirements", ()))
+    planned_preferences: set[str] = set()
+    planned_recipes: set[str] = set()
+    for seed in config["seeds"]:
+        for scenario in config["scenarios"]:
+            for task in generate_ladder(
+                seed=int(seed), scenario=str(scenario),
+                recipe_ids=recipe_ids, settings=settings,
+            ):
+                planned_preferences.add(str(task.preference))
+                planned_recipes.add(str(task.recipe_id))
+
+    failures = []
+    if "catalog_coverage" in requirements:
+        missing = sorted(set(recipe_ids) - planned_recipes)
+        if missing:
+            failures.append(f"the ladder never schedules recipes {missing}")
+    if "behavioral_preference_coverage" in requirements:
+        expected = {
+            preference for recipe_id in recipe_ids
+            for preference in applicable_preferences(recipe_id)
+        }
+        missing = sorted(expected - planned_preferences)
+        if missing:
+            failures.append(
+                f"the ladder never schedules preferences {missing}: the "
+                "catalog declares them but the schedule has no budget to "
+                "reach them, so no episode could exercise one"
+            )
+    # frozen_pairs is not checked here: load_config already rejects a config
+    # whose pair count disagrees with the catalog, and it ran above.
+    return {
+        "planned_recipe_count": len(planned_recipes),
+        "planned_preference_count": len(planned_preferences),
+        "failures": failures,
+    }
+
+
 def validate_result(
     result: Mapping[str, Any], config_path: str | Path,
 ) -> Dict[str, Any]:
@@ -2847,6 +2902,6 @@ def validate_result(
 __all__ = [
     "ARM_NAMES", "CLI_REPORT_KEYS", "FULL_ARM", "NULL_ARM_NAMES",
     "cell_execution_order",
-    "VALIDATION_REQUIREMENTS", "load_config", "run_experiment",
-    "summary_report", "validate_result",
+    "VALIDATION_REQUIREMENTS", "load_config", "plan_preflight",
+    "run_experiment", "summary_report", "validate_result",
 ]

@@ -96,7 +96,19 @@ def main() -> int:
         return 0
     if not args.config:
         parser.error(f"{args.command} requires --config")
-    from .evaluation import run_experiment, summary_report, validate_result
+    from .evaluation import (
+        plan_preflight, run_experiment, summary_report, validate_result,
+    )
+
+    # Whether the schedule can reach every recipe and preference the catalog
+    # declares is decided before a single episode runs, so it is answered
+    # here rather than hours later in validate_result.
+    preflight = plan_preflight(args.config)
+    if preflight["failures"]:
+        raise SystemExit(
+            "schedule preflight failed, no episode was run: "
+            + "; ".join(preflight["failures"])
+        )
 
     result = run_experiment(
         args.config, output_root=args.output, resume_from=args.resume,
