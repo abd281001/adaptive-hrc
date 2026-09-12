@@ -12,6 +12,7 @@ from .catalog import (
     get_preference,
     get_recipe,
     preference_order,
+    preference_sort_key,
 )
 
 
@@ -71,16 +72,11 @@ class CookingPreferencePolicy:
         preference = get_preference(self.name)
         by_token = graph.recipe.action_by_token
         order = {action: index for index, action in enumerate(graph.actions)}
-        if preference.early:
-            key = lambda token: (
-                preference.target_event not in by_token[token].events,
-                order[token],
-            )
-        else:
-            key = lambda token: (
-                preference.target_event in by_token[token].events,
-                order[token],
-            )
+        # Shared with catalog.preference_order so the frontier choice and the
+        # reference ordering cannot describe different preferences.
+        key = preference_sort_key(
+            preference, lambda token: by_token[token].events, order,
+        )
         return min(candidates, key=key)
 
     def ordering(self, graph: CookingTaskGraph) -> Tuple[str, ...]:

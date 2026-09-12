@@ -154,7 +154,7 @@ class AmbiguityDenominatorRegressions(unittest.TestCase):
         ))
 
     def test_conditioning_is_strictly_tighter_across_the_catalog(self):
-        """Over every (recipe, preference) cell, most flagged robot decisions
+        """Over every (recipe, preference) cell, some flagged robot decisions
         are already settled -- so the two denominators are not interchangeable.
         """
         flagged = conditioned = 0
@@ -172,7 +172,17 @@ class AmbiguityDenominatorRegressions(unittest.TestCase):
                         ))
                     completed.append(policy.choose_action(legal, graph))
         self.assertGreater(flagged, 0)
-        self.assertLess(conditioned, flagged // 2)
+        # Strictly tighter: a decision the prefix has already settled must
+        # never enter an accuracy denominator.
+        self.assertLess(conditioned, flagged)
+        # ...and not vacuously tight. This bound used to be `flagged // 2`,
+        # which recorded a weakness rather than a contract: the catalog
+        # settled most flagged decisions before the robot ever moved, because
+        # its recipes carried too few distinct orderings for their length.
+        # What survives conditioning is driven by orderings per action, so
+        # raising it on the recipes whose task graphs admit more moved this
+        # to roughly half. The bound now guards that gain instead.
+        self.assertGreater(conditioned, flagged // 3)
 
 
 class MetricRegressions(unittest.TestCase):

@@ -218,6 +218,7 @@ class CookingHrcRunner:
         memory_updates_enabled: bool = True,
         require_shift_update: bool = True,
         lead_actor_policy: str = HUMAN_FIRST,
+        layout_override: Optional[Mapping[str, str]] = None,
         nll_probability_floor: float | None = None,
     ):
         if getattr(agent, "domain", None) is not domain:
@@ -247,6 +248,12 @@ class CookingHrcRunner:
                 f"lead_actor_policy must be one of {LEAD_ACTOR_POLICIES}"
             )
         self.lead_actor_policy = str(lead_actor_policy)
+        # recipe_id -> layout. Empty in the publication configuration; the
+        # generalisation ablation fills it to re-run the same ladder
+        # elsewhere.
+        self.layout_override: Dict[str, str] = {
+            str(k): str(v) for k, v in dict(layout_override or {}).items()
+        }
         self._assist_exposures: Dict[str, int] = {}
         self._observed_recipes: set[str] = set()
         self._learner_recipe_by_task: Dict[str, str] = {}
@@ -268,6 +275,7 @@ class CookingHrcRunner:
                 recipe_id,
                 horizon=self.horizon,
                 seed=self.planner_seed,
+                layout=self.layout_override.get(recipe_id),
             )
         return self._executors[recipe_id]
 

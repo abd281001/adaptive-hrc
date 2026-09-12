@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations_with_replacement
-from typing import Any, Dict, FrozenSet, Mapping, Tuple
+from typing import (
+    AbstractSet, Any, Callable, Dict, FrozenSet, Mapping, Optional, Tuple,
+)
 
 
 @dataclass(frozen=True)
@@ -76,10 +78,59 @@ class RecipeSpec:
 
 @dataclass(frozen=True)
 class PreferenceSpec:
+    """One workflow preference over a recipe's task graph.
+
+    Two shapes. A *priority* preference names one event and pulls it to the
+    front (``early``) or pushes it to the back; it resolves the first time
+    that event is legal, after which the ordering falls back to declaration
+    order. A *precedence* preference names an ordered pair of events and only
+    acts where both compete, so it cannot be identified from the opening move
+    and stays unresolved deeper into the episode.
+    """
+
     name: str
-    target_event: str
+    target_event: Optional[str] = None
     early: bool = True
+    before: Optional[Tuple[str, str]] = None
     source: str = "talents_like"
+
+    def __post_init__(self) -> None:
+        if (self.target_event is None) == (self.before is None):
+            raise ValueError(
+                f"{self.name}: give exactly one of target_event or before"
+            )
+        if self.before is not None and self.before[0] == self.before[1]:
+            raise ValueError(f"{self.name}: before must name two distinct events")
+
+
+def preference_sort_key(
+    preference: PreferenceSpec,
+    events_of: Callable[[str], AbstractSet[str]],
+    order_index: Mapping[str, int],
+) -> Callable[[str], Tuple[int, int]]:
+    """The single definition of what a preference does to a legal frontier.
+
+    Both the whole-ordering builder and the single-frontier policy call this,
+    so they cannot drift apart: a disagreement between them would make the
+    reference ordering and the discriminating-decision test describe
+    different preferences.
+    """
+    if preference.before is not None:
+        first, second = preference.before
+
+        def rank(token: str) -> int:
+            events = events_of(token)
+            if first in events:
+                return 0
+            if second in events:
+                return 2
+            return 1
+
+        return lambda token: (rank(token), order_index[token])
+    target = preference.target_event
+    if preference.early:
+        return lambda token: (int(target not in events_of(token)), order_index[token])
+    return lambda token: (int(target in events_of(token)), order_index[token])
 
 
 def _action(
@@ -271,110 +322,132 @@ def _catalog() -> Dict[str, RecipeSpec]:
         )
         recipes[recipe.recipe_id] = recipe
 
-    recipes["burrito_combo"] = _combo_recipe()
+    # The catalog's one multi-order episode, and the only task graph that is
+    # not a relabelling of a single-dish one. Longer versions were built and
+    # measured and are deliberately absent: a third order adds 50% more
+    # decisions at a 13.6% contested rate against this recipe's 20.4%, because
+    # what generates preference conflict is orderings per action, not episode
+    # length. See _multi_order_recipe for what the builder supports.
+    recipes["burrito_combo"] = _multi_order_recipe(
+        "burrito_combo", ("steak", "mushroom"),
+        "steak_and_mushroom_burrito_dishes",
+    )
     return recipes
 
 
-def _combo_recipe() -> RecipeSpec:
-    """One steak burrito and one mushroom burrito in a single episode.
+_PROTEIN_PICKUP = {"steak": "pickup_meat", "mushroom": "pickup_mushroom"}
 
-    ``burrito_1-2_2p`` ships this order list and has two pots and two grills.
-    Two constraints from the pinned environment shape the graph:
+
+def _multi_order_recipe(
+    recipe_id: str,
+    orders: Tuple[str, ...],
+    dish: str,
+) -> RecipeSpec:
+    """One episode that fills several burrito orders in sequence.
+
+    ``burrito_1-2_2p`` has two pots, two grills, four plates and an order list
+    that alternates steak and mushroom burritos, so several orders in one
+    episode are within what the pinned environment supplies. Two constraints
+    from that environment shape every graph this builds:
 
     * The sink does not yield a second addressable ``clean_plate``, and the
       upstream grab primitives select their target by object name, so two
-      same-named plates could not be told apart.  Assembly is serialised.
+      same-named plates could not be told apart. Assembly is serialised: an
+      order's plate is staged only once the previous order is served.
     * Cooked proteins and boiled rice burn (``warn_time`` 60 on an 80-tick
-      cook).  A perishable started for the second burrito while the first is
-      still being assembled is charcoal by the time it is needed, so the
-      second burrito's grill and pot start only once the first is served.
+      cook). A perishable started for a later order while an earlier one is
+      still being assembled is charcoal by the time it is needed, so grills
+      and pots start only after the previous serve.
 
-    Non-perishable preparation -- fetching and chopping the second protein --
-    stays concurrent throughout.  The result is a task graph that is not
-    isomorphic to either single-burrito recipe, which is what lets the
-    container-axis holdout test generalisation on the Burrito side rather than
-    relabelling, and it spreads preference-discriminating decisions across both
-    halves of an 18-step episode.
+    Non-perishable preparation -- fetching and chopping a protein -- stays
+    concurrent, but only while that protein is distinguishable: the fetch
+    macro is illegal whenever a chopped or cooked instance of the same
+    protein already exists, so a repeated protein's preparation serialises
+    behind the previous order's serve. A repeated-protein episode is
+    therefore a different task graph from an alternating one, not a
+    relabelling of it.
     """
-    first, second = "steak", "mushroom"
-    serve_first = f"SERVE_{first.upper()}_BURRITO"
-    actions: list[ActionSpec] = [
-        _action(f"FETCH_AND_STAGE_{first.upper()}", "retrieve", "pickup_meat"),
-        _action(
-            f"PREPARE_AND_STAGE_{first.upper()}", "prepare", "chop_ingredients",
-            requires=(f"FETCH_AND_STAGE_{first.upper()}",),
-        ),
-        _action(
-            f"START_COOKING_{first.upper()}", "cook_protein", "grill_protein",
-            requires=(f"PREPARE_AND_STAGE_{first.upper()}",),
-        ),
-        _action(
-            f"FETCH_AND_STAGE_{second.upper()}", "retrieve", "pickup_mushroom",
-        ),
-        _action(
-            f"PREPARE_AND_STAGE_{second.upper()}", "prepare", "chop_ingredients",
-            requires=(f"FETCH_AND_STAGE_{second.upper()}",),
-        ),
-        _action("START_BOILING_RICE", "cook_starch", "pickup_rice", "pot_rice"),
-        _action(
-            "STAGE_CLEAN_PLATE", "stage_container", "wash_plates",
-            "stage_container",
-        ),
-        _action(
-            "PLATE_RICE", "collect", "plate_ingredients", "plate_rice",
-            requires=("START_BOILING_RICE", "STAGE_CLEAN_PLATE"),
-        ),
-        _action(
-            "PLATE_TORTILLA", "wrap", "plate_ingredients", "plate_tortilla",
-            requires=("STAGE_CLEAN_PLATE",),
-        ),
-        _action(
-            f"PLATE_{first.upper()}", "assemble",
-            "plate_ingredients", "plate_protein",
-            requires=(f"START_COOKING_{first.upper()}", "STAGE_CLEAN_PLATE"),
-        ),
-        _action(
-            serve_first, "serve", "deliver_dish",
-            requires=("PLATE_RICE", "PLATE_TORTILLA", f"PLATE_{first.upper()}"),
-        ),
-        _action(
-            f"START_COOKING_{second.upper()}", "cook_protein", "grill_protein",
-            requires=(f"PREPARE_AND_STAGE_{second.upper()}", serve_first),
-        ),
-        _action(
-            "START_BOILING_RICE_2", "cook_starch", "pickup_rice", "pot_rice",
-            requires=(serve_first,),
-        ),
-        _action(
-            "STAGE_CLEAN_PLATE_2", "stage_container", "wash_plates",
-            "stage_container", requires=(serve_first,),
-        ),
-        _action(
-            "PLATE_RICE_2", "collect", "plate_ingredients", "plate_rice",
-            requires=("START_BOILING_RICE_2", "STAGE_CLEAN_PLATE_2"),
-        ),
-        _action(
-            "PLATE_TORTILLA_2", "wrap", "plate_ingredients", "plate_tortilla",
-            requires=("STAGE_CLEAN_PLATE_2",),
-        ),
-        _action(
-            f"PLATE_{second.upper()}", "assemble",
-            "plate_ingredients", "plate_protein",
-            requires=(
-                f"START_COOKING_{second.upper()}", "STAGE_CLEAN_PLATE_2",
-            ),
-        ),
-        _action(
-            f"SERVE_{second.upper()}_BURRITO", "serve", "deliver_dish",
-            requires=(
-                "PLATE_RICE_2", "PLATE_TORTILLA_2", f"PLATE_{second.upper()}",
-            ),
-        ),
+    # Protein tokens are suffixed by that protein's own occurrence; shared
+    # resources (rice, plate) by the order they belong to. That keeps a
+    # two-order alternating episode's tokens identical to the single-dish
+    # recipes it is built from.
+    protein_seen: Dict[str, int] = {}
+    token: list[Dict[str, str]] = []
+    for index, protein in enumerate(orders):
+        upper = protein.upper()
+        occurrence = protein_seen.get(protein, 0) + 1
+        protein_seen[protein] = occurrence
+        psuf = "" if occurrence == 1 else f"_{occurrence}"
+        osuf = "" if index == 0 else f"_{index + 1}"
+        token.append({
+            "fetch": f"FETCH_AND_STAGE_{upper}{psuf}",
+            "prepare": f"PREPARE_AND_STAGE_{upper}{psuf}",
+            "cook": f"START_COOKING_{upper}{psuf}",
+            "rice": f"START_BOILING_RICE{osuf}",
+            "stage": f"STAGE_CLEAN_PLATE{osuf}",
+            "plate_rice": f"PLATE_RICE{osuf}",
+            "plate_tortilla": f"PLATE_TORTILLA{osuf}",
+            "plate_protein": f"PLATE_{upper}{psuf}",
+            "serve": f"SERVE_{upper}_BURRITO{psuf}",
+        })
+
+    # A later order's protein can be fetched and chopped concurrently only
+    # while it is distinguishable: the fetch macro is illegal whenever a
+    # chopped or cooked instance of the same protein already exists.
+    concurrent = [
+        index for index, protein in enumerate(orders)
+        if index > 0 and protein not in orders[:index]
     ]
+
+    def prep(index: int, gate: Tuple[str, ...]) -> list[ActionSpec]:
+        n = token[index]
+        return [
+            _action(n["fetch"], "retrieve", _PROTEIN_PICKUP[orders[index]],
+                    requires=gate),
+            _action(n["prepare"], "prepare", "chop_ingredients",
+                    requires=(n["fetch"],)),
+        ]
+
+    def cook(index: int, gate: Tuple[str, ...]) -> ActionSpec:
+        n = token[index]
+        return _action(n["cook"], "cook_protein", "grill_protein",
+                       requires=(n["prepare"],) + gate)
+
+    def assemble(index: int, gate: Tuple[str, ...]) -> list[ActionSpec]:
+        n = token[index]
+        return [
+            _action(n["rice"], "cook_starch", "pickup_rice", "pot_rice",
+                    requires=gate),
+            _action(n["stage"], "stage_container", "wash_plates",
+                    "stage_container", requires=gate),
+            _action(n["plate_rice"], "collect", "plate_ingredients",
+                    "plate_rice", requires=(n["rice"], n["stage"])),
+            _action(n["plate_tortilla"], "wrap", "plate_ingredients",
+                    "plate_tortilla", requires=(n["stage"],)),
+            _action(n["plate_protein"], "assemble", "plate_ingredients",
+                    "plate_protein", requires=(n["cook"], n["stage"])),
+            _action(n["serve"], "serve", "deliver_dish",
+                    requires=(n["plate_rice"], n["plate_tortilla"],
+                              n["plate_protein"])),
+        ]
+
+    # Declaration order is the canonical strategy and every preference's
+    # tie-break, so it is built deliberately: the first order's protein chain,
+    # then the non-perishable preparation that can genuinely run alongside it,
+    # then the first order's assembly, then each later order in turn.
+    actions: list[ActionSpec] = [*prep(0, ()), cook(0, ())]
+    for index in concurrent:
+        actions.extend(prep(index, ()))
+    actions.extend(assemble(0, ()))
+    for index in range(1, len(orders)):
+        gate = (token[index - 1]["serve"],)
+        if index not in concurrent:
+            actions.extend(prep(index, gate))
+        actions.append(cook(index, gate))
+        actions.extend(assemble(index, gate))
+    ingredients = ("meat", "mushroom", "rice", "tortilla")
     return _burrito_recipe(
-        "burrito_combo", ("meat", "mushroom", "rice", "tortilla"),
-        tuple(actions), "steak_and_mushroom_burrito_dishes",
-        layout="burrito_1-2_2p",
+        recipe_id, ingredients, tuple(actions), dish, layout="burrito_1-2_2p",
     )
 
 
@@ -414,6 +487,76 @@ PREFERENCES: Mapping[str, PreferenceSpec] = {
         ),
         PreferenceSpec(
             "pickup_onion_early", "pickup_onion", source="burrito_relevant",
+        ),
+        # Deferral counterparts. The language already supported `early=False`
+        # and only one preference used it, which left every other preference
+        # resolving at the first frontier that carries its event.
+        PreferenceSpec("pot_rice_late", "pot_rice", early=False, source="deferral"),
+        PreferenceSpec(
+            "pickup_mushroom_late", "pickup_mushroom", early=False,
+            source="deferral",
+        ),
+        PreferenceSpec(
+            "plate_tortilla_late", "plate_tortilla", early=False, source="deferral",
+        ),
+        PreferenceSpec("tomato_late", "pot_tomato", early=False, source="deferral"),
+        PreferenceSpec(
+            "pickup_onion_late", "pickup_onion", early=False, source="deferral",
+        ),
+        # Precedence preferences. These only act where both named events
+        # compete for the same frontier, so they are invisible in the opening
+        # move and survive further into the episode than a priority can.
+        PreferenceSpec(
+            "prep_before_cooking", before=("chop_ingredients", "grill_protein"),
+            source="workflow_precedence",
+        ),
+        PreferenceSpec(
+            "protein_before_rice", before=("plate_protein", "plate_rice"),
+            source="workflow_precedence",
+        ),
+        PreferenceSpec(
+            "gather_before_staging", before=("pickup_tomato", "stage_container"),
+            source="workflow_precedence",
+        ),
+        PreferenceSpec(
+            "slow_items_first", before=("pot_rice", "chop_ingredients"),
+            source="workflow_precedence",
+        ),
+        PreferenceSpec(
+            "container_before_gathering", before=("stage_container", "pickup_onion"),
+            source="workflow_precedence",
+        ),
+        # The native burrito recipes are the only ones with headroom left:
+        # their protein, rice and plate chains are genuinely independent, so
+        # 9 actions admit 337 orderings where the Overcooked recipes admit
+        # 4-15. Every preference below discriminates between those chains,
+        # which is what raises orderings-per-action -- the quantity that
+        # drives how often the stored variants can disagree.
+        PreferenceSpec(
+            "chop_late", "chop_ingredients", early=False,
+            source="burrito_workflow",
+        ),
+        PreferenceSpec(
+            "plate_rice_late", "plate_rice", early=False,
+            source="burrito_workflow",
+        ),
+        PreferenceSpec(
+            "protein_before_starting_rice",
+            before=("plate_protein", "pickup_rice"),
+            source="burrito_workflow",
+        ),
+        PreferenceSpec(
+            "tortilla_before_grilling",
+            before=("plate_tortilla", "grill_protein"),
+            source="burrito_workflow",
+        ),
+        PreferenceSpec(
+            "rice_before_grilling", before=("pickup_rice", "grill_protein"),
+            source="burrito_workflow",
+        ),
+        PreferenceSpec(
+            "rice_before_tortilla", before=("pickup_rice", "plate_tortilla"),
+            source="burrito_workflow",
         ),
     )
 }
@@ -457,17 +600,10 @@ def preference_order(recipe: RecipeSpec, preference: PreferenceSpec) -> Tuple[st
         ]
         if not legal:
             raise RuntimeError(f"cyclic task graph for {recipe.recipe_id}")
-        if preference.early:
-            key = lambda action: (
-                preference.target_event not in action.events,
-                order_index[action.token],
-            )
-        else:
-            key = lambda action: (
-                preference.target_event in action.events,
-                order_index[action.token],
-            )
-        completed.append(min(legal, key=key).token)
+        key = preference_sort_key(
+            preference, lambda token: by_token[token].events, order_index,
+        )
+        completed.append(min((a.token for a in legal), key=key))
     assert set(completed) == set(by_token)
     return tuple(completed)
 

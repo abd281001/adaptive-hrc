@@ -19,18 +19,18 @@
   "holdout"
  ],
  "recipe_ids": [
+  "burrito_chicken_onion",
+  "burrito_combo",
+  "burrito_mushroom_burrito",
+  "burrito_steak_burrito",
+  "burrito_steak_onion",
   "overcooked_onion_onion",
-  "overcooked_onion_tomato",
-  "overcooked_tomato_tomato",
   "overcooked_onion_onion_onion",
   "overcooked_onion_onion_tomato",
+  "overcooked_onion_tomato",
   "overcooked_onion_tomato_tomato",
-  "overcooked_tomato_tomato_tomato",
-  "burrito_steak_onion",
-  "burrito_chicken_onion",
-  "burrito_steak_burrito",
-  "burrito_mushroom_burrito",
-  "burrito_combo"
+  "overcooked_tomato_tomato",
+  "overcooked_tomato_tomato_tomato"
  ],
  "horizon": 1800,
  "arms": [
@@ -42,9 +42,7 @@
   "latest",
   "fixed",
   "no_decay",
-  "bc",
   "ewc",
-  "replay_bc",
   "memory_oracle",
   "canonical_order"
  ],
@@ -52,7 +50,7 @@
  "offline_preference_fraction": 0.5,
  "shared_routing": true,
  "pre_event_probes": true,
- "frozen_pairs": 44,
+ "frozen_pairs": 92,
  "audit_period": 2,
  "audit_prefixes": 16,
  "audit_tolerance": 0.05,

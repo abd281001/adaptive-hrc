@@ -1,7 +1,7 @@
 """Small physical-executor factory for the unified recipe catalog."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from .catalog import get_recipe
 from .legacy_options import LegacyBurritoOptionExecutor
@@ -16,11 +16,23 @@ def create_executor(
     *,
     horizon: int,
     seed: int,
+    layout: Optional[str] = None,
 ) -> Any:
+    """Build the physical executor for one recipe.
+
+    ``layout`` overrides where an Overcooked recipe is carried out. The
+    Burrito executors bind to their own layouts, so an override is rejected
+    there rather than silently ignored.
+    """
     recipe = get_recipe(recipe_id)
     if recipe.environment == "overcooked":
         return OvercookedOptionExecutor(
-            runtime, recipe_id, horizon=horizon, seed=seed,
+            runtime, recipe_id, horizon=horizon, seed=seed, layout=layout,
+        )
+    if layout is not None:
+        raise ValueError(
+            f"layout override is only supported for Overcooked recipes, "
+            f"not {recipe_id!r} ({recipe.environment})"
         )
     if recipe.compatibility_dynamics:
         return LegacyBurritoOptionExecutor(

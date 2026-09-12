@@ -76,9 +76,7 @@ ARM_NAMES: Tuple[str, ...] = (
     "latest",
     "fixed",
     "no_decay",
-    "bc",
     "ewc",
-    "replay_bc",
     "memory_oracle",
 )
 # Zero-learning references, not deployable systems.  They are excluded from the
@@ -226,6 +224,23 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     unknown_recipes = set(map(str, config["recipe_ids"])) - set(RECIPES)
     if unknown_recipes:
         raise ValueError(f"unknown recipes: {sorted(unknown_recipes)}")
+    # Layout overrides move a recipe to a different room without touching its
+    # task graph or its preferences. Only Overcooked recipes can be moved: the
+    # Burrito executors bind to their own layouts.
+    override = dict(config.get("layout_override") or {})
+    unknown_override = set(map(str, override)) - set(RECIPES)
+    if unknown_override:
+        raise ValueError(
+            f"layout_override names unknown recipes: {sorted(unknown_override)}"
+        )
+    misplaced = sorted(
+        recipe_id for recipe_id in override
+        if get_recipe(str(recipe_id)).environment != "overcooked"
+    )
+    if misplaced:
+        raise ValueError(
+            f"layout_override only supports Overcooked recipes: {misplaced}"
+        )
     unknown_arms = (
         set(map(str, config["arms"])) - set(ARM_NAMES) - set(NULL_ARM_NAMES)
     )
@@ -959,6 +974,7 @@ def _run_cell(
         memory_updates_enabled=arm not in {"frozen", "offline_default", "offline_all"},
         require_shift_update=arm == FULL_ARM,
         lead_actor_policy=str(config.get("lead_actor_policy", "human_first")),
+        layout_override=dict(config.get("layout_override") or {}),
     )
     episodes: list[Dict[str, Any]] = []
     failures: list[Dict[str, Any]] = []
@@ -1126,6 +1142,62 @@ def _retrain_settled(row: Mapping[str, Any]) -> bool:
     if bool(row.get("retrain_executed")):
         return True
     return bool(row.get("retrain_correctly_skipped", False))
+
+
+def _adaptation_summary(
+    adaptation: Sequence[Mapping[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Per-arm acquisition-versus-recurrence effect.
+
+    This is the quantity the benchmark exists to measure: a preference is
+    taught once, recurs after a gap, and the question is whether the learner
+    is better on the recurrence than it was at acquisition. It is reported
+    per arm because the zero-learning and frozen arms must show no effect --
+    they cannot update -- which is what makes a positive effect on the
+    deployable arms mean anything.
+
+    Accuracy alone would not show it: a fixed rule scores well on this
+    catalog at acquisition and simply never improves.
+    """
+    by_arm: Dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in adaptation:
+        by_arm[str(row.get("arm"))].append(row)
+    out: list[Dict[str, Any]] = []
+    for arm, rows in sorted(by_arm.items()):
+        acquisition = _finite_mean(
+            row.get("acquisition_teacher_forced_discriminating_top_1")
+            for row in rows
+        )
+        recurrence = _finite_mean(
+            row.get("post_update_teacher_forced_discriminating_top_1")
+            for row in rows
+        )
+        effect = (
+            recurrence - acquisition
+            if isinstance(acquisition, float) and isinstance(recurrence, float)
+            else None
+        )
+        out.append({
+            "arm": arm,
+            "n_adaptations": len(rows),
+            "acquisition_discriminating_top_1": acquisition,
+            "recurrence_discriminating_top_1": recurrence,
+            "adaptation_effect": effect,
+            "post_update_correction_free_rate": _finite_mean(
+                row.get("post_update_correction_free_rate") for row in rows
+            ),
+            "post_update_corrections_per_robot_decision": _finite_mean(
+                row.get("post_update_corrections_per_robot_decision")
+                for row in rows
+            ),
+            "mean_intervening_episodes": _finite_mean(
+                row.get("intervening_episode_count") for row in rows
+            ),
+            "updates_verified": sum(
+                1 for row in rows if row.get("update_verified")
+            ),
+        })
+    return out
 
 
 def _adaptation_records(episodes: Sequence[Mapping[str, Any]]) -> list[Dict[str, Any]]:
@@ -1852,6 +1924,17 @@ def _aggregate(
             (row["seed"], row["scenario"], row["arm"]) for row in excluded
         }),
         "adaptation_record_count": len(adaptation),
+        # The headline effect: taught once, then seen again after a gap.
+        "adaptation_by_arm": _adaptation_summary(adaptation),
+        "adaptation_metric": "post_update_teacher_forced_discriminating_top_1",
+        "adaptation_note": (
+            "acquisition_discriminating_top_1 is accuracy when a preference "
+            "was first taught; recurrence_discriminating_top_1 is accuracy "
+            "when the same preference recurred after a gap. Their difference "
+            "is the adaptation effect. The zero-learning and frozen arms "
+            "cannot update and must show an effect of zero; read every "
+            "deployable arm against them."
+        ),
         "full_post_update_correction_free_rate": _finite_mean(
             row["correction_free"] for row in full_post
         ),
@@ -1878,6 +1961,14 @@ CLI_REPORT_KEYS: Tuple[str, ...] = (
     "assist_episode_count",
     "failure_count",
     "delivery_rate",
+    # The headline effect comes first: every accuracy below it is scored on a
+    # catalog where a fixed rule already does well, so an accuracy read on its
+    # own says little. adaptation_by_arm is the before/after the benchmark is
+    # built to show, with arms that cannot update sitting at zero.
+    "adaptation_metric",
+    "adaptation_by_arm",
+    "adaptation_note",
+    "adaptation_record_count",
     "primary_accuracy_metric",
     "cross_environment_parity_metric",
     "teacher_forced_top_1",
@@ -2320,6 +2411,7 @@ def run_experiment(
         run_dir.mkdir(parents=False, exist_ok=False)
         checkpoint_dir = run_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=False, exist_ok=False)
+    manifest["layout_override"] = dict(config.get("layout_override") or {})
     manifest["cell_execution"] = "arm-major: one arm completes the whole seed/scenario grid before the next starts"
     manifest["arm_order"] = [str(arm) for arm in config["arms"]]
     manifest["artifacts"] = {

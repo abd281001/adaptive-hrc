@@ -32,20 +32,27 @@ class OvercookedOptionExecutor:
         *,
         horizon: int = 800,
         seed: int = 0,
+        layout: Optional[str] = None,
     ):
         self.runtime = runtime
         self.horizon = int(horizon)
         self.seed = int(seed)
         self.execution_log: list[OptionExecution] = []
-        self._build(recipe_id)
+        self._build(recipe_id, layout)
 
-    def _build(self, recipe_id: str) -> None:
+    def _build(self, recipe_id: str, layout: Optional[str] = None) -> None:
         recipe = get_recipe(recipe_id)
         if recipe.environment != "overcooked":
             raise ValueError(f"{recipe_id!r} is not a standard Overcooked recipe")
         self.recipe = recipe
+        # The task graph is a property of the recipe; the layout is only where
+        # it is carried out. Overriding it re-runs the identical preference
+        # ladder on a different spatial arrangement, which is what makes an
+        # adaptation result a claim about preferences rather than about one
+        # room.
+        self.layout = str(layout or recipe.layout)
         self.env = self.runtime.create_overcooked_environment(
-            recipe.layout, recipe.ingredients, horizon=self.horizon,
+            self.layout, recipe.ingredients, horizon=self.horizon,
         )
         from overcooked_ai_py.mdp.actions import Action
         from overcooked_ai_py.mdp.overcooked_mdp import Recipe
