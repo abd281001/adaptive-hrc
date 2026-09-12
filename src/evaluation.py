@@ -114,10 +114,13 @@ SCENARIO_SPECS: Mapping[str, ScenarioSpec] = {
 }
 SCENARIOS = tuple(SCENARIO_SPECS)
 
+# The arms the suites actually run. The behaviour-cloning agents stay
+# implemented in src/baselines.py and remain selectable by name; they are
+# held out of the default roster pending a decision on whether a supervised
+# cloner is a peer of this system at all.
 DEFAULT_BASELINES = (
     "full", "frozen", "offline_default", "offline_all",
-    "unpinned", "latest", "fixed", "no_decay", "bc", "ewc",
-    "replay_bc",
+    "unpinned", "latest", "fixed", "no_decay", "ewc",
 )
 MEMORY_ORACLE = "memory_oracle"
 # The optional GPU arm. It owns a quantized model and cannot share a process

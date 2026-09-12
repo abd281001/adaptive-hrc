@@ -309,30 +309,34 @@ class AblationArmTests(unittest.TestCase):
                     self.assertNotEqual(dict(arm.overrides), {})
                     self.assertNotEqual(self._settings(arm), DEFAULT_SETTINGS)
 
-    def test_memory_group_forms_a_factorial_with_matched_maxent_support(self):
-        from src.ablations import arms_by_name, group_arms
+    def test_behaviour_cloning_arms_are_held_out_of_the_run_roster(self):
+        """BC stays implemented and selectable, but is not a default arm."""
+        from src.ablations import ARMS, groups, roster_arms
+        from src.baselines import BASELINE_AGENTS
+        from src.evaluation import DEFAULT_BASELINES
 
-        arms = arms_by_name()
-        # Two cells come from the deployable roster: Full and BC.
-        self.assertEqual(
-            set(group_arms("memory")),
-            {"full", "bc", "bc_adaptive", "maxent_retain_all"},
-        )
-        levels = {
-            (arms[name].facets["predictor"], arms[name].facets["memory"])
-            for name in ("bc_adaptive", "maxent_retain_all")
-        }
-        self.assertEqual(
-            levels,
-            {("behavior_cloning", "adaptive_pinned"), ("maxent", "retain_all")},
-        )
-        # The repair: the MaxEnt retain-all cell keeps Full's predictor
-        # support, so the memory factor is not confounded with it.
-        settings = self._settings(arms["maxent_retain_all"])
-        self.assertTrue(settings.semantic_fallback_enabled)
-        self.assertTrue(settings.latent_strategy_enabled)
-        self.assertEqual(settings.retention_policy, "none")
-        self.assertFalse(settings.pin_latest)
+        for name in ("bc", "bc_adaptive", "replay_bc"):
+            with self.subTest(agent=name):
+                self.assertIn(name, BASELINE_AGENTS)     # still implemented
+                self.assertNotIn(name, DEFAULT_BASELINES)  # not run by default
+        agents = {arm.agent for arm in ARMS}
+        self.assertEqual(agents & {"bc", "bc_adaptive", "replay_bc"}, set())
+        self.assertNotIn("bc", roster_arms(groups()))
+
+    def test_representation_group_is_maxent_only(self):
+        from src.ablations import arms_by_name, group_arms, group_contrasts
+
+        arms = group_arms("representation")
+        # Model family is no longer varied, so the group is one contrast
+        # against the deployed representation rather than a family sweep.
+        self.assertEqual(set(arms), {"full", "maxent_raw_state"})
+        declared = arms_by_name()
+        for name in arms:
+            if name in declared:
+                self.assertEqual(declared[name].facets.get("family"), "maxent")
+        primary = [c for c in group_contrasts("representation") if c.primary]
+        self.assertEqual(len(primary), 1)
+        self.assertEqual(primary[0].name, "maxent_reward_representation_sensitivity")
 
 
 if __name__ == "__main__":

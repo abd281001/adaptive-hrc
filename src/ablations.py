@@ -2194,11 +2194,12 @@ def run_matcher_ablation(
 # A "group" is therefore a label on contrasts, not a unit of execution.
 # ==========================================================================
 
-# How an arm gets its interaction schedule.
-PUBLISH = "publish"   # runs unconstrained and publishes the route (only 'full')
+# How an arm gets its interaction schedule. Publishing is not among them:
+# the route is published once by 'full' in the standard evaluation, and every
+# arm here either replays it or is explicitly freed from it.
 REPLAY = "replay"     # replays the published route -- the default
 LOCAL = "local"       # free to request its own re-observations (routing only)
-ROUTES = (PUBLISH, REPLAY, LOCAL)
+ROUTES = (REPLAY, LOCAL)
 
 DEFAULT_ABLATION_RESULTS_ROOT = "eval_results"
 DEFAULT_ABLATION_WORKERS = 8
@@ -2355,69 +2356,29 @@ ARMS: Tuple[Arm, ...] = (
         overrides={"retrain_cold_counts_removals": True},
         facets={"factor": "consolidation_schedule"}),
 
-    # -- latent: capacity x trajectory alignment.
+    # -- latent: does partial-trajectory alignment earn its place.
     #    The deployed residual is rank 8 / knn 3 / sequence weight 0.5, which
-    #    is the standard 'full' arm. Declaring the other three corners here
-    #    completes the 2x2 -- the design used to omit the shipped corner and
-    #    could only price trajectory alignment at high capacity.
+    #    is the standard 'full' arm; this arm is the same corner with
+    #    alignment off. The two raised-capacity corners that used to sit here
+    #    priced rank and neighbour count, which are hyperparameters of the
+    #    residual rather than parts of the memory policy, so they answered no
+    #    question the paper asks and are not run.
     Arm("latent_timing_lightweight", "Lightweight latent timing",
         groups=("latent",),
         overrides={"latent_strategy_enabled": True, "latent_strategy_rank": 8,
                    "latent_strategy_knn": 3, "latent_strategy_strength": 1.0,
                    "latent_strategy_sequence_weight": 0.0},
         facets={"capacity": "low", "sequence_alignment": "off"}),
-    Arm("latent_timing_capacity_matched", "Capacity-matched latent timing",
-        groups=("latent",),
-        overrides={"latent_strategy_enabled": True, "latent_strategy_rank": 32,
-                   "latent_strategy_knn": 8, "latent_strategy_strength": 1.0,
-                   "latent_strategy_sequence_weight": 0.0},
-        facets={"capacity": "high", "sequence_alignment": "off"}),
-    Arm("latent_timing_trajectory_hybrid", "Heavy timing-trajectory hybrid",
-        groups=("latent",),
-        overrides={"latent_strategy_enabled": True, "latent_strategy_rank": 32,
-                   "latent_strategy_knn": 8, "latent_strategy_strength": 1.0,
-                   "latent_strategy_sequence_weight": 0.5},
-        facets={"capacity": "high", "sequence_alignment": "on"}),
-
-    # -- memory: predictor x retention policy, 2x2.
-    #    'full' and 'bc' are the standard roster's own arms.
-    Arm("bc_adaptive", "BC + adaptive memory", agent="bc_adaptive",
-        # Also the representation group's full-history cloner: its declared
-        # overrides were the defaults, so it was this same condition.
-        groups=("memory", "representation"),
-        facets={"predictor": "behavior_cloning", "memory": "adaptive_pinned",
-                "family": "behavior_cloning",
-                "representation": "state_plus_action_history",
-                "within_episode_history": "three_action_lags_and_step_count"}),
-    Arm("maxent_retain_all", "MaxEnt + retain-all", groups=("memory",),
-        overrides={"retention_policy": "none", "pin_latest": False},
-        facets={"predictor": "maxent", "memory": "retain_all"}),
 
     # -- representation: what the predictor is allowed to see.
-    Arm("maxent_semantic", "MaxEnt, semantic reward features",
-        groups=("representation",), overrides={"irl_features": "semantic"},
-        facets={"family": "maxent", "representation": "semantic_reward_features",
-                "within_episode_history": "none"}),
+    #    One arm: the rawest reward representation against the deployed one.
+    #    A third semantic-feature point used to sit here to separate model
+    #    family from representation, but family is no longer varied -- the
+    #    cloner roster is held out -- so it was a second point on an axis
+    #    with no second claim.
     Arm("maxent_raw_state", "MaxEnt, raw state features",
         groups=("representation",), overrides={"irl_features": "raw_state"},
         facets={"family": "maxent", "representation": "raw_state_features",
-                "within_episode_history": "none"}),
-    Arm("cloner_history_1", "Cloner, one action lag and step count",
-        agent="bc_adaptive", groups=("representation",),
-        overrides={"bc_history": 1, "bc_prefix_length_feature": True},
-        facets={"family": "behavior_cloning",
-                "representation": "state_plus_action_history",
-                "within_episode_history": "one_action_lag_and_step_count"}),
-    Arm("cloner_step_count_only", "Cloner, step count only",
-        agent="bc_adaptive", groups=("representation",),
-        overrides={"bc_history": 0, "bc_prefix_length_feature": True},
-        facets={"family": "behavior_cloning",
-                "representation": "state_plus_step_count",
-                "within_episode_history": "step_count_only"}),
-    Arm("cloner_state_only", "Cloner, state only", agent="bc_adaptive",
-        groups=("representation",),
-        overrides={"bc_history": 0, "bc_prefix_length_feature": False},
-        facets={"family": "behavior_cloning", "representation": "state_only",
                 "within_episode_history": "none"}),
 
     # -- routing: teaching burden when a method may request its own demos.
@@ -2485,8 +2446,10 @@ CONTRASTS: Tuple[Contrast, ...] = (
              "schedule_removals_count_cold",
              "Effect of letting removals advance the cold-restart counter."),
 
-    # -- latent: a 2x2 of capacity x trajectory alignment.
-    #    'full' is the deployed corner (rank 8, knn 3, sequence weight 0.5).
+    # -- latent: what partial-trajectory alignment buys at the deployed
+    #    capacity. 'full' is the deployed corner (rank 8, knn 3, sequence
+    #    weight 0.5) and 'latent_timing_lightweight' is that corner with
+    #    alignment switched off.
     Contrast("latent_contribution_as_deployed", "latent", "full",
              "full_no_latent_residual",
              "What the residual contributes in the configuration that ships.",
@@ -2499,57 +2462,14 @@ CONTRASTS: Tuple[Contrast, ...] = (
              "Causal contribution of partial-trajectory alignment at the "
              "deployed capacity: rank, KNN, strength and every non-latent "
              "setting match."),
-    Contrast("trajectory_alignment_at_high_capacity", "latent",
-             "latent_timing_trajectory_hybrid", "latent_timing_capacity_matched",
-             "The same contribution at raised capacity. Reading it against "
-             "the low-capacity contrast gives the capacity x alignment "
-             "interaction the three-arm design could not estimate."),
-    Contrast("latent_capacity_sensitivity", "latent",
-             "latent_timing_capacity_matched", "latent_timing_lightweight",
-             "Sensitivity to rank and neighbour count together. Rank and KNN "
-             "move at once, so this bounds capacity rather than attributing "
-             "to either.", descriptive=True),
-
-    # -- memory: predictor x retention, 2x2.
-    Contrast("memory_effect_within_maxent", "memory", "full",
-             "maxent_retain_all",
-             "Does the memory policy help the proposed predictor."),
-    Contrast("memory_effect_within_behavior_cloning", "memory", "bc_adaptive",
-             "bc", "Does the same memory policy help a linear cloner.",
-             primary=True),
-    Contrast("predictor_effect_under_adaptive_memory", "memory", "full",
-             "bc_adaptive",
-             "Predictor gap once both arms share Full's memory policy. The "
-             "MaxEnt arm also carries the semantic fallback and the latent "
-             "residual and the cloner carries neither, so this is not a "
-             "component-matched comparison.", descriptive=True),
-    Contrast("predictor_effect_under_retain_all", "memory",
-             "maxent_retain_all", "bc",
-             "Predictor gap when neither arm forgets. Not component-matched, "
-             "for the same reason.", descriptive=True),
-
     # -- representation: what the predictor can see, memory held fixed.
-    Contrast("cloner_history_contribution", "representation", "bc_adaptive",
-             "cloner_state_only",
-             "Causal contribution of within-episode action history to the "
-             "cloner, with the memory policy, the stored demonstrations and "
-             "every other setting matched.", primary=True),
-    Contrast("cloner_action_identity_contribution", "representation",
-             "bc_adaptive", "cloner_step_count_only",
-             "Separates knowing which actions were taken from knowing how "
-             "far the episode has progressed."),
     Contrast("maxent_reward_representation_sensitivity", "representation",
              "full", "maxent_raw_state",
-             "Bounds how much of the MaxEnt gap the reward representation "
-             "can account for. All three MaxEnt arms keep the semantic "
-             "fallback, so its separate representation still supplies values "
-             "where exact support is missing.", descriptive=True),
-    Contrast("history_free_family_contrast", "representation", "full",
-             "cloner_state_only",
-             "Model family at matched access to history. A small gap here "
-             "beside a large history contribution locates the difference in "
-             "the representation rather than the learner. The families do "
-             "not carry identical components.", descriptive=True),
+             "What the MaxEnt head loses on the rawest reward representation. "
+             "Both arms keep the semantic fallback, whose separate "
+             "representation still supplies values where exact support is "
+             "missing, so this bounds the reward representation's "
+             "contribution rather than isolating it.", primary=True),
 
     # -- routing: what a method spends when it may teach itself.
     #    The reference is the roster arm, which already ran on the shared
@@ -2596,19 +2516,11 @@ INVARIANTS: Tuple[Invariant, ...] = (
                "symmetric_adaptation", "schedule_warm_on_weight_change",
                "schedule_removals_count_cold"),
               ("semantic_fallback_enabled", "latent_strategy_enabled")),
-    Invariant("adaptive_memory_level_is_internally_consistent", "memory",
-              ("full", "bc_adaptive"), ("memory_policy", "latest_pin_enabled")),
-    Invariant("retain_all_memory_level_is_internally_consistent", "memory",
-              ("maxent_retain_all", "bc"), ("memory_policy", "latest_pin_enabled")),
-    Invariant("maxent_cells_share_predictor_support", "memory",
-              ("full", "maxent_retain_all"), _SUPPORT_FIELDS[1:]),
     Invariant("representation_arms_held_memory_fixed", "representation",
-              ("full", "maxent_semantic", "maxent_raw_state", "bc_adaptive",
-               "cloner_history_1", "cloner_step_count_only", "cloner_state_only"),
+              ("full", "maxent_raw_state"),
               ("memory_policy", "latest_pin_enabled")),
     Invariant("latent_arms_share_the_maxent_head", "latent",
-              ("full", "full_no_latent_residual", "latent_timing_lightweight",
-               "latent_timing_capacity_matched", "latent_timing_trajectory_hybrid"),
+              ("full", "full_no_latent_residual", "latent_timing_lightweight"),
               ("predictor", "semantic_fallback_enabled", "memory_policy")),
 )
 
@@ -3173,19 +3085,17 @@ GROUP_NOTES: Mapping[str, str] = {
         "arm, under Full's predictor support."
     ),
     "latent": (
-        "A 2x2 of residual capacity against partial-trajectory alignment. "
-        "The deployed residual is the low-capacity, alignment-on corner, so "
-        "the shipped system is inside the design rather than beside it."
-    ),
-    "memory": (
-        "A 2x2 crossing the predictor with the retention policy. The "
-        "within-family memory effects and their interaction are "
-        "component-matched; the cross-family predictor effects are not."
+        "Whether the latent residual, and the partial-trajectory alignment "
+        "inside it, earn their place in the shipped configuration. Residual "
+        "capacity is a hyperparameter of the residual rather than a part of "
+        "the memory policy, so it is held at the deployed setting and not "
+        "swept here."
     ),
     "representation": (
-        "What the predictor is allowed to see, with Full's memory policy "
-        "held fixed. MaxEnt arms vary the reward representation; cloner arms "
-        "vary within-episode history down to a state-only condition."
+        "What the MaxEnt head is allowed to see, with Full's memory policy "
+        "held fixed. Model family is not varied -- the behaviour-cloning "
+        "roster is held out -- so this group speaks to the reward "
+        "representation only."
     ),
     "routing": (
         "Teaching burden when a method may request its own re-observations "

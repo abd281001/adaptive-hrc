@@ -14,7 +14,6 @@ from src.ablations import (
     GROUP_METRICS,
     INVARIANTS,
     LOCAL,
-    PUBLISH,
     REPLAY,
     Arm,
     COMMIT_FULL,
@@ -73,7 +72,6 @@ class ArmTableTests(unittest.TestCase):
         """The cross-group duplicates the old suites each recomputed."""
         shared = {arm.name: arm.groups for arm in ARMS if len(arm.groups) > 1}
         self.assertEqual(shared["full_no_latent_residual"], ("components", "latent"))
-        self.assertEqual(shared["bc_adaptive"], ("memory", "representation"))
 
     def test_every_group_declares_exactly_one_primary_contrast(self):
         for group in groups():
@@ -96,21 +94,35 @@ class ArmTableTests(unittest.TestCase):
                     directions.setdefault(metric, direction), direction, metric,
                 )
 
-    def test_the_latent_group_is_a_complete_two_by_two(self):
-        """The deployed residual is a corner of the design, not beside it.
+    def test_the_latent_group_varies_alignment_at_the_deployed_capacity(self):
+        """The group prices alignment, and changes nothing else to do it.
 
-        Capacity x sequence alignment has four cells. 'full' is the shipped
-        one -- low capacity with alignment on -- and it comes from the
-        roster, so completing the design costs no extra run.
+        This used to be a 2x2 of capacity against alignment. Rank and
+        neighbour count are hyperparameters of the residual rather than
+        parts of the memory policy, so the two raised-capacity corners
+        answered no question the paper asks and were dropped. What is left
+        must therefore be a clean single-factor manipulation: whatever the
+        contrast reports has to be attributable to alignment alone.
         """
         from src.models import DEFAULT_SETTINGS as D
 
-        corners = {
-            (arm.facets["capacity"], arm.facets["sequence_alignment"])
-            for arm in ARMS if "latent" in arm.groups and "capacity" in arm.facets
+        declared = [
+            arm for arm in ARMS
+            if "latent" in arm.groups and "capacity" in arm.facets
+        ]
+        self.assertEqual(len(declared), 1)
+        arm = declared[0]
+        self.assertEqual(
+            (arm.facets["capacity"], arm.facets["sequence_alignment"]),
+            ("low", "off"),
+        )
+        # Exactly one setting moves, and it is the alignment weight.
+        moved = {
+            key for key, value in arm.overrides.items()
+            if getattr(D, key) != value
         }
-        self.assertEqual(corners, {("low", "off"), ("high", "off"), ("high", "on")})
-        # The fourth corner is Full as deployed.
+        self.assertEqual(moved, {"latent_strategy_sequence_weight"})
+        # The reference corner is Full as deployed, read from the roster.
         self.assertTrue(D.latent_strategy_enabled)
         self.assertEqual(
             (D.latent_strategy_rank, D.latent_strategy_knn,
@@ -125,7 +137,7 @@ class ArmTableTests(unittest.TestCase):
 
     def test_roster_arms_are_referenced_and_never_declared(self):
         referenced = set(roster_arms(groups()))
-        self.assertEqual(referenced, {"full", "unpinned", "bc", "latest", "fixed"})
+        self.assertEqual(referenced, {"full", "unpinned", "latest", "fixed"})
         self.assertEqual(referenced & set(arms_by_name()), set())
 
 
@@ -251,13 +263,13 @@ class InvariantTests(unittest.TestCase):
 
     def test_arms_that_must_agree_are_checked_against_each_other(self):
         rows = [
-            {"arm": "full", "scenario": "homogeneous", "seed": 1,
-             "memory_policy": "adaptive", "latest_pin_enabled": True},
-            {"arm": "bc_adaptive", "scenario": "homogeneous", "seed": 1,
-             "memory_policy": "none", "latest_pin_enabled": True},
+            {"arm": arm, "scenario": "homogeneous", "seed": 1,
+             "memory_policy": policy, "latest_pin_enabled": True}
+            for arm, policy in (("full", "adaptive"),
+                                ("maxent_raw_state", "none"))
         ]
-        checks = {c["name"]: c for c in check_invariants("memory", rows)}
-        self.assertFalse(checks["adaptive_memory_level_is_internally_consistent"]["holds"])
+        checks = {c["name"]: c for c in check_invariants("representation", rows)}
+        self.assertFalse(checks["representation_arms_held_memory_fixed"]["holds"])
 
 
 class ArmReuseTests(unittest.TestCase):
