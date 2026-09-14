@@ -173,11 +173,15 @@ class FixedLayoutDemoController:
             self.console.execute("heading 0")
 
     def reset_scene_baseline(self):
+        """Capture the current physical scene as the episode baseline.
+
+        Freeform mode does not require boxes to start in S0.  The only
+        requirements are: every configured tagged box is visible exactly
+        once, and no two boxes occupy the same calibrated location.
+        """
         with self._lock:
             if self._stopped:
-                raise RuntimeError(
-                    "controller is stopped"
-                )
+                raise RuntimeError("controller is stopped")
 
             self._busy = True
             self._phase = "scan_reset"
@@ -187,41 +191,20 @@ class FixedLayoutDemoController:
                 scene = self.console.scan_scene()
 
                 by_tag = self._by_tag(scene)
-                expected_tags = set(
-                    self._tag_to_object()
-                )
+                expected_tags = set(self._tag_to_object())
 
                 if set(by_tag) != expected_tags:
                     raise RuntimeError(
-                        "reset scene must contain each configured "
-                        f"box exactly once; got {by_tag}"
+                        "baseline must contain each configured box exactly once; "
+                        f"expected tags {sorted(expected_tags)}, got {by_tag}"
                     )
 
-                occupied_sources = set(
-                    by_tag.values()
-                )
+                occupied_locations = list(by_tag.values())
 
-                if occupied_sources != set(
-                    SOURCE_LOCATIONS
-                ):
+                if len(set(occupied_locations)) != len(occupied_locations):
                     raise RuntimeError(
-                        "episode reset requires the three boxes "
-                        "in the three S0 source locations; "
-                        f"observed {occupied_sources}"
+                        "baseline assigns multiple boxes to one calibrated location"
                     )
-
-                for destination in (
-                    "S2",
-                    "S3",
-                    "S4",
-                ):
-                    if (
-                        scene[destination]["status"]
-                        != "empty"
-                    ):
-                        raise RuntimeError(
-                            f"reset requires {destination} empty"
-                        )
 
                 self._phase = "ready"
 

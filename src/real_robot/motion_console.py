@@ -755,8 +755,9 @@ class MotionConsole:
             "HRC_CAMERA_URL",
             "http://127.0.0.1:9100/v1/camera.jpg",
         )
-        SAMPLES = 9
-        CONSENSUS = 5
+        SAMPLES = 15
+        TAG_CONSENSUS = 4
+        MIN_UNIQUE_FRAMES = 8
 
         # Only a tag reasonably close to the horizontal camera center belongs
         # to the location currently being inspected. Adjacent stations may
@@ -841,7 +842,7 @@ class MotionConsole:
         print("tag1=B1, tag3=B3, tag5=B5")
         print(
             f"{SAMPLES} unique frames/location; "
-            f"{CONSENSUS} matching votes required."
+            f"{TAG_CONSENSUS} consistent tag detections required."
         )
         print("")
 
@@ -892,13 +893,15 @@ class MotionConsole:
                 self.sleep(0.08)
 
             vote_counts = Counter(votes)
-            if vote_counts:
-                winner, winner_count = vote_counts.most_common(1)[0]
-            else:
-                winner, winner_count = None, 0
+
+            tag_counts = Counter(
+                tag_id
+                for tag_id in votes
+                if tag_id is not None
+            )
 
             vote_summary = {
-                ("empty" if key is None else f"tag{key}"): int(count)
+                ("empty/miss" if key is None else f"tag{key}"): int(count)
                 for key, count in vote_counts.items()
             }
 
@@ -907,62 +910,119 @@ class MotionConsole:
                 ordered = sorted(nearest_errors)
                 median_center_error = ordered[len(ordered) // 2]
 
-            if len(votes) < CONSENSUS or winner_count < CONSENSUS:
+            strong_tags = [
+                (tag_id, count)
+                for tag_id, count in tag_counts.items()
+                if count >= TAG_CONSENSUS
+            ]
+            strong_tags.sort(
+                key=lambda item: (-item[1], item[0])
+            )
+
+            if len(votes) < MIN_UNIQUE_FRAMES:
                 row = {
                     "status": "uncertain",
                     "heading_deg": heading,
                     "tag_id": None,
                     "box": None,
                     "samples": len(votes),
-                    "winning_votes": winner_count,
                     "votes": vote_summary,
                     "median_nearest_center_error_frac": median_center_error,
                     "capture_failures": capture_failures[-3:],
                 }
                 scene[location] = row
                 scan_errors.append(
-                    f"{location}: no {CONSENSUS}-frame consensus "
-                    f"({vote_summary})"
+                    f"{location}: only {len(votes)} unique camera frames"
                 )
                 print(
                     f"  {location}: UNCERTAIN "
-                    f"{vote_summary}"
+                    f"(too few unique frames; {vote_summary})"
                 )
                 continue
 
-            if winner is None:
+            if len(strong_tags) > 1:
                 row = {
-                    "status": "empty",
+                    "status": "uncertain",
                     "heading_deg": heading,
                     "tag_id": None,
                     "box": None,
+                    "samples": len(votes),
+                    "votes": vote_summary,
+                    "median_nearest_center_error_frac": median_center_error,
+                }
+                scene[location] = row
+                scan_errors.append(
+                    f"{location}: competing centered tags {strong_tags}"
+                )
+                print(
+                    f"  {location}: UNCERTAIN "
+                    f"(competing tags; {vote_summary})"
+                )
+                continue
+
+            if len(strong_tags) == 1:
+                winner, winner_count = strong_tags[0]
+
+                row = {
+                    "status": "occupied",
+                    "heading_deg": heading,
+                    "tag_id": int(winner),
+                    "box": tag_to_box[int(winner)],
                     "samples": len(votes),
                     "winning_votes": winner_count,
                     "votes": vote_summary,
                     "median_nearest_center_error_frac": median_center_error,
                 }
                 scene[location] = row
+
+                print(
+                    f"  {location}: {row['box']} / tag {winner} "
+                    f"({winner_count}/{len(votes)} centered detections)"
+                )
+                continue
+
+            # Missing a tag in a frame is NOT positive evidence for empty.
+            # Empty is accepted only when there is essentially no repeatable
+            # centered AprilTag evidence.
+            weakest_problem = max(tag_counts.values(), default=0)
+
+            if weakest_problem <= 1:
+                row = {
+                    "status": "empty",
+                    "heading_deg": heading,
+                    "tag_id": None,
+                    "box": None,
+                    "samples": len(votes),
+                    "votes": vote_summary,
+                    "median_nearest_center_error_frac": median_center_error,
+                }
+                scene[location] = row
+
                 print(
                     f"  {location}: EMPTY "
-                    f"({winner_count}/{len(votes)} votes)"
+                    f"({len(votes)} frames; {vote_summary})"
                 )
                 continue
 
             row = {
-                "status": "occupied",
+                "status": "uncertain",
                 "heading_deg": heading,
-                "tag_id": int(winner),
-                "box": tag_to_box[int(winner)],
+                "tag_id": None,
+                "box": None,
                 "samples": len(votes),
-                "winning_votes": winner_count,
                 "votes": vote_summary,
                 "median_nearest_center_error_frac": median_center_error,
             }
             scene[location] = row
 
+            scan_errors.append(
+                f"{location}: repeated but insufficient tag evidence "
+                f"({vote_summary})"
+            )
+
             print(
-                f"  {location}: {row['box']} / tag {winner} "
-                f"({winner_count}/{len(votes)} votes)"
+                f"  {location}: UNCERTAIN "
+                f"(weak repeated evidence; {vote_summary})"
             )
 
         # Finish every successful scanning traversal at canonical HOME.
