@@ -251,6 +251,84 @@ class MotionConsole:
         raise MotionFault(f"{key}: target {target:.4f} not reached and settled; "
                           f"measured {self.pose()[key]:.4f}. Inspect before retrying")
 
+    def macro_move_linear(self, name, key, target):
+        """Continuous arm/lift move for already-qualified macro trajectories."""
+        if name not in ("arm", "lift"):
+            raise ValueError("macro_move_linear supports only arm/lift")
+
+        self.preflight()
+        p = self.pose()
+        current = p[key]
+
+        if abs(target - current) <= 0.001:
+            return
+
+        low, high = self.limits()[key]
+
+        if name == "arm":
+            high = min(high, 0.35)
+        else:
+            low = max(low, self.start[key] - 0.15)
+            high = min(high, self.start[key] + 0.15)
+
+        if not low <= target <= high:
+            raise ValueError(
+                f"Macro target {target:.3f} m outside check limits "
+                f"[{low:.3f}, {high:.3f}]"
+            )
+
+        joint = getattr(self.robot, name)
+
+        # Roughly twice the old calibration-console speed.
+        speed = 0.020
+        accel = 0.040
+        timeout = max(10.0, abs(target - current) / speed + 6.0)
+
+        command_name = f"macro_{name}_to_{target:.3f}"
+
+        self.record(
+            "command",
+            command=command_name,
+            target=target,
+            coordinate=key,
+            before=p,
+            timeout_s=timeout,
+        )
+
+        print(
+            f"Continuous {name} move {current:.3f} -> {target:.3f} m; "
+            "watch clearance and keep runstop at hand.",
+            flush=True,
+        )
+
+        try:
+            joint.move_to(target, v_m=speed, a_m=accel)
+            self.robot.push_command()
+            self.wait_target(
+                key,
+                target,
+                tolerance=0.003,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            try:
+                self.record(
+                    "motion_failed",
+                    command=command_name,
+                    error=str(exc),
+                    pose=self.pose(),
+                )
+            except Exception:
+                pass
+            raise MotionFault(str(exc)) from exc
+
+        self.record(
+            "target_reached",
+            command=command_name,
+            target=target,
+            pose=self.status(),
+        )
+
     def goto_calibrated(self, label):
         """Restore known same-size-box geometry using bounded console moves."""
         valid = {
@@ -274,13 +352,7 @@ class MotionConsole:
         PITCH_BOX_DEG = -16.61
 
         def move_linear(command, key, target):
-            while True:
-                current = self.pose()[key]
-                error_cm = 100.0 * (target - current)
-                if abs(error_cm) <= 0.1:
-                    return
-                step = max(-2.0, min(2.0, error_cm))
-                self.execute(f"{command} {step:.3f}")
+            self.macro_move_linear(command, key, target)
 
         def move_pitch(target_deg):
             while True:
@@ -531,6 +603,118 @@ class MotionConsole:
         print("S4 = +36 deg")
         print("B1 remains at S4.")
 
+    def verify_box_tour(self, box):
+        """Move one box S0 -> S2 -> S3 -> S4 -> its original S0 slot."""
+        source_headings = {
+            "b1": -12.0,
+            "b5": -24.0,
+            "b3": -36.0,
+        }
+        destinations = [
+            ("S2", 12.0),
+            ("S3", 24.0),
+            ("S4", 36.0),
+        ]
+
+        box = box.lower()
+        if box not in source_headings:
+            raise ValueError("Use: tour b1 | tour b5 | tour b3")
+
+        source_heading = source_headings[box]
+
+        def confirm(message):
+            answer = input(
+                message +
+                "\nPress the ENTER KEY to continue; type NO to abort: "
+            ).strip().lower()
+            if answer:
+                raise ValueError("Verification tour aborted by operator")
+
+        def route_to(target):
+            # Always route through heading 0 while carrying.
+            # This avoids a direct +36 <-> -36 sweep.
+            self.goto_calibrated("box_view")
+            self.execute("heading 0")
+            if abs(target) > 0.1:
+                self.execute(f"heading {target}")
+
+        def pickup_here(label):
+            self.move_box_gripper(132.0)
+            self.goto_calibrated("box_pregrasp")
+
+            confirm(
+                f"Inspect {box.upper()} at {label}. "
+                "Gripper should be centered around the marked box."
+            )
+
+            self.move_box_gripper(103.0)
+
+            confirm(
+                f"Confirm {box.upper()} is securely gripped at {label}."
+            )
+
+            self.goto_calibrated("box_carry")
+
+        def place_here(label):
+            # box_return lowers to calibrated placement pose,
+            # releases to 132 units, raises, then retracts.
+            self.goto_calibrated("box_return")
+
+            confirm(
+                f"Verify {box.upper()} is sitting correctly on the "
+                f"{label} taped mark."
+            )
+
+        print("")
+        print(f"=== VERIFY {box.upper()} ===")
+        print(
+            f"S0/{box.upper()} {source_heading:+.0f} -> "
+            "S2 +12 -> S3 +24 -> S4 +36 -> S0"
+        )
+
+        # Initial source pickup.
+        self.goto_calibrated("box_view")
+        self.move_box_gripper(132.0)
+        self.execute(f"heading {source_heading}")
+        pickup_here(f"S0/{box.upper()}")
+
+        # S2, S3, S4.
+        for station, heading in destinations:
+            route_to(heading)
+            place_here(station)
+            pickup_here(station)
+
+        # Return to this box's original source slot.
+        route_to(source_heading)
+        place_here(f"S0/{box.upper()}")
+
+        # Finish every tour in the canonical taped HOME orientation.
+        self.execute("heading 0")
+
+        print(f"=== {box.upper()} TOUR PASSED ===")
+        print(f"{box.upper()} is back at its source mark.")
+
+
+    def verify_all_boxes(self):
+        """Run full station tour for B1, B5, then B3."""
+        for box in ("b1", "b5", "b3"):
+            self.verify_box_tour(box)
+
+            if box != "b3":
+                answer = input(
+                    f"{box.upper()} completed and returned to S0.\n"
+                    "Check all stations are clear. Press ENTER KEY for the "
+                    "next box; type NO to stop: "
+                ).strip().lower()
+                if answer:
+                    raise ValueError("Verification stopped between boxes")
+
+        print("")
+        print("================================")
+        print("ALL THREE BOX TOURS COMPLETED")
+        print("B1, B5 and B3 returned to S0.")
+        print("================================")
+
     def execute(self, raw):
         parts = raw.split()
         if not parts:
@@ -554,6 +738,12 @@ class MotionConsole:
             return
         if name == "markstations" and len(parts) == 1:
             self.mark_stations()
+            return
+        if name == "tour" and len(parts) == 2:
+            self.verify_box_tour(parts[1])
+            return
+        if name == "verifyall" and len(parts) == 1:
+            self.verify_all_boxes()
             return
         if name == "cycle" and len(parts) == 2:
             self.cycle_box(parts[1])
@@ -590,7 +780,7 @@ class MotionConsole:
             if abs(delta) > math.radians(49):
                 raise ValueError("Turn <=48 degrees per command; visit heading 0 between extremes")
             key, tolerance, timeout = "theta_rad", math.radians(1), 25
-            command = lambda: self.robot.base.rotate_by(delta, v_r=0.10, a_r=0.10)
+            command = lambda: self.robot.base.rotate_by(delta, v_r=0.15, a_r=0.15)
         elif name in ("lift", "arm"):
             if not 0 < abs(value) <= 2:
                 raise ValueError("Use a nonzero change of at most 2 cm")
