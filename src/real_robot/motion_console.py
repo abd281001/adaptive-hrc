@@ -29,6 +29,7 @@ HELP = """Enter ONE command at a time and watch the robot:
   close           EMPTY gripper only: close to fingertips touching (0 units)
   grip UNITS      signed gripper change, at most 5 units (+ open, - close)
   note LABEL      record the current measured pose under a label
+  scene           scan all 6 calibrated locations using box AprilTags
   quit            stop SDK; no automatic return or stow (support any object)
   Ctrl+C          request runstop and exit; physical runstop is authoritative
 """
@@ -94,6 +95,7 @@ class MotionConsole:
         self.wrist = {name: robot.end_of_arm.get_joint(name) for name in WRIST_JOINTS}
         self.wrist = {name: joint for name, joint in self.wrist.items() if joint is not None}
         self.clear_pose = None
+        self.last_scene = None
         self.start = self.pose()
         self.stamps = {}
         self.assert_health()
@@ -715,6 +717,354 @@ class MotionConsole:
         print("B1, B5 and B3 returned to S0.")
         print("================================")
 
+    def scan_scene(self):
+        """Scan all calibrated physical locations using AprilTag identity."""
+        from collections import Counter
+        import hashlib
+        from urllib.error import URLError
+        from urllib.request import Request, urlopen
+
+        import cv2
+        import numpy as np
+        from pupil_apriltags import Detector
+
+        if self.clear_pose is None:
+            raise ValueError(
+                "Record the high/retracted box_view clearance before scene scanning"
+            )
+
+        # Identity is fixed. Location is NOT.
+        tag_to_box = {
+            1: "B1",
+            3: "B3",
+            5: "B5",
+        }
+
+        # Fixed calibrated geometry.
+        locations = [
+            ("S0_left",   -12.0),
+            ("S0_center", -24.0),
+            ("S0_right",  -36.0),
+            ("S2",         12.0),
+            ("S3",         24.0),
+            ("S4",         36.0),
+        ]
+
+        CAMERA_URL = "http://127.0.0.1:9100/v1/camera.jpg"
+        SAMPLES = 9
+        CONSENSUS = 5
+
+        # Only a tag reasonably close to the horizontal camera center belongs
+        # to the location currently being inspected. Adjacent stations may
+        # still be visible in the wide camera image.
+        CENTER_GATE_FRAC = 0.13
+
+        april = Detector(
+            families="tagStandard41h12",
+            nthreads=2,
+            quad_decimate=1.0,
+        )
+
+        def one_observation():
+            url = f"{CAMERA_URL}?t={time.time_ns()}"
+            request = Request(
+                url,
+                headers={
+                    "Cache-Control": "no-cache, no-store",
+                    "Pragma": "no-cache",
+                },
+            )
+
+            with urlopen(request, timeout=2.0) as response:
+                raw = response.read()
+
+            digest = hashlib.sha1(raw).hexdigest()
+            frame = cv2.imdecode(
+                np.frombuffer(raw, np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            if frame is None:
+                raise ValueError("camera response was not a decodable JPEG")
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            width = float(frame.shape[1])
+            center_x = width / 2.0
+
+            candidates = []
+            for tag in april.detect(gray, estimate_tag_pose=False):
+                tag_id = int(tag.tag_id)
+                hamming = int(tag.hamming)
+
+                if tag_id not in tag_to_box:
+                    continue
+
+                # B3 was empirically observed at h=0,1,2. Consensus across
+                # fresh images protects against accepting one weak detection.
+                if hamming > 2:
+                    continue
+
+                corners = np.asarray(tag.corners, dtype=float)
+                cx = float(corners[:, 0].mean())
+                dx_frac = abs(cx - center_x) / width
+
+                candidates.append(
+                    (dx_frac, tag_id, hamming, cx)
+                )
+
+            if not candidates:
+                return digest, None, None
+
+            candidates.sort(key=lambda row: row[0])
+            dx_frac, tag_id, hamming, cx = candidates[0]
+
+            detail = {
+                "nearest_tag_id": tag_id,
+                "nearest_box": tag_to_box[tag_id],
+                "nearest_hamming": hamming,
+                "nearest_center_error_frac": dx_frac,
+                "nearest_center_x_px": cx,
+            }
+
+            if dx_frac > CENTER_GATE_FRAC:
+                # We can see a known box, but it is too far off-axis to
+                # claim it occupies this calibrated location.
+                return digest, None, detail
+
+            return digest, tag_id, detail
+
+        print("")
+        print("=== APRILTAG SCENE SCAN ===")
+        print("tag1=B1, tag3=B3, tag5=B5")
+        print(
+            f"{SAMPLES} unique frames/location; "
+            f"{CONSENSUS} matching votes required."
+        )
+        print("")
+
+        # Scanner always uses the qualified high/retracted viewing geometry.
+        self.goto_calibrated("box_view")
+
+        scene = {}
+        scan_errors = []
+
+        for location, heading in locations:
+            print(f"Scanning {location} at {heading:+.0f} deg ...")
+
+            self.execute(f"heading {heading}")
+
+            # Allow the base/camera image to settle after the completed turn.
+            self.sleep(0.40)
+
+            votes = []
+            seen_images = set()
+            nearest_errors = []
+            capture_failures = []
+            deadline = self.clock() + 5.0
+
+            while (
+                len(votes) < SAMPLES
+                and self.clock() < deadline
+            ):
+                try:
+                    digest, candidate, detail = one_observation()
+                except (URLError, TimeoutError, OSError, ValueError) as exc:
+                    capture_failures.append(str(exc))
+                    self.sleep(0.10)
+                    continue
+
+                # Never count the same bridge JPEG twice.
+                if digest in seen_images:
+                    self.sleep(0.08)
+                    continue
+
+                seen_images.add(digest)
+                votes.append(candidate)
+
+                if detail is not None:
+                    nearest_errors.append(
+                        float(detail["nearest_center_error_frac"])
+                    )
+
+                self.sleep(0.08)
+
+            vote_counts = Counter(votes)
+            if vote_counts:
+                winner, winner_count = vote_counts.most_common(1)[0]
+            else:
+                winner, winner_count = None, 0
+
+            vote_summary = {
+                ("empty" if key is None else f"tag{key}"): int(count)
+                for key, count in vote_counts.items()
+            }
+
+            median_center_error = None
+            if nearest_errors:
+                ordered = sorted(nearest_errors)
+                median_center_error = ordered[len(ordered) // 2]
+
+            if len(votes) < CONSENSUS or winner_count < CONSENSUS:
+                row = {
+                    "status": "uncertain",
+                    "heading_deg": heading,
+                    "tag_id": None,
+                    "box": None,
+                    "samples": len(votes),
+                    "winning_votes": winner_count,
+                    "votes": vote_summary,
+                    "median_nearest_center_error_frac": median_center_error,
+                    "capture_failures": capture_failures[-3:],
+                }
+                scene[location] = row
+                scan_errors.append(
+                    f"{location}: no {CONSENSUS}-frame consensus "
+                    f"({vote_summary})"
+                )
+                print(
+                    f"  {location}: UNCERTAIN "
+                    f"{vote_summary}"
+                )
+                continue
+
+            if winner is None:
+                row = {
+                    "status": "empty",
+                    "heading_deg": heading,
+                    "tag_id": None,
+                    "box": None,
+                    "samples": len(votes),
+                    "winning_votes": winner_count,
+                    "votes": vote_summary,
+                    "median_nearest_center_error_frac": median_center_error,
+                }
+                scene[location] = row
+                print(
+                    f"  {location}: EMPTY "
+                    f"({winner_count}/{len(votes)} votes)"
+                )
+                continue
+
+            row = {
+                "status": "occupied",
+                "heading_deg": heading,
+                "tag_id": int(winner),
+                "box": tag_to_box[int(winner)],
+                "samples": len(votes),
+                "winning_votes": winner_count,
+                "votes": vote_summary,
+                "median_nearest_center_error_frac": median_center_error,
+            }
+            scene[location] = row
+
+            print(
+                f"  {location}: {row['box']} / tag {winner} "
+                f"({winner_count}/{len(votes)} votes)"
+            )
+
+        # Finish every successful scanning traversal at canonical HOME.
+        self.execute("heading 0")
+
+        # A valid scene must contain every physical demo box exactly once.
+        locations_by_tag = {tag_id: [] for tag_id in tag_to_box}
+        for location, row in scene.items():
+            tag_id = row.get("tag_id")
+            if tag_id in locations_by_tag:
+                locations_by_tag[tag_id].append(location)
+
+        for tag_id, occupied_locations in locations_by_tag.items():
+            box = tag_to_box[tag_id]
+            if len(occupied_locations) == 0:
+                scan_errors.append(
+                    f"{box}/tag{tag_id} was not assigned to any location"
+                )
+            elif len(occupied_locations) > 1:
+                scan_errors.append(
+                    f"{box}/tag{tag_id} was assigned to multiple locations: "
+                    f"{occupied_locations}"
+                )
+
+        valid = not scan_errors
+
+        self.record(
+            "scene_scan",
+            valid=valid,
+            scene=scene,
+            errors=scan_errors,
+        )
+
+        print("")
+        print("SCENE")
+        for location, _heading in locations:
+            row = scene[location]
+            if row["status"] == "occupied":
+                value = f"{row['box']} / tag {row['tag_id']}"
+            else:
+                value = row["status"].upper()
+            print(f"  {location:10s}: {value}")
+
+        if not valid:
+            print("")
+            print("SCAN REJECTED:")
+            for error in scan_errors:
+                print(f"  - {error}")
+            raise ValueError(
+                "Scene scan ambiguous; previous valid scene was not changed"
+            )
+
+        # Compare only two fully validated scenes.
+        previous = self.last_scene
+        if previous is not None:
+            def by_tag(value):
+                result = {}
+                for location, row in value.items():
+                    tag_id = row.get("tag_id")
+                    if tag_id in tag_to_box:
+                        result[int(tag_id)] = location
+                return result
+
+            before = by_tag(previous)
+            after = by_tag(scene)
+
+            moves = []
+            for tag_id in sorted(tag_to_box):
+                if before[tag_id] != after[tag_id]:
+                    moves.append({
+                        "tag_id": tag_id,
+                        "box": tag_to_box[tag_id],
+                        "from": before[tag_id],
+                        "to": after[tag_id],
+                    })
+
+            print("")
+            if len(moves) == 1:
+                move = moves[0]
+                print("DETECTED HUMAN MOVE")
+                print(
+                    f"  {move['box']} / tag {move['tag_id']}: "
+                    f"{move['from']} -> {move['to']}"
+                )
+            elif len(moves) == 0:
+                print("SCENE DELTA: no box moved.")
+            else:
+                print("SCENE DELTA: multiple boxes changed:")
+                for move in moves:
+                    print(
+                        f"  {move['box']} / tag {move['tag_id']}: "
+                        f"{move['from']} -> {move['to']}"
+                    )
+
+            self.record(
+                "scene_delta",
+                moves=moves,
+            )
+        else:
+            print("")
+            print("Baseline scene stored.")
+
+        self.last_scene = scene
+        return scene
+
+
     def execute(self, raw):
         parts = raw.split()
         if not parts:
@@ -733,6 +1083,9 @@ class MotionConsole:
             return
         if self.read_only:
             raise ValueError("This connection is read-only")
+        if name == "scene" and len(parts) == 1:
+            self.scan_scene()
+            return
         if name == "goto" and len(parts) == 2:
             self.goto_calibrated(parts[1].lower())
             return
