@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from importlib.metadata import version
 import json
 import math
+import os
 from pathlib import Path
 import signal
 import sys
@@ -750,7 +751,10 @@ class MotionConsole:
             ("S4",         36.0),
         ]
 
-        CAMERA_URL = "http://127.0.0.1:9100/v1/camera.jpg"
+        CAMERA_URL = os.environ.get(
+            "HRC_CAMERA_URL",
+            "http://127.0.0.1:9100/v1/camera.jpg",
+        )
         SAMPLES = 9
         CONSENSUS = 5
 

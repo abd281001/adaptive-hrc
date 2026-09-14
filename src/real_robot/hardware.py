@@ -187,6 +187,22 @@ class HttpStretchExecutor:
             raise RuntimeError("bridge is in calibration mode and cannot run the experiment UI")
         return status
 
+    def reset_scene_baseline(self) -> Mapping[str, Any]:
+        return dict(self._request(
+            "POST",
+            "/v1/scene-reset",
+            {},
+            timeout_s=90.0,
+        ))
+
+    def observe_human_move(self) -> Mapping[str, Any]:
+        return dict(self._request(
+            "POST",
+            "/v1/observe-human",
+            {},
+            timeout_s=90.0,
+        ))
+
     def execute(self, action: ActionSpec, *, execution_id: str, placement_slot_id: str, config_digest: str) -> ExecutionResult:
         started_wall = time.time()
         started_monotonic = time.monotonic()

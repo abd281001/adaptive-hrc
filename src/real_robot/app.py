@@ -363,6 +363,8 @@ class OperatorHandler(BaseHTTPRequestHandler):
                 result = self.server.session.record_human_action(
                     str(body.get("action", "")), physical_completed=body["physical_completed"],
                 )
+            elif path == "/api/human-observe":
+                result = self.server.session.observe_human_move()
             elif path == "/api/robot/approve":
                 if not isinstance(body.get("human_clear"), bool):
                     raise SessionStateError("human_clear must be a JSON boolean")

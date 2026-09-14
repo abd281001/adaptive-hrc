@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlsplit
 
 from .config import ActionSpec, LabConfig, load_lab_config
 from .stretch_hardware import BridgeDryRunController, StretchHardwareController
+from .fixed_layout_controller import FixedLayoutDemoController
 
 
 TERMINAL_STATUSES = {"completed", "failed", "stopped", "reconciled_after_restart"}
@@ -253,6 +254,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
         try:
+            if path == "/v1/scene-reset":
+                if self.server.ledger.status().get("active_execution_id") is not None:
+                    raise BridgeConflict("cannot scan scene while a robot execution is active")
+                method = getattr(self.server.controller, "reset_scene_baseline", None)
+                if method is None:
+                    raise ValueError("controller does not support scene reset")
+                self._json(HTTPStatus.OK, dict(method()))
+                return
+
+            if path == "/v1/observe-human":
+                if self.server.ledger.status().get("active_execution_id") is not None:
+                    raise BridgeConflict("cannot observe human move while robot is executing")
+                method = getattr(self.server.controller, "observe_human_move", None)
+                if method is None:
+                    raise ValueError("controller does not support human observation")
+                self._json(HTTPStatus.OK, dict(method()))
+                return
+
             if path == "/v1/emergency-stop":
                 self._json(HTTPStatus.OK, dict(self.server.controller.emergency_stop()))
                 return
@@ -302,6 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-motion", action="store_true")
     parser.add_argument("--camera-preview", action="store_true", help="Open the D405 in dry-run mode; robot actions remain simulated")
     parser.add_argument("--calibration-mode", action="store_true", help="Permit supervised single-action probes with an uncalibrated config")
+    parser.add_argument("--fixed-layout-demo", action="store_true", help="Use the calibrated three-box fixed-layout HRC controller")
     parser.add_argument("--confirm-start-station", default="")
     parser.add_argument("--acknowledge-reconciled", action="append", default=[])
     parser.add_argument("--allow-remote-hardware-api", action="store_true")
@@ -317,6 +337,10 @@ def main(argv: list[str] | None = None) -> int:
     config = load_lab_config(args.config)
     if args.calibration_mode and not args.enable_motion:
         raise SystemExit("--calibration-mode requires --enable-motion")
+    if args.fixed_layout_demo and not args.enable_motion:
+        raise SystemExit("--fixed-layout-demo requires --enable-motion")
+    if args.fixed_layout_demo and args.calibration_mode:
+        raise SystemExit("--fixed-layout-demo and --calibration-mode are mutually exclusive")
     state_dir = Path(args.state_dir)
     # A path cleanup must not hide an existing execution ledger or its lock.
     relocated_root = Path("src/real_robot/real_robot_bridge_state").resolve()
@@ -338,13 +362,22 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 f"unresolved executions require scene/pose inspection and --acknowledge-reconciled for each ID: {unresolved}"
             )
-        controller = (
-            StretchHardwareController(
-                config, confirmed_start_station=args.confirm_start_station,
+        if args.fixed_layout_demo:
+            controller = FixedLayoutDemoController(
+                config,
+                confirmed_start_station=args.confirm_start_station,
+            )
+        elif args.enable_motion:
+            controller = StretchHardwareController(
+                config,
+                confirmed_start_station=args.confirm_start_station,
                 calibration_mode=args.calibration_mode,
             )
-            if args.enable_motion else BridgeDryRunController(config, camera_preview=args.camera_preview)
-        )
+        else:
+            controller = BridgeDryRunController(
+                config,
+                camera_preview=args.camera_preview,
+            )
         try:
             server = BridgeServer((args.bind, args.port), controller, config, ledger)
         except BaseException:
