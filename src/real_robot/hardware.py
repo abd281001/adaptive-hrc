@@ -249,6 +249,174 @@ class HttpStretchExecutor:
             "bridge": self.base_url, "restart_required": True,
         }, time.monotonic() - started_monotonic)
 
+    def execute_freeform(
+        self,
+        token: str,
+        *,
+        execution_id: str,
+        config_digest: str,
+    ) -> ExecutionResult:
+        token = str(token).strip().upper()
+        started_wall = time.time()
+        started_monotonic = time.monotonic()
+        deadline = started_monotonic + self.timeout_s
+
+        payload = {
+            "execution_id": execution_id,
+            "config_digest": config_digest,
+            "token": token,
+            "freeform": True,
+        }
+
+        structured_failure: Mapping[str, Any] | None = None
+
+        try:
+            response = self._request(
+                "POST",
+                "/v1/executions",
+                payload,
+                timeout_s=min(
+                    3.0,
+                    max(
+                        0.1,
+                        deadline - time.monotonic(),
+                    ),
+                ),
+            )
+            if response.get("status") in {
+                "conflict",
+                "invalid_request",
+                "bridge_error",
+            }:
+                structured_failure = response
+
+        except BridgeHttpError as exc:
+            structured_failure = exc.payload
+
+        except Exception:
+            # Submission may have reached the bridge.
+            # Never resubmit with a different execution ID.
+            pass
+
+        if structured_failure is not None:
+            return ExecutionResult(
+                False,
+                str(
+                    structured_failure.get(
+                        "status",
+                        "bridge_error",
+                    )
+                ),
+                str(
+                    structured_failure.get(
+                        "message",
+                        "bridge rejected execution",
+                    )
+                ),
+                started_wall,
+                time.time(),
+                dict(structured_failure),
+                time.monotonic() - started_monotonic,
+            )
+
+        last_error = "execution status unavailable"
+        path = (
+            f"/v1/executions/"
+            f"{quote(execution_id, safe='')}"
+        )
+
+        while time.monotonic() < deadline:
+            try:
+                row = self._request(
+                    "GET",
+                    path,
+                    timeout_s=min(
+                        2.0,
+                        max(
+                            0.1,
+                            deadline - time.monotonic(),
+                        ),
+                    ),
+                )
+
+                status = str(
+                    row.get("status", "unknown")
+                )
+
+                if status in {
+                    "completed",
+                    "failed",
+                    "stopped",
+                    "reconciled_after_restart",
+                }:
+                    success = (
+                        bool(row.get("success", False))
+                        and status == "completed"
+                    )
+
+                    duration = row.get("elapsed_s")
+
+                    return ExecutionResult(
+                        success,
+                        status,
+                        str(
+                            row.get(
+                                "message",
+                                status,
+                            )
+                        ),
+                        started_wall,
+                        time.time(),
+                        dict(row),
+                        (
+                            float(duration)
+                            if duration is not None
+                            else (
+                                time.monotonic()
+                                - started_monotonic
+                            )
+                        ),
+                    )
+
+                last_error = (
+                    f"bridge reports {status}"
+                )
+
+            except BridgeHttpError as exc:
+                last_error = str(exc)
+
+            except Exception as exc:
+                last_error = str(exc)
+
+            time.sleep(
+                min(
+                    0.20,
+                    max(
+                        0.0,
+                        deadline - time.monotonic(),
+                    ),
+                )
+            )
+
+        return ExecutionResult(
+            False,
+            "execution_unknown",
+            (
+                "action deadline expired; "
+                f"{last_error}. Inspect bridge ledger and "
+                "physical scene; do not execute again."
+            ),
+            started_wall,
+            time.time(),
+            {
+                "execution_id": execution_id,
+                "action": token,
+                "bridge": self.base_url,
+                "restart_required": True,
+            },
+            time.monotonic() - started_monotonic,
+        )
+
     def status(self) -> Mapping[str, Any]:
         with self._status_lock:
             status = dict(self._status_cache)

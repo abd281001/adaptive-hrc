@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Adaptive-HRC Freeform Physical Demo</title>
+<style>
+:root { color-scheme: dark; font-family: system-ui,sans-serif; }
+body { max-width:980px; margin:auto; padding:24px; background:#111827; color:#f3f4f6; }
+.panel { border:1px solid #374151; border-radius:12px; padding:18px; margin:14px 0; background:#1f2937; }
+.row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+button { padding:12px 16px; border:0; border-radius:8px; cursor:pointer; font-weight:650; }
+.action { background:#2563eb; color:white; }
+.approve { background:#059669; color:white; }
+.correct { background:#d97706; color:white; }
+.danger { background:#dc2626; color:white; }
+.secondary { background:#4b5563; color:white; }
+button:disabled { opacity:.45; cursor:not-allowed; }
+.status { font-size:1.25rem; font-weight:700; }
+.warning { color:#fbbf24; }
+.error { color:#fca5a5; white-space:pre-wrap; }
+.token { font-family:ui-monospace,monospace; background:#111827; padding:3px 7px; border-radius:5px; }
+#camera { display:none; width:100%; max-height:480px; object-fit:contain; border-radius:8px; }
+</style>
+</head>
+<body>
+<h1>Adaptive-HRC — Freeform Physical Demo</h1>
+<div class="warning">Physical runstop remains authoritative.</div>
+<div id="message" class="error"></div>
+
+<section class="panel">
+  <div class="row">
+    <span id="phase" class="status">Loading…</span>
+    <span id="backend"></span>
+  </div>
+  <p id="episode"></p>
+  <p id="locations"></p>
+</section>
+
+<section class="panel">
+  <h2>Controls</h2>
+  <div id="controls"></div>
+</section>
+
+<section class="panel">
+  <h2>Wrist camera</h2>
+  <img id="camera" alt="Latest D405 frame">
+  <div id="cameraStatus">Camera preview unavailable.</div>
+</section>
+
+<section class="panel">
+  <h2>Observed / executed actions</h2>
+  <div id="completed">None</div>
+</section>
+
+<section class="panel">
+  <div class="row">
+    <button class="danger"
+      onclick="post('/api/emergency-stop',{})">
+      Emergency stop
+    </button>
+    <button class="secondary"
+      onclick="post('/api/episode/abort',{})">
+      Abort episode
+    </button>
+  </div>
+</section>
+
+<script>
+let cfg = null;
+let state = null;
+let lastSignature = '';
+let operatorToken =
+  sessionStorage.getItem('hrcOperatorToken') || '';
+
+if (!operatorToken) {
+  operatorToken =
+    prompt('Enter operator token printed by the HRC process:') || '';
+  sessionStorage.setItem('hrcOperatorToken', operatorToken);
+}
+
+const esc = value => String(value).replace(
+  /[&<>"']/g,
+  c => ({
+    '&':'&amp;',
+    '<':'&lt;',
+    '>':'&gt;',
+    '"':'&quot;',
+    "'":'&#39;'
+  }[c])
+);
+
+const label = token =>
+  cfg?.actions?.[token]?.label || token;
+
+function button(text, cls, handler, disabled=false) {
+  return `<button class="${cls}" ${disabled?'disabled':''}
+    onclick="${handler}">${esc(text)}</button>`;
+}
+
+async function post(path, payload) {
+  document.getElementById('message').textContent = '';
+  try {
+    const response = await fetch(path, {
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        'X-HRC-Operator-Token':operatorToken
+      },
+      body:JSON.stringify(payload)
+    });
+    const body = await response.json();
+    if (!response.ok)
+      throw new Error(body.error || `HTTP ${response.status}`);
+    state = body;
+    render();
+  } catch (error) {
+    document.getElementById('message').textContent = error.message;
+  }
+}
+
+function start(mode) {
+  const reset = document.getElementById('propsReset');
+  post('/api/freeform/start', {
+    mode,
+    props_reset: !!reset?.checked
+  });
+}
+
+function endEpisode() {
+  post('/api/freeform/end', {});
+}
+
+function render() {
+  if (!state || !cfg) return;
+
+  const hw = state.hardware || {};
+
+  document.getElementById('phase').textContent =
+    state.phase.replaceAll('_',' ').toUpperCase();
+
+  document.getElementById('backend').textContent =
+    `${hw.backend || 'hardware'} · ` +
+    `${hw.motion_enabled ? 'LIVE MOTION' : 'DRY RUN'} · ` +
+    `${hw.ready ? 'ready' : 'NOT READY'}`;
+
+  document.getElementById('episode').textContent =
+    state.mode
+      ? `${state.mode.toUpperCase()} · ${state.completed.length} actions so far · open-ended`
+      : `No active episode · learned recipes: ${state.known_recipe_count || 0}`;
+
+  const loc = state.locations || {};
+  document.getElementById('locations').textContent =
+    Object.entries(loc)
+      .map(([box, place]) => `${box.toUpperCase()}: ${place}`)
+      .join(' · ');
+
+  document.getElementById('completed').innerHTML =
+    state.completed.length
+      ? state.completed
+          .map(x => `<span class="token">${esc(label(x))}</span>`)
+          .join(' → ')
+      : 'None';
+
+  const signature = JSON.stringify([
+    state.phase,
+    state.mode,
+    state.pending_prediction,
+    state.completed,
+    state.error,
+    state.can_start_assist,
+    state.can_end,
+    hw.ready
+  ]);
+
+  if (signature === lastSignature) return;
+  lastSignature = signature;
+
+  let html = '';
+
+  if (state.phase === 'idle' || state.phase === 'complete') {
+    html += `
+      <label>
+        <input id="propsReset" type="checkbox">
+        I verified all three tagged boxes are in the three S0 source marks
+        and S2/S3/S4 are empty.
+      </label>
+      <p>
+        No recipe ID, preference ID, or condition is supplied to the learner.
+        The learner classifies the demonstrated sequence when you end it.
+      </p>
+      <div class="row">
+        ${button(
+          'Start Demonstration',
+          'action',
+          `start('observe')`
+        )}
+        ${button(
+          'Start Assist',
+          'approve',
+          `start('assist')`,
+          !state.can_start_assist
+        )}
+      </div>
+    `;
+
+    if (state.last_match) {
+      html += `<p>
+        Last internal classification:
+        <span class="token">${esc(state.last_match.kind)}</span>
+        / ${esc(state.last_match.recipe_id || 'none')}
+      </p>`;
+    }
+
+  } else if (state.phase === 'human_turn') {
+    html += `
+      <p>
+        Human performs exactly one physical box move.
+        The AprilTag scene change determines the action.
+      </p>
+      <div class="row">
+        ${button(
+          'Observe completed human move',
+          'action',
+          `post('/api/human-observe',{})`
+        )}
+        ${state.can_end
+          ? button(
+              state.mode === 'observe'
+                ? 'End Demonstration'
+                : 'End Assist Episode',
+              'secondary',
+              'endEpisode()'
+            )
+          : ''}
+      </div>
+    `;
+
+  } else if (state.phase === 'robot_proposal') {
+    const token = state.pending_prediction;
+
+    html += `
+      <p>
+        Robot proposes:
+        <strong>${esc(label(token))}</strong>
+      </p>
+      <label>
+        <input id="humanClear" type="checkbox">
+        Participant, operator and bystanders are outside the swept volume.
+      </label>
+      <div class="row">
+        ${button(
+          'Approve and execute',
+          'approve',
+          `post('/api/robot/approve',{
+            human_clear:document.getElementById('humanClear').checked
+          })`
+        )}
+        ${button(
+          'Observe human correction',
+          'correct',
+          `post('/api/human-observe',{})`
+        )}
+        ${state.can_end
+          ? button(
+              'End Assist Episode',
+              'secondary',
+              'endEpisode()'
+            )
+          : ''}
+      </div>
+      <p>
+        If the proposal is wrong, the human performs exactly one preferred
+        physical move first, then click Observe human correction.
+      </p>
+    `;
+
+  } else if (state.phase === 'correction_required') {
+    html += `
+      <p>
+        No executable robot proposal is available.
+        The human may perform one physical move and have it observed.
+      </p>
+      <div class="row">
+        ${button(
+          'Observe human move',
+          'correct',
+          `post('/api/human-observe',{})`
+        )}
+        ${state.can_end
+          ? button(
+              'End Assist Episode',
+              'secondary',
+              'endEpisode()'
+            )
+          : ''}
+      </div>
+    `;
+
+  } else if (state.phase === 'robot_executing') {
+    html += `
+      <p>
+        Robot executing
+        <strong>${esc(label(state.pending_prediction))}</strong>.
+        Keep the physical runstop in reach.
+      </p>
+    `;
+
+  } else if (state.phase === 'execution_failed') {
+    html += `
+      <p class="error">
+        ${esc(state.error || 'Hardware/protocol failure')}
+      </p>
+      <p>
+        Do not continue this episode. Inspect the physical scene,
+        abort, reset and restart the live bridge if required.
+      </p>
+    `;
+
+  } else if (state.phase === 'reconciliation_required') {
+    html += `
+      <p class="error">
+        Ambiguous robot execution:
+        ${esc(state.error || '')}
+      </p>
+      <label>
+        <input id="sceneVerified" type="checkbox">
+        I inspected the bridge ledger, robot pose, gripper,
+        box and destination.
+      </label>
+      <div class="row">
+        ${button(
+          'Verified completed — commit only',
+          'correct',
+          `post('/api/robot/reconcile',{
+            execution_completed:true,
+            physical_scene_verified:
+              document.getElementById('sceneVerified').checked
+          })`
+        )}
+        ${button(
+          'Verified not completed — fail',
+          'danger',
+          `post('/api/robot/reconcile',{
+            execution_completed:false,
+            physical_scene_verified:
+              document.getElementById('sceneVerified').checked
+          })`
+        )}
+      </div>
+    `;
+
+  } else if (state.phase === 'emergency_stopped') {
+    html += `
+      <p class="error">
+        Emergency stop requested. Abort and reinitialize hardware
+        before continuing.
+      </p>
+    `;
+  }
+
+  document.getElementById('controls').innerHTML = html;
+}
+
+async function refresh() {
+  try {
+    const options = {
+      cache:'no-store',
+      headers:{
+        'X-HRC-Operator-Token':operatorToken
+      }
+    };
+
+    if (!cfg)
+      cfg = await (await fetch('/api/config', options)).json();
+
+    state = await (await fetch('/api/state', options)).json();
+    render();
+
+  } catch (error) {
+    document.getElementById('message').textContent =
+      `Connection error: ${error.message}`;
+  }
+}
+
+function refreshCamera() {
+  const image = document.getElementById('camera');
+
+  image.onload = () => {
+    image.style.display = 'block';
+    document.getElementById('cameraStatus').textContent = '';
+  };
+
+  image.onerror = () => {
+    image.style.display = 'none';
+    document.getElementById('cameraStatus').textContent =
+      'Camera preview unavailable.';
+  };
+
+  image.src =
+    `/api/camera.jpg?t=${Date.now()}&token=${encodeURIComponent(operatorToken)}`;
+}
+
+refresh();
+setInterval(refresh, 750);
+setInterval(refreshCamera, 1000);
+</script>
+</body>
+</html>

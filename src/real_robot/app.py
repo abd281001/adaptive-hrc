@@ -24,9 +24,11 @@ from src.models import Settings
 
 from .config import LabConfig, load_lab_config
 from .domain import PhysicalTaskDomain
+from .freeform_domain import FreeformPhysicalDomain
 from .hardware import DryRunExecutor, HttpStretchExecutor
 from .schedule import StudySchedule, load_study_schedule
 from .session import LiveHrcSession, SessionStateError
+from .freeform_session import FreeformLiveHrcSession
 
 
 class EventJournal:
@@ -292,7 +294,12 @@ class OperatorHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/":
-            body = Path(__file__).with_name("operator.html").read_bytes()
+            operator_page = (
+                "freeform_operator.html"
+                if getattr(self.server.session, "protocol", "") == "freeform_physical"
+                else "operator.html"
+            )
+            body = Path(__file__).with_name(operator_page).read_bytes()
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -320,17 +327,48 @@ class OperatorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/config":
             config = self.server.lab_config
+            freeform = (
+                getattr(self.server.session, "protocol", "")
+                == "freeform_physical"
+            )
+
+            if freeform:
+                domain = self.server.session.domain
+                actions = {
+                    token: {
+                        "label": domain.action_label(token),
+                        "role": domain.action_role(token),
+                    }
+                    for token in domain.actions
+                }
+            else:
+                actions = {
+                    key: {
+                        "label": action.label,
+                        "role": action.role,
+                    }
+                    for key, action in config.actions.items()
+                }
+
             self._json(HTTPStatus.OK, {
+                "protocol": (
+                    "freeform_physical"
+                    if freeform
+                    else "recipe"
+                ),
                 "recipes": {
-                    key: {"label": recipe.label, "actions": list(recipe.actions)}
+                    key: {
+                        "label": recipe.label,
+                        "actions": list(recipe.actions),
+                    }
                     for key, recipe in config.recipes.items()
                 },
-                "actions": {
-                    key: {"label": action.label, "role": action.role}
-                    for key, action in config.actions.items()
-                },
+                "actions": actions,
                 "stations": {
-                    key: {"label": station.label, "heading_deg": station.heading_deg}
+                    key: {
+                        "label": station.label,
+                        "heading_deg": station.heading_deg,
+                    }
                     for key, station in config.stations.items()
                 },
                 "placement_slots": {
@@ -349,7 +387,20 @@ class OperatorHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         try:
             body = self._body()
-            if path == "/api/episode/start":
+            if path == "/api/freeform/start":
+                if getattr(self.server.session, "protocol", "") != "freeform_physical":
+                    raise SessionStateError("freeform protocol is not active")
+                if not isinstance(body.get("props_reset"), bool):
+                    raise SessionStateError("props_reset must be a JSON boolean")
+                result = self.server.session.start_episode(
+                    str(body.get("mode", "")),
+                    props_reset=body["props_reset"],
+                )
+            elif path == "/api/freeform/end":
+                if getattr(self.server.session, "protocol", "") != "freeform_physical":
+                    raise SessionStateError("freeform protocol is not active")
+                result = self.server.session.end_episode()
+            elif path == "/api/episode/start":
                 if not isinstance(body.get("props_reset"), bool):
                     raise SessionStateError("props_reset must be a JSON boolean")
                 result = self.server.session.start_episode(
@@ -418,12 +469,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-checkpoint", default="", help="Trusted local action-level checkpoint.pkl")
     parser.add_argument("--schedule", default="", help="Frozen participant-specific study schedule JSON")
     parser.add_argument("--publication-run", action="store_true", help="Require live calibrated hardware, a frozen schedule, and a clean identified revision")
+    parser.add_argument("--freeform-physical", action="store_true", help="Run open-ended marker-observed physical HRC without external recipe/preference labels")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = load_lab_config(args.config)
+
+    if args.freeform_physical:
+        if args.schedule:
+            raise SystemExit("--freeform-physical does not take --schedule")
+        if args.resume_checkpoint:
+            raise SystemExit("--freeform-physical resume is not enabled yet")
+        if args.publication_run:
+            raise SystemExit(
+                "qualify freeform physical mode first; do not combine it with --publication-run yet"
+            )
+        if not args.hardware_url:
+            raise SystemExit("--freeform-physical requires --hardware-url")
+
     schedule = load_study_schedule(args.schedule, config) if args.schedule else None
     if args.publication_run:
         if not args.require_motion:
@@ -445,7 +510,11 @@ def main(argv: list[str] | None = None) -> int:
         agent, observed, session_state = _load_checkpoint_full(Path(args.resume_checkpoint), config)
         domain = agent.domain
     else:
-        domain = PhysicalTaskDomain(config)
+        domain = (
+            FreeformPhysicalDomain(config)
+            if args.freeform_physical
+            else PhysicalTaskDomain(config)
+        )
         agent = AdaptiveAgent(settings=_settings(config), domain=domain)
     executor = (
         HttpStretchExecutor(
@@ -470,14 +539,24 @@ def main(argv: list[str] | None = None) -> int:
         schedule=schedule,
         publication_run=args.publication_run,
     )
-    session = LiveHrcSession(
-        agent, domain, config, executor, event_sink=journal.append,
-        schedule=schedule,
-    )
-    session.restore_observed_recipes(observed)
+    if args.freeform_physical:
+        session = FreeformLiveHrcSession(
+            agent,
+            domain,
+            config,
+            executor,
+            event_sink=journal.append,
+        )
+    else:
+        session = LiveHrcSession(
+            agent, domain, config, executor, event_sink=journal.append,
+            schedule=schedule,
+        )
+        session.restore_observed_recipes(observed)
+        if session_state is not None:
+            session.restore_checkpoint_state(session_state)
+
     journal.bind(agent, session)
-    if session_state is not None:
-        session.restore_checkpoint_state(session_state)
     token = args.operator_token or secrets.token_urlsafe(18)
     server = OperatorServer((args.bind, args.port), session, config, token)
     print(f"Operator UI: http://{args.bind}:{args.port}")

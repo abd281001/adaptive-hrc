@@ -1,17 +1,13 @@
-"""Live fixed-layout controller for the calibrated three-box HRC demo.
-
-Box identity is AprilTag-based and dynamic.
-Only physical location geometry is fixed.
-"""
+"""Calibrated fixed-layout controller with marker-observed dynamic identity."""
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Any, Mapping
 from urllib.request import urlopen
-import os
 
-from .motion_console import MotionConsole, MotionFault, request_stop
+from .motion_console import MotionConsole, request_stop
 
 
 LOCATION_HEADINGS = {
@@ -23,17 +19,40 @@ LOCATION_HEADINGS = {
     "S4": 36.0,
 }
 
-SOURCE_LOCATIONS = {"S0_left", "S0_center", "S0_right"}
-DESTINATIONS = {"S2", "S3", "S4"}
+SOURCE_LOCATIONS = (
+    "S0_left",
+    "S0_center",
+    "S0_right",
+)
+
+TOKEN_TO_LOCATION = {
+    "S0_LEFT": "S0_left",
+    "S0_CENTER": "S0_center",
+    "S0_RIGHT": "S0_right",
+    "S2": "S2",
+    "S3": "S3",
+    "S4": "S4",
+}
+
+LOCATION_TO_TOKEN = {
+    value: key
+    for key, value in TOKEN_TO_LOCATION.items()
+}
 
 
 class FixedLayoutDemoController:
-    """Marker-observed source selection + calibrated fixed-layout motion."""
+    """AprilTag identity + calibrated physical location execution."""
 
-    def __init__(self, config, *, confirmed_start_station: str):
+    def __init__(
+        self,
+        config,
+        *,
+        confirmed_start_station: str,
+    ):
         if confirmed_start_station != config.home_station:
             raise RuntimeError(
-                f"--confirm-start-station must be {config.home_station!r}"
+                "--confirm-start-station must be "
+                f"{config.home_station!r}"
             )
 
         self.config = config
@@ -49,16 +68,23 @@ class FixedLayoutDemoController:
 
         self.robot = Robot()
         if not self.robot.startup():
-            raise RuntimeError("could not connect to Stretch hardware")
+            raise RuntimeError(
+                "could not connect to Stretch hardware"
+            )
 
         try:
             if not self.robot.is_homed():
                 raise RuntimeError(
-                    "Stretch is not homed; use the normal supervised homing procedure"
+                    "Stretch is not homed"
                 )
 
-            if self.robot.pimu.status.get("runstop_event", True):
-                raise RuntimeError("Stretch runstop is active")
+            if self.robot.pimu.status.get(
+                "runstop_event",
+                True,
+            ):
+                raise RuntimeError(
+                    "Stretch runstop is active"
+                )
 
             self.console = MotionConsole(
                 self.robot,
@@ -68,15 +94,19 @@ class FixedLayoutDemoController:
             self.console.ready()
 
             self._bootstrap_box_view()
-
             self._phase = "ready"
+
         except Exception:
             try:
                 self.robot.stop()
             finally:
                 raise
 
-    def _motion_record(self, event, **data):
+    def _motion_record(
+        self,
+        event,
+        **data,
+    ):
         self._records.append({
             "event": event,
             "time": time.time(),
@@ -85,11 +115,25 @@ class FixedLayoutDemoController:
         if len(self._records) > 200:
             self._records = self._records[-200:]
 
+    def _tag_to_object(self):
+        return {
+            int(spec.marker_id): object_id
+            for object_id, spec in self.config.objects.items()
+        }
+
+    def _by_tag(self, scene):
+        result = {}
+        for location, row in scene.items():
+            tag_id = row.get("tag_id")
+            if tag_id is not None:
+                result[int(tag_id)] = location
+        return result
+
     def _bootstrap_box_view(self):
         print("")
         print("FIXED-LAYOUT HRC STARTUP")
-        print("Base must be physically on the taped HOME position.")
-        print("Workspace must be clear and gripper empty.")
+        print("Base must be physically on taped HOME.")
+        print("Workspace must be clear; gripper empty.")
         print("")
 
         try:
@@ -98,69 +142,42 @@ class FixedLayoutDemoController:
             if "clearance" not in str(exc).lower():
                 raise
 
-            print("")
-            print("Robot is high/retracted but needs startup sweep clearance.")
             answer = input(
-                "Inspect the pose/sweep and type CLEARANCE to continue: "
+                "Inspect high/retracted pose and type "
+                "CLEARANCE to continue: "
             ).strip().upper()
 
             if answer != "CLEARANCE":
-                raise RuntimeError("operator did not approve startup clearance")
+                raise RuntimeError(
+                    "operator did not approve startup clearance"
+                )
 
             self.console.execute("clearance")
             self.console.goto_calibrated("box_view")
 
-        print("")
         answer = input(
-            "Inspect final box_view sweep and type CLEARANCE to use it: "
+            "Inspect final box_view sweep and type "
+            "CLEARANCE to use it: "
         ).strip().upper()
 
         if answer != "CLEARANCE":
-            raise RuntimeError("operator did not approve calibrated box_view")
+            raise RuntimeError(
+                "operator did not approve calibrated box_view"
+            )
 
         self.console.execute("clearance")
 
-        if abs(self.console.pose()["heading_deg"]) > 1.0:
+        if abs(
+            self.console.pose()["heading_deg"]
+        ) > 1.0:
             self.console.execute("heading 0")
-
-    @staticmethod
-    def _by_tag(scene):
-        result = {}
-        for location, row in scene.items():
-            tag = row.get("tag_id")
-            if tag is not None:
-                result[int(tag)] = location
-        return result
-
-    def _marker_to_object(self):
-        return {
-            int(item.marker_id): item.object_id
-            for item in self.config.objects.values()
-        }
-
-    def _expected_action(self, tag_id: int, destination: str):
-        object_id = self._marker_to_object().get(int(tag_id))
-        if object_id is None:
-            raise RuntimeError(f"unknown box tag {tag_id}")
-
-        matches = [
-            token
-            for token, action in self.config.actions.items()
-            if action.object_id == object_id
-            and action.destination_station == destination
-        ]
-
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"no unique action for tag {tag_id} -> {destination}: {matches}"
-            )
-
-        return matches[0]
 
     def reset_scene_baseline(self):
         with self._lock:
             if self._stopped:
-                raise RuntimeError("controller is stopped")
+                raise RuntimeError(
+                    "controller is stopped"
+                )
 
             self._busy = True
             self._phase = "scan_reset"
@@ -170,44 +187,66 @@ class FixedLayoutDemoController:
                 scene = self.console.scan_scene()
 
                 by_tag = self._by_tag(scene)
+                expected_tags = set(
+                    self._tag_to_object()
+                )
 
-                if set(by_tag) != {1, 3, 5}:
+                if set(by_tag) != expected_tags:
                     raise RuntimeError(
-                        f"reset scene must contain tags 1,3,5 exactly once; got {by_tag}"
+                        "reset scene must contain each configured "
+                        f"box exactly once; got {by_tag}"
                     )
 
-                occupied_sources = set(by_tag.values())
+                occupied_sources = set(
+                    by_tag.values()
+                )
 
-                if occupied_sources != SOURCE_LOCATIONS:
+                if occupied_sources != set(
+                    SOURCE_LOCATIONS
+                ):
                     raise RuntimeError(
-                        "reset requires all three boxes in the three S0 source slots; "
+                        "episode reset requires the three boxes "
+                        "in the three S0 source locations; "
                         f"observed {occupied_sources}"
                     )
 
-                for destination in DESTINATIONS:
-                    if scene[destination]["status"] != "empty":
+                for destination in (
+                    "S2",
+                    "S3",
+                    "S4",
+                ):
+                    if (
+                        scene[destination]["status"]
+                        != "empty"
+                    ):
                         raise RuntimeError(
-                            f"reset requires {destination} to be empty"
+                            f"reset requires {destination} empty"
                         )
 
                 self._phase = "ready"
+
                 return {
                     "ok": True,
                     "status": "baseline_captured",
                     "scene": scene,
                     "tag_locations": by_tag,
                 }
+
             finally:
                 self._busy = False
 
     def observe_human_move(self):
         with self._lock:
             if self._stopped:
-                raise RuntimeError("controller is stopped")
+                raise RuntimeError(
+                    "controller is stopped"
+                )
 
             before = self.console.last_scene
             if before is None:
-                raise RuntimeError("capture the episode baseline first")
+                raise RuntimeError(
+                    "capture episode baseline first"
+                )
 
             self._busy = True
             self._phase = "observe_human"
@@ -218,9 +257,25 @@ class FixedLayoutDemoController:
                 before_by = self._by_tag(before)
                 after_by = self._by_tag(after)
 
+                expected_tags = set(
+                    self._tag_to_object()
+                )
+
+                if (
+                    set(before_by) != expected_tags
+                    or set(after_by) != expected_tags
+                ):
+                    self.console.last_scene = before
+                    raise RuntimeError(
+                        "scene did not contain every configured box"
+                    )
+
                 moves = []
-                for tag_id in (1, 3, 5):
-                    if before_by[tag_id] != after_by[tag_id]:
+                for tag_id in sorted(expected_tags):
+                    if (
+                        before_by[tag_id]
+                        != after_by[tag_id]
+                    ):
                         moves.append({
                             "tag_id": tag_id,
                             "from": before_by[tag_id],
@@ -230,20 +285,50 @@ class FixedLayoutDemoController:
                 if len(moves) != 1:
                     self.console.last_scene = before
                     raise RuntimeError(
-                        f"expected exactly one human-moved box; observed {moves}"
+                        "expected exactly one human-moved box; "
+                        f"observed {moves}"
                     )
 
                 move = moves[0]
+                tag_to_object = self._tag_to_object()
+                object_id = tag_to_object[
+                    move["tag_id"]
+                ]
 
-                if move["to"] not in DESTINATIONS:
-                    self.console.last_scene = before
-                    raise RuntimeError(
-                        f"human move must finish at S2/S3/S4; got {move}"
-                    )
+                destination_token = (
+                    LOCATION_TO_TOKEN[
+                        move["to"]
+                    ]
+                )
 
-                token = self._expected_action(
-                    move["tag_id"],
-                    move["to"],
+                freeform_token = (
+                    f"MOVE_{object_id.upper()}_TO_"
+                    f"{destination_token}"
+                )
+
+                configured_matches = []
+
+                if move["to"] in {
+                    "S2",
+                    "S3",
+                    "S4",
+                }:
+                    configured_matches = [
+                        token
+                        for token, action
+                        in self.config.actions.items()
+                        if (
+                            action.object_id == object_id
+                            and
+                            action.destination_station
+                            == move["to"]
+                        )
+                    ]
+
+                configured_token = (
+                    configured_matches[0]
+                    if len(configured_matches) == 1
+                    else None
                 )
 
                 self._phase = "ready"
@@ -251,25 +336,85 @@ class FixedLayoutDemoController:
                 return {
                     "ok": True,
                     "status": "human_move_observed",
-                    "action_token": token,
+                    "action_token": (
+                        configured_token
+                        or freeform_token
+                    ),
+                    "configured_action_token": (
+                        configured_token
+                    ),
+                    "freeform_action_token": (
+                        freeform_token
+                    ),
+                    "object_id": object_id,
                     "move": move,
                     "scene": after,
                 }
+
             finally:
                 self._busy = False
 
     def _route_to(self, heading):
-        self.console.goto_calibrated("box_view")
+        self.console.goto_calibrated(
+            "box_view"
+        )
 
-        current = self.console.pose()["heading_deg"]
+        current = self.console.pose()[
+            "heading_deg"
+        ]
 
-        if abs(float(heading) - current) > 48.0:
+        if abs(
+            float(heading) - current
+        ) > 48.0:
             self.console.execute("heading 0")
 
         if abs(float(heading)) > 0.1:
-            self.console.execute(f"heading {float(heading):.3f}")
-        elif abs(self.console.pose()["heading_deg"]) > 1.0:
+            self.console.execute(
+                f"heading {float(heading):.3f}"
+            )
+        elif abs(
+            self.console.pose()["heading_deg"]
+        ) > 1.0:
             self.console.execute("heading 0")
+
+    def _decode_action(self, action):
+        token = str(action.token).strip().upper()
+
+        if token.startswith("MOVE_"):
+            for destination_token, physical_location in (
+                TOKEN_TO_LOCATION.items()
+            ):
+                suffix = (
+                    f"_TO_{destination_token}"
+                )
+
+                if token.endswith(suffix):
+                    object_token = token[
+                        len("MOVE_"):
+                        -len(suffix)
+                    ]
+                    object_id = object_token.lower()
+
+                    if object_id in self.config.objects:
+                        return (
+                            object_id,
+                            physical_location,
+                        )
+
+        object_id = str(action.object_id)
+
+        if (
+            action.destination_station
+            in LOCATION_HEADINGS
+        ):
+            return (
+                object_id,
+                action.destination_station,
+            )
+
+        raise RuntimeError(
+            f"unsupported physical action {token}"
+        )
 
     def execute(
         self,
@@ -287,14 +432,19 @@ class FixedLayoutDemoController:
                 return {
                     "success": False,
                     "status": "stopped",
-                    "message": "controller is stopped; restart and reconcile",
+                    "message": (
+                        "controller is stopped; "
+                        "restart and reconcile"
+                    ),
                 }
 
             if self._busy:
                 return {
                     "success": False,
                     "status": "failed",
-                    "message": "fixed-layout controller is busy",
+                    "message": (
+                        "fixed-layout controller is busy"
+                    ),
                 }
 
             self._busy = True
@@ -303,76 +453,147 @@ class FixedLayoutDemoController:
             self._last_error = None
 
             try:
-                scene_before = self.console.last_scene
+                scene_before = (
+                    self.console.last_scene
+                )
                 if scene_before is None:
                     raise RuntimeError(
-                        "no validated scene baseline is available"
+                        "no validated scene baseline "
+                        "is available"
                     )
 
-                item = self.config.objects[action.object_id]
+                object_id, target_location = (
+                    self._decode_action(action)
+                )
+
+                item = self.config.objects[
+                    object_id
+                ]
                 tag_id = int(item.marker_id)
-                before_by = self._by_tag(scene_before)
+
+                before_by = self._by_tag(
+                    scene_before
+                )
 
                 if tag_id not in before_by:
                     raise RuntimeError(
-                        f"tag {tag_id} for {action.object_id} is not in the current scene"
+                        f"tag {tag_id} for "
+                        f"{object_id} is not in scene"
                     )
 
-                source_location = before_by[tag_id]
-                destination = action.destination_station
+                source_location = before_by[
+                    tag_id
+                ]
 
-                if destination not in DESTINATIONS:
+                if (
+                    source_location
+                    == target_location
+                ):
                     raise RuntimeError(
-                        f"unsupported destination {destination!r}"
+                        f"{object_id} is already at "
+                        f"{target_location}"
                     )
 
-                if source_location == destination:
+                target_row = scene_before[
+                    target_location
+                ]
+
+                if (
+                    target_row.get("tag_id")
+                    is not None
+                ):
                     raise RuntimeError(
-                        f"{action.object_id} is already at {destination}"
+                        f"target {target_location} "
+                        "is occupied"
                     )
 
-                source_heading = LOCATION_HEADINGS[source_location]
-                destination_heading = LOCATION_HEADINGS[destination]
+                source_heading = (
+                    LOCATION_HEADINGS[
+                        source_location
+                    ]
+                )
+                destination_heading = (
+                    LOCATION_HEADINGS[
+                        target_location
+                    ]
+                )
 
                 self._phase = "pick"
 
-                self.console.goto_calibrated("box_view")
-                self.console.move_box_gripper(132.0)
+                self.console.goto_calibrated(
+                    "box_view"
+                )
+                self.console.move_box_gripper(
+                    132.0
+                )
 
-                self._route_to(source_heading)
-                self.console.goto_calibrated("box_pregrasp")
+                self._route_to(
+                    source_heading
+                )
 
-                self.console.move_box_gripper(103.0)
-                self.console.goto_calibrated("box_carry")
+                self.console.goto_calibrated(
+                    "box_pregrasp"
+                )
+
+                self.console.move_box_gripper(
+                    103.0
+                )
+
+                self.console.goto_calibrated(
+                    "box_carry"
+                )
 
                 self._phase = "transfer"
 
-                self._route_to(destination_heading)
+                self._route_to(
+                    destination_heading
+                )
 
                 self._phase = "place"
 
-                self.console.goto_calibrated("box_return")
+                self.console.goto_calibrated(
+                    "box_return"
+                )
 
-                if abs(self.console.pose()["heading_deg"]) > 1.0:
+                if abs(
+                    self.console.pose()[
+                        "heading_deg"
+                    ]
+                ) > 1.0:
                     self._route_to(0.0)
 
                 self._phase = "verify"
 
-                scene_after = self.console.scan_scene()
-                after_by = self._by_tag(scene_after)
+                scene_after = (
+                    self.console.scan_scene()
+                )
+                after_by = self._by_tag(
+                    scene_after
+                )
 
-                if after_by.get(tag_id) != destination:
+                if (
+                    after_by.get(tag_id)
+                    != target_location
+                ):
                     raise RuntimeError(
-                        f"postcondition failed: tag {tag_id} expected at "
-                        f"{destination}, observed at {after_by.get(tag_id)}"
+                        "postcondition failed: "
+                        f"tag {tag_id} expected at "
+                        f"{target_location}, observed "
+                        f"{after_by.get(tag_id)}"
                     )
 
-                for other_tag in (1, 3, 5):
+                for other_tag in before_by:
                     if other_tag == tag_id:
                         continue
-                    if after_by.get(other_tag) != before_by.get(other_tag):
+
+                    if (
+                        after_by.get(other_tag)
+                        != before_by.get(other_tag)
+                    ):
                         raise RuntimeError(
-                            f"postcondition failed: tag {other_tag} moved unexpectedly"
+                            "postcondition failed: "
+                            f"tag {other_tag} moved "
+                            "unexpectedly"
                         )
 
                 self._phase = "ready"
@@ -380,15 +601,23 @@ class FixedLayoutDemoController:
                 return {
                     "success": True,
                     "status": "completed",
-                    "message": f"completed {action.token}",
+                    "message": (
+                        f"completed {action.token}"
+                    ),
                     "execution_id": execution_id,
                     "action": action.token,
-                    "object_id": action.object_id,
+                    "object_id": object_id,
                     "tag_id": tag_id,
-                    "source_location": source_location,
-                    "destination": destination,
+                    "source_location": (
+                        source_location
+                    ),
+                    "destination_location": (
+                        target_location
+                    ),
                     "scene_after": scene_after,
-                    "elapsed_s": time.time() - started,
+                    "elapsed_s": (
+                        time.time() - started
+                    ),
                 }
 
             except Exception as exc:
@@ -408,7 +637,9 @@ class FixedLayoutDemoController:
                     "execution_id": execution_id,
                     "action": action.token,
                     "restart_required": True,
-                    "elapsed_s": time.time() - started,
+                    "elapsed_s": (
+                        time.time() - started
+                    ),
                 }
 
             finally:
@@ -417,13 +648,18 @@ class FixedLayoutDemoController:
 
     def status(self):
         try:
-            homed = bool(self.robot.is_homed())
+            homed = bool(
+                self.robot.is_homed()
+            )
         except Exception:
             homed = False
 
         try:
             runstop = bool(
-                self.robot.pimu.status.get("runstop_event", True)
+                self.robot.pimu.status.get(
+                    "runstop_event",
+                    True,
+                )
             )
         except Exception:
             runstop = True
@@ -432,6 +668,7 @@ class FixedLayoutDemoController:
             "backend": "fixed_layout_demo",
             "motion_enabled": True,
             "fixed_layout_demo": True,
+            "freeform_supported": True,
             "calibration_mode": False,
             "ready": bool(
                 homed
@@ -445,7 +682,9 @@ class FixedLayoutDemoController:
             "busy": self._busy,
             "current_phase": self._phase,
             "last_error": self._last_error,
-            "calibration_id": "fixed-layout-3box-v1",
+            "calibration_id": (
+                "fixed-layout-3box-v1"
+            ),
         }
 
     def camera_jpeg(self):
@@ -454,7 +693,10 @@ class FixedLayoutDemoController:
             "http://127.0.0.1:9101/v1/camera.jpg",
         )
         try:
-            with urlopen(camera_url, timeout=1.5) as response:
+            with urlopen(
+                camera_url,
+                timeout=1.5,
+            ) as response:
                 return response.read()
         except Exception:
             return None

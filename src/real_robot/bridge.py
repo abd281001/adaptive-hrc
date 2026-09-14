@@ -285,24 +285,103 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if str(body.get("config_digest", "")) != self.server.lab_config.digest:
                 raise BridgeConflict("client and bridge configuration digests differ")
             token = str(body.get("token", "")).strip().upper()
-            action = self.server.lab_config.actions.get(token)
-            if action is None:
-                raise ValueError(f"unknown action {token!r}")
-            expected = {
-                "object_id": action.object_id, "source_station": action.source_station,
-                "destination_station": action.destination_station,
-            }
-            for key, value in expected.items():
-                if str(body.get(key, "")) != value:
-                    raise BridgeConflict(f"client {key} disagrees with bridge configuration")
-            slot_id = str(body.get("placement_slot_id", ""))
-            if slot_id not in self.server.lab_config.placement_slots:
-                raise ValueError(f"unknown placement slot {slot_id!r}")
-            canonical = {
-                "execution_id": execution_id, "config_digest": self.server.lab_config.digest,
-                "token": action.token, **expected, "placement_slot_id": slot_id,
-            }
-            result, created = self.server.ledger.submit(canonical, action, self.server.controller)
+            freeform = bool(body.get("freeform", False))
+
+            if freeform:
+                controller_status = dict(self.server.controller.status())
+
+                if not controller_status.get("fixed_layout_demo"):
+                    raise BridgeConflict(
+                        "freeform execution requires fixed-layout controller"
+                    )
+
+                match = re.fullmatch(
+                    r"MOVE_([A-Z0-9_]+)_TO_"
+                    r"(S0_LEFT|S0_CENTER|S0_RIGHT|S2|S3|S4)",
+                    token,
+                )
+                if match is None:
+                    raise ValueError(
+                        f"invalid freeform action {token!r}"
+                    )
+
+                object_id = match.group(1).lower()
+                destination_token = match.group(2)
+
+                if object_id not in self.server.lab_config.objects:
+                    raise ValueError(
+                        f"unknown freeform object {object_id!r}"
+                    )
+
+                destination_station = (
+                    "home"
+                    if destination_token.startswith("S0_")
+                    else destination_token
+                )
+
+                source_station = (
+                    self.server.lab_config.objects[
+                        object_id
+                    ].source_station
+                )
+
+                action = ActionSpec(
+                    token=token,
+                    label=token.replace("_", " ").title(),
+                    role=destination_token,
+                    object_id=object_id,
+                    source_station=source_station,
+                    destination_station=destination_station,
+                    requires=(),
+                )
+
+                canonical = {
+                    "execution_id": execution_id,
+                    "config_digest": self.server.lab_config.digest,
+                    "token": token,
+                    "freeform": True,
+                    "object_id": object_id,
+                    "source_station": "dynamic_marker_scene",
+                    "destination_station": destination_token,
+                    "placement_slot_id": "freeform",
+                }
+
+            else:
+                action = self.server.lab_config.actions.get(token)
+                if action is None:
+                    raise ValueError(f"unknown action {token!r}")
+
+                expected = {
+                    "object_id": action.object_id,
+                    "source_station": action.source_station,
+                    "destination_station": action.destination_station,
+                }
+
+                for key, value in expected.items():
+                    if str(body.get(key, "")) != value:
+                        raise BridgeConflict(
+                            f"client {key} disagrees with bridge configuration"
+                        )
+
+                slot_id = str(body.get("placement_slot_id", ""))
+                if slot_id not in self.server.lab_config.placement_slots:
+                    raise ValueError(
+                        f"unknown placement slot {slot_id!r}"
+                    )
+
+                canonical = {
+                    "execution_id": execution_id,
+                    "config_digest": self.server.lab_config.digest,
+                    "token": action.token,
+                    **expected,
+                    "placement_slot_id": slot_id,
+                }
+
+            result, created = self.server.ledger.submit(
+                canonical,
+                action,
+                self.server.controller,
+            )
             self._json(HTTPStatus.ACCEPTED if created else HTTPStatus.OK, result)
         except BridgeConflict as exc:
             self._json(HTTPStatus.CONFLICT, {"success": False, "status": "conflict", "message": str(exc)})
