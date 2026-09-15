@@ -90,7 +90,6 @@ def test_agent_accepts_demo_longer_than_three_actions():
             irl_cold_steps=1,
             irl_warm_steps=1,
             irl_horizon=12,
-            latent_strategy_enabled=False,
         ),
         domain=d,
     )

@@ -234,8 +234,12 @@ class FreeformPhysicalDomain:
         return tuple(legal)
 
     def action_role(self, action: str) -> str:
-        _object_id, location = self.action_info(action)
-        return location
+        # Physical relocation destinations are represented explicitly in the
+        # action token and location state. They are not cooking workflow roles.
+        # "other" is the learner's supported neutral role for external-domain
+        # operations that do not map onto the symbolic kitchen role taxonomy.
+        self.canonical_action(action)
+        return "other"
 
     def goal_signature(self, actions: Sequence[str]) -> Hashable:
         # Preserve repeated-action counts while removing preference/order.

@@ -487,11 +487,13 @@ class BridgeDryRunController:
         self._executed: list[str] = []
         self._phase = "ready"
         self.camera_service: Any = None
+        self._preview_april = None
         if camera_preview:
             camera_type = importlib.import_module(
                 "src.real_robot.stretch_runtime.camera_service"
             ).D405CameraService
             p = config.perception
+
             self.camera_service = camera_type(
                 exposure="medium", capture_fps=15, stream_fps=10,
                 startup_timeout_s=p.camera_startup_timeout_s,
@@ -551,6 +553,107 @@ class BridgeDryRunController:
             return None
         cv2 = importlib.import_module("cv2")
         ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        return encoded.tobytes() if ok else None
+
+    def camera_jpeg_annotated(self) -> bytes | None:
+        """Operator preview only; scanner continues to consume raw JPEGs."""
+        if self.camera_service is None:
+            return None
+
+        frame = self.camera_service.get_latest_color(
+            apply_annotations=False
+        )
+        if frame is None:
+            return None
+
+        cv2 = importlib.import_module("cv2")
+        np = importlib.import_module("numpy")
+
+        if self._preview_april is None:
+            Detector = importlib.import_module(
+                "pupil_apriltags"
+            ).Detector
+            self._preview_april = Detector(
+                families="tagStandard41h12",
+                nthreads=1,
+                quad_decimate=1.0,
+            )
+
+        if self._preview_april is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            labels = {
+                1: "B1",
+                3: "B3",
+                5: "B5",
+            }
+
+            for tag in self._preview_april.detect(
+                gray,
+                estimate_tag_pose=False,
+            ):
+                tag_id = int(tag.tag_id)
+                hamming = int(tag.hamming)
+
+                if tag_id not in labels or hamming > 2:
+                    continue
+
+                corners = np.asarray(
+                    tag.corners,
+                    dtype=np.int32,
+                ).reshape((-1, 1, 2))
+
+                cv2.polylines(
+                    frame,
+                    [corners],
+                    True,
+                    (0, 255, 0),
+                    3,
+                )
+
+                cx, cy = np.asarray(
+                    tag.center,
+                    dtype=float,
+                ).astype(int)
+
+                cv2.circle(
+                    frame,
+                    (int(cx), int(cy)),
+                    5,
+                    (0, 255, 0),
+                    -1,
+                )
+
+                x = int(corners[:, 0, 0].min())
+                y = int(corners[:, 0, 1].min())
+
+                cv2.putText(
+                    frame,
+                    f"{labels[tag_id]}  tag{tag_id}  h={hamming}",
+                    (x, max(24, y - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+        cv2.putText(
+            frame,
+            "APRILTAG PREVIEW",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 75],
+        )
         return encoded.tobytes() if ok else None
 
     def close(self) -> None:

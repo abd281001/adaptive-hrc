@@ -6,7 +6,60 @@
 <title>Adaptive-HRC Freeform Physical Demo</title>
 <style>
 :root { color-scheme: dark; font-family: system-ui,sans-serif; }
-body { max-width:980px; margin:auto; padding:24px; background:#111827; color:#f3f4f6; }
+body {
+  max-width:1600px;
+  width:calc(100% - 32px);
+  margin:auto;
+  padding:16px;
+  background:#111827;
+  color:#f3f4f6;
+}
+.dashboard {
+  display:grid;
+  grid-template-columns:minmax(0, 1.65fr) minmax(360px, .85fr);
+  gap:18px;
+  align-items:start;
+}
+.primary { min-width:0; }
+.library-panel {
+  position:sticky;
+  top:16px;
+  max-height:calc(100vh - 32px);
+  overflow:auto;
+}
+.recipe-cluster {
+  border:1px solid #4b5563;
+  border-radius:10px;
+  padding:12px;
+  margin:12px 0;
+  background:#111827;
+}
+.preference-card {
+  border-left:3px solid #64748b;
+  padding:8px 10px;
+  margin:8px 0;
+  background:#1f2937;
+}
+.preference-card.latest {
+  border-left-color:#10b981;
+}
+.preference-order {
+  display:flex;
+  flex-wrap:wrap;
+  gap:5px;
+  margin-top:6px;
+}
+.small {
+  opacity:.75;
+  font-size:.85rem;
+}
+@media (max-width:1050px) {
+  .dashboard { grid-template-columns:1fr; }
+  .library-panel {
+    position:static;
+    max-height:none;
+  }
+}
 .panel { border:1px solid #374151; border-radius:12px; padding:18px; margin:14px 0; background:#1f2937; }
 .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
 button { padding:12px 16px; border:0; border-radius:8px; cursor:pointer; font-weight:650; }
@@ -21,6 +74,48 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 .error { color:#fca5a5; white-space:pre-wrap; }
 .token { font-family:ui-monospace,monospace; background:#111827; padding:3px 7px; border-radius:5px; }
 #camera { display:none; width:100%; max-height:480px; object-fit:contain; border-radius:8px; }
+
+.prob-row {
+  display:grid;
+  grid-template-columns:minmax(120px,1fr) 2fr 58px;
+  gap:8px;
+  align-items:center;
+  margin:6px 0;
+}
+.prob-track {
+  height:12px;
+  background:#374151;
+  border-radius:6px;
+  overflow:hidden;
+}
+.prob-fill {
+  height:100%;
+  background:#60a5fa;
+}
+.model-metrics {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin:8px 0 12px;
+}
+.model-metrics span {
+  background:#111827;
+  border-radius:6px;
+  padding:5px 8px;
+}
+.scan-readout {
+  background:#111827;
+  border-radius:8px;
+  padding:10px;
+  margin-top:8px;
+  font-family:ui-monospace,monospace;
+  font-size:.88rem;
+}
+.history-row {
+  border-top:1px solid #374151;
+  padding:7px 0;
+}
+hr { border:0; border-top:1px solid #4b5563; margin:18px 0; }
 </style>
 </head>
 <body>
@@ -28,6 +123,7 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 <div class="warning">Physical runstop remains authoritative.</div>
 <div id="message" class="error"></div>
 
+<div class="dashboard"><div class="primary">
 <section class="panel">
   <div class="row">
     <span id="phase" class="status">Loading…</span>
@@ -45,7 +141,7 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 <section class="panel">
   <h2>Wrist camera</h2>
   <img id="camera" alt="Latest D405 frame">
-  <div id="cameraStatus">Camera preview unavailable.</div>
+  <div id="scanReadout" class="scan-readout">AprilTag perception idle.</div><div id="cameraStatus">Camera preview unavailable.</div>
 </section>
 
 <section class="panel">
@@ -66,6 +162,27 @@ button:disabled { opacity:.45; cursor:not-allowed; }
   </div>
 </section>
 
+
+</div>
+<aside class="panel library-panel">
+  <h2>Model internals</h2>
+  <div id="modelMetrics" class="model-metrics"></div>
+  <div id="proposalDistribution">No proposal distribution yet.</div>
+
+  <h3>Prediction / correction history</h3>
+  <div id="predictionHistory">No assisted decisions yet.</div>
+
+  <div id="lastClassification"></div>
+
+  <hr>
+  <h2>Learned recipes & preferences</h2>
+  <p class="small">
+    Grouped from the learner's internal recipe/variant memory.
+    No recipe or preference label is supplied by the operator.
+  </p>
+  <div id="learnedLibrary">No completed demonstrations yet.</div>
+</aside>
+</div>
 <script>
 let cfg = null;
 let state = null;
@@ -131,8 +248,199 @@ function endEpisode() {
   post('/api/freeform/end', {});
 }
 
+
+function probabilityRows(distribution) {
+  const rows = Object.entries(distribution || {})
+    .map(([token,p]) => [token, Number(p)])
+    .filter(([,p]) => Number.isFinite(p) && p > 0);
+
+  const total = rows.reduce((sum,[,p]) => sum + p, 0);
+  if (total <= 0) return [];
+
+  return rows
+    .map(([token,p]) => [token, p / total])
+    .sort((a,b) => b[1] - a[1]);
+}
+
+function renderModelInternals() {
+  const rows = probabilityRows(state.pending_distribution);
+  const metrics = document.getElementById('modelMetrics');
+  const dist = document.getElementById('proposalDistribution');
+
+  if (!rows.length) {
+    metrics.innerHTML = '<span>Waiting for assist proposal</span>';
+    dist.innerHTML = '<span class="small">No live proposal distribution.</span>';
+  } else {
+    const top1 = rows[0]?.[1] || 0;
+    const top2 = rows[1]?.[1] || 0;
+    const margin = top1 - top2;
+    const entropy = -rows.reduce(
+      (sum,[,p]) => sum + p * Math.log2(p),
+      0
+    );
+    const separation =
+      margin < .15 ? 'CONFLICT' :
+      margin < .40 ? 'MODERATE' : 'CLEAR';
+
+    const legal =
+      state.available_human_actions ||
+      state.legal_actions ||
+      [];
+
+    metrics.innerHTML = `
+      <span>top-1 ${(100*top1).toFixed(1)}%</span>
+      <span>margin ${(100*margin).toFixed(1)}%</span>
+      <span>entropy ${entropy.toFixed(2)} bits</span>
+      <span>${separation}</span>
+      <span>${legal.length} legal actions</span>
+    `;
+
+    dist.innerHTML = rows.slice(0,5).map(([token,p],i) => `
+      <div class="prob-row">
+        <div>${i === 0 ? '▶ ' : ''}${esc(label(token))}</div>
+        <div class="prob-track">
+          <div class="prob-fill" style="width:${(100*p).toFixed(2)}%"></div>
+        </div>
+        <div>${(100*p).toFixed(1)}%</div>
+      </div>
+    `).join('');
+  }
+
+  const decisions = (state.decisions || [])
+    .filter(row => Object.keys(row.distribution || {}).length)
+    .slice(-6)
+    .reverse();
+
+  document.getElementById('predictionHistory').innerHTML =
+    decisions.length
+    ? decisions.map(row => {
+        const d = probabilityRows(row.distribution);
+        const proposed = row.predicted || d[0]?.[0] || null;
+        const actual = row.action || row.intended_action || null;
+        const pp = proposed
+          ? Number(row.distribution?.[proposed] || 0)
+          : 0;
+        const ap = actual
+          ? Number(row.distribution?.[actual] || 0)
+          : 0;
+        const correction = row.executed_by === 'human_correction';
+
+        return `<div class="history-row">
+          <strong>${correction ? 'Human correction' : esc(row.executed_by || 'decision')}</strong><br>
+          proposal: ${proposed ? esc(label(proposed)) : 'none'}
+          (${(100*pp).toFixed(1)}%)
+          ${actual && actual !== proposed
+            ? `<br>actual: ${esc(label(actual))} (${(100*ap).toFixed(1)}%)`
+            : ''}
+        </div>`;
+      }).join('')
+    : '<span class="small">No assisted decisions yet.</span>';
+
+  const match = state.last_match;
+  document.getElementById('lastClassification').innerHTML = match
+    ? `<hr><strong>Last learner classification</strong><br>
+       recipe ${esc(match.recipe_id || 'none')}
+       ${match.variant_id ? ` · variant ${esc(match.variant_id)}` : ''}
+       ${Number.isFinite(Number(match.jaccard))
+          ? ` · overlap ${Number(match.jaccard).toFixed(2)}` : ''}
+       ${Number.isFinite(Number(match.order_distance))
+          ? ` · order distance ${Number(match.order_distance).toFixed(2)}` : ''}`
+    : '';
+}
+
+function renderScan() {
+  const root = document.getElementById('scanReadout');
+  if (!root) return;
+
+  const scan = state.hardware?.scan;
+  if (!scan) {
+    root.textContent = 'AprilTag perception idle.';
+    return;
+  }
+
+  const scene = scan.scene || {};
+  const order = [
+    'S0_left','S0_center','S0_right','S2','S3','S4'
+  ];
+
+  let html = scan.active
+    ? `<strong>OBSERVING</strong> · ${esc(scan.current_location || 'starting')}
+       ${scan.current_heading_deg == null ? '' :
+         ` · ${Number(scan.current_heading_deg).toFixed(0)}°`}`
+    : '<strong>Latest AprilTag scene</strong>';
+
+  const rows = order
+    .filter(location => scene[location])
+    .map(location => {
+      const row = scene[location];
+      if (row.status === 'occupied') {
+        const votes = row.winning_votes == null
+          ? ''
+          : ` · ${row.winning_votes}/${row.samples}`;
+        return `${esc(location)}: ${esc(row.box)} / tag ${row.tag_id}${votes}`;
+      }
+      return `${esc(location)}: ${esc(String(row.status).toUpperCase())}`;
+    });
+
+  if (rows.length) html += '<br>' + rows.join('<br>');
+  root.innerHTML = html;
+}
+
+function renderLibrary() {
+  const root = document.getElementById('learnedLibrary');
+  if (!root || !state) return;
+
+  const recipes = state.learned_library || [];
+
+  if (!recipes.length) {
+    root.innerHTML =
+      '<p>No completed demonstrations have been committed yet.</p>';
+    return;
+  }
+
+  root.innerHTML = recipes.map(recipe => {
+    const prefs = recipe.preferences || [];
+
+    const preferenceHtml = prefs.map(pref => {
+      const ordering = (pref.ordering || []).map(token =>
+        `<span class="token">${esc(label(token))}</span>`
+      ).join('<span>→</span>');
+
+      return `
+        <div class="preference-card ${pref.latest ? 'latest' : ''}">
+          <div>
+            <strong>Preference ${pref.preference_index}</strong>
+            ${pref.latest ? ' · <span class="warning">latest</span>' : ''}
+          </div>
+          <div class="small">
+            variant ${esc(pref.variant_id)}
+          </div>
+          <div class="preference-order">
+            ${ordering || '<span>empty</span>'}
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    return `
+      <div class="recipe-cluster">
+        <h3>${esc(recipe.recipe_id)}</h3>
+        <div class="small">
+          ${recipe.preference_count} learned preference
+          ${recipe.preference_count === 1 ? '' : 's'}
+        </div>
+        ${preferenceHtml}
+      </div>
+    `;
+  }).join('');
+}
+
 function render() {
   if (!state || !cfg) return;
+  renderModelInternals();
+  renderScan();
+
+  renderLibrary();
 
   const hw = state.hardware || {};
 
@@ -383,27 +691,33 @@ async function refresh() {
   }
 }
 
+let cameraTimer = null;
 function refreshCamera() {
   const image = document.getElementById('camera');
+  const status = document.getElementById('cameraStatus');
+
+  const again = delay => {
+    clearTimeout(cameraTimer);
+    cameraTimer = setTimeout(refreshCamera, delay);
+  };
 
   image.onload = () => {
     image.style.display = 'block';
-    document.getElementById('cameraStatus').textContent = '';
+    status.textContent = '';
+    again(120);
   };
 
   image.onerror = () => {
     image.style.display = 'none';
-    document.getElementById('cameraStatus').textContent =
-      'Camera preview unavailable.';
+    status.textContent = 'Camera preview unavailable.';
+    again(400);
   };
 
   image.src =
-    `/api/camera.jpg?t=${Date.now()}&token=${encodeURIComponent(operatorToken)}`;
+    `${window.location.protocol}//${window.location.hostname}:9101/v1/camera.jpg?annotate=1&t=${Date.now()}`;
 }
 
-refresh();
-setInterval(refresh, 750);
-setInterval(refreshCamera, 1000);
+refresh(); setInterval(refresh, 400); refreshCamera();
 </script>
 </body>
 </html>

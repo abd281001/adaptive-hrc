@@ -14,7 +14,7 @@ import signal
 import threading
 import time
 from typing import Any, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .config import ActionSpec, LabConfig, load_lab_config
 from .stretch_hardware import BridgeDryRunController, StretchHardwareController
@@ -230,6 +230,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if path == "/v1/status":
             payload = {**dict(self.server.controller.status()), **dict(self.server.ledger.status())}
             payload["config_digest"] = self.server.lab_config.digest
+            console = (
+                getattr(self.server.controller, "console", None)
+                or getattr(self.server.controller, "_console", None)
+            )
+            scan = getattr(console, "scan_status", None)
+            if isinstance(scan, Mapping):
+                payload["scan"] = dict(scan)
             if payload.get("active_execution_id") is not None:
                 payload["ready"] = False
             self._json(HTTPStatus.OK, payload)
@@ -238,7 +245,23 @@ class BridgeHandler(BaseHTTPRequestHandler):
             row = self.server.ledger.get(execution_id)
             self._json(HTTPStatus.OK, row) if row is not None else self._json(HTTPStatus.NOT_FOUND, {"status": "not_found", "message": "unknown execution_id"})
         elif path == "/v1/camera.jpg":
-            body = self.server.controller.camera_jpeg()
+            query = parse_qs(urlsplit(self.path).query)
+            annotate = str(
+                query.get("annotate", ["0"])[0]
+            ).lower() in {"1", "true", "yes"}
+
+            annotated = getattr(
+                self.server.controller,
+                "camera_jpeg_annotated",
+                None,
+            )
+
+            body = (
+                annotated()
+                if annotate and callable(annotated)
+                else self.server.controller.camera_jpeg()
+            )
+
             if body is None:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"status": "camera_unavailable", "message": "camera frame unavailable"})
                 return
@@ -474,9 +497,32 @@ def main(argv: list[str] | None = None) -> int:
         def request_shutdown(_signum=None, _frame=None):
             if shutdown_started.is_set():
                 return
+
             shutdown_started.set()
-            controller.emergency_stop()
-            threading.Thread(target=server.shutdown, daemon=True).start()
+
+            # Graceful shutdown is safe only while no physical execution is
+            # active.  If motion is in flight, retain the fail-safe behavior
+            # and request an emergency stop before releasing the SDK.
+            ledger_status = dict(ledger.status())
+            active_execution_id = ledger_status.get("active_execution_id")
+
+            if active_execution_id is not None:
+                print(
+                    f"Active execution {active_execution_id}; "
+                    "requesting emergency stop before shutdown.",
+                    flush=True,
+                )
+                controller.emergency_stop()
+            else:
+                print(
+                    "Bridge idle; shutting down gracefully without runstop.",
+                    flush=True,
+                )
+
+            threading.Thread(
+                target=server.shutdown,
+                daemon=True,
+            ).start()
 
         signal.signal(signal.SIGTERM, request_shutdown)
         signal.signal(signal.SIGINT, request_shutdown)

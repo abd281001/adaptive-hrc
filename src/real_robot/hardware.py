@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import os
 import threading
 import time
 from typing import Any, Mapping, Protocol
@@ -115,6 +116,10 @@ class HttpStretchExecutor:
 
     def __init__(self, base_url: str = "http://127.0.0.1:9100", *, timeout_s: float = 180.0):
         self.base_url = str(base_url).rstrip("/")
+        self.camera_url = os.environ.get(
+            "HRC_CAMERA_URL",
+            f"{self.base_url}/v1/camera.jpg",
+        )
         self.timeout_s = max(5.0, float(timeout_s))
         self.motion_enabled = False
         self._status_lock = threading.Lock()
@@ -168,7 +173,7 @@ class HttpStretchExecutor:
             return previous
 
     def _refresh_loop(self) -> None:
-        while not self._stop_refresh.wait(0.5):
+        while not self._stop_refresh.wait(0.20):
             self._refresh_once()
 
     def preflight(self, config_digest: str, *, require_motion: bool, allow_calibration_mode: bool = False) -> Mapping[str, Any]:
@@ -432,9 +437,17 @@ class HttpStretchExecutor:
             return {"ok": False, "status": "stop_request_failed", "error": str(exc)}
 
     def camera_jpeg(self) -> bytes | None:
-        request = Request(f"{self.base_url}/v1/camera.jpg", method="GET")
+        separator = "&" if "?" in self.camera_url else "?"
+        request = Request(
+            f"{self.camera_url}{separator}t={time.time_ns()}",
+            method="GET",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "Pragma": "no-cache",
+            },
+        )
         try:
-            with urlopen(request, timeout=1.5) as response:
+            with urlopen(request, timeout=1.0) as response:
                 return response.read()
         except (HTTPError, URLError, TimeoutError, OSError):
             return None

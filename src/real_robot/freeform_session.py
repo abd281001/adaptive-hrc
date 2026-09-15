@@ -954,6 +954,51 @@ class FreeformLiveHrcSession:
                 else 0
             )
 
+            # Surface the learner's own recipe/preference organization.
+            # These are internal classifications, not operator labels.
+            library = getattr(self.agent, "library", None)
+            variant_map = getattr(library, "variants", {}) or {}
+            latest_map = getattr(library, "latest", {}) or {}
+
+            learned_library = []
+
+            for recipe_id in sorted(variant_map):
+                preferences = []
+                slot = variant_map[recipe_id]
+
+                for preference_index, (variant_id, variant) in enumerate(
+                    slot.items(),
+                    1,
+                ):
+                    preferences.append({
+                        "preference_index": preference_index,
+                        "variant_id": str(variant_id),
+                        "ordering": list(
+                            getattr(variant, "ordering", ())
+                        ),
+                        "latest": (
+                            str(latest_map.get(recipe_id, ""))
+                            == str(variant_id)
+                        ),
+                        "first_seen_step": int(
+                            getattr(variant, "first_seen_step", 0)
+                        ),
+                        "last_seen_step": int(
+                            getattr(variant, "last_seen_step", 0)
+                        ),
+                    })
+
+                learned_library.append({
+                    "recipe_id": str(recipe_id),
+                    "preference_count": len(preferences),
+                    "latest_variant_id": (
+                        None
+                        if latest_map.get(recipe_id) is None
+                        else str(latest_map[recipe_id])
+                    ),
+                    "preferences": preferences,
+                })
+
             state = {
                 "protocol": self.protocol,
                 "phase": self.phase,
@@ -989,6 +1034,7 @@ class FreeformLiveHrcSession:
                 "known_recipes": list(known_recipes),
                 "known_recipe_count": len(known_recipes),
                 "known_variant_count": known_variant_count,
+                "learned_library": learned_library,
                 "can_start_assist": bool(known_recipes),
                 "can_end": bool(
                     self.completed
