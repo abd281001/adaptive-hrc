@@ -1,0 +1,182 @@
+{
+  "schema_version": 2,
+  "tag_dictionary": "DICT_6X6_250",
+  "home_station": "home",
+  "fingertip_marker_ids": [
+    200,
+    201
+  ],
+  "stations": {
+    "home": {
+      "label": "Taped robot home",
+      "heading_deg": 0.0
+    },
+    "S2": {
+      "label": "Counter S2",
+      "heading_deg": 12.0
+    },
+    "S3": {
+      "label": "Counter S3",
+      "heading_deg": 24.0
+    },
+    "S4": {
+      "label": "Counter S4",
+      "heading_deg": 36.0
+    }
+  },
+  "reference_marker": {
+    "marker_id": 199,
+    "marker_length_mm": 80.0,
+    "expected_position_by_station_m": {
+      "home": [
+        0.0,
+        0.0,
+        0.4
+      ],
+      "S2": [
+        0.0,
+        0.0,
+        0.4
+      ],
+      "S3": [
+        0.0,
+        0.0,
+        0.4
+      ],
+      "S4": [
+        0.0,
+        0.0,
+        0.4
+      ]
+    },
+    "tolerance_m": 0.05
+  },
+  "placement_slots": {
+    "step_1": {
+      "label": "Task step 1",
+      "heading_offset_deg": -4.0,
+      "arm_extension_m": 0.223,
+      "lift_height_m": 0.758,
+      "verify_marker_xyz_m": [
+        0.0,
+        0.0,
+        0.3
+      ],
+      "verify_tolerance_m": 0.08
+    },
+    "step_2": {
+      "label": "Task step 2",
+      "heading_offset_deg": 0.0,
+      "arm_extension_m": 0.223,
+      "lift_height_m": 0.758,
+      "verify_marker_xyz_m": [
+        0.0,
+        0.0,
+        0.3
+      ],
+      "verify_tolerance_m": 0.08
+    },
+    "step_3": {
+      "label": "Task step 3",
+      "heading_offset_deg": 4.0,
+      "arm_extension_m": 0.223,
+      "lift_height_m": 0.758,
+      "verify_marker_xyz_m": [
+        0.0,
+        0.0,
+        0.3
+      ],
+      "verify_tolerance_m": 0.08
+    }
+  },
+  "objects": {
+    "b1": {
+      "label": "Box 1 / AprilTag 1",
+      "marker_id": 1,
+      "marker_length_mm": 40.0,
+      "source_station": "home"
+    },
+    "b5": {
+      "label": "Box 5 / AprilTag 5",
+      "marker_id": 5,
+      "marker_length_mm": 40.0,
+      "source_station": "home"
+    },
+    "b3": {
+      "label": "Box 3 / AprilTag 3",
+      "marker_id": 3,
+      "marker_length_mm": 40.0,
+      "source_station": "home"
+    }
+  },
+  "actions": {
+    "MOVE_B1_S2": {
+      "label": "Move B1 to S2",
+      "role": "S2",
+      "object_id": "b1",
+      "source_station": "home",
+      "destination_station": "S2"
+    },
+    "MOVE_B5_S3": {
+      "label": "Move B5 to S3",
+      "role": "S3",
+      "object_id": "b5",
+      "source_station": "home",
+      "destination_station": "S3"
+    },
+    "MOVE_B3_S4": {
+      "label": "Move B3 to S4",
+      "role": "S4",
+      "object_id": "b3",
+      "source_station": "home",
+      "destination_station": "S4"
+    }
+  },
+  "recipes": {
+    "task_a": {
+      "label": "Three-box counter task",
+      "actions": [
+        "MOVE_B1_S2",
+        "MOVE_B5_S3",
+        "MOVE_B3_S4"
+      ]
+    }
+  },
+  "motion": {
+    "calibrated": false,
+    "calibration_id": "",
+    "calibration_record": "",
+    "calibration_record_sha256": "",
+    "runtime_lock": "",
+    "runtime_lock_sha256": "",
+    "action_timeout_s": 240.0,
+    "command_timeout_s": 30.0,
+    "grasp_timeout_s": 60.0,
+    "rotation_tolerance_deg": 3.0,
+    "max_translation_drift_m": 0.025,
+    "min_station_separation_deg": 10.0,
+    "placement_settle_s": 0.5,
+    "velocity_scale": 0.5
+  },
+  "perception": {
+    "fingertip_marker_length_mm": 14.0,
+    "min_marker_pixels": 18.0,
+    "max_reprojection_error_px": 3.0,
+    "min_marker_depth_m": 0.05,
+    "max_marker_depth_m": 0.8,
+    "stable_frames": 3,
+    "max_position_jump_m": 0.035,
+    "max_frame_age_s": 0.3,
+    "camera_startup_timeout_s": 12.0,
+    "camera_frame_timeout_ms": 1000,
+    "postcondition_timeout_s": 8.0,
+    "require_both_fingertips": true
+  },
+  "agent_settings": {
+    "seed": 1337,
+    "irl_horizon": 12,
+    "irl_cold_steps": 50,
+    "irl_warm_steps": 20,
+    "verbose": false
+  }
+}

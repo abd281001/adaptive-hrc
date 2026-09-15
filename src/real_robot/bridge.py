@@ -14,10 +14,11 @@ import signal
 import threading
 import time
 from typing import Any, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .config import ActionSpec, LabConfig, load_lab_config
 from .stretch_hardware import BridgeDryRunController, StretchHardwareController
+from .fixed_layout_controller import FixedLayoutDemoController
 
 
 TERMINAL_STATUSES = {"completed", "failed", "stopped", "reconciled_after_restart"}
@@ -229,6 +230,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if path == "/v1/status":
             payload = {**dict(self.server.controller.status()), **dict(self.server.ledger.status())}
             payload["config_digest"] = self.server.lab_config.digest
+            console = (
+                getattr(self.server.controller, "console", None)
+                or getattr(self.server.controller, "_console", None)
+            )
+            scan = getattr(console, "scan_status", None)
+            if isinstance(scan, Mapping):
+                payload["scan"] = dict(scan)
             if payload.get("active_execution_id") is not None:
                 payload["ready"] = False
             self._json(HTTPStatus.OK, payload)
@@ -237,7 +245,23 @@ class BridgeHandler(BaseHTTPRequestHandler):
             row = self.server.ledger.get(execution_id)
             self._json(HTTPStatus.OK, row) if row is not None else self._json(HTTPStatus.NOT_FOUND, {"status": "not_found", "message": "unknown execution_id"})
         elif path == "/v1/camera.jpg":
-            body = self.server.controller.camera_jpeg()
+            query = parse_qs(urlsplit(self.path).query)
+            annotate = str(
+                query.get("annotate", ["0"])[0]
+            ).lower() in {"1", "true", "yes"}
+
+            annotated = getattr(
+                self.server.controller,
+                "camera_jpeg_annotated",
+                None,
+            )
+
+            body = (
+                annotated()
+                if annotate and callable(annotated)
+                else self.server.controller.camera_jpeg()
+            )
+
             if body is None:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"status": "camera_unavailable", "message": "camera frame unavailable"})
                 return
@@ -253,6 +277,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
         try:
+            if path == "/v1/scene-reset":
+                if self.server.ledger.status().get("active_execution_id") is not None:
+                    raise BridgeConflict("cannot scan scene while a robot execution is active")
+                method = getattr(self.server.controller, "reset_scene_baseline", None)
+                if method is None:
+                    raise ValueError("controller does not support scene reset")
+                self._json(HTTPStatus.OK, dict(method()))
+                return
+
+            if path == "/v1/observe-human":
+                if self.server.ledger.status().get("active_execution_id") is not None:
+                    raise BridgeConflict("cannot observe human move while robot is executing")
+                method = getattr(self.server.controller, "observe_human_move", None)
+                if method is None:
+                    raise ValueError("controller does not support human observation")
+                self._json(HTTPStatus.OK, dict(method()))
+                return
+
             if path == "/v1/emergency-stop":
                 self._json(HTTPStatus.OK, dict(self.server.controller.emergency_stop()))
                 return
@@ -266,24 +308,103 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if str(body.get("config_digest", "")) != self.server.lab_config.digest:
                 raise BridgeConflict("client and bridge configuration digests differ")
             token = str(body.get("token", "")).strip().upper()
-            action = self.server.lab_config.actions.get(token)
-            if action is None:
-                raise ValueError(f"unknown action {token!r}")
-            expected = {
-                "object_id": action.object_id, "source_station": action.source_station,
-                "destination_station": action.destination_station,
-            }
-            for key, value in expected.items():
-                if str(body.get(key, "")) != value:
-                    raise BridgeConflict(f"client {key} disagrees with bridge configuration")
-            slot_id = str(body.get("placement_slot_id", ""))
-            if slot_id not in self.server.lab_config.placement_slots:
-                raise ValueError(f"unknown placement slot {slot_id!r}")
-            canonical = {
-                "execution_id": execution_id, "config_digest": self.server.lab_config.digest,
-                "token": action.token, **expected, "placement_slot_id": slot_id,
-            }
-            result, created = self.server.ledger.submit(canonical, action, self.server.controller)
+            freeform = bool(body.get("freeform", False))
+
+            if freeform:
+                controller_status = dict(self.server.controller.status())
+
+                if not controller_status.get("fixed_layout_demo"):
+                    raise BridgeConflict(
+                        "freeform execution requires fixed-layout controller"
+                    )
+
+                match = re.fullmatch(
+                    r"MOVE_([A-Z0-9_]+)_TO_"
+                    r"(S0_LEFT|S0_CENTER|S0_RIGHT|S2|S3|S4)",
+                    token,
+                )
+                if match is None:
+                    raise ValueError(
+                        f"invalid freeform action {token!r}"
+                    )
+
+                object_id = match.group(1).lower()
+                destination_token = match.group(2)
+
+                if object_id not in self.server.lab_config.objects:
+                    raise ValueError(
+                        f"unknown freeform object {object_id!r}"
+                    )
+
+                destination_station = (
+                    "home"
+                    if destination_token.startswith("S0_")
+                    else destination_token
+                )
+
+                source_station = (
+                    self.server.lab_config.objects[
+                        object_id
+                    ].source_station
+                )
+
+                action = ActionSpec(
+                    token=token,
+                    label=token.replace("_", " ").title(),
+                    role=destination_token,
+                    object_id=object_id,
+                    source_station=source_station,
+                    destination_station=destination_station,
+                    requires=(),
+                )
+
+                canonical = {
+                    "execution_id": execution_id,
+                    "config_digest": self.server.lab_config.digest,
+                    "token": token,
+                    "freeform": True,
+                    "object_id": object_id,
+                    "source_station": "dynamic_marker_scene",
+                    "destination_station": destination_token,
+                    "placement_slot_id": "freeform",
+                }
+
+            else:
+                action = self.server.lab_config.actions.get(token)
+                if action is None:
+                    raise ValueError(f"unknown action {token!r}")
+
+                expected = {
+                    "object_id": action.object_id,
+                    "source_station": action.source_station,
+                    "destination_station": action.destination_station,
+                }
+
+                for key, value in expected.items():
+                    if str(body.get(key, "")) != value:
+                        raise BridgeConflict(
+                            f"client {key} disagrees with bridge configuration"
+                        )
+
+                slot_id = str(body.get("placement_slot_id", ""))
+                if slot_id not in self.server.lab_config.placement_slots:
+                    raise ValueError(
+                        f"unknown placement slot {slot_id!r}"
+                    )
+
+                canonical = {
+                    "execution_id": execution_id,
+                    "config_digest": self.server.lab_config.digest,
+                    "token": action.token,
+                    **expected,
+                    "placement_slot_id": slot_id,
+                }
+
+            result, created = self.server.ledger.submit(
+                canonical,
+                action,
+                self.server.controller,
+            )
             self._json(HTTPStatus.ACCEPTED if created else HTTPStatus.OK, result)
         except BridgeConflict as exc:
             self._json(HTTPStatus.CONFLICT, {"success": False, "status": "conflict", "message": str(exc)})
@@ -302,6 +423,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-motion", action="store_true")
     parser.add_argument("--camera-preview", action="store_true", help="Open the D405 in dry-run mode; robot actions remain simulated")
     parser.add_argument("--calibration-mode", action="store_true", help="Permit supervised single-action probes with an uncalibrated config")
+    parser.add_argument("--fixed-layout-demo", action="store_true", help="Use the calibrated three-box fixed-layout HRC controller")
     parser.add_argument("--confirm-start-station", default="")
     parser.add_argument("--acknowledge-reconciled", action="append", default=[])
     parser.add_argument("--allow-remote-hardware-api", action="store_true")
@@ -317,6 +439,10 @@ def main(argv: list[str] | None = None) -> int:
     config = load_lab_config(args.config)
     if args.calibration_mode and not args.enable_motion:
         raise SystemExit("--calibration-mode requires --enable-motion")
+    if args.fixed_layout_demo and not args.enable_motion:
+        raise SystemExit("--fixed-layout-demo requires --enable-motion")
+    if args.fixed_layout_demo and args.calibration_mode:
+        raise SystemExit("--fixed-layout-demo and --calibration-mode are mutually exclusive")
     state_dir = Path(args.state_dir)
     # A path cleanup must not hide an existing execution ledger or its lock.
     relocated_root = Path("src/real_robot/real_robot_bridge_state").resolve()
@@ -338,13 +464,22 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 f"unresolved executions require scene/pose inspection and --acknowledge-reconciled for each ID: {unresolved}"
             )
-        controller = (
-            StretchHardwareController(
-                config, confirmed_start_station=args.confirm_start_station,
+        if args.fixed_layout_demo:
+            controller = FixedLayoutDemoController(
+                config,
+                confirmed_start_station=args.confirm_start_station,
+            )
+        elif args.enable_motion:
+            controller = StretchHardwareController(
+                config,
+                confirmed_start_station=args.confirm_start_station,
                 calibration_mode=args.calibration_mode,
             )
-            if args.enable_motion else BridgeDryRunController(config, camera_preview=args.camera_preview)
-        )
+        else:
+            controller = BridgeDryRunController(
+                config,
+                camera_preview=args.camera_preview,
+            )
         try:
             server = BridgeServer((args.bind, args.port), controller, config, ledger)
         except BaseException:
@@ -362,9 +497,32 @@ def main(argv: list[str] | None = None) -> int:
         def request_shutdown(_signum=None, _frame=None):
             if shutdown_started.is_set():
                 return
+
             shutdown_started.set()
-            controller.emergency_stop()
-            threading.Thread(target=server.shutdown, daemon=True).start()
+
+            # Graceful shutdown is safe only while no physical execution is
+            # active.  If motion is in flight, retain the fail-safe behavior
+            # and request an emergency stop before releasing the SDK.
+            ledger_status = dict(ledger.status())
+            active_execution_id = ledger_status.get("active_execution_id")
+
+            if active_execution_id is not None:
+                print(
+                    f"Active execution {active_execution_id}; "
+                    "requesting emergency stop before shutdown.",
+                    flush=True,
+                )
+                controller.emergency_stop()
+            else:
+                print(
+                    "Bridge idle; shutting down gracefully without runstop.",
+                    flush=True,
+                )
+
+            threading.Thread(
+                target=server.shutdown,
+                daemon=True,
+            ).start()
 
         signal.signal(signal.SIGTERM, request_shutdown)
         signal.signal(signal.SIGINT, request_shutdown)

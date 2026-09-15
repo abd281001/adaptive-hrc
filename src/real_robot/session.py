@@ -112,6 +112,14 @@ class LiveHrcSession:
             hardware = dict(self.executor.status())
             if not hardware.get("ready", True):
                 raise SessionStateError(f"hardware is not ready: {hardware.get('error') or hardware.get('last_error') or 'unknown reason'}")
+
+            scene_baseline = None
+            if hardware.get("fixed_layout_demo"):
+                reset_scene = getattr(self.executor, "reset_scene_baseline", None)
+                if not callable(reset_scene):
+                    raise SessionStateError("fixed-layout hardware does not expose reset-scene observation")
+                scene_baseline = dict(reset_scene())
+
             next_mode = OBSERVE if recipe_id not in self._observed_recipes else ASSIST
             if expected_trial is not None:
                 expected_metadata = {
@@ -160,6 +168,8 @@ class LiveHrcSession:
                     "trial_metadata": dict(self.trial_metadata),
                     "config_digest": self.config.digest,
                 })
+                if scene_baseline is not None:
+                    self._emit("scene_baseline", scene_baseline)
                 self._used_trial_ids.add(trial_id)
             except Exception:
                 self._restore_agent(self._agent_snapshot)
@@ -182,6 +192,46 @@ class LiveHrcSession:
             if self.phase != COMPLETE and self.mode == ASSIST:
                 self._prepare_robot_proposal()
         return self.snapshot()
+
+    def observe_human_move(self) -> Mapping[str, Any]:
+        """Observe one physical human move from marker/scene change."""
+        with self._lock:
+            phase = self.phase
+            if phase not in {HUMAN_TURN, ROBOT_PROPOSAL, CORRECTION_REQUIRED}:
+                raise SessionStateError(
+                    "a human physical move is not expected in the current phase"
+                )
+
+            observe = getattr(self.executor, "observe_human_move", None)
+            if not callable(observe):
+                raise SessionStateError(
+                    "hardware backend does not support marker-observed human moves"
+                )
+
+            evidence = dict(observe())
+            token = str(evidence.get("action_token", "")).strip().upper()
+
+            if not token:
+                raise SessionStateError(
+                    "marker observation did not resolve to an action"
+                )
+
+            self._emit("human_move_perceived", {
+                "action": token,
+                "evidence": evidence,
+                "phase_before": phase,
+            })
+
+            if phase == HUMAN_TURN:
+                return self.record_human_action(
+                    token,
+                    physical_completed=True,
+                )
+
+            return self.reject_robot_proposal(
+                token,
+                physical_completed=True,
+            )
 
     def reject_robot_proposal(self, human_action: str, *, physical_completed: bool = True) -> Mapping[str, Any]:
         with self._lock:
