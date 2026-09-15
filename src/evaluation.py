@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+import zlib
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
@@ -27,7 +28,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -171,9 +172,59 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _write_json(path: Path, payload: Any) -> None:
-    encoded = (json.dumps(_jsonable(payload), indent=2, sort_keys=True) + "\n").encode()
+def _write_json(path: Path, payload: Any, *, indent: Optional[int] = 2) -> None:
+    """Write JSON atomically. ``indent=None`` emits compact bytes.
+
+    Indentation is worth its cost only on artifacts a person opens: statuses,
+    manifests, validation reports. On the per-cell and per-event artifacts it
+    is pure overhead repeated over hundreds of thousands of rows, so those
+    callers pass ``indent=None``.
+    """
+    encoded = (
+        json.dumps(_jsonable(payload), indent=indent, sort_keys=True) + "\n"
+    ).encode()
     _atomic_write(path, encoded)
+
+
+def _append_jsonl_gz(path: Path, record: Mapping[str, Any]) -> None:
+    """Append one compact gzip member holding ``record``.
+
+    Each event's rows are appended to a single per-baseline file rather than
+    written as their own file: 1,215 events per seed times 26 arms times 24
+    cells is a file count that costs far more than the bytes it holds, and an
+    uncompressed pretty-printed row is roughly fifty times its gzipped size.
+
+    Appending trades the atomicity of a rename for a truncated final member if
+    the process dies mid-write. That is acceptable here and nowhere else:
+    these checkpoints are an observability artifact, and resuming a stream
+    reads ``partial/resume/<baseline>.pickle`` instead. ``_read_jsonl_gz``
+    therefore stops at the first unreadable member rather than raising.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(_jsonable(record), sort_keys=True) + "\n").encode()
+    with open(path, "ab") as raw:
+        with gzip.GzipFile(fileobj=raw, mode="ab") as stream:
+            stream.write(line)
+        raw.flush()
+        os.fsync(raw.fileno())
+
+
+def _read_jsonl_gz(path: Path) -> Iterator[Dict[str, Any]]:
+    """Yield records from a possibly truncated multi-member gzip stream."""
+    if not path.is_file():
+        return
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    return
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error):
+        return
 
 
 def _write_jsonl_gz(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
@@ -6145,10 +6196,7 @@ class _EventProgressWriter:
             name: rows[offsets[name]:]
             for name, rows in row_groups.items()
         }
-        checkpoint_path = (
-            out_dir / "partial" / "checkpoints" / stream.baseline
-            / f"event_{event_index:06d}.json"
-        )
+        checkpoint_path = _checkpoint_path(out_dir, stream.baseline)
         payload = {
             "state": "event_complete",
             "scenario": plan.scenario,
@@ -6173,7 +6221,7 @@ class _EventProgressWriter:
             },
             "tables": new_rows,
         }
-        _write_json(checkpoint_path, payload)
+        _append_jsonl_gz(checkpoint_path, payload)
         for name, rows in row_groups.items():
             offsets[name] = len(rows)
 
@@ -6203,17 +6251,58 @@ class _EventProgressWriter:
             "latest": progress,
             "per_baseline": self.partial_baselines,
             "analysis_note": (
-                "Each checkpoint is atomic and contains only rows added by its "
-                "completed event. Concatenate checkpoints by baseline and event_index."
+                "partial/checkpoints/<baseline>.jsonl.gz holds one gzip member "
+                "per completed event, in event_index order, each carrying only "
+                "the rows that event added. Read it with gzip and parse one "
+                "JSON object per line; a truncated final line means the run "
+                "died mid-append and should be ignored. The file is deleted "
+                "once tables/*.jsonl.gz is written, which supersedes it."
             ),
         })
         if self.progress_callback is not None:
             self.progress_callback(progress)
 
 
-def _write_plan(plan: Plan, out_dir: Path) -> None:
-    """Record the schedule a cell was run against, next to its results."""
-    _write_json(out_dir / "plan.json", {
+def _shared_plan_path(run_dir: Path, scenario: str, seed: int) -> Path:
+    """Where the one copy of a (scenario, seed) schedule lives for all arms."""
+    return (
+        run_dir / "shared" / "plans"
+        / _safe_component(str(scenario), "scenario")
+        / f"{int(seed):010d}.json"
+    )
+
+
+def _write_plan(plan: Plan, out_dir: Path, run_dir: Optional[Path] = None) -> None:
+    """Record the schedule a cell was run against, next to its results.
+
+    Every arm in a run replays the identical schedule for a given (scenario,
+    seed), so writing the full plan into all twenty-six cell folders stores
+    the same bytes twenty-six times. With ``run_dir`` the plan goes to
+    ``shared/plans/`` once and each cell keeps a pointer to it; without one --
+    a cell run on its own, or a test -- the plan is still written in full
+    locally, so a folder handed around by itself stays self-describing.
+    """
+    payload = _plan_payload(plan)
+    if run_dir is not None:
+        shared_path = _shared_plan_path(run_dir, plan.scenario, int(plan.seed))
+        if not shared_path.is_file():
+            _write_json(shared_path, payload, indent=None)
+        _write_json(out_dir / "plan.json", {
+            "scenario": plan.scenario,
+            "seed": int(plan.seed),
+            "shared_plan": str(shared_path.relative_to(run_dir)),
+            "note": (
+                "The schedule is identical for every arm at this (scenario, "
+                "seed); it is stored once at the run root. Resolve shared_plan "
+                "against the run directory."
+            ),
+        }, indent=None)
+        return
+    _write_json(out_dir / "plan.json", payload, indent=None)
+
+
+def _plan_payload(plan: Plan) -> Dict[str, Any]:
+    return {
         "scenario": plan.scenario,
         "seed": plan.seed,
         "selected_recipes": list(plan.selected_recipes),
@@ -6247,7 +6336,7 @@ def _write_plan(plan: Plan, out_dir: Path) -> None:
             }
             for index, event in enumerate(plan.events)
         ],
-    })
+    }
 
 
 def baseline_run_order(config: EvalSettings) -> Tuple[str, ...]:
@@ -6412,7 +6501,7 @@ def merge_cell(
         },
         "wall_s": float(wall_s),
     }
-    _write_json(out_dir / "summary.json", summary)
+    _write_json(out_dir / "summary.json", summary, indent=None)
     return summary
 
 
@@ -6485,6 +6574,7 @@ def run_baseline_cell(
     agent_name: Optional[str] = None,
     route: Optional[Sequence[str]] = None,
     progress_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    run_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run exactly one arm over one plan and write its own result folder.
 
@@ -6495,7 +6585,7 @@ def run_baseline_cell(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     start_time = time.perf_counter()
-    _write_plan(plan, out_dir)
+    _write_plan(plan, out_dir, run_dir)
     stream, baseline_summary = execute_baseline_stream(
         baseline,
         plan,
@@ -6554,7 +6644,9 @@ def run_baseline_cell(
     }
     if realized is not None:
         summary["realized_route"] = list(realized)
-    _write_json(out_dir / "summary.json", summary)
+    _write_json(out_dir / "summary.json", summary, indent=None)
+    # tables/ now holds every row the checkpoint log was protecting.
+    discarded = _discard_completed_checkpoints(out_dir)
     partial_summary_path = out_dir / "partial" / "summary.json"
     if partial_summary_path.is_file():
         partial_summary = _load_json(partial_summary_path)
@@ -6562,6 +6654,11 @@ def run_baseline_cell(
             "state": "complete",
             "completed_at_utc": _utc_now(),
             "final_summary": "../summary.json",
+            "checkpoints_discarded": int(discarded),
+            "checkpoint_note": (
+                "Event checkpoints are removed on success; ../tables/*.jsonl.gz "
+                "supersedes them."
+            ),
         })
         _write_json(partial_summary_path, partial_summary)
     return summary
@@ -6573,10 +6670,11 @@ def run_plan(
     out_dir: Path,
     *,
     progress_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    run_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     start_time = time.perf_counter()
-    _write_plan(plan, out_dir)
+    _write_plan(plan, out_dir, run_dir)
     per_baseline: Dict[str, Any] = {}
     all_episode_rows: List[Dict[str, Any]] = []
     all_frozen_rows: List[Dict[str, Any]] = []
@@ -6641,7 +6739,9 @@ def run_plan(
         "oracle_summary": summarize_oracle(oracle_comparisons),
         "wall_s": float(time.perf_counter() - start_time),
     }
-    _write_json(out_dir / "summary.json", summary)
+    _write_json(out_dir / "summary.json", summary, indent=None)
+    # tables/ now holds every row the checkpoint log was protecting.
+    discarded = _discard_completed_checkpoints(out_dir)
     partial_summary_path = out_dir / "partial" / "summary.json"
     if partial_summary_path.is_file():
         partial_summary = _load_json(partial_summary_path)
@@ -6649,6 +6749,11 @@ def run_plan(
             "state": "complete",
             "completed_at_utc": _utc_now(),
             "final_summary": "../summary.json",
+            "checkpoints_discarded": int(discarded),
+            "checkpoint_note": (
+                "Event checkpoints are removed on success; ../tables/*.jsonl.gz "
+                "supersedes them."
+            ),
         })
         _write_json(partial_summary_path, partial_summary)
     return summary
@@ -7002,9 +7107,11 @@ def _create_or_resume_run(config: EvalSettings) -> Tuple[Path, Path, str]:
             ),
             "event_checkpoints": (
                 "baselines/<baseline>/scenarios/<scenario>/seeds/<seed>/partial/"
-                "checkpoints/<baseline>/event_<index>.json"
+                "checkpoints/<baseline>.jsonl.gz (present only while the cell "
+                "is unfinished; removed once tables/ is written)"
             ),
             "baseline_status": "baselines/<baseline>/status.json",
+            "shared_plan": "shared/plans/<scenario>/<seed>.json",
             "shared_route": "shared/routing/<scenario>/<seed>.json",
             "merged_cell": "aggregate/cells/<scenario>/<seed>/summary.json",
             "aggregate": "aggregate/",
@@ -7073,21 +7180,30 @@ def _completed_cell_result(
     }
 
 
+def _checkpoint_root(out_dir: Path) -> Path:
+    return out_dir / "partial" / "checkpoints"
+
+
+def _checkpoint_path(out_dir: Path, baseline: str) -> Path:
+    """One append-only gzip log per arm, superseded by ``tables/`` at the end."""
+    return _checkpoint_root(out_dir) / f"{_safe_component(str(baseline), 'baseline')}.jsonl.gz"
+
+
 def _clear_stale_checkpoints(out_dir: Path) -> int:
     """Drop checkpoints from an earlier attempt at this seed.
 
     A seed that did not finish is re-run from its first event, because resume
-    is seed-level. Its old checkpoints are not overwritten past the point the
-    new attempt reaches, so a directory can end up holding a low range from one
-    attempt and a high range from another. Concatenating those by event index --
-    which is what the partial summary tells readers to do -- would splice two
-    different runs of the same seed into one series.
+    is seed-level. Its old checkpoint log is not truncated by the new attempt,
+    so the file can end up holding a low range from one attempt and a high
+    range from another. Reading those in order -- which is what the partial
+    summary tells readers to do -- would splice two different runs of the same
+    seed into one series.
     """
-    checkpoint_root = out_dir / "partial" / "checkpoints"
+    checkpoint_root = _checkpoint_root(out_dir)
     if not checkpoint_root.is_dir():
         return 0
     removed = 0
-    for path in checkpoint_root.glob("*/event_*.json"):
+    for path in checkpoint_root.glob("*.jsonl.gz"):
         path.unlink()
         removed += 1
     return removed
@@ -7096,20 +7212,102 @@ def _clear_stale_checkpoints(out_dir: Path) -> int:
 def _trim_checkpoints_after(
     out_dir: Path, baseline: str, event_index: int,
 ) -> int:
-    """Delete one baseline's checkpoints past a resume point."""
-    directory = out_dir / "partial" / "checkpoints" / baseline
-    if not directory.is_dir():
+    """Drop one baseline's checkpoint records past a resume point.
+
+    Rewrites the log rather than truncating it, because the members past the
+    cut are variable-length and a byte offset is not recoverable without
+    decompressing anyway.
+    """
+    path = _checkpoint_path(out_dir, baseline)
+    if not path.is_file():
+        return 0
+    keep: List[Dict[str, Any]] = []
+    removed = 0
+    for record in _read_jsonl_gz(path):
+        index = record.get("event_index")
+        if isinstance(index, int) and index > int(event_index):
+            removed += 1
+        else:
+            keep.append(record)
+    if not removed:
+        return 0
+    path.unlink()
+    for record in keep:
+        _append_jsonl_gz(path, record)
+    return removed
+
+
+def _discard_completed_checkpoints(out_dir: Path) -> int:
+    """Drop the checkpoint logs once the cell's final tables are on disk.
+
+    The logs exist so a run that dies partway leaves its rows recoverable.
+    ``tables/*.jsonl.gz`` holds the same rows, gzipped once and in full, so
+    keeping both means carrying the data twice for as long as the results
+    live -- which across a suite is tens of gigabytes of pure duplication.
+    """
+    checkpoint_root = _checkpoint_root(out_dir)
+    if not checkpoint_root.is_dir():
         return 0
     removed = 0
-    for path in directory.glob("event_*.json"):
-        try:
-            index = int(path.stem.split("_")[-1])
-        except ValueError:
-            continue
-        if index > int(event_index):
-            path.unlink()
-            removed += 1
+    for path in checkpoint_root.glob("*.jsonl.gz"):
+        path.unlink()
+        removed += 1
+    for path in checkpoint_root.glob("*/event_*.json"):
+        # Left behind by a run that predates the single-log format.
+        path.unlink()
+        removed += 1
+    for directory in sorted(checkpoint_root.glob("*/"), reverse=True):
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    if not any(checkpoint_root.iterdir()):
+        checkpoint_root.rmdir()
     return removed
+
+
+def reclaim_run_checkpoints(run_dir: Path, *, dry_run: bool = False) -> Dict[str, Any]:
+    """Drop checkpoint logs from cells of an existing run that already finished.
+
+    Runs produced before checkpoints were cleared on success keep both the
+    recovery log and the final tables. This reclaims the duplicate, and only
+    the duplicate: a cell is touched only when its status says ``complete``
+    and its ``tables/turns.jsonl.gz`` exists, so an interrupted cell keeps
+    everything it needs to resume.
+    """
+    run_dir = Path(run_dir)
+    reclaimed_bytes = 0
+    cells_cleared = 0
+    cells_skipped: List[str] = []
+    for status_path in sorted(
+        run_dir.glob(f"{BASELINES_DIRNAME}/*/scenarios/*/seeds/*/status.json")
+    ):
+        cell = status_path.parent
+        try:
+            state = str(_load_json(status_path).get("state"))
+        except (OSError, json.JSONDecodeError):
+            state = "unreadable"
+        if state != "complete" or not (cell / "tables" / "turns.jsonl.gz").is_file():
+            if _checkpoint_root(cell).is_dir():
+                cells_skipped.append(str(cell.relative_to(run_dir)))
+            continue
+        root = _checkpoint_root(cell)
+        if not root.is_dir():
+            continue
+        size = sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+        if dry_run:
+            reclaimed_bytes += size
+            cells_cleared += 1
+            continue
+        if _discard_completed_checkpoints(cell):
+            reclaimed_bytes += size
+            cells_cleared += 1
+    return {
+        "run_dir": str(run_dir),
+        "dry_run": bool(dry_run),
+        "cells_cleared": cells_cleared,
+        "cells_skipped_incomplete": cells_skipped,
+        "reclaimed_bytes": int(reclaimed_bytes),
+        "reclaimed_gib": round(reclaimed_bytes / (1024 ** 3), 2),
+    }
 
 
 def _open_worker_fault_log(out_dir: Path) -> Optional[Any]:
@@ -7208,6 +7406,7 @@ def _run_baseline_cell_job(
             agent_name=agent_name,
             route=route,
             progress_callback=report_progress,
+            run_dir=run_path,
         )
         realized = summary.get("realized_route")
         if realized:

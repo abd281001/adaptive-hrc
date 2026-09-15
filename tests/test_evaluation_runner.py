@@ -76,6 +76,12 @@ def _fast_eval_config(**overrides):
     return EvalSettings(**values)
 
 
+def _first_pair():
+    """The first (recipe, task) the catalog offers, for plans that need only one."""
+    recipe_name, builder = next(iter(recipe_builders().items()))
+    return recipe_name, build_task(recipe_name, "default", builder)
+
+
 class EvaluationRunnerContractTests(unittest.TestCase):
     def _pair_and_agent(self):
         recipe_name, builder = next(iter(recipe_builders().items()))
@@ -144,10 +150,9 @@ class EvaluationRunnerContractTests(unittest.TestCase):
                     root,
                     progress_callback=interrupt_after_checkpoint,
                 )
-            checkpoint = json.loads((
-                root / "partial" / "checkpoints" / "full"
-                / "event_000000.json"
-            ).read_text())
+            from src.evaluation import _checkpoint_path, _read_jsonl_gz
+            records = list(_read_jsonl_gz(_checkpoint_path(root, "full")))
+            checkpoint = records[0]
             partial = json.loads((root / "partial" / "summary.json").read_text())
 
         self.assertEqual(checkpoint["state"], "event_complete")
@@ -1357,17 +1362,24 @@ class WorkerCrashDiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             out_dir = Path(directory)
-            checkpoints = out_dir / "partial" / "checkpoints" / "in_context_llm"
-            checkpoints.mkdir(parents=True)
-            for index in (0, 71, 131):
-                (checkpoints / f"event_{index:06d}.json").write_text("{}")
+            from src.evaluation import _append_jsonl_gz, _checkpoint_path
+
+            for baseline in ("in_context_llm", "full", "bc"):
+                for index in (0, 71, 131):
+                    _append_jsonl_gz(
+                        _checkpoint_path(out_dir, baseline),
+                        {"event_index": index},
+                    )
             keep = out_dir / "partial" / "summary.json"
             keep.write_text("{}")
 
             removed = _clear_stale_checkpoints(out_dir)
 
+            # One log per arm, not one file per event.
             self.assertEqual(removed, 3)
-            self.assertEqual(list(checkpoints.glob("event_*.json")), [])
+            self.assertEqual(
+                list((out_dir / "partial" / "checkpoints").glob("*.jsonl.gz")), []
+            )
             # Only per-event checkpoints are stale; the summary is not.
             self.assertTrue(keep.is_file())
 
@@ -1520,18 +1532,183 @@ class EventResumeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            checkpoints = root / "partial" / "checkpoints" / "in_context_llm"
-            checkpoints.mkdir(parents=True)
+            from src.evaluation import (
+                _append_jsonl_gz, _checkpoint_path, _read_jsonl_gz,
+            )
+
+            path = _checkpoint_path(root, "in_context_llm")
             for index in range(6):
-                (checkpoints / f"event_{index:06d}.json").write_text("{}")
+                _append_jsonl_gz(path, {"event_index": index})
 
             removed = _trim_checkpoints_after(root, "in_context_llm", 3)
 
             self.assertEqual(removed, 2)
             self.assertEqual(
-                sorted(p.name for p in checkpoints.glob("event_*.json")),
-                [f"event_{i:06d}.json" for i in range(4)],
+                [record["event_index"] for record in _read_jsonl_gz(path)],
+                list(range(4)),
             )
+
+
+class CheckpointLifecycleTests(unittest.TestCase):
+    """Checkpoints protect an unfinished cell and are reclaimed once it lands."""
+
+    def _one_event_plan(self):
+        recipe_name, pair = _first_pair()
+        return Plan(
+            scenario="unit_checkpoint_lifecycle",
+            seed=23,
+            events=(
+                Event(
+                    "observe",
+                    pair,
+                    {"event_type": "unit", "phase_id": "phase_00", "stage": 0},
+                ),
+            ),
+            eval_pairs=(pair,),
+            selected_recipes=(recipe_name,),
+            selected_preferences=("default",),
+            description="checkpoints are dropped once tables supersede them",
+        )
+
+    def test_checkpoints_are_discarded_once_the_cell_completes(self):
+        from src.evaluation import _checkpoint_root
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_plan(self._one_event_plan(), _fast_eval_config(), root)
+
+            # The rows live on in the final tables, so the log is redundant.
+            self.assertTrue((root / "tables" / "turns.jsonl.gz").is_file())
+            self.assertFalse(_checkpoint_root(root).exists())
+            partial = json.loads((root / "partial" / "summary.json").read_text())
+            self.assertEqual(partial["state"], "complete")
+            self.assertGreaterEqual(partial["checkpoints_discarded"], 1)
+
+    def test_an_interrupted_cell_keeps_its_checkpoints(self):
+        from src.evaluation import _checkpoint_path
+
+        def interrupt(_progress):
+            raise RuntimeError("planned interruption")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(RuntimeError, "planned interruption"):
+                run_plan(
+                    self._one_event_plan(),
+                    _fast_eval_config(),
+                    root,
+                    progress_callback=interrupt,
+                )
+            self.assertTrue(_checkpoint_path(root, "full").is_file())
+
+    def test_reclaim_skips_cells_that_did_not_finish(self):
+        from src.evaluation import (
+            _append_jsonl_gz, _checkpoint_path, _checkpoint_root,
+            reclaim_run_checkpoints,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            done = run_dir / "baselines/full/scenarios/homogeneous/seeds/0000000007"
+            busy = run_dir / "baselines/bc/scenarios/homogeneous/seeds/0000000007"
+            for cell, state in ((done, "complete"), (busy, "running")):
+                (cell / "tables").mkdir(parents=True)
+                (cell / "tables" / "turns.jsonl.gz").write_bytes(b"")
+                (cell / "status.json").write_text(json.dumps({"state": state}))
+                _append_jsonl_gz(_checkpoint_path(cell, "full"), {"event_index": 0})
+
+            report = reclaim_run_checkpoints(run_dir)
+
+            self.assertEqual(report["cells_cleared"], 1)
+            self.assertFalse(_checkpoint_root(done).exists())
+            self.assertTrue(_checkpoint_root(busy).exists())
+            self.assertEqual(
+                report["cells_skipped_incomplete"],
+                ["baselines/bc/scenarios/homogeneous/seeds/0000000007"],
+            )
+
+    def test_reclaim_dry_run_removes_nothing(self):
+        from src.evaluation import (
+            _append_jsonl_gz, _checkpoint_path, _checkpoint_root,
+            reclaim_run_checkpoints,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            cell = run_dir / "baselines/full/scenarios/homogeneous/seeds/0000000007"
+            (cell / "tables").mkdir(parents=True)
+            (cell / "tables" / "turns.jsonl.gz").write_bytes(b"")
+            (cell / "status.json").write_text(json.dumps({"state": "complete"}))
+            _append_jsonl_gz(_checkpoint_path(cell, "full"), {"event_index": 0})
+
+            report = reclaim_run_checkpoints(run_dir, dry_run=True)
+
+            self.assertEqual(report["cells_cleared"], 1)
+            self.assertGreater(report["reclaimed_bytes"], 0)
+            self.assertTrue(_checkpoint_root(cell).exists())
+
+
+class SharedPlanTests(unittest.TestCase):
+    """The schedule is identical across arms, so it is stored once."""
+
+    def test_cells_point_at_one_shared_plan(self):
+        from src.evaluation import _shared_plan_path, _write_plan
+
+        recipe_name, pair = _first_pair()
+        plan = Plan(
+            scenario="unit_shared_plan",
+            seed=7,
+            events=(Event("observe", pair, {"phase_id": "phase_00", "stage": 0}),),
+            eval_pairs=(pair,),
+            selected_recipes=(recipe_name,),
+            selected_preferences=("default",),
+            description="one plan, many arms",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            cells = [
+                run_dir / f"baselines/{arm}/scenarios/unit_shared_plan/seeds/0000000007"
+                for arm in ("full", "bc", "no_decay")
+            ]
+            for cell in cells:
+                cell.mkdir(parents=True)
+                _write_plan(plan, cell, run_dir)
+
+            shared = _shared_plan_path(run_dir, "unit_shared_plan", 7)
+            self.assertTrue(shared.is_file())
+            body = json.loads(shared.read_text())
+            self.assertEqual(body["eval_pairs"], [pair.label])
+
+            for cell in cells:
+                pointer = json.loads((cell / "plan.json").read_text())
+                self.assertEqual(
+                    pointer["shared_plan"], str(shared.relative_to(run_dir)),
+                )
+                # The pointer is a fraction of the plan it replaces.
+                self.assertLess(
+                    (cell / "plan.json").stat().st_size,
+                    shared.stat().st_size,
+                )
+
+    def test_a_standalone_cell_still_writes_its_whole_plan(self):
+        from src.evaluation import _write_plan
+
+        recipe_name, pair = _first_pair()
+        plan = Plan(
+            scenario="unit_standalone_plan",
+            seed=7,
+            events=(Event("observe", pair, {"phase_id": "phase_00", "stage": 0}),),
+            eval_pairs=(pair,),
+            selected_recipes=(recipe_name,),
+            selected_preferences=("default",),
+            description="a folder handed around alone stays self-describing",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cell = Path(directory)
+            _write_plan(plan, cell)
+            body = json.loads((cell / "plan.json").read_text())
+            self.assertEqual(body["eval_pairs"], [pair.label])
+            self.assertNotIn("shared_plan", body)
 
 
 class ResumableRunDiscoveryTests(unittest.TestCase):

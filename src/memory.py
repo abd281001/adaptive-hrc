@@ -255,6 +255,7 @@ class MemoryItem:
     added_step: int
     added_cycle: int
     last_seen_step: int
+    admitted_weight: float = 1.0
     source_mode: str = ""
     transitions: Tuple[StateTransition, ...] = ()
 
@@ -330,6 +331,7 @@ class ReplayMemory:
         if key in self.active:
             entry = self.active[key]
             entry.weight = (1.0 if key in self.latest_keys else initial_weight)
+            entry.admitted_weight = entry.weight
             entry.last_seen_step = now
             entry.ordering = ordering
             if transitions is not None: entry.transitions = transition_trace
@@ -341,7 +343,7 @@ class ReplayMemory:
             removed_item = self.pruned.pop(key)
             if transitions is None: transition_trace = tuple(removed_item.transitions)
 
-        entry = MemoryItem(recipe_id=recipe_id, variant_id=variant_id, ordering=ordering, weight=initial_weight, added_step=now, added_cycle=cycle, last_seen_step=now, transitions=transition_trace)
+        entry = MemoryItem(recipe_id=recipe_id, variant_id=variant_id, ordering=ordering, weight=initial_weight, added_step=now, added_cycle=cycle, last_seen_step=now, admitted_weight=initial_weight, transitions=transition_trace)
         self.active[key] = entry
         if reentering: self.reentry_events.append((int(now), key, int(reuse_gap or 0)))
         if should_pin_latest: self.mark_latest(recipe_id, variant_id, now=now)
@@ -360,6 +362,10 @@ class ReplayMemory:
                 continue
             age = int(now) - int(entry.last_seen_step)
             if self.policy == "adaptive" and age <= self.horizon(key):
+                # A horizon that grows back over a variant's age puts the variant
+                # inside its retention window again, so it holds the weight it was
+                # admitted at rather than a partial weight left by an earlier decay.
+                entry.weight = entry.admitted_weight
                 continue
             entry.weight -= decay_rate
             if entry.weight <= self.settings.prune_threshold:
@@ -513,7 +519,10 @@ class ReplayMemory:
         self.latest_keys.add(key)
         for pinned in retained:
             self.active[pinned].weight = 1.0
-        if key in self.active: self.active[key].weight = 1.0
+            self.active[pinned].admitted_weight = 1.0
+        if key in self.active:
+            self.active[key].weight = 1.0
+            self.active[key].admitted_weight = 1.0
 
     def unmark_latest(self, recipe_id: str, variant_id: str) -> None:
         key = (recipe_id, variant_id)

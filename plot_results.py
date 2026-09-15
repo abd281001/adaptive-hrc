@@ -31,11 +31,39 @@ import numpy as np
 
 
 METHODS = {
-    "full": ("Full", "#008577", "-"),
-    "no_decay": ("No decay", "#4477AA", "--"),
-    "fixed": ("Fixed decay", "#CC8800", "-."),
-    "memory_oracle": ("Memory oracle", "#CC2233", ":"),
+    "full": ("RARE", "#008577", "-"),
+    "no_decay": ("No Decay", "#4477AA", "--"),
+    "fixed": ("Fixed", "#CC8800", "-."),
+    "memory_oracle": ("Oracle", "#CC2233", ":"),
 }
+# Arms for the two line figures. Wider than METHODS because a curve costs
+# only a line, where a bar costs horizontal room. Two arms are deliberately
+# absent: 'ewc' tracks 'no_decay' to within 0.005 accuracy averaged over the
+# schedule, and 'offline_default' tracks 'offline_all' to within 0.044, so
+# plotting them draws a line nobody can separate. Both are in the baseline
+# table instead.
+LINE_METHODS = {
+    "memory_oracle": ("Oracle", "#CC2233", ":"),
+    "full": ("RARE", "#008577", "-"),
+    "no_decay": ("No Decay", "#4477AA", "--"),
+    "unpinned": ("Unpinned", "#777777", "-"),
+    "latest": ("Latest", "#AA4499", (0, (3, 1, 1, 1))),
+    "fixed": ("Fixed", "#CC8800", "-."),
+    "offline_all": ("Offline-all", "#882255", (0, (5, 2))),
+    "frozen": ("Offline-subset", "#111111", ":"),
+}
+# The memory figure drops the frozen controls. Their active set never
+# changes -- it is fixed when training ends -- so they contribute flat lines
+# that compress the axis the adaptive curves are read on.
+MEMORY_METHODS = {
+    name: style for name, style in LINE_METHODS.items()
+    if name not in ("offline_all", "frozen")
+}
+
+# Curves the SE band is drawn for. Eight translucent bands overlap into noise,
+# so the band is spent on the system and the ceiling it is read against.
+BANDED = ("full", "memory_oracle")
+
 PARETO_METHODS = {
     "full": ("Full", "#008577", "o"),
     "unpinned": ("Adaptive decay (no support)", "#555555", "P"),
@@ -52,6 +80,11 @@ COMPONENT_METHODS = {
     "unpinned": ("Without all three", "#555555", "P"),
 }
 SCENARIOS = {"homogeneous": "Homogeneous", "heterogeneous": "Heterogeneous", "holdout": "Holdout"}
+# Execution at which the withheld axis is first demonstrated. Everything before
+# it is the source progression the offline controls were fitted on, so without
+# the marker their scores there read as competitive rather than as training
+# accuracy, and a trailing window carries that reading past the boundary.
+HOLDOUT_INTRODUCTION = 360
 KEYS = ("scenario", "baseline", "seed")
 FIELDS = {
     "episodes": ("pair", "mode", "phase_role", "hrc_robot_correct_count",
@@ -68,14 +101,15 @@ def read_json(path):
 
 
 def read_table(path, table):
-    """Read only the four methods and fields needed for plotting."""
+    """Read only the plotted arms and the fields the figures need."""
+    plotted = {**METHODS, **LINE_METHODS}
     rows = []
     if not Path(path).is_file():
         return rows
     with gzip.open(path, "rt") as stream:
         for line in stream:
             row = json.loads(line)
-            if row["baseline"] not in METHODS:
+            if row["baseline"] not in plotted:
                 continue
             if table == "diagnostics" and row["diagnostic_type"] != "memory_compute":
                 continue
@@ -106,11 +140,11 @@ def load_run(path):
         summary = read_json(folder / "summary.json")
         if summary["state"] != "complete":
             raise ValueError(f"Cell is not complete: {folder}")
-        for baseline in (*METHODS, "unpinned"):
+        for baseline in {**METHODS, **LINE_METHODS, "unpinned": None}:
             arm = summary["per_baseline"][baseline]
             data["systems"].append({**arm["system"], **job, "baseline": baseline})
             data["pareto_accuracy"].append({**job, "baseline": baseline, "value": arm["assist"]["overall"]["live_top_1"]})
-        for baseline in METHODS:
+        for baseline in {**METHODS, **LINE_METHODS}:
             tables = cell_dir(path, baseline, scenario, seed) / "tables"
             for table in FIELDS:
                 data[table].extend(read_table(tables / f"{table}.jsonl.gz", table))
@@ -218,7 +252,8 @@ def retention_changes(episodes, probes):
 def legend(fig, methods=METHODS):
     handles = [Line2D([], [], color=color, linestyle=style, lw=1.8, label=label)
                for label, color, style in methods.values()]
-    fig.legend(handles=handles, loc="outside lower center", ncol=len(methods), frameon=False)
+    fig.legend(handles=handles, loc="outside lower center",
+               ncol=min(len(methods), 4), frameon=False)
 
 
 def finish(fig, output, name, methods=METHODS):
@@ -233,9 +268,9 @@ def finish(fig, output, name, methods=METHODS):
     plt.close(fig)
 
 
-def draw_lines(ax, rows):
+def draw_lines(ax, rows, methods=None):
     support = []
-    for baseline, (label, color, style) in METHODS.items():
+    for baseline, (label, color, style) in (methods or METHODS).items():
         selected = [r for r in rows if r["baseline"] == baseline]
         groups = group_rows(selected, ("x",))
         xs = sorted(key[0] for key in groups)
@@ -243,8 +278,12 @@ def draw_lines(ax, rows):
         if not len(xs):
             continue
         support.extend(int(n) for n in stats[:, 2] if n)
-        ax.plot(xs, stats[:, 0], color=color, linestyle=style, lw=1.5, zorder=4 if baseline == "memory_oracle" else 3)
-        ax.fill_between(xs, stats[:, 0] - stats[:, 1], stats[:, 0] + stats[:, 1], color=color, alpha=0.09, linewidth=0)
+        lead = baseline in ("full", "memory_oracle")
+        ax.plot(xs, stats[:, 0], color=color, linestyle=style, lw=1.7 if lead else 1.2,
+                zorder=5 if baseline == "memory_oracle" else 4 if lead else 3)
+        if baseline in BANDED:
+            ax.fill_between(xs, stats[:, 0] - stats[:, 1], stats[:, 0] + stats[:, 1],
+                            color=color, alpha=0.12, linewidth=0)
     ax.set_xlabel("Task execution")
     ax.margins(x=0)
     if support:
@@ -252,9 +291,10 @@ def draw_lines(ax, rows):
         ax.text(0.98, 0.03, f"n = {count} seeds", ha="right", transform=ax.transAxes, fontsize=7, color="0.4")
 
 
-def draw_bars(ax, rows, categories, field):
+def draw_bars(ax, rows, categories, field, methods=None):
+    methods = methods or METHODS
     for i, category in enumerate(categories):
-        for j, (baseline, (_, color, _)) in enumerate(METHODS.items()):
+        for j, (baseline, (_, color, _)) in enumerate(methods.items()):
             values = [r["value"] for r in rows if r["baseline"] == baseline and r[field] == category]
             mean, se, n = mean_sem(values)
             if not n:
@@ -269,14 +309,35 @@ def draw_bars(ax, rows, categories, field):
     ax.set_xticks(range(len(categories)), [str(c).capitalize() for c in categories])
 
 
+def mark_holdout(ax, rows, window):
+    """Separate the source progression from the withheld-axis block."""
+    xs = [r["x"] for r in rows]
+    if not xs or max(xs) < HOLDOUT_INTRODUCTION:
+        return
+    ax.axvspan(HOLDOUT_INTRODUCTION, max(xs), color="0.5", alpha=0.07, linewidth=0, zorder=0)
+    ax.axvline(HOLDOUT_INTRODUCTION, color="0.35", linewidth=0.8, linestyle=(0, (4, 2)), zorder=2)
+    # A trailing window still averages source executions for its own length
+    # past the boundary, so say where the window is no longer mixed.
+    if window > 1:
+        ax.axvline(HOLDOUT_INTRODUCTION + window, color="0.6", linewidth=0.6,
+                   linestyle=(0, (1, 2)), zorder=2)
+    # Set along the rule so it cannot collide with the seed-count note.
+    ax.annotate("withheld axis introduced", xy=(HOLDOUT_INTRODUCTION, 0.30),
+                xytext=(-3, 0), textcoords="offset points", fontsize=7,
+                color="0.35", ha="right", va="center", rotation=90, zorder=6)
+
+
 def plot_accuracy(episodes, scenarios, output, window):
     rows = time_series(episodes, "hrc_robot_correct_count", "hrc_robot_turn_count", window)
     fig, axes = plt.subplots(1, len(scenarios), figsize=(3.1 * len(scenarios), 2.7), layout="constrained", squeeze=False)
     for ax, scenario in zip(axes[0], scenarios):
-        draw_lines(ax, [r for r in rows if r["scenario"] == scenario])
+        selected = [r for r in rows if r["scenario"] == scenario]
+        draw_lines(ax, selected, LINE_METHODS)
+        if scenario == "holdout":
+            mark_holdout(ax, selected, window)
         ax.set(title=SCENARIOS[scenario], ylim=(0, 1.02), ylabel="Robot Top-1 accuracy")
     fig.suptitle("Per-execution accuracy" if window == 1 else f"Accuracy · {window}-execution trailing window", fontsize=10)
-    finish(fig, output, "accuracy")
+    finish(fig, output, "accuracy", methods=LINE_METHODS)
 
 
 def plot_phases(episodes, scenarios, output):
@@ -301,16 +362,20 @@ def plot_phases(episodes, scenarios, output):
 
 
 def plot_memory(memory, scenarios, output):
-    fig, axes = plt.subplots(2, len(scenarios), figsize=(3.1 * len(scenarios), 4.8), layout="constrained", squeeze=False)
-    for i, (field, label) in enumerate([("active_variants", "Active training workflows"), ("registry_size", "Total stored workflows")]):
-        rows = time_series(memory, field)
-        for ax, scenario in zip(axes[i], scenarios):
-            draw_lines(ax, [r for r in rows if r["scenario"] == scenario])
-            ax.set_ylabel(label)
-            ax.set_ylim(bottom=0)
-            if i == 0:
-                ax.set_title(SCENARIOS[scenario])
-    finish(fig, output, "dataset_growth")
+    """Active rehearsal set only.
+
+    Total stored variants is near-identical across these methods -- they all
+    archive what they retire -- so the second row restated one fact three
+    times at the cost of half the figure.
+    """
+    fig, axes = plt.subplots(1, len(scenarios), figsize=(3.1 * len(scenarios), 2.7),
+                             layout="constrained", squeeze=False)
+    rows = time_series(memory, "active_variants")
+    for ax, scenario in zip(axes[0], scenarios):
+        draw_lines(ax, [r for r in rows if r["scenario"] == scenario], MEMORY_METHODS)
+        ax.set(title=SCENARIOS[scenario], ylabel="Active rehearsal set")
+        ax.set_ylim(bottom=0)
+    finish(fig, output, "dataset_growth", methods=MEMORY_METHODS)
 
 
 def plot_retention(changes, scenarios, output):

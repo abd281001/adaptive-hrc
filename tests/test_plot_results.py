@@ -103,3 +103,40 @@ def test_an_incomplete_cell_is_rejected(run):
     cell.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="not complete"):
         load_arms(path, arms)
+
+
+def test_every_plotted_arm_is_actually_read_from_disk(tmp_path):
+    """A roster the loader filters out draws a legend entry with no curve.
+
+    LINE_METHODS was added for the two line figures, but read_table kept its
+    own `not in METHODS` gate, so four arms appeared in the legend and never
+    on the axes -- a figure that silently under-reports its own comparison.
+    """
+    import gzip
+    from plot_results import LINE_METHODS, METHODS, read_table
+
+    plotted = {**METHODS, **LINE_METHODS}
+    path = tmp_path / "episodes.jsonl.gz"
+    row = {"scenario": "homogeneous", "seed": 1337, "event_index": 0, "pair": "p",
+           "mode": "assist", "phase_role": "settled", "hrc_robot_correct_count": 1,
+           "hrc_robot_turn_count": 1, "hrc_human_turn_count": 0,
+           "hrc_human_correction_count": 0, "recipe_steps": 1}
+    with gzip.open(path, "wt") as stream:
+        for baseline in (*plotted, "not_a_plotted_arm"):
+            stream.write(json.dumps({**row, "baseline": baseline}) + "\n")
+
+    read = {r["baseline"] for r in read_table(path, "episodes")}
+    assert read == set(plotted)
+
+
+def test_line_figures_exclude_arms_that_would_overplot(tmp_path):
+    """Curves within a few thousandths of each other are one visible line.
+
+    'ewc' tracks 'no_decay' to 0.005 and 'offline_default' tracks
+    'offline_all' to 0.044 over the schedule, so each pair contributes one
+    curve to the figure and both members to the baseline table.
+    """
+    from plot_results import LINE_METHODS
+
+    assert "no_decay" in LINE_METHODS and "ewc" not in LINE_METHODS
+    assert "offline_all" in LINE_METHODS and "offline_default" not in LINE_METHODS
